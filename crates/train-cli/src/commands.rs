@@ -837,7 +837,16 @@ mod tests {
         assert!(reach(&a(&["reach", "--level", "/nonexistent/level.json"])).is_err());
     }
 
-    /// A six-tile pit: wider than the 4.0-tile full-speed jump distance.
+    /// A six-tile pit between the start ledge (columns 0–6) and the ledge holding
+    /// the goal (columns 13–15): wider than the 4.0-tile full-speed jump distance,
+    /// so no canonical take-off clears it and the goal is unreachable on foot.
+    ///
+    /// It has to be six. The fixture used to be four tiles wide with the goal one
+    /// column past the far ledge, and a coarse take-off sweep happened to call it
+    /// unbeatable — but a 4-tile pit is exactly the widest jump the physics bible
+    /// allows, and a finer sweep found both the crossing take-off and a mid-air
+    /// touch of the floating goal. The test was passing for the wrong reason: its
+    /// pit was crossable and the goal was simply not standing on anything.
     const UNREACHABLE: &str = "{
       \"format\": \"evo-platformer-level\",
       \"level_format_version\": 1,
@@ -851,8 +860,8 @@ mod tests {
         \"....................\",
         \"....................\",
         \"....................\",
-        \"#######....###......\",
-        \"#######....###......\"
+        \"#######......###....\",
+        \"#######......###....\"
       ],
       \"entities\": [{\"type\": \"goal\", \"x\": 14, \"y\": 5}]
     }";

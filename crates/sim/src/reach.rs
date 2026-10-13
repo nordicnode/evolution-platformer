@@ -17,11 +17,22 @@ pub const MAX_TRAJECTORY_TICKS: u32 = 240;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
-/// An agent can stand anywhere, not just on a lattice: with a 0.6-wide body its
-/// left edge ranges over `col + [0.0, 0.4]`. The L3 spike patch is only clearable
-/// from a narrow band inside that range, so sampling a single offset made the
-/// oracle call a beatable level unbeatable. Cost is linear in this list.
-pub const TAKEOFF_OFFSETS: [f32; 5] = [0.0, 0.1, 0.2, 0.3, 0.4];
+/// An agent can stand anywhere, not just on a lattice: nothing in the sim snaps a
+/// body to a tile boundary, so its left edge ranges over the *whole* column. L3's
+/// spike patch is only clearable from a narrow band inside that range, and a
+/// precision level is built out of jumps that are only clearable from one such
+/// band, so a coarse sweep makes the oracle call beatable levels unbeatable — a
+/// false negative that costs a level designer an hour and teaches them to distrust
+/// the tool.
+///
+/// 0.05 is the granularity: fine enough that a band narrower than a twentieth of a
+/// tile is the level's problem, not the oracle's. Cost is linear in this list
+/// (20 entries, ~4x the old 5), and the whole sweep for a 60-tile level is still
+/// milliseconds.
+pub const TAKEOFF_OFFSETS: [f32; 20] = [
+    0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
+    0.80, 0.85, 0.90, 0.95,
+];
 
 /// A maximal horizontal run of solid tiles with open space above it.
 #[derive(Clone, Copy, Debug, PartialEq)]
