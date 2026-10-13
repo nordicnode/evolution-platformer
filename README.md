@@ -73,7 +73,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 184 tests
+cargo test --workspace                 # 185 tests
 cargo build --release
 
 # Can this level be beaten at all? Milliseconds, no training.
@@ -208,7 +208,7 @@ and why ("gap too wide", "wall too tall").
 
 ## Testing
 
-184 tests, all green. `cargo test --workspace`.
+185 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness

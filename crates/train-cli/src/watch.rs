@@ -944,13 +944,49 @@ fn watch_champion(
         result.fitness,
         result.best_x
     );
-    if (result.fitness - champion.fitness).abs() > 1e-3 {
-        eprintln!(
-            "note: the animation scored {:.2} but the champion records {:.2}",
-            result.fitness, champion.fitness
-        );
+    match replay_verdict(&result, &champion) {
+        ReplayVerdict::Verified => println!("the animation matches the recorded episode"),
+        ReplayVerdict::Mismatch { watched, recorded } => eprintln!(
+            "warning: the animation scored {watched:.2} but the champion records {recorded:.2}; \
+             this champion does not reproduce"
+        ),
+        ReplayVerdict::Truncated { played } => println!(
+            "stopped after {played} of {} frames, so there is nothing to compare \
+             (let it run to the end, or drop --frames)",
+            champion.metadata.frames
+        ),
     }
     Ok(champion)
+}
+
+/// How a watched champion episode compares with the champion's own record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReplayVerdict {
+    /// Played to the end and scored what the file records.
+    Verified,
+    /// Played to the end and scored something else: a real mismatch.
+    Mismatch { watched: f32, recorded: f32 },
+    /// The viewer stopped the animation early (`q`, or a `--frames` cap). A partial
+    /// episode has a partial score, and calling that a mismatch would be a false
+    /// alarm about a champion that is perfectly fine — which is exactly what
+    /// `watch --champion --frames N` would have done by default.
+    Truncated { played: u32 },
+}
+
+fn replay_verdict(result: &evo::EpisodeResult, champion: &ChampionFile) -> ReplayVerdict {
+    if result.outcome == Outcome::Running {
+        return ReplayVerdict::Truncated {
+            played: result.frames,
+        };
+    }
+    if (result.fitness - champion.fitness).abs() > 1e-3 {
+        ReplayVerdict::Mismatch {
+            watched: result.fitness,
+            recorded: champion.fitness,
+        }
+    } else {
+        ReplayVerdict::Verified
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1662,6 +1698,49 @@ mod tests {
         let champ = ChampionFile::load_for_level(&champion, &loaded).expect("champion loads");
         assert!(champ.metadata.generation < 2, "at most two generations ran");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_champion_replay_is_not_reported_as_a_mismatch() {
+        // `--frames` and `q` cut the animation short. A partial episode has a
+        // partial score, and reporting that as a mismatch would send a user hunting
+        // for a bug in a champion that reproduces perfectly.
+        use evo::Genome;
+        let level = load_level(&wpath("levels/l2-first-gap.json")).expect("level loads");
+        let cfg = GaConfig {
+            pop_size: 4,
+            master_seed: 1,
+            ..GaConfig::default()
+        };
+        let eval = cfg.eval_config();
+        let genome = Genome::zeros(0, cfg.shape.clone());
+        let full = evo::run_episode(&level, &genome, &eval, 7);
+        let champion = ChampionFile::new(&genome, &full, &level, 0, &cfg);
+        assert_eq!(replay_verdict(&full, &champion), ReplayVerdict::Verified);
+
+        let mut runner = EpisodeRunner::new(&level, &genome, &eval, 7);
+        for _ in 0..10 {
+            runner.step();
+        }
+        let partial = runner.result();
+        assert_eq!(partial.outcome, Outcome::Running);
+        assert_eq!(
+            replay_verdict(&partial, &champion),
+            ReplayVerdict::Truncated {
+                played: partial.frames
+            }
+        );
+
+        // The same finished episode with a different score is a genuine mismatch.
+        let mut wrong = full.clone();
+        wrong.fitness += 1.0;
+        assert_eq!(
+            replay_verdict(&wrong, &champion),
+            ReplayVerdict::Mismatch {
+                watched: wrong.fitness,
+                recorded: champion.fitness,
+            }
+        );
     }
 
     #[test]
