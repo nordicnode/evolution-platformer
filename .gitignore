@@ -1,0 +1,23 @@
+/[target]/
+**/*.rs.bk
+*.pdb
+
+# Tool-local metadata for the coding agent, not part of the project
+/.freebuff/
+
+# Champion + export artifacts are generated, but the curated starter pack is not.
+/champions/*.json
+!/champions/README.md
+/export/
+
+# Fitness-chart CSV exports from `train-cli train --csv`
+/out/
+
+# Editor / OS noise
+.DS_Store
+/.idea/
+/.vscode/
+*.swp
+
+# Local scratch (benchmarks, research notes pulled in by hand)
+/scratch/

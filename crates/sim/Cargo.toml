@@ -1,0 +1,14 @@
+[package]
+name = "sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic fixed-timestep platformer core: tile grid, AABB physics, sensors."
+
+# BOUNDARY RULE (development_plan.md §4): this crate has no `std::time`, no threads,
+# no engine, no I/O beyond explicit JSON parsing. Deps are pinned deliberately.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rand_xoshiro.workspace = true

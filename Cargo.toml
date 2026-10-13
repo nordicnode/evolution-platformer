@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sim",
+    "crates/evo",
+    "crates/render",
+    "crates/train-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+sim = { path = "crates/sim" }
+evo = { path = "crates/evo" }
+render = { path = "crates/render" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand_xoshiro = "0.8"
+rayon = "1"
+crossterm = "0.29"
+
+# Training is a tight numeric loop; keep release fat.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# `cargo test --profile release` and benches share the training profile.
+[profile.bench]
+inherits = "release"
