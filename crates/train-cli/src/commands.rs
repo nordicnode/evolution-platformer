@@ -37,11 +37,11 @@ const RENDER_OPTS: &[&str] = &["level", "steps", "stride", "action", "seed"];
 const SENSORS_OPTS: &[&str] = &[];
 
 /// Turn a parser error into a message `main` will report as a usage error.
-fn usage<T>(r: Result<T, ParseError>) -> Result<T, String> {
+pub(crate) fn usage<T>(r: Result<T, ParseError>) -> Result<T, String> {
     r.map_err(|e| format!("usage: {e}"))
 }
 
-fn load_level(path: &str) -> Result<Level, String> {
+pub(crate) fn load_level(path: &str) -> Result<Level, String> {
     Level::from_json_file(path)
 }
 
@@ -351,7 +351,7 @@ pub fn reach(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn list_levels(dir: &str) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn list_levels(dir: &str) -> Result<Vec<PathBuf>, String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {dir}: {e}"))?;
     let mut out = Vec::new();
     for entry in entries {
@@ -428,7 +428,7 @@ pub fn replay(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn find_level_by_hash(dir: &str, hash: &str) -> Result<Option<Level>, String> {
+pub(crate) fn find_level_by_hash(dir: &str, hash: &str) -> Result<Option<Level>, String> {
     if !Path::new(dir).exists() {
         return Ok(None);
     }

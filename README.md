@@ -15,12 +15,15 @@ currently does and where it deviates.
 | **M0** scaffolding | done |
 | **M1** sim + hand-written levels | done |
 | **M2** GA + headless training + reachability oracle | done |
-| **M3** watch mode + fun gate | **not started** — this is the decision point |
+| **M3** watch mode + fun gate | **Tier 1 done, fun gate open** — the owner's call |
 | M4 editor, M5 web/release | not started |
 
-The deterministic core, the evolution loop and the reachability oracle are
-implemented and tested. There is no graphical watch mode yet; `train-cli` prints
-the learning curve and `train-cli play` lets a human play a level in the terminal.
+The deterministic core, the evolution loop, the reachability oracle and the Tier 1
+watch mode are implemented and tested. `train-cli watch` grows a population on
+screen: fitness chart, best-4 + random-4 agents per generation, speed control,
+pause, death markers and the genius-agent splash. What remains of M3 is the part
+no test can answer — whether watching it is fun — and that needs a human at a
+keyboard. See [The M3 problem](#the-m3-problem).
 
 ## Measured numbers
 
@@ -48,8 +51,8 @@ deliberately, or the levels need to be much harder. See
 ```
 crates/sim/        the deterministic core: tile grid, AABB physics, sensors, oracle
 crates/evo/        fixed-topology genome, GA, fitness, champion files
-crates/render/     read-only terminal views of sim state (ASCII frame, keyboard play)
-crates/train-cli/  headless driver: train, reach, replay, play, render, sensors
+crates/render/     read-only views: ASCII frame/scene, keyboard play, pure text charts
+crates/train-cli/  driver: train, watch, reach, replay, play, render, sensors
 levels/            hand-written *.json levels (L1-L3)
 champions/         generated champion files (git-ignored)
 ```
@@ -61,18 +64,27 @@ Boundary rules from the plan (§4), enforced by review:
    `serde_json` and `rand_xoshiro`.
 2. Everything the sim needs crosses the boundary as plain data: `&Level`,
    `AgentAction`, `seed: u64`.
-3. `crates/render` only ever borrows `&Sim` and simulates nothing itself.
+3. `crates/render` only ever borrows `&Sim` and simulates nothing itself. One
+documented exception: `render::chart` depends on nothing at all — charts are
+numbers in, text out — so the learning curve can be drawn and unit-tested without
+physics. `watch` is a composition of a scene view and a chart, not a fourth
+renderer.
 
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 121 tests
+cargo test --workspace                 # 184 tests
 cargo build --release
 
 # Can this level be beaten at all? Milliseconds, no training.
 ./target/release/train-cli reach --all --levels-dir levels --verbose
 
-# Evolve, print the fitness chart, save a champion.
+# Watch it learn: chart, best-4 + random-4 agents, deaths, genius splashes.
+./target/release/train-cli watch --level levels/l3-gauntlet.json
+#   space pause   -/+ speed   n next generation   f follow/whole level
+#   s save champion   q quit
+
+# Evolve headlessly, print the fitness chart, save a champion.
 ./target/release/train-cli train --level levels/l3-gauntlet.json \
     --generations 200 --pop 200 --stop-on-win --csv out/l3.csv
 
@@ -196,7 +208,7 @@ and why ("gap too wide", "wall too tall").
 
 ## Testing
 
-121 tests, all green. `cargo test --workspace`.
+184 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -206,6 +218,15 @@ hash), the reachability cases (a 3-tile gap passes, a 5-tile gap reports "gap to
 wide", a 5-tile wall reports "wall too tall"), physics corner cases (landing,
 head-bump, wall-slide, stomp vs side-hit, spike death, pit death, goal trigger),
 and the GA smoke test.
+
+Watch mode adds three that hold its honesty in place:
+`every_showcase_lane_replays_the_episode_that_was_evaluated` (a lane animates the
+episode that was scored, seed for seed, so the picture and the numbers agree),
+`watching_does_not_change_what_is_evolved` (the showcase's RNG is separate, so
+training is identical whether or not anyone is looking), and `pausing_freezes_the
+physics_and_stops_burning_the_frame_budget` (a paused generation may not advance).
+The watch layout itself is testable without a TTY because `--headless` renders
+plain text frames; `cargo test` exercises the whole frame composition that way.
 
 ## Findings and deviations from the plan
 
@@ -246,26 +267,79 @@ deliberate, documented decision — not drift.
 9. **No `rand` crate.** `rand_xoshiro` alone, with a hand-rolled Box–Muller, so
    the exact mutation stream is pinned by this repository's own code rather than
    by a dependency's choice of algorithm.
+10. **Watch mode is deliberately *slower* than training, not faster.** The plan's
+   premise was "watch training at 50× speed", but the benchmark inverted it: a
+   solve takes 0.3 s, so speeding it up shows nothing. Instead each generation is
+   evaluated once (14 ms) and then the eight showcase episodes are re-run tick by
+   tick, and that animation *is* the pacing. `--speed` is physics ticks per
+   rendered frame, exactly as Tier 1.4 specifies; a generation lasts as long as its
+   slowest lane, capped at `level_frames / speed + 30` rendered frames so a survivor
+   cannot hold the view hostage.
+
+   Measured at pop 128, frames drawn per generation (a 60 Hz render loop, so
+   16 ms each): L1 279 frames (4.5 s) at 8× and 45 (0.7 s) at 50×; L3 133 frames
+   (2.1 s) at 8× and 22 (0.3 s) at 50×. The spread between L1 and L3 is the levels
+   answering a different question — L1's agents survive to the flag while L3's die
+   at the first pit, and a death ends a lane sooner than a win. In an interactive
+   session at pop 32: 2 generations in 6 s at 8×, 10 in the same 6 s after three
+   `+` presses.
+11. **A terminal that reports 0 columns drew a blank screen.** `terminal::size()`
+   returns `(0, 0)` under `script`, a CI shell or a detached multiplexer pane, and
+   a zero-width frame is an *empty* frame — the alternate screen stayed blank and
+   watch mode looked hung. Found only by running it under a real pty
+   (`script -qec`), which is now part of how this is verified. Fixed by falling
+   back to 80×30 when the size is unusable.
+12. **Pause used to burn the frame budget.** The generation budget counted drawn
+   frames, so pausing froze the agents while the generation still ticked toward its
+   end; unpausing dumped the viewer into the next generation having seen nothing.
+   The budget now counts *stepped* frames, so a pause holds a generation still
+   indefinitely.
+13. **The lane labels were numbered from the wrong thing.** `Trainer::showcase`
+   numbers random lanes `best_k + n`, so deriving a glyph from `lane.rank` made the
+   four outsiders `e`, `f`, `g`, `h` — and `e` is the walker glyph, which is how
+   this was caught: a random agent was drawn as an enemy. Labels now come from each
+   lane's ordinal *within its group*, and the random alphabet skips `e` and `x`.
+   The lesson is bigger than the glyph: the champion lane is `1` and the eye tracks
+   it, so lane identity is part of the UI contract and is pinned by a test.
+14. **On a level with a walker, the generation max can fall after a win, and that
+   is not degeneration.** `episode_seed` mixes in the generation (§5.5, deliberate:
+   an elite must not keep a luckily easy episode forever), so on the one stochastic
+   level an elite re-rolls the walker's patrol phase every generation and can lose
+   the run that won. `best_ever` keeps the champion — a watched L3 run found a
+   winner at generation 11 and still showed 567 as the max two generations later —
+   but the chart's "max falling = degenerating" reading needs that caveat, and
+   `--trials` (now meaningful) is the mitigation: it averages the noise instead of
+   displaying one roll of it.
 
 ## The M3 problem
 
 The plan's M3 gate is "watch evolution for 10+ minutes and decide whether it is
 fun". The benchmark above makes that gate harder to reach than the plan assumed:
-a champion on L3 arrives in a quarter of a second, so there is no 10-minute arc
-to watch unless something changes. The levers, in the order worth trying:
+a champion on L3 arrives in under a third of a second, so there is no 10-minute
+arc to watch unless something changes. The levers, in the order worth trying:
 
-1. **Pace generations, don't speed them up.** Watch mode should run a fixed
-   number of *generations per second* (or per user keypress), decoupled entirely
-   from how fast the sim can go. The speed control becomes "generations per
-   second", not "physics steps per rendered frame".
-2. **Harder levels.** The current three are trivially easy because continuous
-   bunny-hopping clears pits, stairs and spikes. Difficulty should come from
-   design (moving platforms, tighter spike spacing, walkers on ledges, timing
-   windows) rather than from a bigger network.
-3. **Diversity before fitness.** With pop 200 and no speciation, the population
-   can collapse onto "hop right" within a few generations. Watching requires
-   *variety*: best-4 + random-4 rendering (already planned as Tier 1.5) is the
-   minimum, and rewarding behavioural diversity may be necessary.
+1. **Pace generations, don't speed them up.** — *done, see finding 10.* Watch mode
+   decouples training speed from viewing speed: training still runs at ~70
+   generations per second, and the animation paces what the eye sees. The
+   consequence is
+   that a 10-minute session covers a few hundred generations on L1/L2 (solved at
+   generation 0) and a few dozen on L3 (solved around generation 10–25), so the
+   interesting part of an easy level is over in the first minute.
+2. **Harder levels.** The current three are trivially easy: continuous
+   bunny-hopping clears pits, stairs and spikes, and L1/L2 fall to random genomes at
+   generation 0. This is now the binding constraint on the fun gate — difficulty has
+   to come from design (moving platforms, tighter spike spacing, walkers on ledges,
+   timing windows), not from a bigger network. Nothing in watch mode fixes a level
+   that a coin flip solves.
+3. **Diversity before fitness.** With pop 200 and no speciation the population can
+   collapse onto "hop right" within a few generations — which is exactly the failure
+   the champion-only view would hide. Best-4 + random-4 (Tier 1.5) makes it visible,
+   and the death strip turns "where is it stuck" into a picture rather than a
+   guess.
+
+What is *not* answered by any of that is the gate itself. Tier 1 is complete and
+exercised, but "is watching this fun for 10 minutes" is a human judgement, and the
+honest status is: the instrument exists, the measurement has not been taken.
 
 ## Deliberately deferred
 

@@ -9,6 +9,7 @@
 //! airtime, stomps, or distance travelled backwards — agents farm proxies.
 
 use sim::hash::StateHasher;
+use sim::physics::AgentAction;
 use sim::{EpisodeStats, Level, Outcome, Sim};
 
 use crate::genome::{ActScratch, Genome};
@@ -66,7 +67,18 @@ pub fn score(stats: &EpisodeStats, outcome: Outcome) -> f32 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EpisodeResult {
     pub genome_id: u32,
+    /// Fitness of the **representative episode** (trial 0). This is the number a
+    /// champion records and the number `replay` must reproduce exactly, which is
+    /// why it is always trial 0 rather than whichever trial happened to score best.
     pub fitness: f32,
+    /// Mean fitness over all trials; equal to `fitness` when `trials == 1`.
+    ///
+    /// Selection ranks on this. A single episode is noisy evidence about a genome,
+    /// but it is also the only number a third party can reproduce from one seed,
+    /// so the two are kept apart instead of being conflated: without this split, a
+    /// champion trained with `--trials 4` would advertise an average and then fail
+    /// its own replay check.
+    pub mean_fitness: f32,
     pub outcome: Outcome,
     pub frames: u32,
     pub progress_pixels: f32,
@@ -85,6 +97,105 @@ impl EpisodeResult {
     }
 }
 
+/// Step-by-step episode driver.
+///
+/// [`run_episode`] is this plus a loop, deliberately, so the decision cadence has
+/// exactly **one** implementation. Watch mode drives this directly to animate a
+/// genome; if it re-implemented the cadence, a watched champion could disagree
+/// with the fitness the trainer recorded for it.
+#[derive(Debug)]
+pub struct EpisodeRunner<'a> {
+    genome: &'a Genome,
+    sim: Sim,
+    scratch: ActScratch,
+    action: AgentAction,
+    repeat: u32,
+    seed: u64,
+    trace: StateHasher,
+    iterations: u32,
+    guard: u32,
+}
+
+impl<'a> EpisodeRunner<'a> {
+    pub fn new(level: &Level, genome: &'a Genome, cfg: &EvalConfig, seed: u64) -> Self {
+        let repeat = cfg.action_repeat.max(1);
+        let sim = Sim::new(level, seed);
+        // `max_frames` is the sim's own cap; the extra slack is a belt-and-braces
+        // guard against a future change that forgets to terminate.
+        let guard = sim.max_frames() + repeat + 8;
+        EpisodeRunner {
+            genome,
+            sim,
+            scratch: ActScratch::new(),
+            action: AgentAction::Walk,
+            repeat,
+            seed,
+            trace: StateHasher::new(),
+            iterations: 0,
+            guard,
+        }
+    }
+
+    /// Live view of the episode. Read-only, so a renderer cannot disturb it.
+    pub fn sim(&self) -> &Sim {
+        &self.sim
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    pub fn genome(&self) -> &Genome {
+        self.genome
+    }
+
+    /// One physics tick. Queries the network every `action_repeat` ticks.
+    pub fn step(&mut self) {
+        if self.is_finished() {
+            return;
+        }
+        let frames = self.sim.stats().frames;
+        if frames % self.repeat == 0 {
+            self.action = self.genome.act(&self.sim.observation(), &mut self.scratch);
+            self.trace.u32(frames);
+            self.trace.u8(self.action.index() as u8);
+        }
+        self.sim.step(self.action);
+        self.iterations += 1;
+    }
+
+    /// The episode ended, or the safety guard fired.
+    pub fn is_finished(&self) -> bool {
+        self.sim.outcome().is_finished() || self.iterations >= self.guard
+    }
+
+    /// The action currently being held.
+    pub fn action(&self) -> AgentAction {
+        self.action
+    }
+
+    /// Finish the episode and score it.
+    pub fn result(mut self) -> EpisodeResult {
+        self.trace.u64(self.sim.state_hash());
+        let outcome = self.sim.outcome();
+        let stats = self.sim.stats();
+        let fitness = score(stats, outcome);
+        EpisodeResult {
+            genome_id: self.genome.id,
+            fitness,
+            mean_fitness: fitness,
+            outcome,
+            frames: stats.frames,
+            progress_pixels: stats.progress_pixels,
+            best_x: stats.best_x,
+            stomps: stats.stomps,
+            death_pos: stats.death_pos,
+            seed: self.seed,
+            trajectory_hash: self.trace.finish(),
+        }
+    }
+}
+
 /// Run one episode: the **single** implementation used by training, by champion
 /// replay, and by the round-trip test. If these ever diverged, a champion would
 /// stop reproducing its advertised fitness.
@@ -97,51 +208,18 @@ pub fn run_episode(
     cfg: &EvalConfig,
     seed: u64,
 ) -> EpisodeResult {
-    let repeat = cfg.action_repeat.max(1);
-    let mut sim = Sim::new(level, seed);
-    let mut scratch = ActScratch::new();
-    let mut trace = StateHasher::new();
-    let mut action = sim::physics::AgentAction::Walk;
-
-    // `max_frames` is the sim's own cap; the extra slack is a belt-and-braces
-    // guard against a future change that forgets to terminate.
-    let guard = sim.max_frames() + repeat + 8;
-    let mut iterations = 0u32;
-    while !sim.outcome().is_finished() {
-        let frames = sim.stats().frames;
-        if frames % repeat == 0 {
-            action = genome.act(&sim.observation(), &mut scratch);
-            trace.u32(frames);
-            trace.u8(action.index() as u8);
-        }
-        sim.step(action);
-        iterations += 1;
-        if iterations >= guard {
-            break;
-        }
+    let mut runner = EpisodeRunner::new(level, genome, cfg, seed);
+    while !runner.is_finished() {
+        runner.step();
     }
-
-    trace.u64(sim.state_hash());
-    let outcome = sim.outcome();
-    let stats = sim.stats();
-    EpisodeResult {
-        genome_id: genome.id,
-        fitness: score(stats, outcome),
-        outcome,
-        frames: stats.frames,
-        progress_pixels: stats.progress_pixels,
-        best_x: stats.best_x,
-        stomps: stats.stomps,
-        death_pos: stats.death_pos,
-        seed,
-        trajectory_hash: trace.finish(),
-    }
+    runner.result()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::genome::{default_shape, Genome};
+    use crate::fitness::EpisodeRunner;
     use sim::physics::AgentAction;
     use sim::rng::rng_from_seed;
     use sim::EpisodeStats;
@@ -155,6 +233,59 @@ mod tests {
             stomps: 0,
             death_pos: None,
         }
+    }
+
+    #[test]
+    fn the_step_driver_agrees_with_the_whole_episode_driver() {
+        // Watch mode animates through `EpisodeRunner`; training scores through
+        // `run_episode`. If the two ever disagreed about the decision cadence, a
+        // watched champion would contradict its own recorded fitness -- which is
+        // the one thing watch mode exists to make trustworthy.
+        let level = level();
+        for seed in [1u64, 7, 4242] {
+            let mut rng = rng_from_seed(seed);
+            let g = Genome::random(seed as u32, default_shape(), &mut rng);
+            let cfg = EvalConfig::default();
+
+            let whole = run_episode(&level, &g, &cfg, seed);
+
+            let mut runner = EpisodeRunner::new(&level, &g, &cfg, seed);
+            let mut ticks = 0u32;
+            while !runner.is_finished() {
+                runner.step();
+                ticks += 1;
+                assert!(ticks < 10_000, "the step driver failed to terminate");
+            }
+            let stepped = runner.result();
+
+            assert_eq!(stepped, whole, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn the_step_driver_matches_for_every_action_repeat() {
+        let level = level();
+        let mut rng = rng_from_seed(3);
+        let g = Genome::random(1, default_shape(), &mut rng);
+        for repeat in [1u32, 3, 4, 6, 16] {
+            let cfg = EvalConfig { action_repeat: repeat };
+            let whole = run_episode(&level, &g, &cfg, 5);
+            let mut runner = EpisodeRunner::new(&level, &g, &cfg, 5);
+            while !runner.is_finished() {
+                runner.step();
+            }
+            assert_eq!(runner.result(), whole, "action_repeat {repeat}");
+        }
+    }
+
+    #[test]
+    fn a_single_trial_reports_the_same_number_twice() {
+        let g = Genome::zeros(0, default_shape());
+        let r = run_episode(&level(), &g, &EvalConfig::default(), 1);
+        assert_eq!(
+            r.fitness, r.mean_fitness,
+            "with one trial there is nothing to average"
+        );
     }
 
     #[test]

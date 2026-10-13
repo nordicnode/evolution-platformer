@@ -16,3 +16,6 @@ evo.workspace = true
 render.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Watch mode (§10) is the one interactive subcommand; `render` owns the views and
+# stays terminal-free, so the raw-mode/keyboard plumbing lives here.
+crossterm.workspace = true

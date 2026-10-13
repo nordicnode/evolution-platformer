@@ -5,6 +5,7 @@
 //! | command | what it does |
 //! |---|---|
 //! | `train` | evolve a population on a level, print the fitness chart, save a champion |
+//! | `watch` | the same training, animated: best-4 + random-4 per generation (M3) |
 //! | `reach` | run the jump-reachability oracle on one level or a whole directory |
 //! | `replay` | re-simulate a saved champion and verify it reproduces |
 //! | `play` | human keyboard playtest in the terminal (M1 exit criterion) |
@@ -17,6 +18,7 @@
 
 mod args;
 mod commands;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -72,6 +74,7 @@ fn run(raw: &[String]) -> Result<(), Failure> {
 
     let result = match args.command.as_str() {
         "train" => commands::train(&args),
+        "watch" => watch::watch(&args),
         "reach" => commands::reach(&args),
         "replay" => commands::replay(&args),
         "play" => commands::play(&args),
@@ -105,6 +108,8 @@ USAGE:
 
 COMMANDS:
     train     Evolve a population on a level, print the fitness chart, save a champion.
+    watch     Train with the evolution on screen: chart, best-4 + random-4 agents per
+              generation, speed control, pause, death markers, genius splash (M3).
     reach     Check that a level is beatable in principle (jump-reachability oracle).
     replay    Re-simulate a saved champion and confirm it reproduces its trajectory.
     play      Play a level yourself with the keyboard, in the terminal.
@@ -134,6 +139,26 @@ TRAIN OPTIONS:
     --stop-on-win         Stop as soon as any agent touches the flag.
     --quiet               Print only the final summary and the champion path.
 
+WATCH OPTIONS:
+    --level <PATH>        Level to evolve on. Required unless --champion is given.
+    --champion <PATH>     Watch a saved champion replay instead of training.
+    --generations <N>     Generations to watch.                                [default 300]
+    --pop <N>             Population size.                          [default 200 native]
+    --seed <N>            Master seed.                                       [default 1]
+    --speed <N>           Physics ticks per rendered frame, snapped to 1-50.   [default 8]
+    --best <N>            Best-ranked agents drawn per generation.              [default 4]
+    --random <N>          Random outsiders drawn per generation.                [default 4]
+    --death-window <N>    Generations a death marker keeps showing.           [default 25]
+    --frames <N>          Stop after N rendered frames (always on when headless).[default 6]
+    --headless            Plain text frames, no keyboard. Implied without a TTY.
+    --out <DIR>           Where the best-ever champion is saved.      [default champions]
+    --mut-rate, --mut-sigma, --elite, --tournament, --crossover, --action-repeat,
+    --trials              As for `train`.
+
+KEYS (watch):
+    space pause/resume   -/+ speed   n next generation   f follow/whole level
+    s save the best-ever champion   q quit
+
 REACH OPTIONS:
     --level <PATH>        One level to check.
     --all                 Check every level in --levels-dir.
@@ -161,6 +186,8 @@ EXAMPLES:
     train-cli train --level levels/l1-flat-run.json --generations 40
     train-cli train --level levels/l2-first-gap.json --pop 200 --csv out/l2.csv
     train-cli reach --all
+    train-cli watch --level levels/l2-first-gap.json
+    train-cli watch --champion champions/l1-flat-run.json --speed 16
     train-cli replay --champion champions/l1-flat-run.json
     train-cli play --level levels/l1-flat-run.json
     train-cli render --level levels/l3-gauntlet.json --steps 400 --stride 40
@@ -203,7 +230,9 @@ mod tests {
     #[test]
     fn help_text_mentions_every_subcommand_the_dispatcher_accepts() {
         let text = help();
-        for cmd in ["train", "reach", "replay", "play", "render", "sensors"] {
+        for cmd in [
+            "train", "watch", "reach", "replay", "play", "render", "sensors",
+        ] {
             assert!(text.contains(cmd), "help text omits {cmd}");
         }
     }

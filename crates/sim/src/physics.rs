@@ -237,15 +237,20 @@ pub fn bottom_of(tile_y: i32) -> f32 {
 ///
 /// The epsilon keeps a body flush against a tile edge from claiming the next
 /// tile over — the single most common source of jitter in AABB-vs-grid code.
+///
+/// **Public on purpose.** This is the project's one statement of "which tiles does
+/// this body occupy", and the renderer must not have a second, subtly different
+/// opinion: a body drawn one tile wider than the collision code thinks it is would
+/// make a physics bug invisible instead of obvious.
 #[inline]
-pub(crate) fn tile_span(min: f32, size: f32) -> (i32, i32) {
+pub fn tile_span(min: f32, size: f32) -> (i32, i32) {
     const EPS: f32 = 1.0e-4;
     (min.floor() as i32, (min + size - EPS).floor() as i32)
 }
 
-/// Inclusive row range covered by a vertical span.
+/// Inclusive row range covered by a vertical span. See [`tile_span`].
 #[inline]
-pub(crate) fn row_span(top: f32, height: f32) -> (i32, i32) {
+pub fn row_span(top: f32, height: f32) -> (i32, i32) {
     tile_span(top, height)
 }
 

@@ -130,6 +130,37 @@ pub struct GenerationReport {
     pub best: Genome,
     /// Index-aligned with the population that was evaluated.
     pub results: Vec<EpisodeResult>,
+    /// Indices into `results`, best fitness first, ties broken by lower index.
+    /// Stored rather than recomputed so breeding and lane selection cannot
+    /// disagree about what "the best genomes" means.
+    pub ranking: Vec<usize>,
+}
+
+/// Which half of the "best-4 + random-4" split a showcase lane came from (§10 Tier 1.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneKind {
+    /// Top of the ranking: what the population can do at its best.
+    Best,
+    /// Drawn from the rest: what it is still exploring.
+    Random,
+}
+
+/// One agent to draw in watch mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShowcaseLane {
+    /// Index into the evaluated population (see [`Trainer::step_verbose`]).
+    pub index: usize,
+    /// Position in the showcase: 0 is the champion.
+    pub rank: usize,
+    pub genome_id: u32,
+    pub kind: LaneKind,
+    /// Fitness of the episode this lane will reproduce (trial 0).
+    pub fitness: f32,
+    /// Mean fitness over all trials, i.e. the metric selection used.
+    pub mean_fitness: f32,
+    /// The exact seed the evaluator used, so the lane replays faithfully rather
+    /// than being a fresh episode with the same genome.
+    pub seed: u64,
 }
 
 /// Evaluate a whole population in parallel (Pattern A, §5.6).
@@ -147,20 +178,20 @@ pub fn evaluate_population(
         .par_iter()
         .map(|g| {
             // RNG and sim are constructed inside the closure: never shared.
-            let mut best: Option<EpisodeResult> = None;
             let mut sum = 0.0f32;
+            let mut representative: Option<EpisodeResult> = None;
             for trial in 0..trials {
                 let seed = episode_seed(master_seed, generation, g.id, trial);
                 let r = fitness::run_episode(level, g, &eval, seed);
                 sum += r.fitness;
-                if best.as_ref().is_none_or(|b| r.fitness > b.fitness) {
-                    best = Some(r);
+                // Trial 0 is the representative: it is the one anyone can
+                // reproduce, so it is the one a champion records.
+                if trial == 0 {
+                    representative = Some(r);
                 }
             }
-            let mut result = best.expect("trials >= 1");
-            if trials > 1 {
-                result.fitness = sum / trials as f32;
-            }
+            let mut result = representative.expect("trials >= 1");
+            result.mean_fitness = sum / trials as f32;
             result
         })
         .collect()
@@ -261,22 +292,44 @@ impl Trainer {
 
     /// Evaluate the current population and produce the next generation.
     pub fn step(&mut self, level: &Level) -> GenerationReport {
+        self.advance(level, false).0
+    }
+
+    /// As [`Trainer::step`], but also returns the population that was evaluated.
+    ///
+    /// Watch mode needs it: after `step` returns, `self.genomes` is already the
+    /// *next* generation, so the genomes a [`GenerationReport`] describes are gone.
+    /// The copy costs about 1.2 MB per generation at pop 200, which is why plain
+    /// training does not pay for it.
+    pub fn step_verbose(&mut self, level: &Level) -> (GenerationReport, Vec<Genome>) {
+        self.advance(level, true)
+    }
+
+    fn advance(&mut self, level: &Level, keep_population: bool) -> (GenerationReport, Vec<Genome>) {
         let results = evaluate_population(level, &self.genomes, &self.config, self.generation);
 
         debug_assert_eq!(results.len(), self.genomes.len());
         for (g, r) in self.genomes.iter_mut().zip(results.iter()) {
-            g.fitness = r.fitness;
+            // The genome's own `fitness` is the metric selection uses. The
+            // per-episode number lives in the result, so nothing here has to
+            // guess which of the two it is holding.
+            g.fitness = r.mean_fitness;
         }
 
-        let max_fitness = results
-            .iter()
-            .map(|r| r.fitness)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let min_fitness = results
-            .iter()
-            .map(|r| r.fitness)
-            .fold(f32::INFINITY, f32::min);
-        let avg_fitness = results.iter().map(|r| r.fitness).sum::<f32>() / results.len() as f32;
+        // Snapshot after scoring but before breeding replaces the population, so
+        // the vector handed back really is "the population as evaluated" -- with
+        // its scores on it. Only when asked: this copy is ~1.2 MB at pop 200, and
+        // plain training never needs it.
+        let pop = if keep_population {
+            self.genomes.clone()
+        } else {
+            Vec::new()
+        };
+
+        let metric = |r: &EpisodeResult| r.mean_fitness;
+        let max_fitness = results.iter().map(metric).fold(f32::NEG_INFINITY, f32::max);
+        let min_fitness = results.iter().map(metric).fold(f32::INFINITY, f32::min);
+        let avg_fitness = results.iter().map(metric).sum::<f32>() / results.len() as f32;
         let wins = results.iter().filter(|r| r.won()).count();
 
         // "Genius agent": the maximum jumped by more than 50 % (§10 Tier 1.3). The
@@ -290,8 +343,8 @@ impl Trainer {
         let mut order: Vec<usize> = (0..results.len()).collect();
         order.sort_by(|&a, &b| {
             results[b]
-                .fitness
-                .total_cmp(&results[a].fitness)
+                .mean_fitness
+                .total_cmp(&results[a].mean_fitness)
                 .then(a.cmp(&b))
         });
         let winner = order[0];
@@ -301,7 +354,7 @@ impl Trainer {
         if self
             .best_ever
             .as_ref()
-            .is_none_or(|b| best_result.fitness > b.result.fitness)
+            .is_none_or(|b| best_result.mean_fitness > b.result.mean_fitness)
         {
             self.best_ever = Some(BestEver {
                 generation: self.generation,
@@ -326,16 +379,73 @@ impl Trainer {
         self.last_max = max_fitness;
         best.fitness = max_fitness;
 
-        GenerationReport {
-            generation: row.generation,
-            max_fitness,
-            avg_fitness,
-            min_fitness,
-            wins,
-            genius,
-            best,
-            results,
+        (
+            GenerationReport {
+                generation: row.generation,
+                max_fitness,
+                avg_fitness,
+                min_fitness,
+                wins,
+                genius,
+                best,
+                results,
+                ranking: order,
+            },
+            pop,
+        )
+    }
+
+    /// The lanes watch mode draws: the top `best_k` genomes of the generation just
+    /// evaluated, plus `random_k` more drawn from everything else (§10 Tier 1.5).
+    ///
+    /// Best-plus-random rather than best-only on purpose: a population that has
+    /// collapsed onto one strategy is exactly the failure the watch view has to
+    /// make visible, and a chart cannot show it.
+    ///
+    /// The random draw uses a showcase RNG seeded from the generation, never the
+    /// trainer's own stream, so choosing what to watch cannot change what is
+    /// evolved (§5.6). `population` must be the vector [`Trainer::step_verbose`]
+    /// returned alongside `report`.
+    pub fn showcase(
+        &self,
+        report: &GenerationReport,
+        population: &[Genome],
+        best_k: usize,
+        random_k: usize,
+    ) -> Vec<ShowcaseLane> {
+        debug_assert_eq!(report.ranking.len(), report.results.len());
+        let mut lanes: Vec<ShowcaseLane> = Vec::with_capacity(best_k + random_k);
+        let mut taken = vec![false; report.results.len()];
+
+        for (rank, &index) in report.ranking.iter().take(best_k).enumerate() {
+            taken[index] = true;
+            lanes.push(lane(index, rank, LaneKind::Best, report, population));
         }
+
+        let mut pool: Vec<usize> = report
+            .ranking
+            .iter()
+            .copied()
+            .filter(|i| !taken[*i])
+            .collect();
+        if random_k > 0 && !pool.is_empty() {
+            let mut rng = rng_from_seed(episode_seed(
+                self.config.master_seed,
+                report.generation,
+                u32::MAX,
+                SHOWCASE_TRIAL,
+            ));
+            let draws = random_k.min(pool.len());
+            for n in 0..draws {
+                // `swap_remove` gives a uniform pick *without* replacement in one
+                // pass, so the same genome cannot appear in two lanes.
+                let pick = (rng.next_u32() as usize) % pool.len();
+                let index = pool.swap_remove(pick);
+                lanes.push(lane(index, best_k + n, LaneKind::Random, report, population));
+            }
+        }
+
+        lanes
     }
 
     /// Build the next population in place. Single-threaded on purpose: the RNG
@@ -394,6 +504,31 @@ impl Trainer {
         best
     }
 }
+
+/// Seed salt used for the showcase RNG, kept far from any real trial index so the
+/// lane draw can never collide with an evaluated episode.
+const SHOWCASE_TRIAL: u32 = 0x5EED;
+
+fn lane(
+    index: usize,
+    rank: usize,
+    kind: LaneKind,
+    report: &GenerationReport,
+    population: &[Genome],
+) -> ShowcaseLane {
+    let r = &report.results[index];
+    debug_assert_eq!(population[index].id, r.genome_id);
+    ShowcaseLane {
+        index,
+        rank,
+        genome_id: r.genome_id,
+        kind,
+        fitness: r.fitness,
+        mean_fitness: r.mean_fitness,
+        seed: r.seed,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -647,6 +782,192 @@ mod tests {
             }
         }
         assert!(compared > 0, "no elite survived to be compared");
+    }
+
+    #[test]
+    fn watching_does_not_change_what_is_evolved() {
+        // Watch mode calls `showcase` between generations. That draw uses its own
+        // RNG seed, so it must be invisible to the GA: if it consumed the trainer's
+        // stream, every watched run would evolve differently from the same unwatched
+        // run, and the whole determinism contract would depend on whether a human
+        // was looking (§5.6).
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 1234,
+            ..GaConfig::default()
+        };
+
+        let mut plain = Trainer::new(cfg.clone());
+        let mut plain_history = Vec::new();
+        for _ in 0..4 {
+            plain_history.push(plain.step(&level).max_fitness);
+        }
+
+        let mut watched = Trainer::new(cfg);
+        let mut watched_history = Vec::new();
+        for _ in 0..4 {
+            let (report, pop) = watched.step_verbose(&level);
+            let lanes = watched.showcase(&report, &pop, 4, 4);
+            assert_eq!(lanes.len(), 8, "best-4 + random-4");
+            watched_history.push(report.max_fitness);
+        }
+
+        assert_eq!(
+            plain_history, watched_history,
+            "choosing lanes to watch perturbed the GA's RNG stream"
+        );
+        assert_eq!(plain.next_id(), watched.next_id(), "breeding diverged");
+    }
+
+    #[test]
+    fn every_showcase_lane_replays_the_episode_that_was_evaluated() {
+        // The fidelity guarantee watch mode rests on: a lane is the *same* episode
+        // the trainer scored, not a fresh episode on the same genome. Otherwise the
+        // animation and the fitness column would be describing different runs.
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 99,
+            ..GaConfig::default()
+        };
+        let eval = cfg.eval_config();
+        let mut t = Trainer::new(cfg);
+        let (report, population) = t.step_verbose(&level);
+        let lanes = t.showcase(&report, &population, 2, 2);
+        assert_eq!(lanes.len(), 4);
+
+        for lane in &lanes {
+            let genome = &population[lane.index];
+            assert_eq!(genome.id, lane.genome_id, "lane points at the wrong genome");
+            let replayed = crate::fitness::run_episode(&level, genome, &eval, lane.seed);
+            assert_eq!(
+                replayed.trajectory_hash, report.results[lane.index].trajectory_hash,
+                "lane {} ({:?}) is not the episode that was scored",
+                lane.genome_id, lane.kind
+            );
+            assert_eq!(replayed.fitness, lane.fitness);
+            assert_eq!(replayed.outcome, report.results[lane.index].outcome);
+        }
+
+        // No genome may appear twice: the champion and a random pick colliding
+        // would silently show one agent in two lanes.
+        let ids: std::collections::BTreeSet<u32> = lanes.iter().map(|l| l.genome_id).collect();
+        assert_eq!(ids.len(), lanes.len(), "lanes are not distinct: {lanes:?}");
+
+        // The split is what the plan asks for: the top of the ranking, plus
+        // outsiders. The champion lane must be the ranking's first entry.
+        assert_eq!(lanes[0].genome_id, report.results[report.ranking[0]].genome_id);
+        assert!(lanes.iter().take(2).all(|l| l.kind == LaneKind::Best));
+        assert!(lanes.iter().skip(2).all(|l| l.kind == LaneKind::Random));
+    }
+
+    #[test]
+    fn showcase_asks_for_more_random_lanes_than_exist_without_duplicating() {
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 6,
+            master_seed: 4,
+            ..GaConfig::default()
+        };
+        let mut t = Trainer::new(cfg);
+        let (report, population) = t.step_verbose(&level);
+        // 6 genomes, 4 best + 99 random: only 2 outsiders exist.
+        let lanes = t.showcase(&report, &population, 4, 99);
+        assert_eq!(lanes.len(), 6, "cannot invent genomes that do not exist");
+        let ids: std::collections::BTreeSet<u32> = lanes.iter().map(|l| l.genome_id).collect();
+        assert_eq!(ids.len(), 6);
+    }
+
+    #[test]
+    fn plain_step_is_the_same_run_without_the_population_copy() {
+        // `step` and `step_verbose` differ only in whether they hand back the
+        // population they evaluated. Plain training runs ~200 generations a second
+        // and must not pay ~1.2 MB of copying per generation for a snapshot it
+        // discards, but any drift between the two paths would mean the numbers
+        // watch mode shows are not the numbers training used.
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 6,
+            ..GaConfig::default()
+        };
+        let mut plain = Trainer::new(cfg.clone());
+        let mut verbose = Trainer::new(cfg);
+        for generation in 0..3 {
+            let a = plain.step(&level);
+            let (b, population) = verbose.step_verbose(&level);
+
+            assert_eq!(a.generation, b.generation);
+            assert_eq!(a.max_fitness, b.max_fitness, "generation {generation}");
+            assert_eq!(a.avg_fitness, b.avg_fitness);
+            assert_eq!(a.wins, b.wins);
+            assert_eq!(a.ranking, b.ranking);
+            assert_eq!(a.best.id, b.best.id);
+
+            // The snapshot is the population *as evaluated*: ids in population order,
+            // carrying the very fitness this generation was scored with.
+            assert_eq!(population.len(), 8);
+            for (i, genome) in population.iter().enumerate() {
+                assert_eq!(genome.fitness, b.results[i].mean_fitness, "slot {i}");
+            }
+            // The live population has already been bred, so its scores are reset --
+            // which is exactly why the snapshot has to exist for watch mode.
+            assert!(plain.genomes.iter().all(|g| g.fitness == 0.0));
+        }
+    }
+
+    #[test]
+    fn trials_only_matter_on_a_level_that_is_stochastic() {
+        // `--trials` averages N episodes. A walker's patrol phase is the only thing
+        // in the sim drawn from the episode RNG (§5), so on a walker-free level
+        // every trial is the *same* episode: the mean must equal the representative
+        // exactly, and paying for N copies of one number buys nothing. On a level
+        // with a walker the trials genuinely differ, which is the only reason the
+        // flag exists. (This test previously used L3 and asserted the opposite,
+        // wrongly: random genomes die in L3's first pit, twenty tiles short of its
+        // walker, so their trials were identical for a reason that had nothing to do
+        // with the walker.)
+        let cfg = GaConfig {
+            pop_size: 8,
+            trials: 3,
+            master_seed: 11,
+            ..GaConfig::default()
+        };
+
+        let flat = crate::fixture::flat_runway("trials-flat", 24, 22);
+        let (flat_report, _) = Trainer::new(cfg.clone()).step_verbose(&flat);
+        assert!(
+            flat_report
+                .results
+                .iter()
+                .all(|r| (r.mean_fitness - r.fitness).abs() < 1e-6),
+            "walker-free level: all trials are the same episode"
+        );
+
+        // The walker stands four tiles ahead of the spawn, so any genome that moves
+        // right at all meets it -- and meets it at a different moment in each trial.
+        let guarded = crate::fixture::walker_runway("trials-walker", 24, 22, 5);
+        let (walker_report, _) = Trainer::new(cfg.clone()).step_verbose(&guarded);
+        let differing = walker_report
+            .results
+            .iter()
+            .filter(|r| (r.mean_fitness - r.fitness).abs() > 1e-3)
+            .count();
+        assert!(
+            differing >= 2,
+            "only {differing}/{} genomes saw different trials",
+            walker_report.results.len()
+        );
+
+        // Not a lucky draw from that random population: a genome that is nothing but
+        // "hold right" always reaches the walker.
+        let run_only = vec![Genome::zeros(0, cfg.shape.clone())];
+        let scored = evaluate_population(&guarded, &run_only, &cfg, 0);
+        assert!(
+            (scored[0].mean_fitness - scored[0].fitness).abs() > 1e-3,
+            "the constant-run genome saw identical trials on a level with a walker"
+        );
     }
 
     #[test]

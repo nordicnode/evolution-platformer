@@ -16,8 +16,13 @@ pub mod ga;
 pub mod genome;
 
 pub use champion::{ChampionFile, ChampionMetadata, NetworkSpec, CHAMPION_FORMAT, CHAMPION_VERSION};
-pub use fitness::{run_episode, score, EpisodeResult, EvalConfig, ACTION_REPEAT, FITNESS_VERSION};
-pub use ga::{evaluate_population, BestEver, GaConfig, GenerationReport, GenRow, Trainer};
+pub use fitness::{
+    run_episode, score, EpisodeResult, EpisodeRunner, EvalConfig, ACTION_REPEAT, FITNESS_VERSION,
+};
+pub use ga::{
+    evaluate_population, BestEver, GaConfig, GenerationReport, GenRow, LaneKind, ShowcaseLane,
+    Trainer,
+};
 pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
 
 /// Test-only level construction, shared by this crate's unit tests.
@@ -93,6 +98,50 @@ pub(crate) mod fixture {
     /// learn *when* to jump — the point of the GA smoke test.
     pub fn gap_runway(name: &str, width: i32, goal_x: i32, pits: &[(i32, i32)]) -> Level {
         runway(name, width, goal_x, pits)
+    }
+
+    /// A flat runway carrying a single patrolling walker `walker_x` tiles from the
+    /// left wall, goal at `goal_x`.
+    ///
+    /// This is the fixture for asking how a *stochastic* level behaves. A walker's
+    /// patrol phase is drawn from the episode RNG (§5), so two trials of the same
+    /// genome are two different episodes — the only case where `trials > 1` does
+    /// anything. Note fitness pays for survival frames, so merely reaching the
+    /// walker at a different tick is already a different score.
+    pub fn walker_runway(name: &str, width: i32, goal_x: i32, walker_x: i32) -> Level {
+        runway_with(name, width, goal_x, &[], &[("walker", walker_x)])
+    }
+
+    fn runway_with(
+        name: &str,
+        width: i32,
+        goal_x: i32,
+        pits: &[(i32, i32)],
+        walkers: &[(&str, i32)],
+    ) -> Level {
+        const HEIGHT: i32 = 8;
+        const GROUND: i32 = 6;
+        let mut entities: Vec<(&str, i32, i32)> = walkers
+            .iter()
+            .map(|(kind, x)| (*kind, *x, GROUND - 1))
+            .collect();
+        entities.push(("goal", goal_x, GROUND - 1));
+        let rows: Vec<String> = (0..HEIGHT)
+            .map(|y| {
+                (0..width)
+                    .map(|x| {
+                        let in_pit = pits.iter().any(|(s, l)| x >= *s && x < s + l);
+                        if y >= GROUND && !in_pit {
+                            '#'
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
+        level(name, &refs, (1, GROUND - 1), &entities)
     }
 
     fn runway(name: &str, width: i32, goal_x: i32, pits: &[(i32, i32)]) -> Level {
