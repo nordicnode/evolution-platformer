@@ -1077,12 +1077,14 @@ mod tests {
             "tree_b_top",
             // The tree-line is planted on the sky's ridge rather than on a level's floor,
             // and the anchor is the same one: a pine whose trunk stopped short would float
-            // a pixel above whatever it is standing on, wherever that is, and both ranks
-            // stand on something.
+            // a pixel above whatever it is standing on, wherever that is, and all three
+            // ranks stand on something.
             "pine_a",
             "pine_b",
             "pine_c",
             "pine_d",
+            "pine_near_a",
+            "pine_near_b",
         ] {
             let sprite = pixels.sprite(name);
             let lowest = *sprite.opaque_rows().last().expect("a prop has pixels");

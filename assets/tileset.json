@@ -593,153 +593,163 @@
       "row": 7
     },
     {
-      "name": "cloud_a",
+      "name": "pine_near_a",
       "col": 5,
+      "row": 7
+    },
+    {
+      "name": "pine_near_b",
+      "col": 6,
+      "row": 7
+    },
+    {
+      "name": "cloud_a",
+      "col": 7,
       "row": 7
     },
     {
       "name": "cloud_b",
-      "col": 6,
+      "col": 8,
       "row": 7
     },
     {
       "name": "cloud_c",
-      "col": 7,
+      "col": 9,
       "row": 7
     },
     {
       "name": "dust_a",
-      "col": 8,
+      "col": 10,
       "row": 7
     },
     {
       "name": "dust_b",
-      "col": 9,
+      "col": 11,
       "row": 7
     },
     {
       "name": "puff",
-      "col": 10,
+      "col": 12,
       "row": 7
     },
     {
       "name": "spark_a",
-      "col": 11,
+      "col": 13,
       "row": 7
     },
     {
       "name": "spark_b",
-      "col": 12,
+      "col": 14,
       "row": 7
     },
     {
       "name": "blend_grass_l",
-      "col": 13,
+      "col": 15,
       "row": 7
     },
     {
       "name": "blend_grass_r",
-      "col": 14,
-      "row": 7
+      "col": 0,
+      "row": 8
     },
     {
       "name": "blend_grass_t",
-      "col": 15,
-      "row": 7
+      "col": 1,
+      "row": 8
     },
     {
       "name": "blend_dirt_l",
-      "col": 0,
+      "col": 2,
       "row": 8
     },
     {
       "name": "blend_dirt_r",
-      "col": 1,
-      "row": 8
-    },
-    {
-      "name": "blend_dirt_t",
-      "col": 2,
-      "row": 8
-    },
-    {
-      "name": "blend_dirt_b",
       "col": 3,
       "row": 8
     },
     {
-      "name": "blend_stone_l",
+      "name": "blend_dirt_t",
       "col": 4,
       "row": 8
     },
     {
-      "name": "blend_stone_r",
+      "name": "blend_dirt_b",
       "col": 5,
       "row": 8
     },
     {
-      "name": "blend_stone_t",
+      "name": "blend_stone_l",
       "col": 6,
       "row": 8
     },
     {
-      "name": "blend_stone_b",
+      "name": "blend_stone_r",
       "col": 7,
       "row": 8
     },
     {
-      "name": "blend_beach_l",
+      "name": "blend_stone_t",
       "col": 8,
       "row": 8
     },
     {
-      "name": "blend_beach_r",
+      "name": "blend_stone_b",
       "col": 9,
       "row": 8
     },
     {
-      "name": "blend_beach_t",
+      "name": "blend_beach_l",
       "col": 10,
       "row": 8
     },
     {
-      "name": "blend_packed_l",
+      "name": "blend_beach_r",
       "col": 11,
       "row": 8
     },
     {
-      "name": "blend_packed_r",
+      "name": "blend_beach_t",
       "col": 12,
       "row": 8
     },
     {
-      "name": "blend_packed_t",
+      "name": "blend_packed_l",
       "col": 13,
       "row": 8
     },
     {
-      "name": "blend_packed_b",
+      "name": "blend_packed_r",
       "col": 14,
       "row": 8
     },
     {
-      "name": "blend_sandstone_l",
+      "name": "blend_packed_t",
       "col": 15,
       "row": 8
     },
     {
-      "name": "blend_sandstone_r",
+      "name": "blend_packed_b",
       "col": 0,
       "row": 9
     },
     {
-      "name": "blend_sandstone_t",
+      "name": "blend_sandstone_l",
       "col": 1,
       "row": 9
     },
     {
-      "name": "blend_sandstone_b",
+      "name": "blend_sandstone_r",
       "col": 2,
+      "row": 9
+    },
+    {
+      "name": "blend_sandstone_t",
+      "col": 3,
+      "row": 9
+    },
+    {
+      "name": "blend_sandstone_b",
+      "col": 4,
       "row": 9
     }
   ]

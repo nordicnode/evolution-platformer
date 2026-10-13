@@ -44,7 +44,7 @@ const BACKDROP_DARK: Color32 = Color32::from_rgb(196, 220, 238);
 /// disc and a hazy silhouette are two very different backgrounds, and the rule is about
 /// every one of them rather than about the sky it happens to start from.
 #[cfg(test)]
-pub fn backdrop_colours() -> [Color32; 11] {
+pub fn backdrop_colours() -> [Color32; 13] {
     [
         SKY_TOP,
         SKY_BOTTOM,
@@ -57,6 +57,8 @@ pub fn backdrop_colours() -> [Color32; 11] {
         PINE_SHADE,
         PINE_FAR_LIGHT,
         PINE_FAR,
+        PINE_NEAR_LIGHT,
+        PINE_NEAR,
     ]
 }
 const GRID_LINE: Color32 = Color32::from_rgba_premultiplied(24, 30, 40, 26);
@@ -82,18 +84,37 @@ const SUN_FACE: Color32 = Color32::from_rgb(255, 240, 190);
 /// standing on a faded hill read as being *on* it rather than in front of it — and the rank
 /// behind is a further step into the same haze, so the two ranks are two distances rather than
 /// two sizes of the same one.
+///
+/// Lightened in the parallax pass, and greened with it: the tones this replaces
+/// (117/106/99/92) were a dark blue-grey whose darkest member sat at a luminance near
+/// 120, and a pine's tiers alternate the body with the shadow, so half of every crown
+/// was that darkest tone — a row of trees that read as one dark mass against the hill
+/// rather than as trees *on* it. Every tone is roughly twenty points brighter now
+/// and green is the strongest channel in each, so the crown is a pale hazy green and
+/// only the trunk keeps the old depth. The mirrors in `tools/art/common.py` say the
+/// same thing, because the PNG is drawn from them and this list is drawn from the PNG.
 #[cfg(test)]
-const PINE_LIGHT: Color32 = Color32::from_rgb(117, 156, 164);
+const PINE_LIGHT: Color32 = Color32::from_rgb(142, 180, 168);
 #[cfg(test)]
-const PINE: Color32 = Color32::from_rgb(106, 148, 159);
+const PINE: Color32 = Color32::from_rgb(128, 172, 158);
 #[cfg(test)]
-const PINE_DARK: Color32 = Color32::from_rgb(99, 139, 153);
+const PINE_DARK: Color32 = Color32::from_rgb(116, 160, 148);
 #[cfg(test)]
-const PINE_SHADE: Color32 = Color32::from_rgb(92, 130, 147);
+const PINE_SHADE: Color32 = Color32::from_rgb(104, 148, 138);
 #[cfg(test)]
-const PINE_FAR_LIGHT: Color32 = Color32::from_rgb(116, 158, 172);
+const PINE_FAR_LIGHT: Color32 = Color32::from_rgb(140, 180, 182);
 #[cfg(test)]
-const PINE_FAR: Color32 = Color32::from_rgb(110, 150, 166);
+const PINE_FAR: Color32 = Color32::from_rgb(130, 170, 174);
+/// The near hills' tree-line: the same conifer one band closer, in `common.py`'s
+/// `PINE_NEAR_*` tones. Saturated green and darker *as a hue* than the far rank —
+/// that ordering is the depth cue the fade test holds — but no darker in luminance
+/// than the far rank used to be, because a near tree drawn near-black is the "too
+/// dark" mistake again, one band nearer. Only the lit tone and the body are listed:
+/// those are the two a runner can fill a frame against.
+#[cfg(test)]
+const PINE_NEAR_LIGHT: Color32 = Color32::from_rgb(104, 176, 104);
+#[cfg(test)]
+const PINE_NEAR: Color32 = Color32::from_rgb(84, 158, 88);
 /// Tiles between one dome and the next in a band.
 ///
 /// Five, and every band's shortest dome is at least half of that, so two neighbours always
@@ -126,19 +147,29 @@ const SWELL_TILES: f32 = 11.0;
 /// clumps two of its own spacings beyond the edge, and a clump is a tree and a half wide. A
 /// band that stopped at the window's edge leaves those trees standing in the air.
 const SKY_PAD: f32 = 8.0;
-/// How high the sun stands above the level's ground line, in tiles, and how high each of the
-/// three rows of cloud drifts.
+/// How high the sun stands above the level's ground line, in tiles.
 ///
-/// Altitudes above the *ground*, not fractions of the window: the sky belongs to the world,
-/// so a sun a tenth of the way down the window is a sun that slides relative to the level
-/// every time the camera changes what it is looking at or how far away it is.
+/// An altitude above the *ground*, not a fraction of the window: the sky belongs to the
+/// world, so a sun a tenth of the way down the window is a sun that slides relative to
+/// the level every time the camera changes what it is looking at or how far away it is.
 ///
-/// Both have to fit in the sky a *follow* camera has above the player, which is half a window
-/// at 28 points a tile — about twelve tiles — and above the hills, which stand five of them.
-/// The clouds are above the range and the sun is above the clouds; a camera zoomed in past
+/// It has to fit in the sky a *follow* camera has above the player, which is half a
+/// window at 28 points a tile — about twelve tiles — and above the hills, which stand
+/// five of them, and above the clouds, whose own altitudes are ranges rather than rows
+/// (see [`CloudLayer`]). The sun is above the highest cloud; a camera zoomed in past
 /// that leaves the sun out of the frame, which is what looking at the ground does.
-const SUN_ALTITUDE: f32 = 10.0;
-const CLOUD_ALTITUDES: [f32; 3] = [5.5, 7.0, 8.5];
+const SUN_ALTITUDE: f32 = 10.5;
+/// The sun's parallax: the smallest in the scene, because it is the furthest thing in it.
+///
+/// Every backdrop layer's factor lives in one place now — this, the two
+/// [`CloudLayer`]s and the two hill bands — and they are in strictly increasing
+/// order back to front, which is the whole of what "parallax" means here: a layer
+/// that is drawn behind another also *moves* less than it. The clouds are the
+/// cautionary tale: they used to be called with 0.30 and 0.55, in front of nothing
+/// but moving faster than both hill bands in front of them, so the sky slid past
+/// the hills it was supposed to be behind — a backdrop where the distance cues
+/// disagreed with each other, and the eye believed the motion.
+const SUN_PARALLAX: f32 = 0.04;
 /// The far hills' parallax, shared with the tree-line that stands on their ridge.
 ///
 /// Shared because a tree planted on a ridge has to move with the ridge: at its own parallax
@@ -146,7 +177,8 @@ const CLOUD_ALTITUDES: [f32; 3] = [5.5, 7.0, 8.5];
 /// which is a fence of bobbing trees rather than a hillside. Two things that stand on each
 /// other are one layer.
 const FAR_HILLS_PARALLAX: f32 = 0.20;
-/// The near hills' parallax. They are in front of the far band, and in front of its trees.
+/// The near hills' parallax, shared with the tree-line that stands on *their* ridge.
+/// They are in front of the far band, and in front of its trees.
 const NEAR_HILLS_PARALLAX: f32 = 0.38;
 /// Where the population keeps dying. Warm, so a corpse never reads as terrain.
 const DEATH_MARK: [u8; 3] = [235, 70, 60];
@@ -406,6 +438,15 @@ impl Sprites {
     }
 }
 
+/// How much bigger an agent's *picture* is than its physics box, measured on the
+/// box's height. See [`Sheet::actor`]: the box is a collision shape the sim owns,
+/// and at 1.0 the player — the one sprite that is always on screen — was smaller
+/// than the bushes it ran past. 1.3 puts the runner at about 1.17 tiles against a
+/// walker's 0.78, a bush's 0.75 and a foreground tree's 3.0: present without
+/// towering, and the same factor for every agent, so the player-to-walker ratio
+/// the physics describes (0.9 against 0.6) is the ratio the eye sees.
+const ACTOR_DRAW_SCALE: f32 = 1.3;
+
 /// Everything a draw call needs that is not the thing being drawn.
 ///
 /// One value rather than eight arguments, and the texture id and sprite rectangles
@@ -482,18 +523,34 @@ impl<'a> Sheet<'a> {
     /// box instead — centred horizontally, standing on the box's floor — costs nothing
     /// and makes every character keep the proportions it was drawn with.
     ///
+    /// The square is sized off the box's *height*, enlarged by [`ACTOR_DRAW_SCALE`] —
+    /// and both halves of that sentence fix a bug apiece. This used to fit the square
+    /// to the *smaller* side, `w.min(h)`, which threw the player's height away: a
+    /// 0.6-by-0.9 box was drawn as a 0.6-tile square, exactly the walker's size, even
+    /// though the walker it runs into is a 0.6-by-0.6 box — the one sprite that is
+    /// always on screen was the smallest thing in the scene, smaller than a bush
+    /// (0.75 tiles) standing beside it. And a sprite drawn at exactly its physics
+    /// height reads small next to everything else in the vocabulary anyway, because
+    /// the rest of the world is drawn generously: foreground trees at a tile and a
+    /// half per cell, the goal two tiles tall. So the art overflows its box by the
+    /// scale below — centred on the box, feet on the box's floor — the way a
+    /// platformer character is always bigger than its collision. The physics does
+    /// not change: the box is the sim's, and this only decides how much picture is
+    /// painted over it. At the scale below the player stands about 1.17 tiles tall
+    /// and the walker about 0.78, so the runner is taller than the thing it stomps
+    /// and shorter than the flag it runs to, which is the ordering the eye expects.
+    ///
     /// The argument list is a box, its art, its mirror and its tint — the whole of what an
     /// agent sprite *is*, and a struct for it would only be unpacked again at the two call
     /// sites that exist.
     #[allow(clippy::too_many_arguments)]
     pub fn actor(&self, x: f32, y: f32, w: f32, h: f32, uv: Rect, flip: bool, tint: Color32) {
-        let scale = self.camera.scale();
-        let size = w.min(h) * scale;
+        let height_tiles = h * ACTOR_DRAW_SCALE;
         let rect = self.camera.world_rect(
-            x + (w - size / scale) * 0.5,
-            y + h - size / scale,
-            size / scale,
-            size / scale,
+            x + w * 0.5 - height_tiles * 0.5,
+            y + h - height_tiles,
+            height_tiles,
+            height_tiles,
             self.viewport,
         );
         self.image_facing(rect, uv, flip, tint);
@@ -814,6 +871,19 @@ pub fn tile_hash(tx: i32, ty: i32, salt: u32) -> u32 {
     n = n.wrapping_mul(0x2545_F491);
     n ^= n >> 13;
     n
+}
+
+/// A hash as a fraction in [0, 1), taken from the hash's *high* slice.
+///
+/// The same lesson [`scenery_sprite`] learned about `% 100`: the low bits of
+/// [`tile_hash`] move in step along a run of neighbouring indices, so a fraction
+/// built from them (`hash % 1000 / 1000`) clusters — neighbouring clouds came out
+/// the same size and the same height because their indices are neighbours. The
+/// slice above bit 8 is the mixed part of the hash, so consecutive indices give
+/// unrelated fractions, which is what a *continuous* placement (a cloud's size,
+/// its altitude, its jitter along the sky) needs.
+fn hash_frac(tx: i32, ty: i32, salt: u32) -> f32 {
+    ((tile_hash(tx, ty, salt) >> 8) % 1000) as f32 / 1000.0
 }
 
 /// The sprite for a solid tile: autotile, rock or soil or sand, and its variant if there is
@@ -1361,10 +1431,16 @@ pub fn draw_background(sheet: Sheet<'_>, level: &Level, backdrop: Backdrop, cloc
     match backdrop {
         Backdrop::Checker => draw_checker(painter, viewport, camera, level),
         Backdrop::Sky => {
-            // Furthest first: the sun, the clouds, the far hills, the tree-line standing on
-            // their ridge, then the near hills in front of all of it. The order is the depth
-            // order and the parallax factors are what make the layers read as distance rather
-            // than as five pictures stacked up — the sun barely moves, the clouds move most.
+            // Furthest first: the sun, the two cloud layers, the far hills, the
+            // tree-line standing on their ridge, then the near hills and *their*
+            // tree-line in front of all of it. The order is the depth order, and
+            // the parallax factors increase in exactly this order — sun 0.04,
+            // far clouds 0.08, near clouds 0.17, far hills 0.20, near hills
+            // 0.38, the level itself 1.0 — which is what makes the layers read
+            // as distance rather than as six pictures stacked up. A layer that
+            // is drawn behind another and moves *faster* than it (which is what
+            // the clouds used to do, at 0.30 and 0.55 against the hills' 0.20
+            // and 0.38) tells the eye two opposite stories at once.
             //
             // The clouds moved in front of the hills to behind them when they were given an
             // altitude: hung off the top of the window they never overlapped a hill, and at
@@ -1372,16 +1448,21 @@ pub fn draw_background(sheet: Sheet<'_>, level: &Level, backdrop: Backdrop, cloc
             // is a cloud that is further away than the hill rather than a cut-out pasted
             // over it.
             draw_sun(painter, viewport, camera, level);
-            draw_clouds(sheet, level, clock, 0.30);
-            draw_clouds(sheet, level, clock + 7.5, 0.55);
-            // The tree-line is handed the band it stands on rather than the numbers to
+            for layer in CLOUD_LAYERS {
+                draw_clouds(sheet, level, clock, layer);
+            }
+            // A tree-line is handed the band it stands on rather than the numbers to
             // rebuild it: a tree planted on a ridge rides that ridge, and two copies of a
-            // hill's geometry is one copy after the first edit.
+            // hill's geometry is one copy after the first edit. Both bands get one:
+            // the near hills stood bare in front of a forested range for as long as
+            // only the far band had a line, which read as a nearer hill that was
+            // somehow balder than the one behind it.
             let far = HillBand::new(camera, level, viewport, FAR_HILLS_PARALLAX, FAR_DOMES, 11);
             far.draw(painter, HILL_FAR);
-            draw_treeline(sheet, &far);
+            draw_treeline(sheet, &far, &RANKS);
             let near = HillBand::new(camera, level, viewport, NEAR_HILLS_PARALLAX, NEAR_DOMES, 17);
             near.draw(painter, HILL_NEAR);
+            draw_treeline(sheet, &near, &NEAR_RANKS);
         }
     }
 }
@@ -1418,7 +1499,7 @@ fn draw_checker(painter: &Painter, viewport: Rect, camera: &Camera, level: &Leve
 /// the camera moves. A sun placed at a tenth of the viewport used to be a sun that hung in
 /// front of the level at one framing and sank behind its own hills at the next.
 fn draw_sun(painter: &Painter, viewport: Rect, camera: &Camera, level: &Level) {
-    let shift = camera.centre.x * 0.04 * camera.scale();
+    let shift = camera.centre.x * SUN_PARALLAX * camera.scale();
     let centre = Pos2::new(
         viewport.left() + viewport.width() * 0.76 - shift,
         sky_line(camera, level, viewport) - SUN_ALTITUDE * camera.scale(),
@@ -1433,7 +1514,7 @@ fn draw_sun(painter: &Painter, viewport: Rect, camera: &Camera, level: &Level) {
     }
 }
 
-/// One rank of the tree-line: the same construction at one of two distances.
+/// One rank of a tree-line: the same construction at any of its distances.
 #[derive(Clone, Copy)]
 struct Rank {
     /// Tiles between the clumps this rank plants.
@@ -1456,14 +1537,21 @@ struct Rank {
 
 /// How far apart two trees of one clump stand, as a fraction of a tree's own width.
 ///
-/// Less than one, so neighbours overlap and a clump is a single mass with a ragged top. The
-/// first version packed a clump to the *rank's* spacing instead, which put two trees twenty
+/// Less than one, so neighbours touch and a clump is a single mass with a ragged top — but
+/// only just less. A pine's crown is opaque across about three quarters of its cell, so at
+/// the 0.5 this used to be, two neighbours overlapped by a third of a crown each: the left
+/// tree's lit edge and the right tree's shadow rows landed on the same pixels, their tiers
+/// interleaved at two different heights, and a clump read as two trees printed on top of
+/// each other rather than as two trees growing together. At 0.62 the crowns meet at their
+/// ragged edges and barely cross — a mass, not a double exposure — while the centres stay
+/// well inside the rank's own spacing, which is what the bunching test measures. The first
+/// version packed a clump to the *rank's* spacing instead, which put two trees twenty
 /// points apart at a size of twenty-five: three-quarters of a tree of open sky between two
-/// trees that are supposed to be growing out of the same stump, which reads as the even row of
-/// singles the bunching was meant to replace.
-const CLUMP_PACK: f32 = 0.5;
+/// trees that are supposed to be growing out of the same stump, which reads as the even row
+/// of singles the bunching was meant to replace.
+const CLUMP_PACK: f32 = 0.62;
 
-/// The two ranks of the tree-line, farthest first.
+/// The two ranks of the far tree-line, farthest first.
 ///
 /// A forest edge is bunched and two deep: one row of trees at even spacing, which is how this
 /// started, reads as a fence with gaps in it — the eye finds the rhythm in three trees and
@@ -1472,6 +1560,13 @@ const CLUMP_PACK: f32 = 0.5;
 /// from becoming a hedge), and a second rank stands behind the first — denser than the rank in
 /// front, a size smaller and a haze paler, so the clearings in the front rank show a band of
 /// trees further off rather than an empty horizon.
+///
+/// The height ranges are narrow, and that is part of the same overlap fix as
+/// [`CLUMP_PACK`]: at the old 1.0-to-1.6 spread, two trees of one clump could differ
+/// by sixty per cent, so the shorter one's crown ended halfway up the taller one's
+/// tiers — two silhouettes crossing mid-crown, which is the strange overlap a
+/// clump showed. A stand of one species on one ridge varies by a third, not by
+/// two thirds, so the ranges below span about that.
 const RANKS: [Rank; 2] = [
     // Behind: the hazier rank, in the `pine_c`/`pine_d` sprites' two-tone palette. Planted at
     // nearly every position — a clearing in the rank behind is a clearing with sky in it, which
@@ -1482,36 +1577,65 @@ const RANKS: [Rank; 2] = [
         shapes: ["pine_c", "pine_d"],
         least: 1,
         most: 3,
-        short: 0.8,
-        tall: 1.2,
+        short: 0.85,
+        tall: 1.15,
         sunk: 0.35,
         salt: 171,
     },
-    // In front: the rank standing on the ridge, one tile to one and a half tiles tall.
+    // In front: the rank standing on the ridge, a tile and a fraction tall.
     Rank {
         spacing: 3.0,
         gap: 3,
         shapes: ["pine_a", "pine_b"],
         least: 2,
         most: 3,
-        short: 1.0,
-        tall: 1.6,
+        short: 1.05,
+        tall: 1.45,
         sunk: 0.0,
         salt: 71,
     },
 ];
 
-/// A forest edge of conifers along the far hills' ridge, in two ranks.
+/// The near hills' tree-line: one rank, in the `pine_near_*` sprites' saturated green.
+///
+/// The near band stood bare while the range behind it was forested, which is
+/// backwards — a nearer hillside shows *more* of its trees, not fewer. One rank
+/// rather than two: this band is already in front of a two-deep line, and a second
+/// rank behind it would be hidden by the first at this size. The trees are the
+/// biggest in the backdrop (a tile and a half to two tiles: closer is bigger),
+/// planted sparser than the far line and in clumps of at most two, because a near
+/// tree drawn at this size in a tight clump of three is a foreground object
+/// competing with the level rather than a backdrop. A quarter of its positions
+/// are clearings, and through them the far line shows, which is what ties the
+/// two bands into one landscape.
+///
+/// The sprites are optional art, in the way the butterflies are: a tileset drawn
+/// before the near band grew a line simply has bare near hills, and [`draw_rank`]
+/// skips a tree whose sprite the atlas does not have rather than panicking.
+const NEAR_RANKS: [Rank; 1] = [Rank {
+    spacing: 3.4,
+    gap: 4,
+    shapes: ["pine_near_a", "pine_near_b"],
+    least: 1,
+    most: 2,
+    short: 1.5,
+    tall: 2.1,
+    sunk: 0.0,
+    salt: 271,
+}];
+
+/// A forest edge of conifers along a hill band's ridge, in ranks.
 ///
 /// The cheapest depth cue in the sky and the one it was missing: silhouettes planted along
-/// the ridge of the band behind them, and only two shapes because at this size a tree is a
-/// silhouette with a ragged edge rather than a species.
+/// the ridge of the band behind them, and only two shapes per rank because at this size a
+/// tree is a silhouette with a ragged edge rather than a species.
 ///
 /// **Small, because it is far.** A tree on a ridge three hills away is a tenth of the height
 /// of one you could walk to, and this line was drawn at nearly half the height of the hills it
 /// stands on, which reads as a row of pines planted just behind the level's back wall. A tree
-/// here is one tile to one and a half tiles tall on screen at every zoom, against domes three
-/// and a half to five and a half tiles across, and the rank behind it is smaller again.
+/// on the far band is a tile and a fraction tall on screen at every zoom, against domes three
+/// and a half to five tiles across, and the rank behind it is smaller again; the near band's
+/// trees are the largest of the three ranks and still under half their domes' height.
 ///
 /// Each tree stands on [`HillBand::ridge`] at its own centre column, and the band it is given
 /// is the very object that drew the hills, so the two cannot disagree about where the ground
@@ -1519,15 +1643,23 @@ const RANKS: [Rank; 2] = [
 /// every tree thirty to eighty points below the ridge it should stand on, inside the hill's flat
 /// fill: a pine hovering in front of a hill, its trunk ending in mid air, with the nearest thing
 /// below it the level's floor two tiles further down.
-fn draw_treeline(sheet: Sheet<'_>, band: &HillBand) {
+fn draw_treeline(sheet: Sheet<'_>, band: &HillBand, ranks: &[Rank]) {
     // Farther rank first, so the rank in front draws over it: that overlap is the whole of what
     // makes the second rank read as *behind* rather than beside.
-    for rank in RANKS {
-        draw_rank(sheet, band, rank);
+    for rank in ranks {
+        draw_rank(sheet, band, *rank);
     }
 }
 
-/// Draw one rank of the tree-line: clumps of two or three trees, planted on the band's ridge.
+/// Draw one rank of a tree-line: clumps of trees, planted on the band's ridge.
+///
+/// A clump is drawn tallest first, so the shorter trees of a stand stand *in front
+/// of* the taller ones: drawn in planting order (left to right) instead, which
+/// tree of a clump occluded its neighbour depended on which side of the clump it
+/// happened to be planted on, and a tall crown could be cut across by a short
+/// neighbour on one side and cut across that neighbour on the other. Back-to-front
+/// by height is the order a painter would use, and it makes every clump read the
+/// same way.
 fn draw_rank(sheet: Sheet<'_>, band: &HillBand, rank: Rank) {
     let (painter, viewport, camera, sprites) =
         (sheet.painter, sheet.viewport, sheet.camera, sheet.sprites);
@@ -1542,9 +1674,21 @@ fn draw_rank(sheet: Sheet<'_>, band: &HillBand, rank: Rank) {
             continue;
         }
         let count = rank.least + tile_hash(i, 43, rank.salt + 1) % (rank.most - rank.least + 1);
+        // Resolve the whole clump before drawing any of it, so it can be painted
+        // tallest first (above) rather than in planting order. Each entry is
+        // `(size, x, foot, sprite)`: the foot is resolved here, with the tree,
+        // because it is a property of where the tree stands.
+        let mut clump: Vec<(f32, f32, f32, Rect)> = Vec::new();
         for k in 0..count {
             let seed = i * 4 + k as i32;
-            let uv = sprites.get(rank.shapes[(tile_hash(seed, 31, rank.salt + 2) % 2) as usize]);
+            // Optional art is skipped, not panicked on: the near rank's sprites are
+            // newer than the far ranks', and a tileset without them has a bare near
+            // band rather than no game (see [`NEAR_RANKS`]).
+            let Some(uv) =
+                sprites.try_get(rank.shapes[(tile_hash(seed, 31, rank.salt + 2) % 2) as usize])
+            else {
+                continue;
+            };
             // Whole pixels and a whole-pixel size, like everything else: a horizon of trees is
             // the one place where forty half-pixel sprites would shimmer together.
             let height = rank.short
@@ -1567,6 +1711,10 @@ fn draw_rank(sheet: Sheet<'_>, band: &HillBand, rank: Rank) {
             // when the hill was painted before it: the trunk crosses the skyline and its base
             // is on the far slope.
             let foot = (band.ridge(x + size * 0.5) + rank.sunk * scale).ceil();
+            clump.push((size, x, foot, uv));
+        }
+        clump.sort_by(|a, b| b.0.partial_cmp(&a.0).expect("no NaN size"));
+        for (size, x, foot, uv) in clump {
             painter.image(
                 sheet.texture,
                 Rect::from_min_size(Pos2::new(x, foot - size), Vec2::splat(size)),
@@ -1754,51 +1902,134 @@ impl HillBand {
     }
 }
 
-/// Clouds drifting at their own speed, in three shapes.
+/// One layer of cloud drift: every property that makes it a *distance*.
+///
+/// The sky has two of these, and they are layers in the same sense as the hill
+/// bands — everything about a layer agrees: the farther one is smaller, higher,
+/// paler (lower alpha), slower to drift and slower under the camera (a smaller
+/// parallax, and crucially a smaller one than either hill band's: see
+/// [`SUN_PARALLAX`]). A layer is a value rather than eight more arguments
+/// because the numbers are only readable next to the other layer's.
+#[derive(Clone, Copy, Debug)]
+struct CloudLayer {
+    /// How much of the camera's motion this layer follows. Behind both hill
+    /// bands, ahead of only the sun.
+    parallax: f32,
+    /// Drift speed, in tiles per second, on top of the parallax: the sky moves
+    /// even when nobody is walking, and the nearer layer drifts faster.
+    drift: f32,
+    /// Tiles between one cloud slot and the next, before the per-cloud jitter.
+    spacing: f32,
+    /// Cloud widths in tiles: smallest to largest in this layer. A *range*,
+    /// sampled per cloud — see [`draw_clouds`].
+    widths: (f32, f32),
+    /// Altitudes in tiles above the ground line, measured to the cloud's top:
+    /// lowest to highest in this layer, also sampled per cloud.
+    altitudes: (f32, f32),
+    /// Alpha the layer is drawn at: the farther layer is the paler one.
+    alpha: u8,
+    /// Which hashes this layer draws with, so the two layers are not the same
+    /// sky twice at two speeds — which they were, when both calls shared one
+    /// set of salts and differed only in parallax and a clock offset.
+    salt: u32,
+}
+
+/// The two cloud layers, farthest first.
+///
+/// The far layer's altitude range sits above the near layer's centre, and its
+/// widths sit under the near layer's: higher and smaller is farther, in a sky
+/// as much as on a hillside. Both ranges keep a cloud's top above the far
+/// range's tallest dome ([`FAR_DOMES`]), because a cloud is behind the hills
+/// and only the part of it above their ridge is ever seen.
+const CLOUD_LAYERS: [CloudLayer; 2] = [
+    CloudLayer {
+        parallax: 0.08,
+        drift: 0.020,
+        spacing: 11.0,
+        widths: (2.4, 3.9),
+        altitudes: (7.0, 9.2),
+        alpha: 150,
+        salt: 101,
+    },
+    CloudLayer {
+        parallax: 0.17,
+        drift: 0.045,
+        spacing: 14.0,
+        widths: (3.6, 5.8),
+        altitudes: (5.6, 8.0),
+        alpha: 205,
+        salt: 211,
+    },
+];
+
+/// How tall a cloud is drawn for how wide it is.
+///
+/// The sprites' own proportions, roughly: a cumulus cell is opaque across about
+/// fourteen of its sixteen columns and ten of its rows, so a cloud drawn square
+/// (which this used to do, one 4-tile square for every cloud in the sky) is a
+/// cloud stretched half again too tall — and, being the same square every time,
+/// the same cloud every time.
+const CLOUD_ASPECT: f32 = 0.72;
+
+/// Clouds drifting at their own speed, in three shapes and every size in a range.
 ///
 /// They are sprites rather than shapes because a cloud needs soft edges and a light top,
-/// and they carry the *only* motion in the background: a still sky behind a moving level
+/// and they carry their own motion in the background: a still sky behind a moving level
 /// looks like a painted wall.
 ///
-/// A cloud's height is a world altitude like the sun's ([`CLOUD_ALTITUDES`]) and its x is the
-/// camera's, because a cloud is not *at* a place in the level: it is far enough away to be in
-/// the same direction from anywhere. What that buys is that the cloud the window showed at
-/// one framing is the same cloud at the next, one row of the sky higher or lower as the
-/// ground is.
-fn draw_clouds(sheet: Sheet<'_>, level: &Level, clock: f32, parallax: f32) {
+/// A cloud's height is a world altitude like the sun's and its x is the camera's, because
+/// a cloud is not *at* a place in the level: it is far enough away to be in the same
+/// direction from anywhere. What that buys is that the cloud the window showed at one
+/// framing is the same cloud at the next, higher or lower in the sky as the ground is.
+///
+/// **No two clouds in a layer are the same size, the same height or the same slot
+/// apart**, and that is a change, not a hope: this used to place every cloud in one
+/// of three altitude rows, draw every one at exactly 4.0 tiles square, and space
+/// them on an unjittered 13-tile grid. Three rows at one size on a rigid grid is
+/// a frieze, and the sky read as one cloud stamped across it at one height —
+/// the shapes differed and nothing else did. Now the row is a range sampled per
+/// cloud from the hash's high slice ([`hash_frac`], because the low bits of
+/// neighbouring indices move together and the frieze would survive in miniature),
+/// the width is a range in the same way, and each cloud is jittered off its slot
+/// by up to a third of the spacing, so the eye gets a sky rather than a pattern.
+fn draw_clouds(sheet: Sheet<'_>, level: &Level, clock: f32, layer: CloudLayer) {
     let (painter, viewport, camera, sprites) =
         (sheet.painter, sheet.viewport, sheet.camera, sheet.sprites);
     let scale = camera.scale();
-    let spacing = scale * 13.0;
-    // The drift is a slow time term on top of the camera's parallax: the sky moves even
-    // when nobody is walking.
-    let shift = camera.centre.x * parallax * scale + clock * scale * 0.08;
+    let spacing = scale * layer.spacing;
+    // The drift is a slow time term on top of the camera's parallax.
+    let shift = camera.centre.x * layer.parallax * scale + clock * scale * layer.drift;
     let ground = sky_line(camera, level, viewport);
     let first = ((shift - viewport.width() * 0.5) / spacing).floor() as i32 - 2;
     let last = ((shift + viewport.width() * 1.5) / spacing).ceil() as i32 + 2;
     for i in first..=last {
-        let roll = tile_hash(i, 5, 31) % 3;
-        if roll != 0 {
+        if tile_hash(i, 5, layer.salt) % 3 != 0 {
             continue;
         }
-        let shape = tile_hash(i, 7, 37) % 3;
-        let row = tile_hash(i, 11, 41) % 3;
+        let shape = tile_hash(i, 7, layer.salt + 1) % 3;
         let uv = sprites.get(match shape {
             0 => "cloud_a",
             1 => "cloud_b",
             _ => "cloud_c",
         });
-        let size = scale * 4.0;
-        let x = viewport.center().x + i as f32 * spacing - shift;
-        let y = ground - CLOUD_ALTITUDES[row as usize] * scale;
+        // Width and altitude are independent samples — different salts, so a big
+        // cloud is not automatically a low one — and each is a range, not a row.
+        let width =
+            layer.widths.0 + hash_frac(i, 13, layer.salt + 2) * (layer.widths.1 - layer.widths.0);
+        let altitude = layer.altitudes.0
+            + hash_frac(i, 17, layer.salt + 3) * (layer.altitudes.1 - layer.altitudes.0);
+        let jitter = (hash_frac(i, 19, layer.salt + 4) - 0.5) * spacing * 0.66;
+        let size = Vec2::new(scale * width, scale * width * CLOUD_ASPECT);
+        let x = viewport.center().x + i as f32 * spacing - shift + jitter;
+        let y = ground - altitude * scale;
         // Drawn at a lower alpha than the level: a cloud is behind everything, and a
         // full-strength white blob at the top of the frame fights the panel for attention.
         painter.image(
             // The sheet's own texture, so a cloud is the same art as everything else.
             sheet.texture,
-            Rect::from_min_size(Pos2::new(x, y), Vec2::splat(size)),
+            Rect::from_min_size(Pos2::new(x, y), size),
             uv,
-            Color32::from_white_alpha(190),
+            Color32::from_white_alpha(layer.alpha),
         );
     }
 }
@@ -2984,17 +3215,27 @@ mod tests {
         let (high, low) = (clouds(&above), clouds(&below));
         assert!(high.len() >= 3, "the sky has {} cloud(s) in it", high.len());
         assert_eq!(high.len(), low.len(), "the same sky, one window lower");
+        // The altitudes the two layers between them can place a cloud at: a range
+        // per layer now, not the three rows this used to assert membership of —
+        // a cloud at a row's *exact* height is the frieze the ranges replaced.
+        let (lowest, highest) = (CLOUD_LAYERS[1].altitudes.0, CLOUD_LAYERS[0].altitudes.1);
         for (i, cloud) in high.iter().enumerate() {
             let altitude = (line - cloud.min.y) / scale;
             assert!(
-                CLOUD_ALTITUDES.iter().any(|a| (a - altitude).abs() < 0.01),
-                "a cloud is {altitude:.2} tiles over the ground line, and the sky's rows are \
-                 {CLOUD_ALTITUDES:?}"
+                altitude >= lowest - 0.01 && altitude <= highest + 0.01,
+                "a cloud is {altitude:.2} tiles over the ground line, and the layers \
+                 place clouds between {lowest} and {highest} tiles"
             );
             assert!(
                 altitude > FAR_DOMES.1,
                 "a cloud at {altitude:.2} tiles is inside the {}-tile range rather than over it",
                 FAR_DOMES.1
+            );
+            assert!(
+                (cloud.height() / cloud.width() - CLOUD_ASPECT).abs() < 0.03,
+                "a cloud is {} points wide and {} tall: not the sprites' proportions",
+                cloud.width(),
+                cloud.height()
             );
             assert!(
                 (low[i].min.y - cloud.min.y - 5.0 * scale).abs() <= 1.0,
@@ -3050,12 +3291,13 @@ mod tests {
         // those two are all the difference there is. A tree planted on the horizon line this
         // used to use sits thirty to eighty points inside a dome's fill — not like this at all.
         const SLACK: f32 = 1.5;
-        // And small, because it is far. A pine is one tile to one and a half tiles tall on
+        // And small, because it is far. A pine is a tile to a tile and a half tall on
         // screen whatever the zoom; at the size this line was first drawn — nearly half the
         // height of the hills it stands on — it read as a row of trees just behind the
-        // level's back wall rather than a ridge three hills away.
+        // level's back wall rather than a ridge three hills away. The range is the front
+        // far rank's own ([`RANKS`]): 1.05 to 1.45 tiles, floored at a tile by the draw.
         for pine in &pines {
-            let (shortest, tallest) = (scale, scale * 1.6 + 1.0);
+            let (shortest, tallest) = (scale, scale * 1.45 + 1.0);
             assert!(
                 pine.height() >= shortest && pine.height() <= tallest,
                 "a pine is {:.0} points tall at {scale} points a tile: {shortest} to {tallest} \
@@ -3077,6 +3319,351 @@ mod tests {
             assert!(
                 frame.covers(HILL_FAR, Pos2::new(x, pine.max.y + 2.0)),
                 "a pine at x={x} is standing in the air: nothing under its foot"
+            );
+        }
+    }
+
+    /// The near hills carry a tree-line of their own, standing on *their* ridge.
+    ///
+    /// The far band's line is pinned by `every_pine_stands_on_the_hills_ridge`; this
+    /// is the same claim for the band in front of it, which stood bare while the
+    /// range behind it was forested. Measured the same way — feet read back against
+    /// the near band's drawn silhouette — plus the two things that make this rank
+    /// a *nearer* one rather than a copy: its trees are bigger than the far rank's,
+    /// and they are drawn after it (in front of it), because draw order is depth.
+    #[test]
+    fn the_near_hills_have_a_treeline_of_their_own() {
+        let level = shipped("l1-flat-run");
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let frame = headless_frame(
+            &level,
+            viewport.size(),
+            Backdrop::Sky,
+            0.0,
+            RenderOpts::playing(),
+        );
+        let scale = Camera::fit(&level, viewport, 24.0).scale();
+        let pines = drawn_sprites(&frame, &["pine_near_a", "pine_near_b"]);
+        assert!(
+            pines.len() >= 6,
+            "the near tree-line has shrunk to {} pine(s)",
+            pines.len()
+        );
+        const SLACK: f32 = 1.5;
+        for pine in &pines {
+            // The near rank's own range: a tile and a half to two tiles and a bit —
+            // bigger than the far rank's 1.05–1.45, because it is nearer.
+            let (shortest, tallest) = (scale * 1.5 - 1.0, scale * 2.1 + 1.0);
+            assert!(
+                pine.height() >= shortest && pine.height() <= tallest,
+                "a near pine is {:.0} points tall at {scale} points a tile: {shortest} to \
+                 {tallest} is the near rank's range",
+                pine.height()
+            );
+            let x = pine.center().x;
+            let ridge = frame.ridge_at(HILL_NEAR, x);
+            assert!(
+                (pine.max.y - ridge).abs() <= SLACK,
+                "a near pine at x={x} has its foot at {} while the near hills' ridge is \
+                 at {ridge}",
+                pine.max.y
+            );
+            assert!(
+                frame.covers(HILL_NEAR, Pos2::new(x, pine.max.y + 2.0)),
+                "a near pine at x={x} is standing in the air: nothing under its foot"
+            );
+        }
+        // In front: every near tree reaches the frame after every far one.
+        let atlas = atlas();
+        let index_of = |name: &str| {
+            let uv = atlas.uv(name).expect("the pine is in the atlas");
+            frame
+                .sprites
+                .iter()
+                .position(|(_, drawn)| *drawn == uv)
+                .expect("the pine is drawn")
+        };
+        let first_near = ["pine_near_a", "pine_near_b"]
+            .iter()
+            .map(|name| index_of(name))
+            .min()
+            .expect("a near pine is drawn");
+        let last_far = ["pine_a", "pine_b", "pine_c", "pine_d"]
+            .iter()
+            .filter_map(|name| {
+                let uv = atlas.uv(name).expect("the pine is in the atlas");
+                frame.sprites.iter().rposition(|(_, drawn)| *drawn == uv)
+            })
+            .max()
+            .expect("a far pine is drawn");
+        assert!(
+            last_far < first_near,
+            "the near tree-line is drawn at {first_near}, before the far line is \
+             finished at {last_far}: the nearer trees are behind the farther ones"
+        );
+    }
+
+    /// Draw one frame of a live episode (backdrop, level and agents) and report
+    /// its sprite quads, in the shape of [`headless_frame_with`] but through
+    /// [`draw_sim`]: the agents only exist in a `Sim`, so a level-only frame
+    /// cannot say anything about how big the player is drawn.
+    fn headless_sim_sprites(level: &Level, camera: Camera, size: Vec2) -> Vec<(Rect, Rect)> {
+        let ctx = egui::Context::default();
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
+        let viewport = Rect::from_min_size(Pos2::ZERO, size);
+        let sim = Sim::new(level, 1);
+        let anim = AgentAnim::new();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::default())
+                    .show(ctx, |ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let painter = ui.painter_at(rect);
+                        let sheet = Sheet::new(&painter, &atlas, &sprites, &camera, rect);
+                        draw_background(sheet, level, Backdrop::Sky, 0.0);
+                        draw_sim(sheet, &sim, RenderOpts::playing(), 0.0, &anim);
+                    });
+            },
+        );
+        let texture = atlas.texture_id();
+        let mut quads = Vec::new();
+        for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+            let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
+                continue;
+            };
+            if mesh.texture_id != texture {
+                continue;
+            }
+            for chunk in mesh.vertices.chunks(4) {
+                if chunk.len() < 4 {
+                    continue;
+                }
+                let (mut screen, mut uv) = (Rect::NOTHING, Rect::NOTHING);
+                for v in chunk {
+                    screen = screen.union(Rect::from_min_size(v.pos, Vec2::ZERO));
+                    uv = uv.union(Rect::from_min_size(v.uv, Vec2::ZERO));
+                }
+                quads.push((screen, uv));
+            }
+        }
+        quads
+    }
+
+    /// The player is drawn bigger than its box — and bigger than a walker.
+    ///
+    /// The regression this pins is the actor fitting its square to the box's
+    /// *smaller* side: the 0.6-by-0.9 player came out as a 0.6-tile sprite,
+    /// the same size as the 0.6-by-0.6 walker and smaller than a bush. Read
+    /// off the frame: the player's rectangle is square (the art's proportions),
+    /// its height is the box's height times [`ACTOR_DRAW_SCALE`], its feet are
+    /// on the box's floor (an enlarged sprite that floated or sank would trade
+    /// one bug for another), and it is plainly taller than the walker in the
+    /// same frame — the ordering the physics describes, 0.9 against 0.6.
+    #[test]
+    fn the_player_is_drawn_bigger_than_its_box_and_its_walkers() {
+        let level = shipped("l3-gauntlet");
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let camera = Camera::fit(&level, viewport, 24.0);
+        let scale = camera.scale();
+        let quads = headless_sim_sprites(&level, camera, viewport.size());
+        let atlas = atlas();
+        let find = |name: &str| -> Vec<Rect> {
+            let uv = atlas.uv(name).expect("the sprite is in the atlas");
+            quads
+                .iter()
+                .filter(|(_, drawn)| *drawn == uv)
+                .map(|(screen, _)| *screen)
+                .collect()
+        };
+        let players = find("player_idle_a");
+        assert_eq!(players.len(), 1, "one standing player in the frame");
+        let player = players[0];
+        let sim = Sim::new(&level, 1);
+        let p = sim.player();
+        // Square, and the box's height at the draw scale — not its width.
+        assert!(
+            (player.width() - player.height()).abs() <= 1.0,
+            "the player is {} by {} points: its proportions were squeezed",
+            player.width(),
+            player.height()
+        );
+        let expected = p.h * ACTOR_DRAW_SCALE * scale;
+        assert!(
+            (player.height() - expected).abs() <= 1.5,
+            "the player is {:.0} points tall; its {:.2}-tile box at {} points a \
+             tile and a draw scale of {ACTOR_DRAW_SCALE} is {expected:.0}",
+            player.height(),
+            p.h,
+            scale
+        );
+        assert!(
+            player.height() > scale,
+            "the player is {:.0} points tall at {scale} points a tile: under a \
+             tile, which is smaller than the scenery it runs past",
+            player.height()
+        );
+        // Feet on the box's floor, centred on the box.
+        let floor = camera.to_screen(0.0, p.y + p.h, viewport).y;
+        assert!(
+            (player.max.y - floor).abs() <= 1.5,
+            "the player's feet are at {}, and its box's floor is at {floor}",
+            player.max.y
+        );
+        let centre = camera.to_screen(p.x + p.w * 0.5, 0.0, viewport).x;
+        assert!(
+            (player.center().x - centre).abs() <= 1.5,
+            "the player is centred at {}, and its box is centred at {centre}",
+            player.center().x
+        );
+        // Taller than a walker, by roughly the boxes' own ratio.
+        let walkers: Vec<Rect> = ["walker_a", "walker_b", "walker_c", "walker_d"]
+            .iter()
+            .flat_map(|name| find(name))
+            .collect();
+        assert!(
+            !walkers.is_empty(),
+            "the gauntlet has a walker in the frame"
+        );
+        for walker in &walkers {
+            assert!(
+                player.height() > walker.height() * 1.3,
+                "the player ({:.0} points) is barely taller than a walker \
+                 ({:.0}): the two boxes are 0.9 and 0.6 tiles",
+                player.height(),
+                walker.height()
+            );
+        }
+    }
+
+    /// No two clouds are the same size, and they are not all at the same height.
+    ///
+    /// The regression this pins is a sky of one cloud: every cloud drawn at
+    /// exactly 4.0 tiles square, in one of three altitude rows, on a 13-tile
+    /// grid. Read back off a wide frame so the sample is a sky and not three
+    /// clouds: the widths must span a real range (the two layers between them
+    /// span 2.4 to 5.8 tiles), the altitudes must span a real range (5.6 to
+    /// 9.2), and the widths must actually be *various* — several distinct
+    /// sizes, not one size with a single outlier doing the spanning.
+    #[test]
+    fn the_clouds_are_not_all_the_same_size_or_height() {
+        let level = shipped("l1-flat-run");
+        let size = Vec2::new(2600.0, 700.0);
+        let viewport = Rect::from_min_size(Pos2::ZERO, size);
+        let ground = sky_ground(&level);
+        let camera = Camera {
+            centre: Vec2::new(30.0, ground - 2.0),
+            zoom: 28.0,
+        };
+        let frame = headless_frame_with(
+            &level,
+            camera,
+            size,
+            Backdrop::Sky,
+            0.0,
+            RenderOpts::playing(),
+        );
+        let scale = camera.scale();
+        let line = sky_line(&camera, &level, viewport);
+        let clouds = drawn_sprites(&frame, &["cloud_a", "cloud_b", "cloud_c"]);
+        assert!(
+            clouds.len() >= 6,
+            "a wide sky holds {} cloud(s): too few to measure a sky by",
+            clouds.len()
+        );
+        let widths: Vec<f32> = clouds.iter().map(|c| c.width() / scale).collect();
+        let altitudes: Vec<f32> = clouds.iter().map(|c| (line - c.min.y) / scale).collect();
+        let span = |v: &[f32]| {
+            v.iter().fold(f32::MIN, |a, b| a.max(*b)) - v.iter().fold(f32::MAX, |a, b| a.min(*b))
+        };
+        assert!(
+            span(&widths) >= 1.2,
+            "the clouds span {:.2} tiles of width ({widths:.1?}): one size stamped \
+             across the sky is the bug this is for",
+            span(&widths)
+        );
+        assert!(
+            span(&altitudes) >= 1.2,
+            "the clouds span {:.2} tiles of altitude ({altitudes:.1?}): one height \
+             across the sky is the bug this is for",
+            span(&altitudes)
+        );
+        let mut distinct: Vec<i32> = widths.iter().map(|w| (w * scale) as i32).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 4,
+            "the sky has {} distinct cloud width(s) in it: {widths:.1?}",
+            distinct.len()
+        );
+    }
+
+    /// The backdrop's layers move at the speed of their depth, in order.
+    ///
+    /// Parallax is a *relation* between layers, so it is asserted as one: the
+    /// factors strictly increase in draw order (sun, far clouds, near clouds,
+    /// far hills, near hills), every one of them is slower than the level
+    /// itself, and the two hill bands really do translate by their own factor
+    /// when the camera moves — measured on the bands' origins, which are the
+    /// geometry both the hills and their tree-lines are placed from, so a band
+    /// and its trees cannot pass this separately and disagree on screen. The
+    /// cloud layers' own agreement is asserted with them: farther is smaller,
+    /// higher, paler and slower-drifting.
+    #[test]
+    fn the_backdrop_layers_move_at_the_speed_of_their_depth() {
+        let factors = [
+            SUN_PARALLAX,
+            CLOUD_LAYERS[0].parallax,
+            CLOUD_LAYERS[1].parallax,
+            FAR_HILLS_PARALLAX,
+            NEAR_HILLS_PARALLAX,
+        ];
+        for pair in factors.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "the parallax factors are not in depth order: {factors:?}"
+            );
+        }
+        assert!(
+            factors.iter().all(|f| *f > 0.0 && *f < 1.0),
+            "a backdrop layer moves with the level or against it: {factors:?}"
+        );
+        let (far, near) = (CLOUD_LAYERS[0], CLOUD_LAYERS[1]);
+        assert!(
+            far.widths.1 <= near.widths.0 + 1.5
+                && far.altitudes.0 >= near.altitudes.0
+                && far.alpha < near.alpha
+                && far.drift < near.drift,
+            "the far cloud layer is not the smaller, higher, paler, slower one: \
+             {far:?} against {near:?}"
+        );
+
+        let level = shipped("l1-flat-run");
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let ground = sky_ground(&level);
+        let at = |x: f32| Camera {
+            centre: Vec2::new(x, ground - 0.5),
+            zoom: 28.0,
+        };
+        let (a, b) = (at(20.0), at(30.0));
+        let scale = a.scale();
+        for (parallax, domes, salt) in [
+            (FAR_HILLS_PARALLAX, FAR_DOMES, 11),
+            (NEAR_HILLS_PARALLAX, NEAR_DOMES, 17),
+        ] {
+            let origin_a = HillBand::new(&a, &level, viewport, parallax, domes, salt).origin;
+            let origin_b = HillBand::new(&b, &level, viewport, parallax, domes, salt).origin;
+            let moved = origin_a - origin_b;
+            let expected = 10.0 * parallax * scale;
+            assert!(
+                (moved - expected).abs() <= 0.01,
+                "a band at parallax {parallax} moved {moved} points for ten tiles of \
+                 camera, not {expected}: it is not at its own depth"
             );
         }
     }
@@ -3306,20 +3893,56 @@ mod tests {
         // Far before near: each pair is the same kind of thing one band or one rank apart.
         for (far, near, what) in [
             (HILL_FAR, HILL_NEAR, "the two hill bands"),
-            (PINE_FAR, PINE, "the two ranks of the tree-line"),
-            (PINE_FAR_LIGHT, PINE_LIGHT, "the lit tones of the two ranks"),
+            (PINE_FAR, PINE, "the two ranks of the far tree-line"),
+            (PINE_FAR_LIGHT, PINE_LIGHT, "the lit tones of the far ranks"),
+            (PINE, PINE_NEAR, "the far rank and the near hills' rank"),
+            (
+                PINE_LIGHT,
+                PINE_NEAR_LIGHT,
+                "the lit tones of the far and near ranks",
+            ),
         ] {
             assert!(
                 to_sky(far) < to_sky(near),
                 "{what}: the far one ({far:?}) is not the paler one ({near:?})"
             );
         }
-        // And both ranks are darker than the hills they stand on, or the far one would vanish
+        // And every rank is darker than the hills it stands on, or it would vanish
         // into them rather than standing on them.
-        for (tone, rank) in [(PINE, "the rank in front"), (PINE_FAR, "the rank behind")] {
+        for (tone, rank, hill) in [
+            (PINE, "the far rank in front", HILL_FAR),
+            (PINE_FAR, "the far rank behind", HILL_FAR),
+            (PINE_NEAR, "the near hills' rank", HILL_NEAR),
+        ] {
             assert!(
-                to_sky(tone) > to_sky(HILL_FAR),
-                "{rank} ({tone:?}) is not darker than the hills it stands on"
+                to_sky(tone) > to_sky(hill),
+                "{rank} ({tone:?}) is not darker than the hills it stands on ({hill:?})"
+            );
+        }
+        // And no rank is *too* dark: the far ranks' tones all sit above the
+        // luminance the old palette's darkest tone had, which is the reading
+        // that shipped as a dark mass against the hill (see the `PINE_*`
+        // constants). Luminance, not distance-to-sky, because "too dark" is a
+        // claim about light, and a saturated green can be far from the sky
+        // while still being light.
+        fn luminance(colour: Color32) -> f32 {
+            0.2126 * f32::from(colour.r())
+                + 0.7152 * f32::from(colour.g())
+                + 0.0722 * f32::from(colour.b())
+        }
+        for (tone, what) in [
+            (PINE_LIGHT, "the far rank's lit tone"),
+            (PINE, "the far rank's body"),
+            (PINE_DARK, "the far rank's shadow"),
+            (PINE_SHADE, "the far rank's trunk"),
+            (PINE_FAR, "the rank behind's body"),
+            (PINE_NEAR, "the near rank's body"),
+        ] {
+            assert!(
+                luminance(tone) > 130.0,
+                "{what} ({tone:?}) has a luminance of {:.0}: a backdrop tree tone \
+                 that dark is the mass this palette replaced",
+                luminance(tone)
             );
         }
     }
@@ -3327,8 +3950,9 @@ mod tests {
     /// The sky has a sun and a tree-line, and the editor's backdrop has neither.
     ///
     /// Both are new *layers* rather than new tints: the sun is a shape at the smallest
-    /// parallax in the scene, and the pines are sprites standing on the ridge of the far hills,
-    /// in the hills' own layer because that is what they are standing on. The editor keeps its
+    /// parallax in the scene, and the pines are sprites standing on the ridges of
+    /// both hill bands, each in its band's own layer because that is what they are
+    /// standing on. The editor keeps its
     /// graph paper, because a level being drawn is measured against a grid rather than admired.
     #[test]
     fn the_sky_has_a_sun_and_a_treeline_and_the_editor_does_not() {
@@ -3344,7 +3968,14 @@ mod tests {
             RenderOpts::editing(),
         );
 
-        for name in ["pine_a", "pine_b", "pine_c", "pine_d"] {
+        for name in [
+            "pine_a",
+            "pine_b",
+            "pine_c",
+            "pine_d",
+            "pine_near_a",
+            "pine_near_b",
+        ] {
             let uv = atlas.uv(name).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(sky.draws(uv), "{name} is never drawn in the sky");
             assert!(!checker.draws(uv), "the editor's backdrop grew a tree-line");

@@ -147,18 +147,39 @@ GOLD_DARK = (206, 156, 44)
 # the tones are 40, 49 and 61 away from the hills where the old ones were 69, 102, 130 and
 # 161: the trunk is still the darkest thing in the tree-line, because it is the part that has
 # to read against the hill it is standing on, and nothing here is darker than that.
-PINE_LIGHT = (117, 156, 164)
-PINE = (106, 148, 159)
-PINE_DARK = (99, 139, 153)
-PINE_SHADE = (92, 130, 147)
+#
+# Lightened again in the parallax pass, and greened with it: the previous tones
+# (117/106/99/92 in the red channel, blue nearly as high as green) read on screen as a
+# dark blue-grey mass rather than as trees — the tiers alternate the body and the
+# shadow, so half of every crown was the darkest tone, and a crown that is half
+# shadow at a luminance near 120 is a silhouette with the light off. Every tone is
+# roughly twenty points brighter now and green is the strongest channel in all of
+# them, which is what a conifer in haze actually looks like against a blue hill:
+# paler than the hill is blue, and greener than it.
+PINE_LIGHT = (142, 180, 168)
+PINE = (128, 172, 158)
+PINE_DARK = (116, 160, 148)
+PINE_SHADE = (104, 148, 138)
 
 # The rank behind that one, a further step into the haze: two tones rather than four, since
 # four tones of shading is detail an eye that far away does not get, and the rank behind is
 # the one the haze eats first. Closer to the hills again — 20 and 31 away from them, where
 # the near rank is 39 and 64 — because the whole point of a second rank is that it is the
 # *farther* of the two, and tone is how a flat picture says so.
-PINE_FAR_LIGHT = (116, 158, 172)
-PINE_FAR = (110, 150, 166)
+PINE_FAR_LIGHT = (140, 180, 182)
+PINE_FAR = (130, 170, 174)
+
+# The rank on the *near* hills: the same conifer, one band closer, so the haze is
+# mostly off it. Saturated green rather than the far rank's blue-green, and darker
+# than the far rank tone for tone — that ordering is the depth cue — but not darker
+# in luminance than the far rank used to be: a near tree is the most present tree
+# in the backdrop, and a present thing drawn near-black is the "too dark" mistake
+# again, one band nearer. Its body sits at about the far rank's old luminance with
+# the blue taken out and the green put in.
+PINE_NEAR_LIGHT = (104, 176, 104)
+PINE_NEAR = (84, 158, 88)
+PINE_NEAR_DARK = (68, 138, 74)
+PINE_NEAR_SHADE = (66, 132, 70)
 
 # --- props, decor and effects -------------------------------------------
 LEAF_LIGHT = (132, 204, 96)

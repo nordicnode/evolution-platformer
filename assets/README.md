@@ -60,8 +60,9 @@ for a missing seam), and the fallbacks are in `crate::view::scenery_sprite` and
 | `vine_a`, `vine_b` | a vine hanging from a tile's underside, two frames of sway |
 | `cloud_a`, `cloud_b`, `cloud_c` | three cumulus shapes for the parallax sky |
 | `butterfly_a_1`, `butterfly_a_2`, `butterfly_b_1`, `butterfly_b_2` | two butterflies, two frames of wingbeat each — the only sprites in the game that are not standing on anything |
-| `pine_a`, `pine_b` | two conifer silhouettes: the tree-line standing on the ridge of the hills it is drawn in front of |
+| `pine_a`, `pine_b` | two conifer silhouettes: the tree-line standing on the ridge of the far hills it is drawn in front of |
 | `pine_c`, `pine_d` | the same two in the hazier palette of the rank behind: a forest edge, not a row |
+| `pine_near_a`, `pine_near_b` | the same two again in the saturated green of the near hills' own tree-line: one band closer, so bigger and greener, and optional art — a tileset without them has bare near hills |
 | `dust_a`, `dust_b` | the puff a running foot kicks up |
 | `puff` | the burst a dying agent leaves |
 | `spark_a`, `spark_b` | the sparkle at the goal |

@@ -47,6 +47,10 @@ from .common import (
     PINE_FAR,
     PINE_FAR_LIGHT,
     PINE_LIGHT,
+    PINE_NEAR,
+    PINE_NEAR_DARK,
+    PINE_NEAR_LIGHT,
+    PINE_NEAR_SHADE,
     PINE_SHADE,
     TRANSPARENT,
     DIRT_DARK,
@@ -566,8 +570,8 @@ def butterfly(shape: int, frame: int) -> Image.Image:
     return img
 
 
-def pine(shape: int, far: bool = False) -> Image.Image:
-    """A conifer silhouette for the horizon, two shapes in two ranks.
+def pine(shape: int, far: bool = False, near: bool = False) -> Image.Image:
+    """A conifer silhouette for the horizon, two shapes in three ranks.
 
     A silhouette because that is all a tree three hills away is: one dark mass with a
     ragged edge, and no interior detail the eye could resolve at this size. Its base is on
@@ -582,17 +586,19 @@ def pine(shape: int, far: bool = False) -> Image.Image:
     also five rows up rather than three, or the skirt would come down to the ground and the
     trunk would be one pixel of it.
 
-    `far` draws the rank *behind* the tree-line, in the two-tone haze of `common.PINE_FAR_*`.
-    The silhouette is the same one, because the difference between the two ranks is distance
-    rather than species and a second species is invisible at this size — what changes is the
-    palette, and how much of it there is: four tones of shading on the rank three hills away
-    is detail nobody gets to see.
+    `far` draws the rank *behind* the far tree-line, in the two-tone haze of
+    `common.PINE_FAR_*`, and `near` draws the rank on the near hills, in the saturated
+    green of `common.PINE_NEAR_*`. The silhouette is the same one in every rank, because
+    the difference between the ranks is distance rather than species and a second species
+    is invisible at this size — what changes is the palette, and how much of it there is:
+    four tones of shading on the rank three hills away is detail nobody gets to see.
     """
-    bar, shadow, lit, stem = (
-        (PINE_FAR_LIGHT, PINE_FAR, PINE_FAR_LIGHT, PINE_FAR)
-        if far
-        else (PINE, PINE_DARK, PINE_LIGHT, PINE_SHADE)
-    )
+    if far:
+        bar, shadow, lit, stem = (PINE_FAR_LIGHT, PINE_FAR, PINE_FAR_LIGHT, PINE_FAR)
+    elif near:
+        bar, shadow, lit, stem = (PINE_NEAR, PINE_NEAR_DARK, PINE_NEAR_LIGHT, PINE_NEAR_SHADE)
+    else:
+        bar, shadow, lit, stem = (PINE, PINE_DARK, PINE_LIGHT, PINE_SHADE)
     img = cell()
     px = img.load()
     if shape == 0:
@@ -737,12 +743,16 @@ def sprites() -> list[tuple[str, Image.Image]]:
         ("butterfly_a_2", butterfly(0, 1)),
         ("butterfly_b_1", butterfly(1, 0)),
         ("butterfly_b_2", butterfly(1, 1)),
-        # The tree-line's two ranks: the one standing on the ridge, and the hazier one
-        # behind it that turns the row of trees into a forest edge.
+        # The tree-line's ranks: the one standing on the far ridge, the hazier one
+        # behind it that turns the row of trees into a forest edge, and the one on
+        # the near hills — a band closer, so it gets its own saturated palette and
+        # its own sprites rather than the far rank's art drawn bigger.
         ("pine_a", pine(0)),
         ("pine_b", pine(1)),
         ("pine_c", pine(0, far=True)),
         ("pine_d", pine(1, far=True)),
+        ("pine_near_a", pine(0, near=True)),
+        ("pine_near_b", pine(1, near=True)),
         ("cloud_a", cloud(0)),
         ("cloud_b", cloud(1)),
         ("cloud_c", cloud(2)),
