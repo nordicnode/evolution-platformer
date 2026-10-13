@@ -279,7 +279,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-216 tests, all green. `cargo test --workspace`.
+223 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -342,6 +342,21 @@ scrubbed frame describes the record and never the live lane count, and
 frame that actually reaches the screen.
 The watch layout itself is testable without a TTY because `--headless` renders
 plain text frames; `cargo test` exercises the whole frame composition that way.
+
+The playtest mode gets its own file. `render::play`'s seven unit tests pin the
+keyboard layer's mechanics without a terminal — that a press latches for the window
+and a release ends it at once, that the six actions are chosen in the plan's priority
+order (jump beats direction, so a held direction while jumping is a real forward
+jump), that quit and restart fire once rather than every frame, that a five-presses-a-
+second repeat runs the player across tiles instead of pixels, and that with no press
+at all the player does not drift. `crates/render/tests/playability.rs` then measures
+the conjunction that matters — the keyboard layer against the shipped levels: one
+latched press must clear L2's first gap over a take-off window of at least 192 ms
+(the shipped constants measure 224 ms; a 150 ms latch fails the test), the gap must
+stay fatal without a press (or the test measures nothing), holding right must beat
+L1, and a player who jumps when they see an obstacle must clear the first gap at some
+reaction latency inside 240 ms. That last one is the M1 exit criterion in executable
+form, as far as a model of a player can carry it.
 
 ## Findings and deviations from the plan
 
@@ -578,6 +593,43 @@ deliberate, documented decision — not drift.
      checkpoint came from and says plainly that the fitnesses either side are not
      comparable.
 
+23. **The playtest mode could not be played, and no test could see it.** M1's exit
+   criterion is "a human can beat L1–L3", and `play` is the tool that decides it —
+   but the tool had only ever been driven by a keyboard, which is not a thing CI has.
+   Driving it through a pty at a real terminal's auto-repeat rate (about five presses
+   a second) found why a first playtest reads as "the controls are broken": the loop
+   stepped **one frame per key press**, so holding a key moved the player at whatever
+   rate the terminal happened to repeat. On L1, four seconds of holding right ended
+   at `best x 2.40` — the spawn is at 2.0, so four tenths of a tile, a progress of
+   3 px, where a held key covers 24 tiles in the same time. A press now latches its
+   intent for 200 ms (a terminal that reports releases ends the latch early), the
+   same four seconds reach `best x 26.9`, and twelve seconds of it reach the flag.
+
+   What the fix had to be checked against is the *level*, and the instrument is the
+   take-off window: the range of moments at which one press clears an obstacle.
+   Swept on L2's first gap (columns 18–20, fatal without a press at x 20.05):
+
+   | press | take-off window |
+   |---|---|
+   | one frame (16 ms) | 9 ticks, 144 ms |
+   | one latched press (13 ticks, 208 ms) | **14 ticks, 224 ms** |
+   | held down (640 ms) | 19 ticks, 304 ms |
+
+   Two things fall out of that. The physics force-holds every jump for
+   `min_jump_hold` ticks, so a one-frame press is not punished — the latch's
+   contribution is the extra third of a second of *margin* above that floor. And the
+   window belongs to the physics, not the keyboard: it does not narrow when the
+   keyboard layer changes, which is why the test that pins it asserts the width a
+   latched press buys (≥ 192 ms) rather than the latch's own length.
+
+   The bound on M1's exit, as measured: a player who holds right and jumps whenever
+   something appears in front of them wins L1 at every reaction latency up to 384 ms,
+   and clears L2's first gap at some latency in 0–240 ms. Blind bunny-hopping wins L1
+   and L2 outright and dies on L3, because landing on a spike is fatal. **L3 is not
+   measured**: it chains a 3-tile gap, a 2-tile spike patch and a 3-tile gap with a
+   3-tile landing zone between them, and placing those jumps is a judgement the model
+   cannot make — it needs a person, which is the person the fun gate needs too.
+
 ## The M3 problem
 
 The plan's M3 gate is "watch evolution for 10+ minutes and decide whether it is
@@ -627,13 +679,6 @@ measurement has not been taken.
    when chosen at launch, and switching it *at* a stall did not rescue one. The next
    lever is therefore not a slider but a different landscape — resume from the stuck
    point on an easier level.
-7. **Move the stuck population somewhere it can learn.** — *done, see finding 22.*
-   `--curriculum <easier level>` makes the first stall checkpoint the population, train
-   it there for 40 generations and hand it back, and `watch --resume` restarts from that
-   checkpoint. On the seed that never solved L5 in any number of generations, this
-   solves it (generation 163 via L3, 418 via L4). This closes the plan's stall chain —
-   detector, death-spot highlight, resume, honest charts — with the measurement the
-   plan asked for and the numbers the README can be held to.
 6. **Show how the route changed, not just how the number did.** — *done, see finding
    21.* Tier 2.7's timeline scrubber: watch mode records the champion's route — one
    position every 4 frames — for each generation that improves the best, and
@@ -642,6 +687,22 @@ measurement has not been taken.
    "what changed when it stopped being stuck", and on the shipped pack its span *is*
    the stall: seed 5's record runs `gen 0..38`, exactly the generation finding 19
    measured as the last improvement.
+
+7. **Move the stuck population somewhere it can learn.** — *done, see finding 22.*
+   `--curriculum <easier level>` makes the first stall checkpoint the population, train
+   it there for 40 generations and hand it back, and `watch --resume` restarts from that
+   checkpoint. On the seed that never solved L5 in any number of generations, this
+   solves it (generation 163 via L3, 418 via L4). This closes the plan's stall chain —
+   detector, death-spot highlight, resume, honest charts — with the measurement the
+   plan asked for and the numbers the README can be held to.
+
+8. **Hand the thing to a human, at a keyboard.** — *partly done, see finding 23.*
+   `play` is M1's exit tool and the gate's final instrument, and it had never been
+driven by a real terminal. Doing that found and fixed the reason a first playtest
+looked broken (one frame per press), and it turned the exit criterion into two
+measurements instead of an assumption: L1 and L2 are beatable by holding right and
+jumping when something appears, L3 is not measured, and the whole check now runs in
+CI (`crates/render/tests/playability.rs`) rather than in someone's memory.
 
 ## Deliberately deferred
 
