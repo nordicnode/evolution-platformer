@@ -333,7 +333,7 @@ Priority-ordered. Tier 1 is the M3 exit gate.
 
 ### M4 — Editor + content (2–3 weeks) — started
 The window, the painter, the playtest, live validation **and the evolution view** are in
-`crates/app`; the new entity types and the curated pack are open. README findings 24–27
+`crates/app`; the new entity types and the curated pack are open. README findings 24–29
 record the choices. M3's watch mode is hosted here rather than reimplemented: `crate::lab`
 runs the `evo::Trainer` on its own thread and hands the window one finished generation at
 a time, so the fun gate can now be sat in front of a real window — with the chart, the
@@ -344,6 +344,12 @@ lanes, the death map, the route scrubber and champion saving in it.
 - New entities: flyer enemy, moving platform (horizontal/vertical, deterministic — driven by tick count, not wall-clock). **Open.**
 - Curated starter level pack (8–12 levels, easy→brutal) built with the editor. **Open** — L1–L6 are hand-written so far.
 - Watch mode in the window (§10 Tier 1, M3's deliverable) — **done in full**, not in the plan's M4 list: the trainer runs off-thread, the chart is real geometry from `render`'s readings, the recorded routes scrub by generation, champions save, and the stall chain's last item (curriculum resume, findings 19–22) is hosted here too — `evo::curriculum_step` is called by both front-ends, and the window takes `--resume`, `--curriculum` and `--curriculum-generations` with the terminal's meanings (finding 28). Nothing in the watch mode is terminal-only any more.
+- Art pass: the tileset is generated from rules rather than drawn tile by tile — a 4-bit
+  mask per solid tile (`ground_N` / `deep_N`), a parallaxed sky, scattered scenery and a
+  full animation set (idle, a six-frame distance-driven run, jump/fall/land/hurt, a
+  four-frame walker march and a waving flag). README finding 29. The art modules live in
+  `tools/art/`, the generator is grid-and-manifest only, and the shipped PNG is checked as
+  pixels by the tests rather than trusted.
 - **Exit:** a non-developer can build a level, validate it, and evolve a solver without touching JSON.
 
 ### M5 — Evolution polish + web + release (2–3 weeks)

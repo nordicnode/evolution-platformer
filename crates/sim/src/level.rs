@@ -35,6 +35,7 @@ pub const MIN_LEVEL_H: i32 = 5;
 /// Grid characters. Anything else in a level file is a load error, not a shrug.
 pub const GLYPH_EMPTY: char = '.';
 pub const GLYPH_SOLID: char = '#';
+pub const GLYPH_SAND: char = 'S';
 pub const GLYPH_SPIKE: char = '^';
 pub const GLYPH_GOAL: char = 'G';
 
@@ -49,6 +50,16 @@ pub enum Tile {
     Spike = 2,
     /// Reserved glyph for a goal *tile*; normalized into an entity at load time.
     Goal = 3,
+    /// Soil of a different material: a beach, a dune, a desert floor.
+    ///
+    /// **Physics does not know about sand.** It is solid exactly as [`Tile::Solid`] is —
+    /// `is_solid` says yes, the collision code never asks which material a tile is made of,
+    /// and an agent's own senses report it as solid ([`crate::sensors`]), so a level painted
+    /// with sand is not a new problem for the population: it is the same problem in a
+    /// different colour. What the variant buys is authorship and art: a level file can say
+    /// `S` where it means a beach, and the renderer draws the sand family over it, which is
+    /// the whole difference between "ground" and "the ground here is sand".
+    Sand = 4,
 }
 
 impl Tile {
@@ -56,6 +67,7 @@ impl Tile {
         match c {
             GLYPH_EMPTY => Some(Tile::Empty),
             GLYPH_SOLID => Some(Tile::Solid),
+            GLYPH_SAND => Some(Tile::Sand),
             GLYPH_SPIKE => Some(Tile::Spike),
             GLYPH_GOAL => Some(Tile::Goal),
             _ => None,
@@ -66,13 +78,23 @@ impl Tile {
         match self {
             Tile::Empty => GLYPH_EMPTY,
             Tile::Solid => GLYPH_SOLID,
+            Tile::Sand => GLYPH_SAND,
             Tile::Spike => GLYPH_SPIKE,
             Tile::Goal => GLYPH_GOAL,
         }
     }
 
     pub fn is_solid(self) -> bool {
-        matches!(self, Tile::Solid)
+        matches!(self, Tile::Solid | Tile::Sand)
+    }
+
+    /// Is this tile only a different *material* of solid ground?
+    ///
+    /// The one question the renderer asks about sand: which autotile family to draw it in.
+    /// It is deliberately not a question about collision — nothing that decides where the
+    /// player goes may care what the ground is made of.
+    pub fn is_sand(self) -> bool {
+        matches!(self, Tile::Sand)
     }
 }
 
@@ -547,6 +569,19 @@ impl Level {
             .collect()
     }
 
+    /// Whether a walker placed at tile `(tx, ty)` would be standing on something.
+    ///
+    /// A placement is anchored by its feet: [`add_walker_tile`](Self::add_walker_tile) puts
+    /// the box so its bottom rests on the row *below* `ty`, and a walker with nothing under
+    /// it falls on the first tick — which the shipped pack's own test refuses. The editor
+    /// asks this before it writes a walker, and that test asks it too, so the two cannot
+    /// disagree about what a level is allowed to contain.
+    pub fn walker_stands_on_ground(&self, tx: i32, ty: i32) -> bool {
+        let x = tx as f32 + (1.0 - PHYSICS.walker_w) * 0.5;
+        let (c0, c1) = crate::physics::tile_span(x, PHYSICS.walker_w);
+        (c0..=c1).any(|c| self.is_solid(c, ty + 1))
+    }
+
     /// Add a walker at a tile position if it is on the map. Returns whether it landed.
     pub fn add_walker_tile(&mut self, tx: i32, ty: i32) -> bool {
         if tx_out(tx, ty, self.width, self.height) {
@@ -840,7 +875,7 @@ mod editing_tests {
         assert_eq!(level.content_hash(), before, "erasing must give it back");
 
         // Painting over every tile type is allowed; the grid is the editor's.
-        for tile in [Tile::Empty, Tile::Solid, Tile::Spike] {
+        for tile in [Tile::Empty, Tile::Solid, Tile::Sand, Tile::Spike] {
             assert!(level.set_tile(3, 3, tile));
             assert_eq!(level.tile(3, 3), Some(tile));
         }

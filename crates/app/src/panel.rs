@@ -27,6 +27,9 @@ use render::chart::{
 };
 
 use crate::lab::{Lane, Packet, MUTATION_RATES, SPEEDS};
+use crate::replay::{Population, Replay};
+use crate::view::cohort_swatch;
+use sim::Outcome;
 
 /// Panel background, one shade lighter than the window's own dark grey.
 const PANEL_BG: Color32 = Color32::from_rgb(30, 34, 40);
@@ -96,11 +99,7 @@ impl BestLine {
         best_x: f32,
         goal_x: f32,
     ) -> BestLine {
-        let distance = if won {
-            0.0
-        } else {
-            (goal_x - best_x).max(0.0)
-        };
+        let distance = if won { 0.0 } else { (goal_x - best_x).max(0.0) };
         BestLine {
             generation,
             fitness,
@@ -233,7 +232,6 @@ impl RunSummary {
     pub fn solved(&self) -> bool {
         self.wins > 0 || self.best.as_ref().is_some_and(|b| b.outcome == "won")
     }
-
 }
 
 /// What the window is doing right now, owned by the window and edited by the widgets.
@@ -290,6 +288,8 @@ pub enum Command {
     Live,
     /// Follow the leading agent's camera, or go back to the whole level.
     ToggleFollow,
+    /// Show or hide the replay's ghosts.
+    ToggleGhosts,
     /// Walk the record: -1 older, +1 newer.
     Scrub(i32),
     /// One rung of the speed ladder: +1 faster, -1 slower.
@@ -311,6 +311,12 @@ pub struct Actions {
     /// The follow checkbox was clicked. The window owns the state, as it does for pause:
     /// the widget reports the intent and the state is flipped in one place.
     pub follow: bool,
+    /// Watch the run's best agent: the recorded episode replayed at real time, with the
+    /// generation's other agents ghosted. Offered by the evolution panel, and only once
+    /// there is an agent to watch.
+    pub watch: bool,
+    /// The ghosts checkbox was clicked, in the replay's own panel.
+    pub ghosts: bool,
     /// -1 / +1 from the scrubber's step buttons.
     pub scrub_delta: i32,
 }
@@ -366,6 +372,8 @@ pub struct Keys {
     pub live: bool,
     /// `f`
     pub follow: bool,
+    /// `g`
+    pub ghosts: bool,
     /// `s`
     pub save: bool,
     /// `left`
@@ -413,6 +421,9 @@ pub fn commands_for(keys: Keys, view: &ViewState) -> Vec<Command> {
     }
     if keys.follow {
         out.push(Command::ToggleFollow);
+    }
+    if keys.ghosts {
+        out.push(Command::ToggleGhosts);
     }
     if keys.save {
         out.push(Command::Save);
@@ -492,7 +503,8 @@ pub fn lab_panel(
         ui.colored_label(
             GOOD,
             format!(
-                "this run is over ({} generations) — Restart to train again",
+                "this run is over ({} generations) — Restart to train again, or V to \
+                 watch the agent it found",
                 summary.generations_run
             ),
         );
@@ -502,7 +514,9 @@ pub fn lab_panel(
         ui.add_space(4.0);
         ui.small(format!(
             "best: gen {} id {} fitness {}",
-            best.generation, best.genome_id, format_fitness(best.fitness)
+            best.generation,
+            best.genome_id,
+            format_fitness(best.fitness)
         ));
         ui.small(format!(
             "{} after {} frames, best_x {:.1}, {:.1} tiles from the flag",
@@ -553,6 +567,23 @@ pub fn lab_panel(
             actions.save = true;
         }
     });
+    // Watching the run's answer is the one thing the run cannot offer from inside itself:
+    // the population advances a generation at a time, and this is one episode at the speed
+    // of the game. Offered as soon as there is an agent to watch, and pointed at again in
+    // the "this run is over" line above once the search has stopped.
+    let watch = ui
+        .add_enabled_ui(summary.best.is_some(), |ui| {
+            ui.button("Watch the best (V)")
+                .on_hover_text(
+                    "replay the run's best agent at real time, with every other agent of \
+                     its generation ghosted",
+                )
+                .on_disabled_hover_text("nothing scored yet: a replay needs an agent to watch")
+        })
+        .inner;
+    if watch.clicked() {
+        actions.watch = true;
+    }
 
     // Both ladders are sliders over an index rather than a raw value, so every value
     // the mouse can reach is a rung the terminal's keys can also reach (§10 Tier 2.9).
@@ -690,7 +721,11 @@ pub fn lab_panel(
                 format!(
                     "showing recorded generation {} ({}, fitness {}) — not the live run",
                     generation,
-                    if record.won { "reached the flag" } else { "died" },
+                    if record.won {
+                        "reached the flag"
+                    } else {
+                        "died"
+                    },
                     format_fitness(record.fitness)
                 ),
             );
@@ -703,14 +738,193 @@ pub fn lab_panel(
     actions
 }
 
+/// What to say when the ghost limit left agents out of the field, if it did.
+///
+/// `population.size` is everything the generation held and `ghosted` is what is drawn, so
+/// the two differ only when the roster was capped. The comparison allows for the slot the
+/// champion occupies in the population when it is in it: at exactly the limit nothing is
+/// left out, and a line saying otherwise would describe a cap nobody hit.
+fn capped_roster_note(population: Population, ghosted: usize) -> Option<String> {
+    (population.size > ghosted + 1).then(|| {
+        format!(
+            "only the best {ghosted} of the generation's {} agents are ghosted, so the \
+             field stays readable",
+            population.size
+        )
+    })
+}
+
+/// The right-hand panel while a replay is on screen: whose episode it is, how it is
+/// going, and the playback controls.
+///
+/// It reads the replay rather than the run for the same reason the canvas does — the run
+/// is parked behind this view and none of its numbers describe the episode on screen. The
+/// one thing the two modes share is the camera, which is why `follow` still arrives from
+/// the view state: following is a rule about where to point, not about what is running.
+pub fn replay_panel(ui: &mut egui::Ui, replay: &mut Replay, view: &ViewState) -> Actions {
+    let mut actions = Actions::default();
+    let star = replay.star().clone();
+
+    ui.heading("Replay");
+    ui.label(replay.level_name().to_string());
+    ui.separator();
+
+    // --- whose episode this is --------------------------------------------
+    ui.label("the run's best agent");
+    ui.monospace(format!(
+        "generation {}   id {}",
+        star.generation + 1,
+        star.genome_id
+    ));
+    ui.small(format!(
+        "recorded: {} in {} frames, fitness {}",
+        star.outcome.as_str(),
+        star.frames,
+        format_fitness(star.fitness)
+    ));
+
+    if replay.star_finished() {
+        // The score beside the record is the replay's own receipt: same episode, same
+        // number if it is faithful. A mismatch would be a bug here rather than news about
+        // the run, which is exactly why the two are printed together.
+        let outcome = replay.star_sim().outcome();
+        ui.colored_label(
+            if outcome == Outcome::Won { GOOD } else { WARN },
+            format!(
+                "now: {} in {:.1}s, score {}",
+                outcome.as_str(),
+                replay.clock(),
+                format_fitness(replay.star_score())
+            ),
+        );
+    } else {
+        ui.colored_label(
+            TEXT,
+            format!(
+                "now: {:.1}s in, score {}",
+                replay.clock(),
+                format_fitness(replay.star_score())
+            ),
+        );
+    }
+
+    // --- the ghosts -------------------------------------------------------
+    ui.add_space(6.0);
+    ui.separator();
+    ui.label("Ghosts");
+    // Named, and named as a *different* generation from the champion's: the field is the
+    // run's newest scored generation and the agent above it is the best-ever record, which
+    // are two numbers the moment the search has moved past its best idea.
+    ui.small(format!(
+        "the population of generation {}, each replaying its own episode",
+        replay.population().generation + 1
+    ));
+    ui.monospace(format!(
+        "{} ghosted: {} still going, {} at the flag",
+        replay.ghost_count(),
+        replay.ghosts_running(),
+        replay.ghosts_won()
+    ));
+    if let Some(note) = capped_roster_note(replay.population(), replay.ghost_count()) {
+        ui.small(note);
+    }
+    // The legend for the colours on the canvas, in the canvas's own palette
+    // (`view::cohort_swatch`): a field drawn in four tints and explained nowhere would be
+    // four tints of noise, and the one thing a viewer cannot guess from the picture is
+    // which end of the rank order a colour is. It is drawn whether or not the ghosts are
+    // showing — the bands are a fact about the field rather than about the toggle, and a
+    // panel that reflowed every time `G` was pressed would move the controls under the
+    // viewer's hand.
+    ui.add_space(4.0);
+    ui.small("the field by rank, best first — each band fainter than the one above it");
+    for (band, ranks) in replay.cohorts() {
+        ui.horizontal(|ui| {
+            ui.colored_label(cohort_swatch(band), "\u{25a0}");
+            ui.small(format!(
+                "ranks {}–{} ({})",
+                ranks.start + 1,
+                ranks.end,
+                ranks.len()
+            ));
+        });
+    }
+    if replay.all_finished() {
+        // Every agent has stopped, so nothing is moving any more: a viewer who wants the
+        // field to run again is told how, rather than watching a still frame wonder.
+        ui.small("the whole field has finished — R runs it again");
+    }
+    let mut ghosts = replay.ghosts;
+    if ui
+        .checkbox(&mut ghosts, "show ghosts (G)")
+        .on_hover_text(
+            "hidden ghosts keep running, so the field is where the champion has it \
+             rather than where it was when you last looked",
+        )
+        .changed()
+    {
+        actions.ghosts = true;
+    }
+
+    // --- controls ---------------------------------------------------------
+    ui.add_space(6.0);
+    ui.separator();
+    ui.label("Controls");
+    ui.horizontal(|ui| {
+        // The label says what the *next* press does, and the button only reports the
+        // intent: flipping `paused` here as well would double-toggle it.
+        let label = if replay.paused { "Play" } else { "Pause" };
+        if ui.button(label).clicked() {
+            actions.pause = true;
+        }
+        if ui
+            .button("Again (R)")
+            .on_hover_text("run the same episodes again, from the first tick")
+            .clicked()
+        {
+            actions.restart = true;
+        }
+    });
+
+    let mut speed_index = SPEEDS.iter().position(|s| *s == replay.speed).unwrap_or(0);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Slider::new(&mut speed_index, 0..=SPEEDS.len() - 1)
+                .text("speed")
+                .show_value(false),
+        );
+        // Real time is the rung this view opens on, and the only one worth naming.
+        ui.monospace(if SPEEDS[speed_index] == crate::replay::REAL_TIME {
+            "1x real time".to_string()
+        } else {
+            format!("{}x", SPEEDS[speed_index])
+        });
+    });
+    replay.speed = SPEEDS[speed_index];
+
+    let mut follow = view.follow;
+    if ui
+        .checkbox(&mut follow, "follow the champion")
+        .on_hover_text("stay on the agent being replayed, or show the whole level")
+        .changed()
+    {
+        actions.follow = true;
+    }
+
+    if ui
+        .button("Back to the run (Esc)")
+        .on_hover_text("return to the evolution view, which is parked where you left it")
+        .clicked()
+    {
+        actions.resume = true;
+    }
+    ui.small("space pause   R again   G ghosts   +/- speed   F follow   V or Esc back");
+
+    actions
+}
+
 /// The bottom panel: the fitness chart, with every generation that reached the flag
 /// marked. `scrub` is the recorded generation being shown, when there is one.
-pub fn chart_panel(
-    ui: &mut egui::Ui,
-    history: &[HistoryPoint],
-    height: f32,
-    scrub: Option<u32>,
-) {
+pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scrub: Option<u32>) {
     let width = ui.available_width().max(200.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let painter = ui.painter_at(rect);
@@ -792,7 +1006,10 @@ pub fn chart_panel(
     // the top rule where the eye can count how long ago it happened.
     for win in &geometry.wins {
         painter.line_segment(
-            [Pos2::new(win.x, plot.top()), Pos2::new(win.x, plot.top() + 6.0)],
+            [
+                Pos2::new(win.x, plot.top()),
+                Pos2::new(win.x, plot.top() + 6.0),
+            ],
             Stroke::new(2.0_f32, WIN_TICK),
         );
     }
@@ -802,7 +1019,9 @@ pub fn chart_panel(
         *generation >= geometry.first_generation && *generation <= geometry.last_generation
     });
     if let Some(generation) = scrubbed {
-        let span = geometry.last_generation.saturating_sub(geometry.first_generation);
+        let span = geometry
+            .last_generation
+            .saturating_sub(geometry.first_generation);
         let x = if span == 0 {
             plot.center().x
         } else {
@@ -842,10 +1061,7 @@ fn draw_series(painter: &egui::Painter, points: &[Pos2], colour: Color32) {
             painter.circle_filled(*only, 2.5, colour);
         }
         _ => {
-            painter.add(Shape::line(
-                points.to_vec(),
-                Stroke::new(1.6_f32, colour),
-            ));
+            painter.add(Shape::line(points.to_vec(), Stroke::new(1.6_f32, colour)));
         }
     }
 }
@@ -901,8 +1117,7 @@ pub fn chart_geometry(history: &[HistoryPoint], plot: Rect) -> ChartGeometry {
     let last = usable[usable.len() - 1].generation;
     let x = |generation: u32| {
         if last > first {
-            plot.left()
-                + plot.width() * (generation - first) as f32 / (last - first) as f32
+            plot.left() + plot.width() * (generation - first) as f32 / (last - first) as f32
         } else {
             plot.center().x
         }
@@ -1010,6 +1225,9 @@ mod tests {
             genius: false,
             pop_size: 200,
             lanes: vec![lane(0, 12, 431.2), lane(1, 40, 120.0)],
+            // The population the replay ghosts. The chart tests are about the run's shape,
+            // so the roster they never draw is empty here.
+            agents: Vec::new(),
             history,
             deaths,
             traces: vec![trace(0, 10.0, false), trace(4, 411.0, won)],
@@ -1038,10 +1256,22 @@ mod tests {
 
     #[test]
     fn the_y_range_covers_both_series() {
-        let points = history(&[(0, -12.0, -30.0, 0), (1, 400.0, 90.0, 0), (2, 411.0, 120.0, 0)]);
+        let points = history(&[
+            (0, -12.0, -30.0, 0),
+            (1, 400.0, 90.0, 0),
+            (2, 411.0, 120.0, 0),
+        ]);
         let geometry = chart_geometry(&points, plot());
-        assert!(geometry.lo <= -30.0, "lo {} misses the average", geometry.lo);
-        assert!(geometry.hi >= 411.0, "hi {} misses the maximum", geometry.hi);
+        assert!(
+            geometry.lo <= -30.0,
+            "lo {} misses the average",
+            geometry.lo
+        );
+        assert!(
+            geometry.hi >= 411.0,
+            "hi {} misses the maximum",
+            geometry.hi
+        );
         assert!(geometry.lo < geometry.hi);
     }
 
@@ -1089,7 +1319,10 @@ mod tests {
         let geometry = chart_geometry(&points, plot());
         assert_eq!(geometry.max.len(), 2, "the NaN maximum was plotted");
         assert_eq!(geometry.avg.len(), 2, "the infinite average was plotted");
-        assert!(geometry.max.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+        assert!(geometry
+            .max
+            .iter()
+            .all(|p| p.x.is_finite() && p.y.is_finite()));
         assert!(geometry.lo.is_finite() && geometry.hi.is_finite());
         // And a history that is *entirely* non-finite is not drawable at all.
         let poisoned = history(&[(0, f32::NAN, f32::NAN, 0)]);
@@ -1161,13 +1394,19 @@ mod tests {
             (900.0, 5.0, 29),
         ];
         let summary = RunSummary::new(&packet(points.clone(), deaths.clone(), false), &points);
-        assert!(summary.stall.is_some(), "this run is flat for 29 generations");
+        assert!(
+            summary.stall.is_some(),
+            "this run is flat for 29 generations"
+        );
         let summary = summary.with_level(40);
         let expected = death_cluster(&deaths, 40).expect("a cluster");
         assert_eq!(summary.deaths_at, Some(expected.0));
         assert_eq!(summary.deaths_count, expected.1);
         assert_eq!(summary.deaths_at, Some(33));
-        assert_eq!(summary.deaths_count, 3, "the mark outside the level is ignored");
+        assert_eq!(
+            summary.deaths_count, 3,
+            "the mark outside the level is ignored"
+        );
 
         // Before a stall the same deaths say nothing: nobody is stuck yet.
         let young = history(&[(0, 100.0, 60.0, 0), (1, 101.0, 61.0, 0)]);
@@ -1285,6 +1524,13 @@ mod tests {
         );
         assert_eq!(
             one(Keys {
+                ghosts: true,
+                ..Default::default()
+            }),
+            vec![Command::ToggleGhosts]
+        );
+        assert_eq!(
+            one(Keys {
                 older: true,
                 ..Default::default()
             }),
@@ -1341,7 +1587,11 @@ mod tests {
         let points = history(&[(0, 10.0, 5.0, 0), (1, 20.0, 9.0, 0)]);
         let summary = RunSummary::new(&packet(points.clone(), Vec::new(), false), &points);
         draw_panel(&summary, &mut view);
-        assert!(SPEEDS.contains(&view.speed), "speed {} is off the ladder", view.speed);
+        assert!(
+            SPEEDS.contains(&view.speed),
+            "speed {} is off the ladder",
+            view.speed
+        );
         assert!(
             MUTATION_RATES.contains(&view.mutation_rate),
             "mutation rate {} is off the ladder",
@@ -1357,7 +1607,10 @@ mod tests {
             (2, 411.0, 90.0, 1),
         ]);
         let vertices = draw_in_headless_context(&points, 120.0, Some(1));
-        assert!(vertices > 100, "the chart drew almost nothing: {vertices} vertices");
+        assert!(
+            vertices > 100,
+            "the chart drew almost nothing: {vertices} vertices"
+        );
 
         // And with no history at all it still draws the placeholder.
         let placeholder = draw_in_headless_context(&[], 120.0, None);
@@ -1373,7 +1626,11 @@ mod tests {
     /// The same pattern `view`'s tests use: a real egui frame, tessellated, so the
     /// assertion is about the geometry that would reach the screen rather than about
     /// the functions that produced it.
-    fn draw_in_headless_context(history: &[HistoryPoint], height: f32, scrub: Option<u32>) -> usize {
+    fn draw_in_headless_context(
+        history: &[HistoryPoint],
+        height: f32,
+        scrub: Option<u32>,
+    ) -> usize {
         let ctx = egui::Context::default();
         let size = Vec2::new(900.0, 200.0);
         let output = ctx.run(
@@ -1395,6 +1652,55 @@ mod tests {
                 _ => 0,
             })
             .sum()
+    }
+
+    #[test]
+    fn the_panel_says_when_the_ghost_limit_left_agents_out() {
+        // A field under the limit is not described as capped, including at exactly the
+        // limit with the champion in the population (its slot is the one not ghosted).
+        assert_eq!(
+            capped_roster_note(
+                Population {
+                    generation: 3,
+                    size: 200
+                },
+                199
+            ),
+            None
+        );
+        assert_eq!(
+            capped_roster_note(
+                Population {
+                    generation: 3,
+                    size: 201
+                },
+                200
+            ),
+            None
+        );
+        // Nor when the champion is not in the population at all and every agent is drawn.
+        assert_eq!(
+            capped_roster_note(
+                Population {
+                    generation: 20,
+                    size: 200
+                },
+                200
+            ),
+            None
+        );
+
+        // A capped roster says what was drawn and what the generation actually held.
+        let note = capped_roster_note(
+            Population {
+                generation: 3,
+                size: 1_001,
+            },
+            256,
+        )
+        .expect("a capped roster is reported");
+        assert!(note.contains("best 256"), "{note}");
+        assert!(note.contains("1001"), "{note}");
     }
 
     /// Draw the whole panel headlessly, for the tests that care what the widgets do to

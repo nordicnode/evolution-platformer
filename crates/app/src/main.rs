@@ -9,6 +9,9 @@
 //! * **Evolve** — the M3 watch mode, in the window: a population trains on the level on
 //!   its own thread while the generation it just finished is animated over the terrain,
 //!   with the fitness chart, the run's readings and the recorded champion routes.
+//! * **Replay** — the run's answer, once the viewer has stopped pushing the search: its
+//!   best-ever agent playing the level at real time, with the population of the last
+//!   generation it scored ghosted on the same clock.
 //!
 //! Everything is drawn from the deterministic core: this binary owns no physics, and the
 //! trainer it hosts is the same `evo` the headless driver uses.
@@ -20,9 +23,9 @@
 //! by the other.
 //!
 //! ```text
-//! evo-app [--level levels/l6-marathon.json] [--assets assets] [--evolve]
-//!         [--pop 200] [--seed 1] [--generations 300] [--champions champions]
-//!         [--resume champions/l5-tightrope.population.json]
+//! evo-app [--level levels/l6-marathon.json] [--assets assets] [--splash] [--evolve]
+//!         [--replay] [--pop 200] [--seed 1] [--generations 300]
+//!         [--champions champions] [--resume champions/l5-tightrope.population.json]
 //!         [--curriculum levels/l3-gauntlet.json] [--curriculum-generations 40]
 //!         [--screenshot out.png]
 //! ```
@@ -33,6 +36,8 @@ mod editor;
 mod lab;
 mod panel;
 mod play;
+mod replay;
+mod splash;
 mod view;
 
 use std::path::PathBuf;
@@ -49,7 +54,21 @@ USAGE:
 OPTIONS:
     --level <PATH>        Level to open.                       [default l1-flat-run]
     --assets <DIR>        Directory holding tileset.json/png.  [default assets]
+    --splash              Show the title screen and wait for a key. It is the default
+                          opening for an interactive launch; pass --no-splash to go
+                          straight to the editor, or --splash to see it in front of
+                          a scripted frame as --splash --screenshot does. The screen
+                          plays the run's saved champion for the level being opened
+                          when --champions holds one that won, and a demo run otherwise.
+    --no-splash           Skip the title screen and open the editor on the first frame.
     --evolve              Open in the evolution view and start training at once.
+    --replay              Open in the replay of the run's best agent: it starts a run
+                          like --evolve, takes it to its cap when one was given, and then
+                          plays back the best episode it found at real time, with the
+                          population of the last generation it scored ghosted.
+    --no-ghosts           Open that replay with the population hidden, showing the best
+                          agent alone (the `g` key and the panel's checkbox do the same
+                          thing while the window is up).
     --pop <N>             Population size for that run.        [default 200]
     --seed <N>            Master seed; every run is reproducible from it. [default 1]
     --generations <N>     Stop after N generations.            [default: until closed]
@@ -72,6 +91,9 @@ struct Options {
     assets: PathBuf,
     screenshot: Option<PathBuf>,
     lab: LabOptions,
+    /// Whether to open on the title screen. `None` is the default, which is "on for a person
+    /// at a window, off for a scripted frame" — see [`app::run`].
+    splash: Option<bool>,
 }
 
 fn parse(raw: &[String]) -> Result<Option<Options>, String> {
@@ -79,6 +101,9 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
     let mut assets = None;
     let mut screenshot = None;
     let mut lab = LabOptions::default();
+    // Unset is the common case, and it means "the default": on for an interactive launch,
+    // off for a scripted one. The flags are for overriding that.
+    let mut splash = None;
     let mut i = 0;
     while i < raw.len() {
         let arg = raw[i].as_str();
@@ -98,10 +123,17 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
             "--level" => level = Some(PathBuf::from(value("--level")?)),
             "--assets" => assets = Some(PathBuf::from(value("--assets")?)),
             "--screenshot" => screenshot = Some(PathBuf::from(value("--screenshot")?)),
+            "--splash" => splash = Some(true),
+            "--no-splash" => splash = Some(false),
             // A population of one has no selection pressure, and a zero-generation run
             // would never score anything: both are refused rather than clamped, because a
             // scripted `--generations 0` is a mistake in the script, not a preference.
             "--evolve" => lab.evolve = true,
+            // `--replay` is `--evolve` plus one thing done afterwards, so it is not an
+            // error to ask for both: whichever lands, the run is started and the replay is
+            // what the window ends up showing.
+            "--replay" => lab.replay = true,
+            "--no-ghosts" => lab.ghosts = false,
             "--pop" => {
                 let pop = number("--pop")?;
                 if pop < 2 {
@@ -156,6 +188,7 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
         assets,
         screenshot,
         lab,
+        splash,
     }))
 }
 
@@ -173,7 +206,13 @@ fn main() -> ExitCode {
         }
     };
 
-    match app::run(options.level, options.assets, options.screenshot, options.lab) {
+    match app::run(
+        options.level,
+        options.assets,
+        options.screenshot,
+        options.lab,
+        options.splash,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");

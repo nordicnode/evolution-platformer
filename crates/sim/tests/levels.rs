@@ -115,11 +115,11 @@ fn every_shipped_level_keeps_its_entities_inside_the_grid() {
         }
         for (i, walker) in level.walkers.iter().enumerate() {
             bounds(&format!("walker {i}"), walker);
+            // The predicate is the editor's too, so a walker this test refuses is one the
+            // editor will not let you place — the rule has one definition, not two.
             let foot_row = (walker.y + walker.h).floor() as i32;
-            let c0 = walker.x.floor() as i32;
-            let c1 = (walker.x + walker.w - f32::EPSILON).floor() as i32;
             assert!(
-                (c0..=c1).any(|c| level.is_solid(c, foot_row)),
+                level.walker_stands_on_ground(walker.x.floor() as i32, foot_row - 1),
                 "{slug}: walker {i} at x={} row {foot_row} stands on nothing, \
                  so it will hang in the air for the whole episode",
                 walker.x
@@ -271,4 +271,72 @@ fn malformed_levels_are_refused() {
         sim::Level::from_json_str(&no_goal).is_err(),
         "a level with no goal cannot be beaten and must be refused"
     );
+}
+
+/// Sand is a material, not a mechanic: the same level in sand simulates identically.
+///
+/// This is the whole of what `Tile::Sand` promises, and it is worth a test because the
+/// promise is what makes the material *safe*: a level author can paint a beach wherever a
+/// floor would go and the level's difficulty is unchanged. Three claims, in order of
+/// strength:
+///
+/// * the glyph round-trips, so opening and saving a level cannot turn sand into soil — the
+///   one failure a rendering test could never see;
+/// * sand is solid, so a body stands on it;
+/// * and two levels that differ *only* in which of the two glyphs their floor is written in
+///   produce the same state hash and the same observation on every one of four hundred
+///   ticks. The second is the half that matters for evolution: the population sees sand as
+///   it sees soil, so a beach is not a new problem to learn.
+#[test]
+fn sand_is_a_material_and_not_a_mechanic() {
+    // The glyph round trip, including that snad and soil are different glyphs.
+    for tile in [sim::Tile::Empty, sim::Tile::Solid, sim::Tile::Sand, sim::Tile::Spike] {
+        assert_eq!(
+            sim::Tile::from_glyph(tile.glyph()),
+            Some(tile),
+            "the glyph {:?} does not read back as the tile it came from",
+            tile.glyph()
+        );
+    }
+    assert_ne!(sim::Tile::Sand.glyph(), sim::Tile::Solid.glyph());
+    assert!(sim::Tile::Sand.is_solid(), "sand has to hold a body up");
+
+    let sky = "....".to_string();
+    let rows = vec![sky.clone(), sky.clone(), "#SSS".to_string()];
+    let level = common::fixture("beach", &rows, (1, 1), &[("goal", 3, 1)]);
+    assert_eq!(level.tile(0, 2), Some(sim::Tile::Solid));
+    assert_eq!(level.tile(2, 2), Some(sim::Tile::Sand));
+    let round_tripped = sim::Level::from_json_str(
+        &level.to_json_pretty().expect("a level serializes"),
+    )
+    .expect("and reads back");
+    assert_eq!(
+        round_tripped.content_hash(),
+        level.content_hash(),
+        "sand did not survive a save and a load"
+    );
+
+    // And the same level, twice, with only the floor's material changed.
+    let soil = common::fixture("soil-floor", &[sky.clone(), sky.clone(), "####".into()], (1, 1), &[("goal", 3, 1)]);
+    let sand = common::fixture("sand-floor", &[sky.clone(), sky.clone(), "SSSS".into()], (1, 1), &[("goal", 3, 1)]);
+    let mut a = sim::Sim::new(&soil, 1);
+    let mut b = sim::Sim::new(&sand, 1);
+    let actions = common::forward_actions(7, 400);
+    for (tick, action) in actions.iter().enumerate() {
+        a.step(*action);
+        b.step(*action);
+        assert_eq!(
+            a.state_hash(),
+            b.state_hash(),
+            "the two floors diverge at tick {tick}: sand is not behaving as soil"
+        );
+        assert_eq!(
+            a.observation(),
+            b.observation(),
+            "an agent can tell sand from soil at tick {tick}, which makes it a new problem \
+             to learn rather than a different colour of ground"
+        );
+    }
+    assert_eq!(a.outcome(), b.outcome());
+    assert!(a.player().grounded, "the body should be standing on the floor");
 }

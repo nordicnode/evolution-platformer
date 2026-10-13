@@ -37,12 +37,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use evo::{
-    curriculum_step, BestEver, ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome,
-    LaneKind, PopulationFile, Trainer,
+    curriculum_step, BestEver, ChampionFile, EpisodeResult, EpisodeRunner, EvalConfig, GaConfig,
+    Genome, LaneKind, PopulationFile, Trainer,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use render::trace::{ChampionTrace, TraceLog, TracePoint, TRACE_SAMPLE_FRAMES};
 use sim::{Level, Outcome, Sim};
+
+use crate::replay::Replay;
+use crate::view::AgentAnim;
 
 pub use evo::{DEFAULT_CURRICULUM_GENERATIONS, MUTATION_RATES};
 
@@ -188,6 +191,19 @@ pub fn save_champion(
     Ok(path)
 }
 
+/// One agent of a generation, as it travels to the window.
+///
+/// The genome *and* the episode it was scored on, because a genome alone cannot
+/// reproduce an episode: the seed is the other half of it. The lanes carry this pair for
+/// the eight agents the run draws; the packet carries it for all of them, because the
+/// replay ghosts every other agent of the generation and a ghost is only honest if it is
+/// running the episode that was actually scored.
+#[derive(Clone, Debug)]
+pub struct Agent {
+    pub genome: Genome,
+    pub result: EpisodeResult,
+}
+
 /// One generation, packaged for the window.
 #[derive(Clone, Debug)]
 pub struct Packet {
@@ -201,6 +217,15 @@ pub struct Packet {
     pub genius: bool,
     pub pop_size: usize,
     pub lanes: Vec<Lane>,
+    /// Every agent the generation scored, in population order, index-aligned with the
+    /// report's own results.
+    ///
+    /// The lanes are a sample chosen for drawing eight agents legibly; this is the
+    /// population itself, and it exists for the replay, which ghosts every other agent of
+    /// the generation beside the champion. It is the one heavy field here — the copy
+    /// `step_verbose` already makes for the lanes is the same ~1.2 MB at pop 200 — and it
+    /// is paid once per generation rather than once per frame.
+    pub agents: Vec<Agent>,
     /// The whole run's history, not just this generation: the chart is the run's shape,
     /// and re-deriving it in the window would let the two disagree.
     pub history: Vec<HistoryPoint>,
@@ -231,6 +256,8 @@ pub struct Packet {
 pub struct Lanes {
     packet: Packet,
     runners: Vec<EpisodeRunner>,
+    /// One agent's animation per lane, advanced with the lane.
+    anims: Vec<AgentAnim>,
     /// Fractional ticks carried between frames, so a fast monitor does not animate
     /// further per second than a slow one.
     carry: f32,
@@ -247,9 +274,11 @@ impl Lanes {
             .iter()
             .map(|lane| EpisodeRunner::new(level, lane.genome.clone(), eval, lane.seed))
             .collect();
+        let anims = vec![AgentAnim::new(); packet.lanes.len()];
         Lanes {
             packet,
             runners,
+            anims,
             carry: 0.0,
             ticks: 0,
         }
@@ -287,18 +316,30 @@ impl Lanes {
         self.runners[i].sim()
     }
 
+    /// One lane's animation: the run cycle, the landing pose and the dust.
+    pub fn anim(&self, i: usize) -> &AgentAnim {
+        &self.anims[i]
+    }
+
     /// Advance by `dt` seconds of wall clock at `speed`.
     pub fn advance(&mut self, dt: f32, speed: u32) {
         self.carry += ticks_for(dt, speed);
         let whole = self.carry.floor();
         self.carry -= whole;
         let ticks = whole.max(0.0) as u32;
-        for runner in &mut self.runners {
+        for (runner, anim) in self.runners.iter_mut().zip(self.anims.iter_mut()) {
+            let mut stepped = 0u32;
             for _ in 0..ticks {
                 if runner.is_finished() {
                     break;
                 }
                 runner.step();
+                stepped += 1;
+            }
+            // Simulated time, not wall clock: a finished lane's dust settles instead of
+            // drifting on for as long as the slowest lane in the generation keeps running.
+            if stepped > 0 {
+                anim.advance(runner.sim(), stepped as f32 * sim::DT);
             }
         }
         self.ticks += ticks;
@@ -429,11 +470,8 @@ impl Generator {
                 if let Some(note) = checkpoint.level_note(&level) {
                     origin.push_str(&format!("; {note}"));
                 }
-                let trainer = Trainer::resume(
-                    cfg.clone(),
-                    checkpoint.to_genomes()?,
-                    checkpoint.generation,
-                )?;
+                let trainer =
+                    Trainer::resume(cfg.clone(), checkpoint.to_genomes()?, checkpoint.generation)?;
                 (trainer, Some(origin))
             }
             None => (Trainer::new(cfg.clone()), None),
@@ -548,6 +586,16 @@ impl Generator {
                     seed: lane.seed,
                 }
             })
+            .collect(); // The whole population, not only the eight lanes: the replay ghosts all of it, and
+                        // the pairing that makes a ghost faithful is (genome, the seed it was scored on),
+                        // which is exactly what the report's index-aligned results hold.
+        let agents: Vec<Agent> = population
+            .iter()
+            .zip(report.results.iter())
+            .map(|(genome, result)| Agent {
+                genome: genome.clone(),
+                result: result.clone(),
+            })
             .collect();
 
         // Record the champion's route when it is an improvement (§10 Tier 2.7). Asked
@@ -597,7 +645,8 @@ impl Generator {
                 .curriculum
                 .as_ref()
                 .map(|c| (c.level.clone(), c.generations));
-            if let (Some((easier, generations)), Some(stall)) = (fallback, fitness_stall(&self.history))
+            if let (Some((easier, generations)), Some(stall)) =
+                (fallback, fitness_stall(&self.history))
             {
                 let path = self
                     .out_dir
@@ -631,6 +680,7 @@ impl Generator {
             genius: report.genius,
             pop_size: self.cfg.pop_size,
             lanes,
+            agents,
             history: self.history.clone(),
             deaths: self.deaths.clone(),
             traces: self.traces.entries().to_vec(),
@@ -775,6 +825,29 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32) {
     }
 }
 
+/// A scored generation on `level`, for the tests that need a packet to work on.
+///
+/// Test-only, and shared across this crate's test modules on purpose: the replay's roster
+/// and the canvas that draws it both want a packet that came out of the real generator,
+/// and two fixtures would be two chances for them to drift apart.
+#[cfg(test)]
+pub(crate) fn scored_packet(level: &Level, tag: &str) -> Packet {
+    let mut generator = Generator::new(
+        level.clone(),
+        GaConfig {
+            pop_size: 8,
+            elite: 2,
+            ..GaConfig::default()
+        },
+        DEFAULT_BEST_LANES,
+        DEFAULT_RANDOM_LANES,
+        RunPlan::default(),
+        std::env::temp_dir().join(format!("evo-scored-packet-{tag}")),
+    )
+    .expect("the generator starts");
+    generator.next_packet()
+}
+
 /// The window's handle on a running evolution.
 pub struct Lab {
     hub: Arc<Hub>,
@@ -897,6 +970,17 @@ impl Lab {
 
     pub fn pop_size(&self) -> usize {
         self.pop_size
+    }
+
+    /// Build a replay of this run's best agent, with the generation's population as its
+    /// ghosts.
+    ///
+    /// It lives here rather than in the window because the two things a roster needs —
+    /// the level and the eval config the generation was scored with — are the run's, and
+    /// the same pair [`Lanes::new`] is handed for the same reason. `None` when nothing has
+    /// been scored yet: a replay of an unscored run would be a mode with nothing in it.
+    pub fn replay(&self, packet: &Packet) -> Option<Replay> {
+        Replay::new(packet, &self.level, &self.eval)
     }
 
     /// Was this run started on the level as it stands now?
@@ -1050,10 +1134,13 @@ mod tests {
     }
 
     fn new_generator(slug: &str, target: Option<u32>) -> Generator {
-        generator_on(slug, RunPlan {
-            cap: target,
-            ..RunPlan::default()
-        })
+        generator_on(
+            slug,
+            RunPlan {
+                cap: target,
+                ..RunPlan::default()
+            },
+        )
     }
 
     fn generator_on(slug: &str, plan: RunPlan) -> Generator {
@@ -1179,15 +1266,26 @@ mod tests {
         generator.start_over(other.clone(), 99, 0.10);
         assert_eq!(generator.level().name, other.name);
         let fresh = generator.next_packet();
-        assert_eq!(fresh.generation, 0, "a fresh population starts at generation 0");
-        assert_eq!(fresh.history.len(), 1, "the old chart is gone with the old run");
+        assert_eq!(
+            fresh.generation, 0,
+            "a fresh population starts at generation 0"
+        );
+        assert_eq!(
+            fresh.history.len(),
+            1,
+            "the old chart is gone with the old run"
+        );
         // A first generation always records (there is nothing to beat), so the record is
         // not empty — but everything in it belongs to the fresh run, which is what
         // "the old record is gone" actually means.
         assert!(
             fresh.traces.iter().all(|t| t.generation == 0),
             "an old route survived the restart: {:?}",
-            fresh.traces.iter().map(|t| t.generation).collect::<Vec<_>>()
+            fresh
+                .traces
+                .iter()
+                .map(|t| t.generation)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1423,8 +1521,14 @@ mod tests {
             .expect("a scored generation has a best-ever genome");
 
         let dir = scratch("champion");
-        let path = save_champion(&best, generator.level(), &tiny_config(), &dir, "l3-gauntlet")
-            .expect("the champion file is written");
+        let path = save_champion(
+            &best,
+            generator.level(),
+            &tiny_config(),
+            &dir,
+            "l3-gauntlet",
+        )
+        .expect("the champion file is written");
         let loaded = ChampionFile::load_for_level(&path, generator.level())
             .expect("the file this run wrote loads back against its own level");
 
@@ -1509,7 +1613,11 @@ mod tests {
         // is the way back into this run, for the terminal's `--resume` and the window's.
         let path = dir.join("l5-tightrope.population.json");
         let checkpoint = PopulationFile::load(&path).expect("the step's checkpoint loads");
-        assert_eq!(checkpoint.networks.len(), 2, "the whole population is written");
+        assert_eq!(
+            checkpoint.networks.len(),
+            2,
+            "the whole population is written"
+        );
         assert!(
             checkpoint.note.contains("stalled"),
             "the checkpoint records why it exists: {:?}",
@@ -1555,7 +1663,10 @@ mod tests {
         let mut stalled = false;
         for _ in 0..40 {
             let packet = generator.next_packet();
-            assert!(packet.curriculum.is_none(), "there is no level to fall back to");
+            assert!(
+                packet.curriculum.is_none(),
+                "there is no level to fall back to"
+            );
             stalled |= fitness_stall(&packet.history).is_some();
             if packet.finished {
                 break;
@@ -1626,7 +1737,9 @@ mod tests {
         )
         .expect("a checkpoint this build wrote loads");
 
-        let origin = resumed.origin().expect("a resumed run says where it came from");
+        let origin = resumed
+            .origin()
+            .expect("a resumed run says where it came from");
         assert!(origin.starts_with("resumed "), "{origin}");
         assert!(origin.contains("population of 2"), "{origin}");
         assert!(

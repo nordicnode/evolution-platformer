@@ -42,7 +42,7 @@ pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUT
 pub(crate) mod fixture {
     use sim::Level;
 
-    const GLYPHS: [char; 4] = ['.', '#', '^', 'G'];
+    const GLYPHS: [char; 5] = ['.', '#', 'S', '^', 'G'];
 
     pub fn level_src(
         name: &str,

@@ -1,0 +1,33 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 1,
+  "name": "scratch-seam",
+  "width": 24,
+  "height": 12,
+  "spawn": {
+    "x": 1,
+    "y": 9
+  },
+  "tiles": [
+    "........................",
+    "........................",
+    "........................",
+    "........................",
+    "........................",
+    "........................",
+    "........................",
+    "........................",
+    "..SSSS.......SS.........",
+    "..SSSS.......SS.........",
+    "############SSSSSSSSSSSS",
+    "############SSSSSSSSSSSS"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 22,
+      "y": 9
+    }
+  ],
+  "_notes": "Scratch: a seam close-up. A lawn meeting a beach on a flat floor, a sand shelf resting on the lawn, and a sand step on the beach. For out/seam-zoom.png."
+}

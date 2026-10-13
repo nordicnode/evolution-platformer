@@ -26,6 +26,8 @@ const UNDO_LIMIT: usize = 128;
 pub enum Brush {
     /// Solid terrain.
     Solid,
+    /// Solid terrain of a different material: a beach, a dune, a desert floor.
+    Sand,
     /// A lethal spike.
     Spike,
     /// Clears terrain.
@@ -41,8 +43,9 @@ pub enum Brush {
 }
 
 impl Brush {
-    pub const ALL: [Brush; 7] = [
+    pub const ALL: [Brush; 8] = [
         Brush::Solid,
+        Brush::Sand,
         Brush::Spike,
         Brush::Empty,
         Brush::Spawn,
@@ -52,9 +55,16 @@ impl Brush {
     ];
 
     /// The atlas sprite that represents this brush in the palette.
+    ///
+    /// Every one of these has to be a name the shipped atlas actually carries, because the
+    /// palette draws the icon by `atlas.uv(...)` and a name that is not there is a **blank
+    /// button** rather than an error — the ground brush said `grass`, which no tileset has
+    /// ever had a sprite called, and it had been an empty square in the palette ever since.
+    /// `atlas::tests::every_brush_has_an_icon_in_the_atlas` is what says so now.
     pub fn sprite(self) -> &'static str {
         match self {
-            Brush::Solid => "grass",
+            Brush::Solid => "ground_1",
+            Brush::Sand => "sand_1",
             Brush::Spike => "spike",
             Brush::Empty => "empty",
             Brush::Spawn => "spawn_marker",
@@ -67,6 +77,7 @@ impl Brush {
     pub fn label(self) -> &'static str {
         match self {
             Brush::Solid => "ground",
+            Brush::Sand => "sand",
             Brush::Spike => "spikes",
             Brush::Empty => "clear",
             Brush::Spawn => "spawn",
@@ -80,6 +91,7 @@ impl Brush {
     pub fn about(self) -> &'static str {
         match self {
             Brush::Solid => "Solid tile: blocks movement from every side.",
+            Brush::Sand => "Sand: solid tile, same physics, drawn as a beach.",
             Brush::Spike => "Spike: not solid, lethal on contact.",
             Brush::Empty => "Empty space: clears a tile.",
             Brush::Spawn => "Where the player starts. Only one per level.",
@@ -185,6 +197,21 @@ impl Editor {
         self.redo.clear();
     }
 
+    /// Whether the document's rules allow `brush` at `(tx, ty)`.
+    ///
+    /// The one rule that needs deciding *before* the write is the walker's: everything else
+    /// is refused by its own writer (a tile outside the grid does not land, a goal needs a
+    /// free tile, the spawn is clamped into the grid), while a walker with no ground under
+    /// it would be accepted by the document and refused by the pack's own test. The app
+    /// asks this to colour the drop ghost, so a placement that will be refused looks
+    /// refused before the mouse button comes up.
+    pub fn can_place(&self, brush: Brush, tx: i32, ty: i32) -> bool {
+        match brush {
+            Brush::Walker => self.level.walker_stands_on_ground(tx, ty),
+            _ => true,
+        }
+    }
+
     /// Apply the active brush at a tile. Returns whether the document changed.
     ///
     /// Extends the stroke from the previously painted tile, so a fast drag does not
@@ -231,6 +258,7 @@ impl Editor {
     fn paint_one(&mut self, brush: Brush, tx: i32, ty: i32) -> bool {
         match brush {
             Brush::Solid => self.level.set_tile(tx, ty, Tile::Solid),
+            Brush::Sand => self.level.set_tile(tx, ty, Tile::Sand),
             Brush::Spike => self.level.set_tile(tx, ty, Tile::Spike),
             Brush::Empty => self.level.set_tile(tx, ty, Tile::Empty),
             Brush::Spawn => {
@@ -248,6 +276,11 @@ impl Editor {
             }
             Brush::Walker => {
                 if self.level.walker_tiles().contains(&(tx, ty)) {
+                    return false;
+                }
+                if !self.can_place(Brush::Walker, tx, ty) {
+                    // A click that does nothing is a bug report; the reason is the point.
+                    self.message = "a walker needs ground under it".to_string();
                     return false;
                 }
                 self.level.add_walker_tile(tx, ty)
@@ -319,7 +352,10 @@ impl Editor {
         self.dirty = true;
         let mut parts = Vec::new();
         if report.dropped_walkers > 0 {
-            parts.push(format!("{} walker(s) fell off the map", report.dropped_walkers));
+            parts.push(format!(
+                "{} walker(s) fell off the map",
+                report.dropped_walkers
+            ));
         }
         if report.dropped_goals > 0 {
             parts.push(format!("{} goal(s) dropped", report.dropped_goals));
@@ -333,7 +369,12 @@ impl Editor {
         self.message = if parts.is_empty() {
             format!("resized to {}x{}", self.level.width, self.level.height)
         } else {
-            format!("resized to {}x{}: {}", self.level.width, self.level.height, parts.join(", "))
+            format!(
+                "resized to {}x{}: {}",
+                self.level.width,
+                self.level.height,
+                parts.join(", ")
+            )
         };
     }
 
@@ -457,6 +498,54 @@ mod tests {
         assert_eq!(ed.level.tile(5, 2), Some(Tile::Solid));
     }
 
+    /// A walker is refused where it would fall, and the refusal says why.
+    ///
+    /// This is the shipped pack's own rule (`sim`'s `walker_stands_on_ground`), applied when
+    /// the click happens rather than by a test afterwards — the author's own level had five
+    /// walkers in it, two of them hanging in the air, because nothing drew them and nothing
+    /// said no.
+    #[test]
+    fn a_walker_is_refused_where_it_would_have_nothing_to_stand_on() {
+        let mut ed = doc();
+        ed.brush = Some(Brush::Walker);
+
+        // The starter's floor is its bottom row, so the tile above it holds a walker...
+        let floor_row = ed.level.height - 1;
+        ed.begin_stroke();
+        assert!(ed.paint(10, floor_row - 1));
+        ed.end_stroke();
+        assert_eq!(ed.level.walker_tiles(), vec![(10, floor_row - 1)]);
+
+        // ...and the same column seven rows up does not.
+        ed.begin_stroke();
+        assert!(!ed.paint(10, floor_row - 8));
+        ed.end_stroke();
+        assert_eq!(
+            ed.level.walker_tiles(),
+            vec![(10, floor_row - 1)],
+            "the mid-air walker was written anyway"
+        );
+        assert!(
+            ed.message.contains("ground"),
+            "the refusal should say why: {:?}",
+            ed.message
+        );
+
+        // The preview and the write agree, which is what keeps the ghost honest.
+        assert!(ed.can_place(Brush::Walker, 10, floor_row - 1));
+        assert!(!ed.can_place(Brush::Walker, 10, floor_row - 8));
+
+        // And a solid tile where the walker would hang makes it legal again.
+        ed.brush = Some(Brush::Solid);
+        ed.begin_stroke();
+        ed.paint(10, floor_row - 7);
+        ed.end_stroke();
+        ed.brush = Some(Brush::Walker);
+        ed.begin_stroke();
+        assert!(ed.paint(10, floor_row - 8));
+        ed.end_stroke();
+    }
+
     #[test]
     fn undo_restores_entities_and_the_spawn_too() {
         let mut ed = doc();
@@ -496,10 +585,7 @@ mod tests {
         ed.begin_stroke();
         ed.paint(6, 10);
         ed.end_stroke();
-        assert!(
-            ed.level.walker_tiles().is_empty(),
-            "the entity goes first"
-        );
+        assert!(ed.level.walker_tiles().is_empty(), "the entity goes first");
         assert_eq!(
             ed.level.tile(6, 10),
             Some(Tile::Solid),
@@ -568,9 +654,14 @@ mod tests {
 
         ed.level.goals.clear();
         let path = std::env::temp_dir().join(format!("evo-refused-{}.json", std::process::id()));
-        let err = ed.save(Some(path.clone())).expect_err("a goal-less level is not writable");
+        let err = ed
+            .save(Some(path.clone()))
+            .expect_err("a goal-less level is not writable");
         assert!(err.contains("no goal"), "{err}");
-        assert!(!path.exists(), "a refused save must not leave a file behind");
+        assert!(
+            !path.exists(),
+            "a refused save must not leave a file behind"
+        );
         assert!(ed.dirty, "a refused save leaves the document edited");
     }
 
@@ -590,7 +681,10 @@ mod tests {
             ed.level.set_tile(tx, ed.level.height - 2, Tile::Spike);
         }
         ed.refresh_report();
-        assert!(!ed.beatable(), "spikes across the whole approach are not beatable");
+        assert!(
+            !ed.beatable(),
+            "spikes across the whole approach are not beatable"
+        );
         assert!(ed.verdict().starts_with("NOT beatable"));
     }
 
@@ -598,7 +692,11 @@ mod tests {
     fn resizing_reports_what_it_had_to_move() {
         let mut ed = doc();
         ed.resize(10, 8, Tile::Empty);
-        assert!((ed.level.width, ed.level.height) == (10, 8), "{:?}", ed.message);
+        assert!(
+            (ed.level.width, ed.level.height) == (10, 8),
+            "{:?}",
+            ed.message
+        );
         assert!(ed.message.contains("spawn moved"), "{}", ed.message);
         assert!(ed.level.validate().is_ok());
         // The pending-size pair the UI edits is deliberately not the document's.

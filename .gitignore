@@ -21,3 +21,7 @@
 
 # Local scratch (benchmarks, research notes pulled in by hand)
 /scratch/
+
+# Python bytecode from the art generator (tools/gen_tileset.py, tools/art/*.py)
+__pycache__/
+*.pyc

@@ -35,7 +35,11 @@ pub const ENC_ENEMY: f32 = -1.0;
 #[inline]
 fn encode_tile(t: Tile) -> f32 {
     match t {
-        Tile::Solid => ENC_SOLID,
+        // Sand is solid, and an agent is told so: the observation is about what a body can
+        // do, not what the world is made of. A material that looked different to the
+        // sensors would be a new problem for the population to solve, which is the one
+        // thing adding a *colour* of ground must never be.
+        Tile::Solid | Tile::Sand => ENC_SOLID,
         Tile::Spike => ENC_SPIKE,
         Tile::Empty | Tile::Goal => ENC_EMPTY,
     }
