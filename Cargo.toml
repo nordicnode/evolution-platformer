@@ -5,6 +5,7 @@ members = [
     "crates/evo",
     "crates/render",
     "crates/train-cli",
+    "crates/app",
 ]
 
 [workspace.package]
@@ -23,6 +24,17 @@ serde_json = "1"
 rand_xoshiro = "0.8"
 rayon = "1"
 crossterm = "0.29"
+
+# The desktop game shell: windowing, immediate-mode UI, and PNG decoding for the
+# art atlas. Pinned to the 0.32 line for a fast, warm build.
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.32"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Training is a tight numeric loop; keep release fat.
 [profile.release]

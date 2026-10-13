@@ -210,23 +210,14 @@ impl Keys {
         matches!(self.until[held as usize], Some(until) if until > now)
     }
 
-    /// The action for this frame. Priority is the plan's action set, not the order
-    /// keys were pressed in: jump beats direction, so holding a direction while
-    /// jumping is a real forward jump rather than a standing one.
+    /// The action for this frame, from the intents this frame's latch makes live.
     fn action(&self, now: Instant) -> AgentAction {
-        if self.is_down(Held::Jump, now) && self.is_down(Held::Right, now) {
-            AgentAction::RunJump
-        } else if self.is_down(Held::Jump, now) {
-            AgentAction::JumpInPlace
-        } else if self.is_down(Held::Right, now) {
-            AgentAction::Run
-        } else if self.is_down(Held::Left, now) {
-            AgentAction::Retreat
-        } else if self.is_down(Held::Brake, now) {
-            AgentAction::Brake
-        } else {
-            AgentAction::Walk
-        }
+        action_for(
+            self.is_down(Held::Left, now),
+            self.is_down(Held::Right, now),
+            self.is_down(Held::Jump, now),
+            self.is_down(Held::Brake, now),
+        )
     }
 
     fn take_restart(&mut self) -> bool {
@@ -273,6 +264,33 @@ fn read_keys(keys: &mut Keys, now: Instant) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The action a set of held intents means.
+///
+/// Priority is the plan's action set, not the order keys were pressed in: jump
+/// beats direction, so holding a direction while jumping is a real forward jump
+/// rather than a standing one. There is no jump-left in the action set, so a neutral
+/// jump with left held carries momentum leftward instead.
+///
+/// Public because there is more than one way to play: the terminal playtest learns
+/// a press from a key event and latches it, the desktop shell reads the key state
+/// directly, and both call this. One definition of the keyboard, so the two cannot
+/// drift into being different games.
+pub fn action_for(left: bool, right: bool, jump: bool, brake: bool) -> AgentAction {
+    if jump && right {
+        AgentAction::RunJump
+    } else if jump {
+        AgentAction::JumpInPlace
+    } else if right {
+        AgentAction::Run
+    } else if left {
+        AgentAction::Retreat
+    } else if brake {
+        AgentAction::Brake
+    } else {
+        AgentAction::Walk
+    }
 }
 
 /// The control hint drawn under the level view.

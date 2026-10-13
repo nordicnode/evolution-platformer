@@ -71,10 +71,13 @@ workspace/
 │   │   ├── ga.rs               # selection, crossover, mutation; evaluate() uses rayon
 │   │   └── fitness.rs          # fitness function (versioned alongside sensors)
 │   ├── render/                 # Reads &Sim ONLY. Never mutates sim state.
-│   ├── editor/                 # egui tile painter (M4). Depends on sim.
+│   ├── app/                    # egui game shell (M4): pixel renderer, tile painter
+│   │                           # and playtest. Depends on sim + render. (Planned as
+│   │                           # `editor/`; it grew into the game's window instead.)
 │   └── train-cli/              # headless binary: train → champions/*.json. Native speed.
 ├── web/                        # wasm-bindgen wrapper + TS UI (M5)
-└── levels/                     # *.json level files (hand-written in M1–M3)
+└── levels/                     # *.json level files (hand-written in M1–M3, painted in
+                                # the editor after that)
 ```
 
 **Boundary rules (non-negotiable):**
@@ -328,12 +331,14 @@ Priority-ordered. Tier 1 is the M3 exit gate.
 - **The fun question:** build one fresh level, watch evolution for 10+ minutes. **GO/NO-GO gate:** if watching isn't fun, the fix is in UX (speed, markers, charts, drama), not a bigger network. Do not proceed to M4 on a "no-go" without a UX redesign.
 - **Exit:** fun-gate passed (owner's call); Tier 1 watch UX complete; champion round-trip test green.
 
-### M4 — Editor + content (2–3 weeks)
-- egui tile painter: paint/erase tiles, entity palette (walker, spikes, goal, spawn), undo, save/load JSON.
-- Human playtest mode inside the editor.
-- Reachability validation live in the editor (warn on unreachable goal, highlight first failing jump).
-- New entities: flyer enemy, moving platform (horizontal/vertical, deterministic — driven by tick count, not wall-clock).
-- Curated starter level pack (8–12 levels, easy→brutal) built with the editor.
+### M4 — Editor + content (2–3 weeks) — started
+The window, the painter, the playtest and live validation are in `crates/app`; the new
+entity types and the curated pack are open. README findings 24–25 record the choices.
+- egui tile painter: paint/erase tiles, entity palette (walker, spikes, goal, spawn), undo, save/load JSON. **Done** — drag out of the palette onto the level, plus grid resize; saving goes through `sim`'s writer, which can only emit documents the loader accepts.
+- Human playtest mode inside the editor. **Done** — in-canvas, and it shares `render::play::action_for` with the terminal mode so the two cannot diverge.
+- Reachability validation live in the editor (warn on unreachable goal, highlight first failing jump). **Done** — the verdict, the culprit jump and the unreachable tint, re-run whenever the level's content hash changes.
+- New entities: flyer enemy, moving platform (horizontal/vertical, deterministic — driven by tick count, not wall-clock). **Open.**
+- Curated starter level pack (8–12 levels, easy→brutal) built with the editor. **Open** — L1–L6 are hand-written so far.
 - **Exit:** a non-developer can build a level, validate it, and evolve a solver without touching JSON.
 
 ### M5 — Evolution polish + web + release (2–3 weeks)

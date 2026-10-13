@@ -1,0 +1,214 @@
+//! Playtest the level being edited, in the same window.
+//!
+//! This is M4's "human playtest mode inside the editor" and it is the fastest
+//! possible answer to "is what I just drew actually fun to play?" — the level never
+//! leaves the document, so there is no export, no reload, no separate binary.
+//!
+//! Two things are deliberate here.
+//!
+//! * **The action mapping is not reimplemented.** [`action_for`] is the terminal
+//!   playtest's own function (`render::play`), so the keys mean the same thing in
+//!   both, and a change to the priority order cannot silently apply to only one of
+//!   them.
+//! * **The sim runs on a fixed timestep with an accumulator** (§5.1), not one tick
+//!   per rendered frame. A frame that takes 30 ms must advance the physics 30 ms
+//!   worth, or the game would slow down on a busy machine — and the terminal
+//!   playtest's one-tick-per-frame behaviour would be a *different game*.
+
+use egui::{Context, Key};
+use sim::{AgentAction, Level, Sim};
+
+pub use render::play::action_for;
+
+/// Physics ticks per second, from the sim's own timestep.
+const TICK: f32 = sim::DT;
+
+/// How much simulation a single frame may catch up on. A long stall (a breakpoint,
+/// a slow redraw) must not teleport the player through a spike.
+const MAX_CATCHUP: f32 = 0.25;
+
+/// Which intents are held down right now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Keys {
+    pub left: bool,
+    pub right: bool,
+    pub jump: bool,
+    pub brake: bool,
+}
+
+impl Keys {
+    /// Read the held keys out of egui's input state.
+    ///
+    /// A GUI reports the real key state, so unlike the terminal path there is no
+    /// latch: a held key is simply held.
+    pub fn read(ctx: &Context) -> Keys {
+        ctx.input(|i| Keys {
+            left: i.key_down(Key::ArrowLeft) || i.key_down(Key::A),
+            right: i.key_down(Key::ArrowRight) || i.key_down(Key::D),
+            jump: i.key_down(Key::Space) || i.key_down(Key::ArrowUp) || i.key_down(Key::W),
+            brake: i.key_down(Key::ArrowDown) || i.key_down(Key::S),
+        })
+    }
+
+    pub fn action(&self) -> AgentAction {
+        action_for(self.left, self.right, self.jump, self.brake)
+    }
+}
+
+/// One playtest of one level.
+pub struct Session {
+    sim: Sim,
+    seed: u64,
+    accumulator: f32,
+    /// Wall-clock seconds since the session started, for animation only.
+    pub clock: f32,
+}
+
+impl Session {
+    pub fn new(level: &Level, seed: u64) -> Session {
+        Session {
+            sim: Sim::new(level, seed),
+            seed,
+            accumulator: 0.0,
+            clock: 0.0,
+        }
+    }
+
+    /// Start over on the current level — after editing it, or after dying.
+    pub fn restart(&mut self, level: &Level) {
+        let clock = self.clock;
+        *self = Session::new(level, self.seed);
+        self.clock = clock;
+    }
+
+    /// Advance by `dt` seconds of wall clock, in whole sim ticks.
+    pub fn advance(&mut self, dt: f32, keys: Keys) {
+        self.clock += dt;
+        self.accumulator += dt.min(MAX_CATCHUP);
+        let action = keys.action();
+        while self.accumulator >= TICK {
+            self.accumulator -= TICK;
+            self.sim.step(action);
+        }
+    }
+
+    pub fn sim(&self) -> &Sim {
+        &self.sim
+    }
+
+    /// The line under the canvas: how the run is going.
+    pub fn summary(&self) -> String {
+        let stats = self.sim.stats();
+        let level = self.sim.level();
+        let progress = if level.width_pixels() > 0.0 {
+            100.0 * stats.progress_pixels / level.width_pixels()
+        } else {
+            0.0
+        };
+        format!(
+            "{}  frame {}/{}  x {:.1}  progress {:.0}%  stomps {}  {}",
+            self.sim.outcome().as_str(),
+            stats.frames,
+            self.sim.max_frames(),
+            stats.best_x,
+            progress,
+            stats.stomps,
+            if stats.frames == 0 { "ready" } else { "press R to restart" }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim::Level;
+
+    fn shipped(slug: &str) -> Level {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../levels")
+            .join(format!("{slug}.json"));
+        Level::from_json_file(&path).unwrap_or_else(|e| panic!("{slug}: {e}"))
+    }
+
+    /// The desktop shell must mean the same thing by the keys as the terminal
+    /// playtest: this is the one mapping both call.
+    #[test]
+    fn the_action_priority_is_the_plan_s() {
+        use sim::AgentAction::*;
+        assert_eq!(action_for(false, false, false, false), Walk);
+        assert_eq!(action_for(true, false, false, false), Retreat);
+        assert_eq!(action_for(true, true, false, false), Run, "right beats left");
+        assert_eq!(action_for(false, false, false, true), Brake);
+        assert_eq!(action_for(false, false, true, false), JumpInPlace);
+        assert_eq!(action_for(false, true, true, false), RunJump);
+        assert_eq!(action_for(true, true, true, true), RunJump, "jump beats all");
+    }
+
+    #[test]
+    fn the_sim_advances_by_wall_clock_in_fixed_ticks() {
+        let level = shipped("l1-flat-run");
+        let mut session = Session::new(&level, 1);
+        // Half a second of play at 60 Hz is thirty ticks, whatever the frame rate.
+        for _ in 0..30 {
+            session.advance(1.0 / 60.0, Keys::default());
+        }
+        assert_eq!(session.sim().stats().frames, 30, "one tick per 1/60 s");
+
+        // A frame that took 30 ms must not lose physics: the accumulator carries it.
+        let mut session = Session::new(&level, 1);
+        session.advance(0.03, Keys::default());
+        assert_eq!(session.sim().stats().frames, 1, "0.03 s is one tick, 0.018 left");
+        session.advance(0.03, Keys::default());
+        assert_eq!(session.sim().stats().frames, 3, "the remainder was carried");
+
+        // And a stall is clamped: a two-second frame must not teleport the player.
+        let mut session = Session::new(&level, 1);
+        session.advance(2.0, Keys::default());
+        assert!(
+            session.sim().stats().frames <= (MAX_CATCHUP / TICK) as u32 + 1,
+            "a long hitch is clamped, got {}",
+            session.sim().stats().frames
+        );
+    }
+
+    #[test]
+    fn holding_right_beats_the_opening_level_through_the_real_input_path() {
+        let level = shipped("l1-flat-run");
+        let mut session = Session::new(&level, 1);
+        let keys = Keys {
+            right: true,
+            ..Keys::default()
+        };
+        for _ in 0..1200 {
+            session.advance(1.0 / 60.0, keys);
+            if session.sim().outcome().is_finished() {
+                break;
+            }
+        }
+        assert_eq!(
+            session.sim().outcome(),
+            sim::Outcome::Won,
+            "{}",
+            session.summary()
+        );
+    }
+
+    #[test]
+    fn a_restart_rewinds_the_episode_and_keeps_the_level() {
+        let level = shipped("l2-first-gap");
+        let mut session = Session::new(&level, 7);
+        let keys = Keys {
+            right: true,
+            ..Keys::default()
+        };
+        for _ in 0..120 {
+            session.advance(1.0 / 60.0, keys);
+        }
+        assert!(session.sim().stats().frames > 0);
+        session.restart(&level);
+        assert_eq!(session.sim().stats().frames, 0);
+        assert_eq!(session.sim().outcome(), sim::Outcome::Running);
+        // The same seed means the restart is the same episode, not a new one.
+        assert_eq!(session.sim().state_hash(), Session::new(&level, 7).sim().state_hash());
+    }
+}

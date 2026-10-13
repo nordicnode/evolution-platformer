@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Desktop game shell: pixel-art renderer, level editor and playtest (M4)."
+
+[[bin]]
+name = "evo-app"
+path = "src/main.rs"
+
+[dependencies]
+sim.workspace = true
+render.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+serde_json.workspace = true

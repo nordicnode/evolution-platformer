@@ -1,0 +1,101 @@
+{
+  "format": "evo-platformer-tileset",
+  "version": 1,
+  "image": "tileset.png",
+  "cell": 16,
+  "cols": 8,
+  "rows": 3,
+  "generator": "tools/gen_tileset.py",
+  "sprites": [
+    {
+      "name": "empty",
+      "col": 0,
+      "row": 0
+    },
+    {
+      "name": "grass",
+      "col": 1,
+      "row": 0
+    },
+    {
+      "name": "grass_left",
+      "col": 2,
+      "row": 0
+    },
+    {
+      "name": "grass_right",
+      "col": 3,
+      "row": 0
+    },
+    {
+      "name": "dirt",
+      "col": 4,
+      "row": 0
+    },
+    {
+      "name": "dirt_left",
+      "col": 5,
+      "row": 0
+    },
+    {
+      "name": "dirt_right",
+      "col": 6,
+      "row": 0
+    },
+    {
+      "name": "spike",
+      "col": 7,
+      "row": 0
+    },
+    {
+      "name": "player_stand",
+      "col": 0,
+      "row": 1
+    },
+    {
+      "name": "player_run_a",
+      "col": 1,
+      "row": 1
+    },
+    {
+      "name": "player_run_b",
+      "col": 2,
+      "row": 1
+    },
+    {
+      "name": "player_jump",
+      "col": 3,
+      "row": 1
+    },
+    {
+      "name": "walker_a",
+      "col": 4,
+      "row": 1
+    },
+    {
+      "name": "walker_b",
+      "col": 5,
+      "row": 1
+    },
+    {
+      "name": "walker_dead",
+      "col": 6,
+      "row": 1
+    },
+    {
+      "name": "goal_top",
+      "col": 7,
+      "row": 1
+    },
+    {
+      "name": "goal_bottom",
+      "col": 0,
+      "row": 2
+    },
+    {
+      "name": "spawn_marker",
+      "col": 1,
+      "row": 2
+    }
+  ]
+}

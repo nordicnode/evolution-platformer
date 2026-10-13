@@ -16,7 +16,8 @@ currently does and where it deviates.
 | **M1** sim + hand-written levels | done |
 | **M2** GA + headless training + reachability oracle | done |
 | **M3** watch mode + fun gate | **Tiers 1 and 2 done, fun gate open** — the owner's call |
-| M4 editor, M5 web/release | not started — except M5's stall chain, done early (findings 19–22) |
+| **M4** editor + content | **started: the game shell exists** — pixel renderer, generated art, full drag-and-drop editor, in-editor playtest (findings 24–25). Not yet: evolving or watching *inside* it, and the curated starter pack |
+| M5 web/release | not started — except M5's stall chain, done early (findings 19–22) |
 
 The deterministic core, the evolution loop, the reachability oracle and the Tier 1
 watch mode are implemented and tested. `train-cli watch` grows a population on
@@ -108,10 +109,19 @@ over in under a minute at every speed.
 crates/sim/        the deterministic core: tile grid, AABB physics, sensors, oracle
 crates/evo/        fixed-topology genome, GA, fitness, champion files
 crates/render/     read-only views: ASCII frame/scene, keyboard play, pure text charts
-crates/train-cli/  driver: train, watch, reach, replay, play, render, sensors
+crates/train-cli/  headless driver: train, watch, reach, replay, play, render, sensors
+crates/app/        the game: pixel renderer, drag-and-drop level editor, playtest
 levels/            hand-written *.json levels (L1-L6, easy → brutal)
+assets/            generated pixel art: the tileset atlas, its manifest, a preview
+tools/             asset generator (python3 tools/gen_tileset.py)
 champions/         generated champion files (git-ignored)
 ```
+
+The plan's §4 layout put the editor at `crates/editor`; it is `crates/app` here
+because it grew past an editor into the game shell — it owns the window, the pixel
+renderer, the editor *and* the playtest, and evolve/watch will move in beside them.
+The two toolchains stay separate on purpose: `train-cli` remains the headless,
+no-window, all-cores path, and nothing in `sim`/`evo`/`render` depends on a GUI.
 
 Boundary rules from the plan (§4), enforced by review:
 
@@ -129,8 +139,20 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 216 tests
+cargo test --workspace                 # 253 tests
 cargo build --release
+
+# The game: draw a level, drag tiles out of a palette, play it yourself.
+python3 tools/gen_tileset.py           # only if you change the art
+cargo run --release -p app             # opens on levels/l1-flat-run.json
+cargo run --release -p app -- --level levels/l6-marathon.json
+#   drag a palette item onto the level to place it; click to paint
+#   right-drag erases   middle-drag (or alt-drag) pans   wheel zooms
+#   ctrl+Z / ctrl+Y undo   G grid   F fit   ctrl+S save   P play/pause-mode
+#   in play: arrows or W/A/S/D move and jump, R restarts, P or Esc returns
+
+# Render one frame to a PNG and exit (how the renderer is verified without a human).
+cargo run --release -p app -- --screenshot out/frame.png
 
 # Can this level be beaten at all? Milliseconds, no training.
 ./target/release/train-cli reach --all --levels-dir levels --verbose
@@ -279,7 +301,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-223 tests, all green. `cargo test --workspace`.
+253 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -357,6 +379,25 @@ stay fatal without a press (or the test measures nothing), holding right must be
 L1, and a player who jumps when they see an obstacle must clear the first gap at some
 reaction latency inside 240 ms. That last one is the M1 exit criterion in executable
 form, as far as a model of a player can carry it.
+
+The desktop shell gets eighteen, and they exist because two of its failure modes are
+invisible from the outside. `crates/sim`'s editing API has twelve of its own, the one
+that matters being `every_shipped_level_round_trips_through_the_writer_with_the_same
+_hash` — the hash covers the name, the grid, the spawn and every entity box, so a
+tile column that rounds the wrong way when an entity's position is converted back to
+a tile fails there instead of shipping a level that plays differently. The app's
+atlas tests check that every sprite maps *inside the texture* at exactly one cell
+(the bug in finding 25 rendered a level as nothing at all), that the shipped art
+carries every name the renderer asks for, and that a manifest disagreeing with the
+image is refused rather than drawn as confetti. Its view test draws a shipped level
+into a headless egui context and counts the sprite quads that come out — a real frame,
+no window, no GPU. Its editor tests hold the rules the user depends on: a drag paints
+a gapless line as one undo step, the eraser takes an entity before the terrain under
+it, the last goal cannot be erased away, a refused save leaves no file behind, and the
+beatable/not-beatable verdict is the oracle's answer following a spike curtain drawn
+across the approach. Its playtest tests pin the accumulator (a 30 ms frame must not
+lose physics, a two-second hitch must not teleport the player), that holding right
+beats L1 through the real input path, and that a restart is the same seeded episode.
 
 ## Findings and deviations from the plan
 
@@ -630,6 +671,55 @@ deliberate, documented decision — not drift.
    3-tile landing zone between them, and placing those jumps is a judgement the model
    cannot make — it needs a person, which is the person the fun gate needs too.
 
+24. **The game exists now, and it is the *renderer and editor* that had to be built
+   first, not the evolution UI.** The owner's call was a native desktop app, a full
+drag-and-drop editor and generated pixel art, so `crates/app` is an eframe window
+with three deliberate properties:
+
+   * **The art is data, not code.** `tools/gen_tileset.py` writes a 16x16-cell atlas
+     and a manifest naming each sprite; the app reads the manifest, so replacing the
+     art is replacing two files. A manifest that disagrees with the image's size is
+     refused at startup, and a missing sprite is a startup error listing what the
+     file does contain — a tileset that is *almost* right must fail loudly rather
+     than draw mystery tiles.
+   * **Terrain is picked by what surrounds it.** A solid tile is grass where the sky
+     shows, dirt where it is buried, with left/right variants where a side is open,
+     which is why eight terrain sprites cover a whole pack and a level needs no
+     per-tile art choices.
+   * **The keyboard has exactly one definition.** `render::play::action_for` is now
+     public and both playtests call it: the terminal one latches a press, the GUI
+     reads a held key, and neither can drift into being a different game.
+
+   Two editor rules came out of the failure modes rather than from taste. The oracle
+   is re-run when a *level hash* changes instead of behind a dirty flag, because a
+   flag has to be remembered by every writer — including the ones that reach the level
+   directly — and a hash cannot forget; the app caught a stale validation badge while
+   the tests were being written. And an edit that cannot be saved is refused up front:
+   the last goal cannot be erased and a shrinking grid drags its goal back in, so the
+   document is never in a state where Save cannot work.
+
+   The renderer is verified without a human: `--screenshot` renders one frame, writes
+   a PNG and exits, and the pipeline asserts on the pixels. L1 renders roughly 19 000
+   terrain pixels across its 60 tiles — grass over dirt, with the flag at the far end
+   — and L3 renders 2 100 more plus the steel of its spikes, so the diff between the
+   two frames is exactly the terrain and the spikes and nothing else.
+
+25. **A wrong unit rendered a whole level as nothing, and every test still passed.**
+   `Atlas::uv` computed a cell's UV rect as `cell / cols` — 16 pixels divided by 8
+   *columns*, i.e. 2.0 — where it needed the fraction of the *image*, `1 / cols`.
+   Every sprite therefore sampled far outside the texture, so the level drew no
+   terrain at all, while the code that resolved sprite names, chose animation frames,
+   converted tiles to screen rectangles and counted what it had drawn all looked
+   perfectly healthy: the frame was the right size, the panels were right, the grid
+   lines and the spawn marker (drawn from rects, not images) were right. The pixels
+   were the only witness, and every colour in the canvas was sky.
+
+   The fix is one division; the lesson is the test. The atlas tests now assert that
+   every sprite in the shipped tileset maps **inside** the texture at exactly one
+   cell, and the view test counts the sprite quads a headless frame emits and where
+   they land. Counting draw *calls* would not have caught this — the calls were all
+   there; only the rectangles were wrong.
+
 ## The M3 problem
 
 The plan's M3 gate is "watch evolution for 10+ minutes and decide whether it is
@@ -707,5 +797,14 @@ CI (`crates/render/tests/playability.rs`) rather than in someone's memory.
 ## Deliberately deferred
 
 NEAT/speciation, survival-analysis difficulty estimation, online champion
-sharing, sound, mobile, powerups, achievements/tutorial, threaded WASM, the GUI
-editor, and the web build. See the plan's §12 for the gates.
+sharing, sound, mobile, powerups, achievements/tutorial, threaded WASM, and the
+web build. See the plan's §12 for the gates.
+
+No longer deferred: the pixel renderer and the editor existed as a terminal view
+and hand-written JSON through M1–M3, and are now a real window (`crates/app`).
+Still open inside it, in the order worth doing: **evolve and watch from the app**
+(the whole point of the game — the view, the chart and the route scrubber already
+exist in `render`, they need hosting in a panel), the level list as a browsable
+shelf rather than an Open menu, and the curated starter pack (M4's exit: a
+non-developer builds a level, validates it and evolves a solver without touching
+JSON — the middle third works, the last third is the missing panel).
