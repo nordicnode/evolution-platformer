@@ -91,6 +91,19 @@ const DEFAULT_SPEED: u32 = 8;
 /// agent that survives to the episode cap cannot hold the view hostage.
 const SLACK_FRAMES: usize = 30;
 
+/// The mutation-rate ladder (§10 Tier 2.9's slider, inside §7.5's 0.03–0.10 range).
+///
+/// A ladder for the same reason the speed control is one: every keypress lands on a
+/// rung the viewer can get back to, and no keypress can drive the run somewhere the
+/// plan does not document. 0.05 is the trainer's default, so a fresh run starts in
+/// the middle and both directions are available — which is the point of the slider.
+/// The two reasons to reach for it are opposite: a population that has converged
+/// onto an obstacle needs shaking *up* (finding 16's plateau), and one that keeps
+/// destroying the genome that nearly solved the level needs calming *down*. The
+/// boxcar2d lesson the plan quotes is that this tuning is itself part of the fun,
+/// which is why it is a key and not a restart flag.
+const MUT_RATES: [f32; 4] = [0.03, 0.05, 0.08, 0.10];
+
 const MIN_CHART_ROWS: usize = 4;
 const MAX_CHART_ROWS: usize = 10;
 const MIN_SCENE_ROWS: usize = 5;
@@ -160,7 +173,13 @@ pub fn watch(a: &Args) -> Result<(), String> {
         pop_size,
         elite: usage(a.usize_opt("elite", 4))?,
         tournament: usage(a.usize_opt("tournament", 4))?,
-        mutation_rate: usage(a.f32_opt("mut-rate", 0.05))?,
+        // Snapped to the same ladder the `m`/`M` keys walk, so the rate the run
+        // starts at is a rate the viewer can get back to and the value on screen is
+        // always the value in the config (§10 Tier 2.9).
+        mutation_rate: nearest_mut_rate(usage(a.f32_opt(
+            "mut-rate",
+            GaConfig::default().mutation_rate,
+        ))?),
         mutation_sigma: usage(a.f32_opt("mut-sigma", 0.30))?,
         crossover_rate: usage(a.f32_opt("crossover", 0.75))?,
         action_repeat: usage(a.usize_opt("action-repeat", 4))? as u32,
@@ -168,9 +187,10 @@ pub fn watch(a: &Args) -> Result<(), String> {
         master_seed: usage(a.u64_opt("seed", 1))?,
         ..GaConfig::default()
     };
+    live.mut_rate = cfg.mutation_rate;
 
     println!(
-        "watching {} ({}x{})  pop {}  seed {}  lanes {}+{}  speed {}{}",
+        "watching {} ({}x{})  pop {}  seed {}  lanes {}+{}  speed {}  mut {}{}",
         level.name,
         level.width,
         level.height,
@@ -179,6 +199,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
         best_k,
         random_k,
         speed_label(live.speed),
+        mut_label(live.mut_rate),
         if headless { "  [headless]" } else { "" }
     );
     println!(
@@ -201,6 +222,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
         if live.quit {
             break;
         }
+        // Anything the viewer changed with the keyboard applies from this
+        // generation on, so a rate change shows up in the very next offspring.
+        apply_live_config(&mut trainer, &live);
         // The population snapshot is taken before breeding, so these are the exact
         // genomes (with the exact ids) the report describes.
         let (report, population) = trainer.step_verbose(&level);
@@ -387,6 +411,9 @@ fn lane_glyph(label: char, finished: bool, outcome: Outcome) -> char {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LiveState {
     speed: u32,
+    /// Per-gene mutation probability, adjustable while the run is on screen
+    /// (§10 Tier 2.9), always one of [`MUT_RATES`].
+    mut_rate: f32,
     paused: bool,
     /// Follow the leading agent's camera, or hold the whole level still.
     follow: bool,
@@ -399,6 +426,7 @@ impl Default for LiveState {
     fn default() -> LiveState {
         LiveState {
             speed: DEFAULT_SPEED,
+            mut_rate: GaConfig::default().mutation_rate,
             paused: false,
             follow: true,
             quit: false,
@@ -415,6 +443,14 @@ impl LiveState {
             next_speed_down(self.speed)
         };
     }
+
+    fn step_mut_rate(&mut self, up: bool) {
+        self.mut_rate = if up {
+            next_mut_rate_up(self.mut_rate)
+        } else {
+            next_mut_rate_down(self.mut_rate)
+        };
+    }
 }
 
 /// What one keypress means. Split out of the event loop so the whole key map is
@@ -424,6 +460,8 @@ enum KeyAction {
     None,
     SpeedUp,
     SpeedDown,
+    MutRateUp,
+    MutRateDown,
     TogglePause,
     ToggleFollow,
     SkipGeneration,
@@ -438,6 +476,8 @@ fn key_action(code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
         KeyCode::Char(' ') => KeyAction::TogglePause,
         KeyCode::Char('+') | KeyCode::Char('=') => KeyAction::SpeedUp,
         KeyCode::Char('-') | KeyCode::Char('_') => KeyAction::SpeedDown,
+        KeyCode::Char('m') => KeyAction::MutRateUp,
+        KeyCode::Char('M') => KeyAction::MutRateDown,
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('.') | KeyCode::Enter => {
             KeyAction::SkipGeneration
         }
@@ -458,6 +498,14 @@ fn apply_key(action: KeyAction, live: &mut LiveState) -> bool {
         }
         KeyAction::SpeedDown => {
             live.step_speed(false);
+            false
+        }
+        KeyAction::MutRateUp => {
+            live.step_mut_rate(true);
+            false
+        }
+        KeyAction::MutRateDown => {
+            live.step_mut_rate(false);
             false
         }
         KeyAction::TogglePause => {
@@ -506,6 +554,46 @@ fn next_speed_down(speed: u32) -> u32 {
 
 fn speed_label(speed: u32) -> String {
     format!("{speed}x")
+}
+
+fn mut_label(rate: f32) -> String {
+    format!("{rate:.2}")
+}
+
+/// Snap an arbitrary rate onto the ladder, so `--mut-rate 0.07` behaves like the
+/// nearest keypress rather than creating a rate no key can get back to. The
+/// trainer's own `sanitized` clamp is a backstop, not the contract: the contract is
+/// that the value on screen is always one of [`MUT_RATES`].
+fn nearest_mut_rate(requested: f32) -> f32 {
+    if !requested.is_finite() {
+        return GaConfig::default().mutation_rate;
+    }
+    let mut best = MUT_RATES[0];
+    for rate in MUT_RATES {
+        if (rate - requested).abs() < (best - requested).abs() {
+            best = rate;
+        }
+    }
+    best
+}
+
+fn next_mut_rate_up(rate: f32) -> f32 {
+    let i = MUT_RATES.iter().position(|r| *r >= rate).unwrap_or(0);
+    MUT_RATES[(i + 1).min(MUT_RATES.len() - 1)]
+}
+
+fn next_mut_rate_down(rate: f32) -> f32 {
+    let i = MUT_RATES.iter().rposition(|r| *r <= rate).unwrap_or(0);
+    MUT_RATES[i.saturating_sub(1)]
+}
+
+/// Push the live knobs into the trainer, which breeds the *next* generation from
+/// the configuration it currently holds.
+///
+/// Factored out of the run loop so "the key changes the evolution, not just the
+/// on-screen number" is a testable claim rather than a comment.
+fn apply_live_config(trainer: &mut Trainer, live: &LiveState) {
+    trainer.config.mutation_rate = live.mut_rate;
 }
 
 // ---------------------------------------------------------------------------
@@ -578,14 +666,19 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
     // 1. Where we are. Always visible (Tier 1.1). The level name gets a fixed
     //    budget: it is the least important thing on the line, and a long one must
     //    not be able to push the flags off an 80-column terminal.
+    // Single spaces between fields on purpose: at 80 columns the flags at the end
+    // (`PAUSED`, `whole level`) are the difference between a viewer waiting and a
+    // viewer thinking the thing has hung, and double spacing was enough to clip
+    // them off once the live mutation rate joined the line.
     let mut head = format!(
-        "{:<14} gen {}/{}  lanes {}/{} alive  speed {}",
+        "{:<14} gen {}/{} lanes {}/{} alive speed {} mut {}",
         clip(f.level_name, 14),
         f.generation,
         f.generations.max(1),
         f.alive,
         f.lane_count,
-        speed_label(f.live.speed)
+        speed_label(f.live.speed),
+        mut_label(f.live.mut_rate)
     );
     if f.live.paused {
         head.push_str("  PAUSED");
@@ -676,7 +769,7 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
 
     // 9. What the viewer can do, and what the glyphs mean.
     lines.push(clip(
-        "keys  space pause   -/+ speed   n next generation   f follow/whole   s save champion   q quit",
+        "keys  space pause  -/+ speed  m/M mutation  n next  f follow  s save  q quit",
         cols,
     ));
     let legend = format!(
@@ -1236,6 +1329,78 @@ mod tests {
     // -- keys -----------------------------------------------------------------
 
     #[test]
+    fn the_mutation_ladder_stays_inside_the_plans_range() {
+        // §7.5 documents 0.03–0.10; the plan's slider (Tier 2.9) is that range, so a
+        // keypress must not be able to leave it, and the default must be reachable.
+        let default = GaConfig::default().mutation_rate;
+        assert!(
+            MUT_RATES.contains(&default),
+            "the default rate must be one of the rungs, not between two: {MUT_RATES:?}"
+        );
+        for pair in MUT_RATES.windows(2) {
+            assert!(pair[0] < pair[1], "the ladder must rise: {MUT_RATES:?}");
+        }
+        for rate in MUT_RATES {
+            assert!(
+                (0.03..=0.10).contains(&rate),
+                "{rate} is outside the range the plan documents for the slider"
+            );
+        }
+
+        // Snapping, so `--mut-rate 0.07` behaves like a keypress rather than creating
+        // a rate no key can return to.
+        assert_eq!(nearest_mut_rate(0.07), 0.08);
+        assert_eq!(nearest_mut_rate(0.031), 0.03);
+        assert_eq!(nearest_mut_rate(99.0), 0.10);
+        assert_eq!(nearest_mut_rate(-4.0), MUT_RATES[0]);
+        assert_eq!(nearest_mut_rate(f32::NAN), default);
+
+        // Both ends are hard stops, not wraparounds.
+        assert_eq!(next_mut_rate_up(0.10), 0.10);
+        assert_eq!(next_mut_rate_down(0.03), 0.03);
+        assert_eq!(next_mut_rate_up(0.03), 0.05);
+        assert_eq!(next_mut_rate_down(0.10), 0.08);
+    }
+
+    /// The keyboard has to reach *evolution*, not just the number on screen. Two
+    /// trainers from the same seed, one of them turned up to the top rung: after a
+    /// generation the populations must differ, which is only true if
+    /// `apply_live_config` feeds the breeder rather than the status line.
+    #[test]
+    fn the_live_mutation_rate_changes_the_offspring() {
+        let level = load_level(&wpath("levels/l4-rhythm.json")).expect("level loads");
+        let cfg = GaConfig {
+            pop_size: 24,
+            master_seed: 9,
+            ..GaConfig::default()
+        };
+        let mut quiet = Trainer::new(cfg.clone());
+        let mut lively = Trainer::new(cfg);
+        let mut live = LiveState::default();
+        apply_live_config(&mut quiet, &live);
+
+        live.mut_rate = *MUT_RATES.last().expect("ladder");
+        apply_live_config(&mut lively, &live);
+        assert_eq!(
+            lively.config.mutation_rate,
+            *MUT_RATES.last().expect("ladder")
+        );
+
+        quiet.step(&level);
+        lively.step(&level);
+        let same = quiet
+            .genomes
+            .iter()
+            .zip(&lively.genomes)
+            .all(|(a, b)| a.weights == b.weights);
+        assert!(
+            !same,
+            "raising the mutation rate through the live controls must change the \
+             next generation; identical populations mean the knob is only cosmetic"
+        );
+    }
+
+    #[test]
     fn every_documented_key_maps_to_an_action() {
         assert_eq!(
             key_action(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -1268,6 +1433,14 @@ mod tests {
         assert_eq!(
             key_action(KeyCode::Char('s'), KeyModifiers::NONE),
             KeyAction::Save
+        );
+        assert_eq!(
+            key_action(KeyCode::Char('m'), KeyModifiers::NONE),
+            KeyAction::MutRateUp
+        );
+        assert_eq!(
+            key_action(KeyCode::Char('M'), KeyModifiers::SHIFT),
+            KeyAction::MutRateDown
         );
         assert_eq!(
             key_action(KeyCode::Char('q'), KeyModifiers::NONE),
@@ -1312,6 +1485,33 @@ mod tests {
             &mut live
         ));
         assert!(live.save_requested);
+
+        // Mutation is a ladder too: up twice from the default, then pinned at the
+        // top; down three times, then pinned at the bottom.
+        let default_rate = LiveState::default().mut_rate;
+        for _ in 0..2 {
+            apply_key(
+                key_action(KeyCode::Char('m'), KeyModifiers::NONE),
+                &mut live,
+            );
+        }
+        assert_eq!(live.mut_rate, *MUT_RATES.last().expect("ladder"));
+        apply_key(
+            key_action(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut live,
+        );
+        assert_eq!(live.mut_rate, *MUT_RATES.last().expect("ladder"));
+        for _ in 0..5 {
+            apply_key(
+                key_action(KeyCode::Char('M'), KeyModifiers::NONE),
+                &mut live,
+            );
+        }
+        assert_eq!(live.mut_rate, MUT_RATES[0]);
+        assert!(
+            default_rate > MUT_RATES[0],
+            "the default has to have a rung below it or the slider only goes one way"
+        );
 
         apply_key(
             key_action(KeyCode::Char('q'), KeyModifiers::NONE),
@@ -1662,6 +1862,9 @@ mod tests {
         assert!(lines[0].contains("gen 3/100"), "{}", lines[0]);
         assert!(lines[0].contains("lanes 6/8 alive"), "{}", lines[0]);
         assert!(lines[0].contains("speed 8x"), "{}", lines[0]);
+        // Tier 2.9: the live mutation knob is on screen, because a control whose
+        // current value is invisible is a control the viewer cannot use.
+        assert!(lines[0].contains("mut 0.05"), "{}", lines[0]);
 
         // Tier 1.2: the numbers, the chart, and the reading in words.
         assert!(lines[1].contains("learning"), "{}", lines[1]);
@@ -1735,6 +1938,7 @@ mod tests {
                 paused: true,
                 follow: false,
                 speed: 50,
+                mut_rate: *MUT_RATES.last().expect("ladder"),
                 ..LiveState::default()
             },
             history: &h,
@@ -1753,6 +1957,19 @@ mod tests {
         assert!(text.contains("PAUSED"));
         assert!(text.contains("whole level"));
         assert!(text.contains("speed 50x"));
+        assert!(text.contains("mut 0.10"));
+        // The header has to survive the narrowest terminal a flag can matter on.
+        // Every value here is at its widest: a 12-character level name, a
+        // three-digit generation, a full-speed run and the top mutation rung.
+        let head = text.lines().next().expect("a frame has a header");
+        assert!(
+            head.chars().count() <= 80,
+            "the header is {} columns and lost a flag at 80: {head:?}",
+            head.chars().count()
+        );
+        for flag in ["PAUSED", "whole level", "mut 0.10", "lanes 8/8 alive"] {
+            assert!(head.contains(flag), "{flag:?} was clipped off: {head:?}");
+        }
     }
 
     #[test]

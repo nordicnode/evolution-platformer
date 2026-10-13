@@ -24,7 +24,8 @@ screen: fitness chart, best-4 + random-4 agents per generation, speed control,
 pause, death markers and the genius-agent splash. The level pack behind it is now
 six levels wide, and its two hardest are *hard* (findings 15–18) — hard enough that
 they sometimes stall, which the view reports with a stall line naming how long the
-population has been stuck and which obstacle it keeps dying on (finding 19). What
+population has been stuck and which obstacle it keeps dying on (finding 19), and
+offers a live mutation-rate knob to try instead (finding 20). What
 remains of M3 is the part no test can answer — whether watching it is fun — and
 that needs a human at a keyboard. See [The M3 problem](#the-m3-problem).
 
@@ -121,7 +122,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 195 tests
+cargo test --workspace                 # 197 tests
 cargo build --release
 
 # Can this level be beaten at all? Milliseconds, no training.
@@ -129,8 +130,8 @@ cargo build --release
 
 # Watch it learn: chart, best-4 + random-4 agents, deaths, genius splashes.
 ./target/release/train-cli watch --level levels/l5-tightrope.json
-#   space pause   -/+ speed   n next generation   f follow/whole level
-#   s save champion   q quit
+#   space pause   -/+ speed   m/M mutation rate   n next generation
+#   f follow/whole level   s save champion   q quit
 
 # Evolve headlessly, print the fitness chart, save a champion.
 ./target/release/train-cli train --level levels/l3-gauntlet.json \
@@ -262,7 +263,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-195 tests, all green. `cargo test --workspace`.
+197 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -282,7 +283,7 @@ pack's difficulty is pinned by `crates/evo/tests/difficulty.rs`: a random
 population must win L1/L2 at generation 0, must win none of L3–L6 on any of four
 seeds, and L4 must still fall to evolution inside 60 generations at pop 64.
 
-Watch mode adds five that hold its honesty in place:
+Watch mode adds seven that hold its honesty in place:
 `every_showcase_lane_replays_the_episode_that_was_evaluated` (a lane animates the
 episode that was scored, seed for seed, so the picture and the numbers agree),
 `watching_does_not_change_what_is_evolved` (the showcase's RNG is separate, so
@@ -292,7 +293,11 @@ and two on the stall line: `the_stall_line_waits_for_the_cutoff_and_clears_on_an
 improvement` (25 flat generations, no fewer, and a new best removes it again) and
 `the_stall_line_names_the_stall_and_the_death_cluster` (the row carries the count,
 the place deaths pile up, and replaces the trend caption instead of contradicting
-it).
+it). Two more hold the live mutation knob honest: `the_live_mutation_rate_changes_
+the_offspring` presses `m` and asserts the *next generation's genomes* actually
+differ from the unpressed run — the key changes the evolution rather than the label
+— and `the_mutation_ladder_stays_inside_the_plans_range` pins every rung to the
+documented 0.03–0.10 and checks the ends clamp instead of wrapping.
 The watch layout itself is testable without a TTY because `--headless` renders
 plain text frames; `cargo test` exercises the whole frame composition that way.
 
@@ -434,6 +439,25 @@ deliberate, documented decision — not drift.
    with a strict flatness test instead, the elite re-rolling its episode on a walker
    level (finding 14) would reset the clock forever, and a shorter cutoff would fire
    on runs that are simply slow.
+20. **The mutation rate is a real knob, and it is not what unsticks a stall.** Tier
+   2.9 asks for live mutation-rate tuning; measuring it gave two different answers to
+   two different questions. *As a launch setting* it decides outcomes: on L5 seed 5 —
+   the seed that never solves at the default rate, flat from generation 38 —
+   `--mut-rate 0.03`, `0.08` and `0.10` all reach the flag (generations 31, 11 and
+   65), while `0.05` fails all 420. *As a mid-run rescue* it does not work: switching
+   a stalled run to 0.08, 0.10 or 0.12 at generation 45 left it unsolved at 420 —
+   0.08 reached a best of 760 and the others 587 and 587, against a control of 587
+   and a winning fitness of ~11 100, so the switched populations kept exploring and
+   still never found the jump. That is finding 15 seen from the
+   operator's seat — the park trap is the *criterion* rewarding "stand still and
+   survive" (26.3 of 100 units are progress), not the search's step size, so no
+   amount of local jitter escapes a peak the fitness function itself points at. The
+   key is shipped because the rate genuinely matters and the plan asks for it, and
+   the honest reading is that it belongs in the launch settings more than in the
+   rescue kit: what would end a stall is a different landscape (resume from the stuck
+   point on an easier level, M5), not a different schedule. The ladder is clamped to
+   the plan's own 0.03–0.10 and snaps `--mut-rate` onto it, so the number in the
+   header is always the number being used.
 18. **The oracle's jump windows are a lower bound, not a difficulty meter.** The
    canonical model jumps from a standing start at full run speed; the sim also
    allows a take-off inside the 4-tick coyote window *after* walking off a ledge,
@@ -485,6 +509,13 @@ and 4.5 minutes at the default speed and 29 and 36 minutes at 1× — but "is wa
 this fun for 10 minutes" is still a human judgement, and the honest status is: the
 instrument exists and is pointed at a level hard enough to need it, and the
 measurement has not been taken.
+5. **Let the viewer turn the knob.** — *done, see finding 20.* `m`/`M` move the
+   mutation rate along the plan's ladder (0.03–0.10) and the header shows the live
+   value, so a stall is something the operator can act on rather than only read. The
+   measurement that came with it is the useful part: the rate *decides* outcomes
+   when chosen at launch, and switching it *at* a stall did not rescue one. The next
+   lever is therefore not a slider but a different landscape — resume from the stuck
+   point on an easier level.
 
 ## Deliberately deferred
 
