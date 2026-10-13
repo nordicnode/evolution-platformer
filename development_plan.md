@@ -343,7 +343,7 @@ lanes, the death map, the route scrubber and champion saving in it.
 - Reachability validation live in the editor (warn on unreachable goal, highlight first failing jump). **Done** — the verdict, the culprit jump and the unreachable tint, re-run whenever the level's content hash changes.
 - New entities: flyer enemy, moving platform (horizontal/vertical, deterministic — driven by tick count, not wall-clock). **Open.**
 - Curated starter level pack (8–12 levels, easy→brutal) built with the editor. **Open** — L1–L6 are hand-written so far.
-- Watch mode in the window (§10 Tier 1, M3's deliverable) — **done**, not in the plan's M4 list: the trainer runs off-thread, the chart is real geometry from `render`'s readings, and the recorded routes scrub by generation. The curriculum step (findings 19–22) is the one watch feature still terminal-only.
+- Watch mode in the window (§10 Tier 1, M3's deliverable) — **done in full**, not in the plan's M4 list: the trainer runs off-thread, the chart is real geometry from `render`'s readings, the recorded routes scrub by generation, champions save, and the stall chain's last item (curriculum resume, findings 19–22) is hosted here too — `evo::curriculum_step` is called by both front-ends, and the window takes `--resume`, `--curriculum` and `--curriculum-generations` with the terminal's meanings (finding 28). Nothing in the watch mode is terminal-only any more.
 - **Exit:** a non-developer can build a level, validate it, and evolve a solver without touching JSON.
 
 ### M5 — Evolution polish + web + release (2–3 weeks)

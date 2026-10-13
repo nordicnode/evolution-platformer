@@ -16,7 +16,7 @@ currently does and where it deviates.
 | **M1** sim + hand-written levels | done |
 | **M2** GA + headless training + reachability oracle | done |
 | **M3** watch mode + fun gate | **Tiers 1 and 2 done, fun gate open** — the owner's call |
-| **M4** editor + content | **the shell and the evolution view work** — pixel renderer, generated art, drag-and-drop editor, in-editor playtest, and watch mode hosted in the window (chart, lanes, route scrubber, champion saving, findings 24–27). Not yet: the curated starter pack and a browsable level shelf |
+| **M4** editor + content | **the shell and the evolution view work** — pixel renderer, generated art, drag-and-drop editor, in-editor playtest, and the *whole* watch mode hosted in the window: chart, lanes, route scrubber, champion saving, stall fallback and checkpoint resume (findings 24–28). Not yet: the curated starter pack and a browsable level shelf |
 | M5 web/release | not started — except M5's stall chain, done early (findings 19–22) |
 
 The deterministic core, the evolution loop, the reachability oracle and the Tier 1
@@ -30,7 +30,9 @@ offers a live mutation-rate knob to try instead (finding 20). A run can also be 
 which easier level to fall back to: the first stall writes the stuck population out
 as a checkpoint and trains it there for a while before returning, which turns one
 run that never solved L5 in any number of generations into one that solves it
-(finding 22). Every generation that
+(finding 22) — and since finding 28 that step, its checkpoint and a resume from it are
+all in the window too, so the terminal is a second front-end rather than the only one.
+Every generation that
 improves the best also has its champion route recorded, and the arrow keys scrub
 back through those routes — position by position — to the moment a jump was first
 learned (finding 21). What
@@ -147,7 +149,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 283 tests
+cargo test --workspace                 # 294 tests
 cargo build --release
 
 # The game: draw a level, drag tiles out of a palette, play it yourself.
@@ -163,9 +165,19 @@ cargo run --release -p app -- --level levels/l6-marathon.json
 cargo run --release -p app -- --evolve --level levels/l2-first-gap.json
 #   space pause   n one generation   -/+ speed   m/M mutation rate
 #   left/right scrub the recorded champions   h back to live
-#   s save the best-ever champion   P or Esc back to the editor
+#   s save the best-ever champion   f follow the leader/whole level
+#   P or Esc back to the editor
 cargo run --release -p app -- --evolve --pop 60 --seed 5 --generations 8 \
     --screenshot out/evolve.png
+
+# The window takes the terminal's own run flags, with the terminal's meanings, so a run
+# can be started in one front-end and resumed in the other: the same stall fallback
+# (finding 22/28), and the same checkpoint file either way.
+cargo run --release -p app -- --evolve --level levels/l5-tightrope.json \
+    --curriculum levels/l3-gauntlet.json
+cargo run --release -p app -- --evolve --level levels/l5-tightrope.json \
+    --resume champions/l5-tightrope.population.json
+# A run with --generations saves its best genome when it stops, exactly as `watch` does.
 
 # Render one frame to a PNG and exit (how the renderer is verified without a human).
 cargo run --release -p app -- --screenshot out/frame.png
@@ -317,7 +329,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-283 tests, all green. `cargo test --workspace`.
+294 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -347,7 +359,14 @@ and the id counter untouched, and a population that would break the run (wrong s
 duplicate ids, malformed genome) is refused. Watch mode's own end-to-end test runs a
 stalled L5 through `--curriculum`, asserts the checkpoint exists and names the stall
 that produced it, then restarts from that very file and asserts the champion it saves
-carries an id out of the checkpoint.
+carries an id out of the checkpoint. The window runs the same test from its own side of
+the boundary (`crates/app/src/lab.rs`): a stalled run writes its checkpoint, hands the
+population back, says so once and keeps its own chart, a run without an easier level
+stalls without writing anything, a resumed run continues the checkpoint's generation and
+genomes, and `--resume` on a file that cannot be read refuses rather than training
+something else. Two of those tests only exist because the rule moved out of the window:
+the follow camera's leader (`lab::leader_centre`) and the curriculum's sentence
+(`evo::CurriculumStep::note`) are now functions, not lines inside a frame.
 
 The recorded champion paths get six of their own in `render::trace` — the log keeps
 an improvement and drops the flat generations, refuses a non-finite fitness (a NaN
@@ -804,6 +823,55 @@ with three deliberate properties:
    whole population at once. Counting something is not the same as counting the right
    thing, which is finding 25's lesson one level up.
 
+28. **The window hosts the run, not a convenient subset of it.** Finding 26 moved watch mode
+   into the window; one feature stayed behind in the terminal — the stall fallback of finding
+   22, "checkpoint the stuck population, train it somewhere easier, hand it back". It is now
+   `evo::curriculum_step`, called by both front-ends, for the reason the mutation ladder
+   moved there: a checkpoint and an excursion are properties of a *run*, and two copies of
+   "save the population, train it elsewhere, adopt it back" are two chances for the two
+   front-ends to disagree about what a stall costs. The window gained the terminal's flags
+   with the terminal's meanings — `--resume`, `--curriculum`, `--curriculum-generations` —
+   and both refuse the same way: a checkpoint that will not load is a startup error, and
+   `--curriculum-generations 0` is a usage error, not a clamp.
+
+   The subtlety is that resume and the fallback belong together, and only one of them was
+   in the terminal. Without `--resume`, the checkpoint the window wrote would have been a
+   one-way door: readable by `train-cli watch`, useless to the window that produced it.
+   The pair is now closed in both directions, and the verification is the artifact rather
+   than the screen: a window run stalls on L5, writes its checkpoint ("stalled: no new best
+   in 25 generations (best 244.8 set at gen 9)", generation 35, two genomes), and a second
+   window run told `--resume` on that file re-scores generation 35 and saves a champion
+   whose generation is 35 and whose genome id is one of the checkpoint's own.
+
+   Three smaller decisions follow from the same boundary rule. `f` is the terminal's
+   follow/whole-level toggle, but the *defaults* differ because the media do: eighty
+   columns cannot hold a whole level, so the terminal follows; this window can, so
+   whole-level is what it shows and `f` is the viewer asking to zoom in on one agent. The
+   rule for "the leader" — the live lane furthest along, counting a winner still standing
+   on the flag — moved to `lab::leader_centre` so it is a tested function rather than a
+   loop inside a frame, and the window then centres the camera on it (a *scrubbed* route
+   centres on where the route stopped, which is the terminal's rule for the same moment).
+   And the terminal's habit of saving the champion when a watched run ends has a window
+   equivalent with one added restriction: the save happens when a **capped** run reaches
+   its cap, because a cap is something the viewer asked for, so a `--screenshot
+   --generations N` run leaves the artifacts a session at the keyboard would and an
+   open-ended run needs the Save button it already has.
+
+   The curriculum's sentence lives in `evo::CurriculumStep::note` and is *sticky* on the
+   packet: "this run changed shape" is not something the viewer should have to catch inside
+   a single generation, and the panel shows it for the rest of the run. That made one test
+   interesting — "the run stepped back once" cannot be asserted by counting notes, because
+   the note is meant to persist, so it is asserted twice over instead: the note never
+   changes once it appears, and the checkpoint on disk is no newer than the generation the
+   note first appeared at (a second step would have moved both). Two other tests were
+   wrong in instructive ways. One pinned the literal `best there 812.35` for a value of
+   812.345, which asserts a rounding rather than the note — `{:.2}` of that `f32` is
+   812.34 — and now formats the expected string from the struct's own number. The other
+   asserted that a run with nowhere to fall back to writes no checkpoint, using a shared
+   scratch directory, so it found the checkpoint a *parallel* test had just written; each
+   test's artifacts now live under their own tag. A test that shares a directory with
+   another test is not testing the thing it names.
+
 ## The M3 problem
 
 The plan's M3 gate is "watch evolution for 10+ minutes and decide whether it is
@@ -889,7 +957,8 @@ existed as a terminal view and hand-written JSON through M1–M3, and are now a 
 window (`crates/app`) — which means a non-developer can build a level, validate it,
 play it and **evolve a solver on it without touching JSON** (the last third of M4's
 exit criterion, in place as of finding 26). Still open inside it, in the order worth
-doing: the curated starter pack M4 exits on (built with the editor, not by hand), the
-level list as a browsable shelf rather than an Open menu, and the curriculum step
-(finding 22) in the window — the stall line and the death cluster are already there,
-but a stalled run in the app can only be restarted, not handed an easier level.
+doing: the curated starter pack M4 exits on (built with the editor, not by hand) and the
+level list as a browsable shelf rather than an Open menu. The watch mode's last
+terminal-only feature — the stall fallback of finding 22 and the resume that goes with
+it — is in the window as of finding 28, so every M3 and M5 watch behaviour is reachable
+from both front-ends.

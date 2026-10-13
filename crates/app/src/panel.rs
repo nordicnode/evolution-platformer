@@ -138,6 +138,10 @@ pub struct RunSummary {
     pub trend: Trend,
     pub stall: Option<Stall>,
     pub genius: bool,
+    /// The note from the run's one curriculum step, if it fell back to an easier level
+    /// when it stalled (§12 M5). A fact about the run rather than a reading of its
+    /// history, so it is carried through from the packet and not derived here.
+    pub curriculum: Option<String>,
     pub finished: bool,
     /// Tile the population is dying in, when a stall makes that the interesting
     /// question. `None` before a stall, and `None` until a level width is supplied.
@@ -186,6 +190,7 @@ impl RunSummary {
             trend: fitness_trend(history),
             stall: fitness_stall(history),
             genius: packet.genius,
+            curriculum: packet.curriculum.clone(),
             finished: packet.finished,
             deaths_at: None,
             deaths_count: 0,
@@ -240,6 +245,14 @@ pub struct ViewState {
     /// Per-gene mutation probability, always one of `lab::MUTATION_RATES`.
     pub mutation_rate: f32,
     pub show_deaths: bool,
+    /// Follow the leading agent's camera rather than holding the whole level still.
+    ///
+    /// Off by default, and that is the one place the two front-ends differ on purpose:
+    /// the terminal follows because its frame is eighty columns wide and cannot show a
+    /// whole level, while the window can — so following here is the viewer asking to
+    /// zoom in on the leader, not the only way to see anything. The terminal's `f` key
+    /// and this checkbox are the same control either way.
+    pub follow: bool,
     /// The recorded generation being shown, or `None` for the live view.
     pub scrub: Option<u32>,
 }
@@ -251,6 +264,7 @@ impl Default for ViewState {
             speed: crate::lab::DEFAULT_SPEED,
             mutation_rate: MUTATION_RATES[1],
             show_deaths: true,
+            follow: false,
             scrub: None,
         }
     }
@@ -274,6 +288,8 @@ pub enum Command {
     Save,
     /// Leave the scrubbed view and follow the live run again.
     Live,
+    /// Follow the leading agent's camera, or go back to the whole level.
+    ToggleFollow,
     /// Walk the record: -1 older, +1 newer.
     Scrub(i32),
     /// One rung of the speed ladder: +1 faster, -1 slower.
@@ -292,6 +308,9 @@ pub struct Actions {
     pub save: bool,
     /// Leave the scrubbed view and follow the live run again.
     pub resume: bool,
+    /// The follow checkbox was clicked. The window owns the state, as it does for pause:
+    /// the widget reports the intent and the state is flipped in one place.
+    pub follow: bool,
     /// -1 / +1 from the scrubber's step buttons.
     pub scrub_delta: i32,
 }
@@ -345,6 +364,8 @@ pub struct Keys {
     pub mutate_down: bool,
     /// `h`
     pub live: bool,
+    /// `f`
+    pub follow: bool,
     /// `s`
     pub save: bool,
     /// `left`
@@ -389,6 +410,9 @@ pub fn commands_for(keys: Keys, view: &ViewState) -> Vec<Command> {
     }
     if keys.live {
         out.push(Command::Live);
+    }
+    if keys.follow {
+        out.push(Command::ToggleFollow);
     }
     if keys.save {
         out.push(Command::Save);
@@ -458,6 +482,11 @@ pub fn lab_panel(
     }
     if summary.genius {
         ui.colored_label(WIN_TICK, "genius agent: max jumped by more than half");
+    }
+    // The run's own account of the one detour it took, in the words `evo` gave it: the
+    // window has no opinion about how the step went, it only has to say it happened.
+    if let Some(note) = &summary.curriculum {
+        ui.colored_label(TEXT, note);
     }
     if summary.finished {
         ui.colored_label(
@@ -563,6 +592,16 @@ pub fn lab_panel(
     view.mutation_rate = MUTATION_RATES[mut_index];
 
     ui.checkbox(&mut view.show_deaths, "show death marks");
+    // The button reports the intent and the window flips the state, exactly as the pause
+    // button does: a widget that changed it here as well would double-toggle.
+    let mut follow = view.follow;
+    if ui
+        .checkbox(&mut follow, "follow the leader")
+        .on_hover_text("follow the leading agent, or show the whole level")
+        .changed()
+    {
+        actions.follow = true;
+    }
 
     // --- the lanes --------------------------------------------------------
     ui.add_space(6.0);
@@ -978,6 +1017,7 @@ mod tests {
             level_name: "l1-flat-run".to_string(),
             level_hash: "test".to_string(),
             best: None,
+            curriculum: None,
             finished: false,
         }
     }
@@ -1137,6 +1177,24 @@ mod tests {
     }
 
     #[test]
+    fn the_curriculum_note_comes_from_the_packet_and_only_when_there_was_a_step() {
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 20.0, 9.0, 0)]);
+        let plain = RunSummary::new(&packet(points.clone(), Vec::new(), false), &points);
+        assert!(
+            plain.curriculum.is_none(),
+            "a run with no easier level has no step to report"
+        );
+
+        let note = "curriculum: 40 generations on l1-flat-run from the stalled population";
+        let mut stepped = packet(points.clone(), Vec::new(), false);
+        stepped.curriculum = Some(note.to_string());
+        let summary = RunSummary::new(&stepped, &points);
+        assert_eq!(summary.curriculum.as_deref(), Some(note));
+        // And the panel draws it: a rescue the window never mentions would be invisible.
+        draw_panel(&summary, &mut ViewState::default());
+    }
+
+    #[test]
     fn a_champions_remaining_distance_is_measured_in_tiles_not_in_fitness() {
         let won = BestLine::from_episode(4, 12, 431.2, "won", true, 210, 55.0, 58.0);
         assert_eq!(won.distance_to_goal, 0.0, "a won episode is at the flag");
@@ -1210,6 +1268,13 @@ mod tests {
                 ..Default::default()
             }),
             vec![Command::Live]
+        );
+        assert_eq!(
+            one(Keys {
+                follow: true,
+                ..Default::default()
+            }),
+            vec![Command::ToggleFollow]
         );
         assert_eq!(
             one(Keys {

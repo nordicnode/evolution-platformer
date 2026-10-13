@@ -11,6 +11,7 @@
 //! no rendering and no terminal I/O.
 
 pub mod champion;
+pub mod curriculum;
 pub mod fitness;
 pub mod ga;
 pub mod genome;
@@ -20,6 +21,7 @@ pub use champion::{
     check_reproducibility, ChampionFile, ChampionMetadata, NetworkSpec, TrainingSummary,
     CHAMPION_FORMAT, CHAMPION_VERSION,
 };
+pub use curriculum::{curriculum_step, CurriculumStep, DEFAULT_CURRICULUM_GENERATIONS};
 pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};
 pub use fitness::{
     run_episode, score, EpisodeResult, EpisodeRunner, EvalConfig, ACTION_REPEAT, FITNESS_VERSION,

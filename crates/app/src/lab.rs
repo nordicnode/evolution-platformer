@@ -37,13 +37,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use evo::{
-    BestEver, ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, Trainer,
+    curriculum_step, BestEver, ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome,
+    LaneKind, PopulationFile, Trainer,
 };
-use render::chart::HistoryPoint;
+use render::chart::{fitness_stall, HistoryPoint};
 use render::trace::{ChampionTrace, TraceLog, TracePoint, TRACE_SAMPLE_FRAMES};
 use sim::{Level, Outcome, Sim};
 
-pub use evo::MUTATION_RATES;
+pub use evo::{DEFAULT_CURRICULUM_GENERATIONS, MUTATION_RATES};
 
 /// Generations of death marks the canvas keeps, matching watch mode's `--death-window`:
 /// a forty-generation-old corpse says nothing about where the population is stuck *now*.
@@ -54,6 +55,57 @@ pub const DEATH_WINDOW: u32 = 25;
 /// is exactly the failure the view has to make visible, and a chart cannot show it.
 pub const DEFAULT_BEST_LANES: usize = 4;
 pub const DEFAULT_RANDOM_LANES: usize = 4;
+
+/// A file-name-safe version of a level name.
+///
+/// The level's *name*, not its file's: a level drawn in the editor has no file until it
+/// is saved, and one level should not produce two champions depending on how the run was
+/// launched. Everything that is not a letter or a digit collapses to a dash, so the
+/// result is always a usable file name whatever the level is called.
+pub fn slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, ' ' | '_' | '-') && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// How a run was asked for: how long it may run, where it starts from, and what to do
+/// when it stops moving.
+///
+/// One value rather than four arguments to [`Lab::start`], because these arrive together
+/// (from the command line or from the window) and belong to the *run*, not to the level
+/// it happens to be training on. A restart edits the resume field rather than rebuilding
+/// the whole thing: the population is new, the settings are the same.
+#[derive(Clone, Debug, Default)]
+pub struct RunPlan {
+    /// Stop after this many generations. `None` runs until the window stops it.
+    pub cap: Option<u32>,
+    /// Start from a population checkpoint instead of a fresh population, as the
+    /// terminal's `--resume` does. The checkpoint's generation and genome ids continue,
+    /// because the ids are part of every episode seed.
+    pub resume: Option<PathBuf>,
+    /// The easier level to fall back to when the run stalls, and for how long.
+    pub curriculum: Option<Curriculum>,
+}
+
+/// A run's fallback level: what a stalled population gets trained on instead (§12 M5).
+#[derive(Clone, Debug)]
+pub struct Curriculum {
+    pub level: Level,
+    /// Generations the detour lasts. At least one: a detour of zero generations would
+    /// checkpoint the population and hand it straight back, which is not a step.
+    pub generations: u32,
+}
 
 /// The speed ladder, in physics ticks per 1/60 s. Same rungs as watch mode's `--speed`,
 /// so the plan's 1x–50x range (§10 Tier 1.4) is a handful of steps wide here too.
@@ -163,6 +215,10 @@ pub struct Packet {
     pub target: Option<u32>,
     pub level_name: String,
     pub level_hash: String,
+    /// The note from the run's one curriculum step, if it fell back to an easier level
+    /// when it stalled (§12 M5). `None` for a run that never stalled, or one with no
+    /// easier level to fall back to.
+    pub curriculum: Option<String>,
     /// The run reached its cap and the worker has stopped.
     pub finished: bool,
 }
@@ -290,6 +346,28 @@ pub fn step_mutation_rate(current: f32, up: bool) -> f32 {
     MUTATION_RATES[next]
 }
 
+/// The centre of the agent a follow camera should be on, in tile coordinates.
+///
+/// The **live lane furthest along**, counting a winner still standing on the flag: the
+/// terminal watch mode's own rule, kept here rather than in the window for two reasons —
+/// it can be tested without a window, and the two front-ends cannot disagree about which
+/// agent "the leader" is. `None` when every lane is dead: there is nobody to follow, and
+/// the camera should stay where the viewer put it rather than fly to a corpse.
+pub fn leader_centre(lanes: &Lanes) -> Option<(f32, f32)> {
+    let mut leader: Option<(f32, (f32, f32))> = None;
+    for i in 0..lanes.len() {
+        let sim = lanes.sim(i);
+        let outcome = sim.outcome();
+        let player = sim.player();
+        let standing = !outcome.is_finished() || outcome == Outcome::Won;
+        let centre = (player.x + player.w * 0.5, player.y + player.h * 0.5);
+        if standing && leader.as_ref().is_none_or(|(x, _)| centre.0 > *x) {
+            leader = Some((centre.0, centre));
+        }
+    }
+    leader.map(|(_, centre)| centre)
+}
+
 /// Physics ticks one rendered frame is worth.
 ///
 /// Frame-rate independent on purpose: `speed` is "physics ticks per 1/60 s", so 8x is
@@ -307,35 +385,88 @@ pub struct Generator {
     level: Level,
     cfg: GaConfig,
     eval: EvalConfig,
+    /// How this run was asked for. A restart edits this rather than replacing it: a
+    /// fresh population is not a fresh set of settings.
+    plan: RunPlan,
+    /// Where a curriculum step writes its checkpoint — the level's own stem in the run's
+    /// output directory, which is the file `train-cli watch --resume` reads.
+    out_dir: PathBuf,
+    /// The checkpoint this run started from, as a note for the viewer.
+    origin: Option<String>,
+    /// The one curriculum step's note, kept for the rest of the run: "this run changed
+    /// shape" is not something the viewer should have to catch inside one generation.
+    curriculum: Option<String>,
     traces: TraceLog,
     history: Vec<HistoryPoint>,
     deaths: Vec<(f32, f32, u32)>,
     best_k: usize,
     random_k: usize,
-    target: Option<u32>,
 }
 
 impl Generator {
+    /// A fresh population, or — when the plan names a checkpoint — the population that
+    /// checkpoint holds.
+    ///
+    /// A resumed run continues the ids and the generation it was handed, for the reason
+    /// the terminal's `--resume` does: the ids are part of every episode seed, so
+    /// renumbering them would silently train on different episodes than the ones the
+    /// population was stalled on. A checkpoint's level hash is a note rather than a gate
+    /// — resuming on a different level is exactly what a curriculum step is, and
+    /// [`evo::PopulationFile::level_note`] is what says so out loud.
     pub fn new(
         level: Level,
         cfg: GaConfig,
         best_k: usize,
         random_k: usize,
-        target: Option<u32>,
-    ) -> Generator {
+        plan: RunPlan,
+        out_dir: PathBuf,
+    ) -> Result<Generator, String> {
         let cfg = cfg.sanitized(None);
-        Generator {
+        let (trainer, origin) = match plan.resume.as_deref() {
+            Some(path) => {
+                let checkpoint = PopulationFile::load(path)?;
+                let mut origin = format!("resumed {}", checkpoint.summary());
+                if let Some(note) = checkpoint.level_note(&level) {
+                    origin.push_str(&format!("; {note}"));
+                }
+                let trainer = Trainer::resume(
+                    cfg.clone(),
+                    checkpoint.to_genomes()?,
+                    checkpoint.generation,
+                )?;
+                (trainer, Some(origin))
+            }
+            None => (Trainer::new(cfg.clone()), None),
+        };
+        Ok(Generator {
             eval: cfg.eval_config(),
-            trainer: Trainer::new(cfg.clone()),
+            trainer,
             level,
             cfg,
+            plan,
+            out_dir,
+            origin,
+            curriculum: None,
             traces: TraceLog::new(),
             history: Vec::new(),
             deaths: Vec::new(),
             best_k,
             random_k,
-            target,
-        }
+        })
+    }
+
+    /// How this run was asked for, including the edits a restart makes to it.
+    ///
+    /// Only the tests read this: the window asks the [`Lab`] what a run is doing, never
+    /// the generator, which belongs to the worker thread.
+    #[cfg(test)]
+    pub fn plan(&self) -> &RunPlan {
+        &self.plan
+    }
+
+    /// The checkpoint this run was started from, as a note for the viewer.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 
     /// The level a generation is being evaluated on. The window reads the run's level
@@ -362,6 +493,13 @@ impl Generator {
         self.history.clear();
         self.deaths.clear();
         self.level = level;
+        // A restart means a *fresh population*, so a checkpoint this run started from is
+        // dropped: reproducing it is the opposite of what Restart means. The fallback
+        // level stays, because it is a setting of the run rather than of its population,
+        // and a run restarted onto a hard level still wants somewhere to step back to.
+        self.plan.resume = None;
+        self.origin = None;
+        self.curriculum = None;
     }
 
     /// The viewer's live mutation-rate slider: applied from the next generation on, so a
@@ -448,6 +586,42 @@ impl Generator {
         });
         let run = self.history.len() as u32;
 
+        // The stall the panel is about to report is the trigger for the run's one
+        // curriculum step (§12 M5). It reads the *same* stall rule the summary line
+        // shows, so a run cannot step back to an easier level on a stall the viewer is
+        // not being told about, and it happens before the packet is packaged so the note
+        // and the history it describes arrive together.
+        if self.curriculum.is_none() {
+            let fallback = self
+                .plan
+                .curriculum
+                .as_ref()
+                .map(|c| (c.level.clone(), c.generations));
+            if let (Some((easier, generations)), Some(stall)) = (fallback, fitness_stall(&self.history))
+            {
+                let path = self
+                    .out_dir
+                    .join(format!("{}.population.json", slug(&self.level.name)));
+                self.curriculum = Some(
+                    match curriculum_step(
+                        &mut self.trainer,
+                        &self.level,
+                        &easier,
+                        generations,
+                        &path,
+                        self.cfg.mutation_rate,
+                        &stall.label(),
+                    ) {
+                        Ok(step) => step.note(&self.level.name),
+                        // A step that cannot run is not a reason to lose the run: the
+                        // stall line still says the search has stopped, which is the
+                        // honest thing to leave on screen.
+                        Err(err) => format!("curriculum step failed: {err}"),
+                    },
+                );
+            }
+        }
+
         Packet {
             generation: report.generation,
             max_fitness: report.max_fitness,
@@ -461,10 +635,11 @@ impl Generator {
             deaths: self.deaths.clone(),
             traces: self.traces.entries().to_vec(),
             best: self.trainer.best_ever().cloned(),
-            target: self.target,
+            target: self.plan.cap,
             level_name: self.level.name.clone(),
             level_hash: self.level.content_hash_string(),
-            finished: self.target.is_some_and(|t| run >= t),
+            curriculum: self.curriculum.clone(),
+            finished: self.plan.cap.is_some_and(|t| run >= t),
         }
     }
 }
@@ -618,6 +793,14 @@ pub struct Lab {
     asked: bool,
     /// The run's configuration, mirrored here for the champion file's metadata.
     config: GaConfig,
+    /// Where this run's own files go: the champion the viewer saves, and the checkpoint a
+    /// curriculum step writes. One directory for the run, so a run's artifacts are not
+    /// scattered by whoever wrote them.
+    out_dir: PathBuf,
+    /// The checkpoint this run was started from, when it was resumed rather than started
+    /// fresh (`--resume`). The window shows it once, because a number on screen that came
+    /// from another level deserves saying so.
+    origin: Option<String>,
 }
 
 impl Lab {
@@ -628,10 +811,21 @@ impl Lab {
         cfg: GaConfig,
         best_k: usize,
         random_k: usize,
-        target: Option<u32>,
+        plan: RunPlan,
+        out_dir: PathBuf,
     ) -> Result<Lab, String> {
         let cfg = cfg.sanitized(None);
-        let generator = Generator::new(level.clone(), cfg.clone(), best_k, random_k, target);
+        // A checkpoint that cannot be loaded is a startup error, not a run that quietly
+        // trains something else: it is the same refusal the terminal's `--resume` makes.
+        let generator = Generator::new(
+            level.clone(),
+            cfg.clone(),
+            best_k,
+            random_k,
+            plan,
+            out_dir.clone(),
+        )?;
+        let origin = generator.origin().map(str::to_string);
         let rate = cfg.mutation_rate;
         let hub = Arc::new(Hub {
             state: Mutex::new(State {
@@ -659,7 +853,28 @@ impl Lab {
             pop_size: cfg.pop_size,
             asked: true,
             config: cfg,
+            out_dir,
+            origin,
         })
+    }
+
+    /// Where this run's files go.
+    pub fn out_dir(&self) -> &Path {
+        &self.out_dir
+    }
+
+    /// The stem this run names its files with.
+    ///
+    /// Derived from the level's name rather than stored, so a run restarted onto another
+    /// level names its artifacts after the level it is actually training on.
+    pub fn stem(&self) -> String {
+        slug(&self.level_name)
+    }
+
+    /// The checkpoint this run started from, when it was resumed rather than started
+    /// fresh.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 
     /// The level the run is training on. Not the editor's document: a lane has to be
@@ -823,14 +1038,52 @@ mod tests {
         }
     }
 
+    /// A scratch directory for a test's artifacts: the champion it writes and the
+    /// checkpoint a curriculum step writes both land here rather than in the repository.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("evo-app-{tag}-{}", std::process::id()));
+        // A directory left behind by an earlier run must not be mistaken for this one's
+        // output: "the checkpoint exists" is only evidence if nothing wrote it before this
+        // test did.
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     fn new_generator(slug: &str, target: Option<u32>) -> Generator {
+        generator_on(slug, RunPlan {
+            cap: target,
+            ..RunPlan::default()
+        })
+    }
+
+    fn generator_on(slug: &str, plan: RunPlan) -> Generator {
+        generator_with(slug, tiny_config(), plan, "lab")
+    }
+
+    /// A generator writing its artifacts under their own tag: two tests running in
+    /// parallel must not find each other's checkpoint.
+    fn generator_with(slug: &str, cfg: GaConfig, plan: RunPlan, tag: &str) -> Generator {
         Generator::new(
             shipped(slug),
-            tiny_config(),
+            cfg,
             DEFAULT_BEST_LANES,
             DEFAULT_RANDOM_LANES,
-            target,
+            plan,
+            scratch(tag),
         )
+        .expect("a fresh generator starts")
+    }
+
+    /// A population small enough that the hardest level stalls inside a test's patience:
+    /// two genomes of a level that needs a precise jump stop improving almost at once.
+    /// The terminal's own curriculum test uses the same recipe on the same level.
+    fn stalling_config() -> GaConfig {
+        GaConfig {
+            pop_size: 2,
+            elite: 1,
+            tournament: 2,
+            ..tiny_config()
+        }
     }
 
     fn wait_for(lab: &mut Lab, budget: Duration) -> Option<Lanes> {
@@ -1026,6 +1279,60 @@ mod tests {
         assert!((score(replay.sim().stats(), replay.sim().outcome()) - lane.fitness).abs() < 1e-3);
     }
 
+    /// The follow camera's rule, animated for real: the leader is a lane that is still
+    /// standing, and no standing lane is further along than it is.
+    #[test]
+    fn the_leader_is_the_lane_furthest_along_that_is_still_standing() {
+        let mut generator = new_generator("l2-first-gap", None);
+        let packet = generator.next_packet();
+        let level = generator.level().clone();
+        let eval = tiny_config().eval_config();
+        let mut lanes = Lanes::new(packet, &level, &eval);
+
+        let standing_centres = |lanes: &Lanes| -> Vec<(f32, f32)> {
+            (0..lanes.len())
+                .filter_map(|i| {
+                    let sim = lanes.sim(i);
+                    let outcome = sim.outcome();
+                    let player = sim.player();
+                    (!outcome.is_finished() || outcome == Outcome::Won)
+                        .then_some((player.x + player.w * 0.5, player.y + player.h * 0.5))
+                })
+                .collect()
+        };
+
+        let mut followed = 0usize;
+        for _ in 0..400 {
+            let standing = standing_centres(&lanes);
+            match leader_centre(&lanes) {
+                Some(centre) => {
+                    followed += 1;
+                    assert!(
+                        standing.contains(&centre),
+                        "the leader {centre:?} is not one of the standing lanes {standing:?}"
+                    );
+                    let furthest = standing
+                        .iter()
+                        .map(|(x, _)| *x)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    assert_eq!(
+                        centre.0, furthest,
+                        "a lane further along should have been followed"
+                    );
+                }
+                None => assert!(
+                    standing.is_empty(),
+                    "nobody standing, so there is nobody to follow"
+                ),
+            }
+            if lanes.is_finished() {
+                break;
+            }
+            lanes.advance(1.0 / 60.0, 8);
+        }
+        assert!(followed > 0, "the rule never had anybody to follow");
+    }
+
     #[test]
     fn speed_is_frame_rate_independent_and_clamped() {
         // At 60 Hz, 8x is eight ticks a frame; at 120 Hz the same second of wall clock
@@ -1047,7 +1354,18 @@ mod tests {
     #[test]
     fn a_run_waits_for_the_viewer_between_generations() {
         let level = shipped("l1-flat-run");
-        let mut lab = Lab::start(&level, tiny_config(), 4, 4, Some(2)).expect("thread starts");
+        let mut lab = Lab::start(
+            &level,
+            tiny_config(),
+            4,
+            4,
+            RunPlan {
+                cap: Some(2),
+                ..RunPlan::default()
+            },
+            scratch("lab-run"),
+        )
+        .expect("thread starts");
         assert!(lab.trained_on(&level));
         assert!(!lab.trained_on(&shipped("l2-first-gap")));
 
@@ -1075,7 +1393,15 @@ mod tests {
     #[test]
     fn a_fresh_run_starts_on_the_level_it_was_asked_for() {
         let level = shipped("l1-flat-run");
-        let mut lab = Lab::start(&level, tiny_config(), 2, 2, None).expect("thread starts");
+        let mut lab = Lab::start(
+            &level,
+            tiny_config(),
+            2,
+            2,
+            RunPlan::default(),
+            scratch("lab-fresh"),
+        )
+        .expect("thread starts");
         // A restart does not wait for the animation to finish: the window may want to
         // abandon a run it has already seen the first generation of.
         lab.restart(&shipped("l3-gauntlet"), 7);
@@ -1096,7 +1422,7 @@ mod tests {
             .clone()
             .expect("a scored generation has a best-ever genome");
 
-        let dir = std::env::temp_dir().join(format!("evo-app-champion-{}", std::process::id()));
+        let dir = scratch("champion");
         let path = save_champion(&best, generator.level(), &tiny_config(), &dir, "l3-gauntlet")
             .expect("the champion file is written");
         let loaded = ChampionFile::load_for_level(&path, generator.level())
@@ -1115,10 +1441,292 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
+    /// The window's `--curriculum`, driven end to end: a run that stops moving writes
+    /// its stuck population down, trains it on the easier level, says so once, and
+    /// carries on where it was.
+    #[test]
+    fn a_stalled_run_checkpoints_itself_and_hands_the_population_back() {
+        // L5 at pop 2 does not improve for the 25 generations the stall rule asks for,
+        // which is exactly the trigger; L1 is easier, and a small population wins it at
+        // once, so the detour is cheap to run. Same shape as the terminal's own test of
+        // the same feature, because it is the same feature.
+        let dir = scratch("curriculum");
+        let mut generator = generator_with(
+            "l5-tightrope",
+            stalling_config(),
+            RunPlan {
+                cap: Some(40),
+                curriculum: Some(Curriculum {
+                    level: shipped("l1-flat-run"),
+                    generations: 2,
+                }),
+                ..RunPlan::default()
+            },
+            "curriculum",
+        );
+
+        // The note is sticky on purpose — "this run changed shape" is not something the
+        // viewer should have to catch inside one generation — so the test waits for it to
+        // appear, then insists that it never changes afterwards. A run that stepped a
+        // second time would have a second set of numbers to report.
+        let (mut note, mut first_seen, mut last) = (None, None, None);
+        for _ in 0..40 {
+            let packet = generator.next_packet();
+            if let Some(text) = &packet.curriculum {
+                match &note {
+                    None => {
+                        first_seen = Some(packet.generation);
+                        assert!(
+                            text.contains(&shipped("l1-flat-run").name),
+                            "the note names the level the population was trained on: {text}"
+                        );
+                        assert!(text.contains("best there"), "{text}");
+                        assert!(text.contains("back on"), "{text}");
+                    }
+                    Some(earlier) => assert_eq!(
+                        earlier, text,
+                        "the run stepped back a second time: the note changed"
+                    ),
+                }
+                note = Some(text.clone());
+            }
+            last = Some(packet.clone());
+            if packet.finished {
+                break;
+            }
+        }
+        let note = note.expect("L5 at pop 2 stalls, so the step should have fired");
+        assert!(
+            note.contains("stalled population"),
+            "the note should say where the population came from: {note}"
+        );
+        assert!(
+            note.contains(&shipped("l5-tightrope").name),
+            "the note should say which level the run is back on: {note}"
+        );
+
+        // The checkpoint is the stuck population, under the level's own stem: that file
+        // is the way back into this run, for the terminal's `--resume` and the window's.
+        let path = dir.join("l5-tightrope.population.json");
+        let checkpoint = PopulationFile::load(&path).expect("the step's checkpoint loads");
+        assert_eq!(checkpoint.networks.len(), 2, "the whole population is written");
+        assert!(
+            checkpoint.note.contains("stalled"),
+            "the checkpoint records why it exists: {:?}",
+            checkpoint.note
+        );
+        assert!(
+            checkpoint.generation > 0 && checkpoint.generation < 40,
+            "the checkpoint was taken at the stall, not at the cap: generation {}",
+            checkpoint.generation
+        );
+        // And it was taken when the note appeared, not at some later stall: the run
+        // stepped back once, so the file a viewer would resume has the population the
+        // first stall held.
+        let seen = first_seen.expect("the note was seen");
+        assert!(
+            checkpoint.generation <= seen + 1,
+            "the checkpoint (generation {}) is newer than the step the note reported \
+             (generation {seen}), so the run stepped back twice",
+            checkpoint.generation
+        );
+
+        // The run kept its own chart on its own level: the detour is a pause in the run,
+        // not a new run, so the history is the main level's from start to finish.
+        let last = last.expect("the loop scored at least one generation");
+        assert_eq!(last.generation, 39, "a capped run still runs to its cap");
+        assert_eq!(last.history.last().map(|p| p.generation), Some(39));
+        assert_eq!(last.level_name, shipped("l5-tightrope").name);
+    }
+
+    /// A run without an easier level never steps back, however long it sits still: the
+    /// stall line reports the stall, and nothing acts on it.
+    #[test]
+    fn a_run_with_no_easier_level_stalls_without_stepping_back() {
+        let mut generator = generator_with(
+            "l5-tightrope",
+            stalling_config(),
+            RunPlan {
+                cap: Some(40),
+                ..RunPlan::default()
+            },
+            "stalls",
+        );
+        let mut stalled = false;
+        for _ in 0..40 {
+            let packet = generator.next_packet();
+            assert!(packet.curriculum.is_none(), "there is no level to fall back to");
+            stalled |= fitness_stall(&packet.history).is_some();
+            if packet.finished {
+                break;
+            }
+        }
+        assert!(
+            stalled,
+            "this run has to actually stall, or it proves nothing about stepping back"
+        );
+        assert!(
+            !scratch("lab").join("l5-tightrope.population.json").exists(),
+            "a run with nowhere to fall back to writes no checkpoint"
+        );
+    }
+
+    /// The window's `--resume`: the population, its ids and its generation continue from
+    /// the checkpoint, and the run says where it came from.
+    #[test]
+    fn a_run_started_from_a_checkpoint_continues_it() {
+        let dir = scratch("resume");
+        let level = shipped("l3-gauntlet");
+        let cfg = tiny_config();
+
+        // Write a checkpoint the way a step does, out of a real run's own population.
+        let mut source = Generator::new(
+            level.clone(),
+            cfg.clone(),
+            2,
+            2,
+            RunPlan {
+                cap: Some(3),
+                ..RunPlan::default()
+            },
+            dir.clone(),
+        )
+        .expect("a fresh generator starts");
+        let mut packet = source.next_packet();
+        for _ in 1..3 {
+            packet = source.next_packet();
+        }
+        let genomes: Vec<Genome> = packet
+            .lanes
+            .iter()
+            .take(2)
+            .map(|lane| lane.genome.clone())
+            .collect();
+        let checkpoint = PopulationFile::new(
+            &genomes,
+            packet.generation,
+            &level,
+            &cfg,
+            "operator's own reason",
+        );
+        let path = dir.join("l3-gauntlet.population.json");
+        checkpoint.save(&path).expect("the checkpoint is written");
+
+        let mut resumed = Generator::new(
+            level.clone(),
+            cfg.clone(),
+            2,
+            2,
+            RunPlan {
+                cap: Some(1),
+                resume: Some(path.clone()),
+                ..RunPlan::default()
+            },
+            dir.clone(),
+        )
+        .expect("a checkpoint this build wrote loads");
+
+        let origin = resumed.origin().expect("a resumed run says where it came from");
+        assert!(origin.starts_with("resumed "), "{origin}");
+        assert!(origin.contains("population of 2"), "{origin}");
+        assert!(
+            origin.contains("operator's own reason"),
+            "the checkpoint's own note comes through: {origin}"
+        );
+
+        let first = resumed.next_packet();
+        assert_eq!(
+            first.generation, checkpoint.generation,
+            "a resumed run scores the checkpoint's own generation first — nothing is skipped \
+             and nothing is renumbered"
+        );
+        let ids: Vec<u32> = first.lanes.iter().map(|lane| lane.genome_id).collect();
+        assert!(
+            ids.iter().all(|id| checkpoint.genome_ids.contains(id)),
+            "the lanes are the checkpoint's genomes, not a fresh population: {ids:?} against {:?}",
+            checkpoint.genome_ids
+        );
+
+        // And a checkpoint that cannot be read is a refusal, not a run on something else.
+        let missing = Generator::new(
+            level,
+            cfg,
+            2,
+            2,
+            RunPlan {
+                resume: Some(dir.join("not-written-yet.json")),
+                ..RunPlan::default()
+            },
+            dir,
+        );
+        assert!(
+            missing.is_err(),
+            "a checkpoint that does not load must not silently train a fresh population"
+        );
+    }
+
+    /// A restart is a fresh population: the checkpoint it may have started from is
+    /// forgotten, while the fallback level — a setting of the run rather than of its
+    /// population — is kept.
+    #[test]
+    fn a_restart_forgets_the_checkpoint_but_keeps_the_fallback() {
+        let dir = scratch("restart-plan");
+        let level = shipped("l1-flat-run");
+        let cfg = tiny_config();
+        let mut rng = sim::rng_from_seed(7);
+        let genomes = vec![
+            Genome::random(11, evo::default_shape(), &mut rng),
+            Genome::random(12, evo::default_shape(), &mut rng),
+        ];
+        let checkpoint = PopulationFile::new(&genomes, 12, &level, &cfg, "a stall");
+        let path = dir.join("l1-flat-run.population.json");
+        checkpoint.save(&path).expect("the checkpoint is written");
+
+        let mut generator = Generator::new(
+            level.clone(),
+            cfg,
+            2,
+            2,
+            RunPlan {
+                resume: Some(path),
+                curriculum: Some(Curriculum {
+                    level: shipped("l2-first-gap"),
+                    generations: 3,
+                }),
+                ..RunPlan::default()
+            },
+            dir,
+        )
+        .expect("the checkpoint loads");
+
+        generator.start_over(shipped("l3-gauntlet"), 5, 0.05);
+        assert!(
+            generator.plan().resume.is_none(),
+            "a restart reproduces nothing: it starts a fresh population"
+        );
+        assert!(
+            generator.plan().curriculum.is_some(),
+            "the fallback level belongs to the run, not to the population"
+        );
+        assert!(
+            generator.origin().is_none(),
+            "nothing to declare about a population nobody handed over"
+        );
+        assert_eq!(generator.next_packet().generation, 0);
+    }
+
     #[test]
     fn dropping_the_lab_stops_the_worker() {
         let level = shipped("l1-flat-run");
-        let lab = Lab::start(&level, tiny_config(), 4, 4, None).expect("thread starts");
+        let lab = Lab::start(
+            &level,
+            tiny_config(),
+            4,
+            4,
+            RunPlan::default(),
+            scratch("lab-drop"),
+        )
+        .expect("thread starts");
         let started = Instant::now();
         drop(lab);
         // `stop` joins the thread, so returning here at all proves the quit handshake

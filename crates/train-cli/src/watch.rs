@@ -41,8 +41,8 @@ use crossterm::terminal::{
     LeaveAlternateScreen,
 };
 use evo::{
-    ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, MUTATION_RATES,
-    PopulationFile, ShowcaseLane, Trainer,
+    curriculum_step, ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind,
+    MUTATION_RATES, PopulationFile, ShowcaseLane, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
 use render::chart::{
@@ -83,14 +83,6 @@ const WATCH_OPTS: &[&str] = &[
     "curriculum-generations",
     "resume",
 ];
-
-/// Generations spent on the easier level when a run stalls (§12 M5, finding 22).
-///
-/// Measured, not guessed: a 40-generation detour was the cheapest that rescued both
-/// stalled seeds tried, and the longer ones were strictly worse on the seed that was
-/// going to solve anyway (L5 seed 3 won at overall generation 100 with 40 detour
-/// generations, and at 284 and 321 with 100 and 200).
-const DEFAULT_CURRICULUM_GENERATIONS: u32 = 40;
 
 /// The speed ladder. `+`/`-` step through it rather than doubling forever, so the
 /// range the plan asks for (1x-50x, §10 Tier 1.4) is seven keystrokes wide and no
@@ -342,16 +334,19 @@ pub fn watch(a: &Args) -> Result<(), String> {
         // so the run cannot act on a stall the viewer is not being told about.
         if curriculum_taken.is_none() {
             if let (Some(stall), Some(easier)) = (fitness_stall(&history), &curriculum_level) {
-                let summary = run_curriculum_step(
+                // The step itself is `evo`'s, because the window runs the same one:
+                // a checkpoint and an excursion are the run's, not a front-end's.
+                let path = Path::new(&out_dir).join(format!("{stem}.population.json"));
+                let step = curriculum_step(
                     &mut trainer,
                     &level,
                     easier,
                     curriculum_generations,
-                    &live,
-                    &stem,
-                    &out_dir,
-                    stall,
+                    &path,
+                    live.mut_rate,
+                    &stall.label(),
                 )?;
+                let summary = step.note(&level.name);
                 note = Some(summary.clone());
                 curriculum_taken = Some(summary);
             }
@@ -1454,79 +1449,6 @@ fn save_champion(
         best.generation,
         best.result.fitness,
         path.display()
-    ))
-}
-
-/// One curriculum step: checkpoint the stuck population, train it on the easier
-/// level for a while, and hand it back to the run it came from (§12 M5).
-///
-/// The excursion is **not animated**, deliberately. At pop 200 a generation costs
-/// about 14 ms, so the whole detour is over in well under a second, while forty
-/// seconds of a *different level* on screen would bury the thing the viewer is
-/// actually waiting for — the hard level's next generation. What the viewer gets
-/// instead is a note naming what happened, and a run whose population has changed.
-///
-/// The population is trained on the easier level by a separate trainer and adopted
-/// back, so the run keeps its own chart, its own best-ever champion and its own RNG
-/// stream: those belong to the run, not to whichever level the population last saw.
-///
-/// Returns the note to show. Errors only for real failures (a checkpoint that cannot
-/// be written, a population that cannot be adopted) — a detour that learns nothing is
-/// a result, not an error.
-#[allow(clippy::too_many_arguments)]
-fn run_curriculum_step(
-    trainer: &mut Trainer,
-    main_level: &Level,
-    curriculum_level: &Level,
-    generations: u32,
-    live: &LiveState,
-    stem: &str,
-    out_dir: &str,
-    stall: Stall,
-) -> Result<String, String> {
-    // The stuck population on disk, before anything moves it: this is the plan's
-    // "checkpoint at the stuck point", and it is what makes an unrepeatable run
-    // repeatable — `watch --resume` is the way back in.
-    let checkpoint = PopulationFile::new(
-        &trainer.genomes,
-        trainer.generation,
-        main_level,
-        &trainer.config,
-        format!("stalled: {}", stall.label()),
-    );
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("cannot create {out_dir}: {e}"))?;
-    let path = Path::new(out_dir).join(format!("{stem}.population.json"));
-    checkpoint.save(&path)?;
-
-    // A real training run on the easier level, from the population that is stuck:
-    // same genomes, same ids (they are part of every episode seed), same
-    // hyperparameters — including the mutation rate the viewer has dialled in.
-    let mut cfg = trainer.config.clone();
-    cfg.mutation_rate = live.mut_rate;
-    let mut excursion = Trainer::resume(cfg, trainer.genomes.clone(), trainer.generation)?;
-    let mut best = f32::NEG_INFINITY;
-    let mut flag_at = None;
-    for _ in 0..generations {
-        let report = excursion.step(curriculum_level);
-        best = best.max(report.max_fitness);
-        if report.wins > 0 && flag_at.is_none() {
-            flag_at = Some(excursion.generation);
-        }
-    }
-    let spent = excursion.generation.saturating_sub(trainer.generation);
-    trainer.adopt(excursion.genomes.clone())?;
-
-    Ok(format!(
-        "curriculum: {spent} generations on {} from the stalled population \
-         (checkpoint -> {}, best there {}, {}); back on {}",
-        curriculum_level.name,
-        path.display(),
-        format_fitness(best),
-        match flag_at {
-            Some(g) => format!("flag reached at its generation {g}"),
-            None => "flag not reached there yet".to_string(),
-        },
-        main_level.name
     ))
 }
 

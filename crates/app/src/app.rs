@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use egui::{Color32, Context, Pos2, Rect, Sense, Stroke, Vec2};
 use evo::GaConfig;
-use sim::Tile;
+use sim::{Level, Tile};
 
 use crate::atlas::Atlas;
 use crate::editor::{Brush, Editor};
@@ -46,6 +46,13 @@ use render::chart::HistoryPoint;
 
 /// Height of the fitness chart's strip at the bottom of the window.
 const CHART_PANEL_HEIGHT: f32 = 150.0;
+
+/// Points per tile the follow camera zooms to.
+///
+/// Following means looking at one agent, and the whole-level fit would make that
+/// pointless: at a fit zoom a 60-tile level draws a six-pixel agent. The zoom is only
+/// raised to this, never lowered, so a viewer who has zoomed in further keeps their zoom.
+const FOLLOW_ZOOM: f32 = 34.0;
 
 /// Which of the three things the window is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +71,17 @@ pub struct LabOptions {
     pub seed: u64,
     /// Stop after this many generations. `None` runs until the window is closed.
     pub generations: Option<u32>,
-    /// Where `Save champion` writes.
+    /// Where `Save champion` writes, and where a curriculum step's checkpoint goes.
     pub champions: PathBuf,
+    /// Start the run from a population checkpoint instead of a fresh population, as
+    /// `train-cli watch --resume` does.
+    pub resume: Option<PathBuf>,
+    /// Easier level to fall back to when the run stalls (§12 M5), loaded when the run
+    /// starts — a mistyped path is then an error at startup rather than a surprise forty
+    /// generations into a stalled run, which is the terminal's rule too.
+    pub curriculum: Option<PathBuf>,
+    /// Generations a curriculum step spends on that easier level.
+    pub curriculum_generations: u32,
 }
 
 impl Default for LabOptions {
@@ -76,6 +92,9 @@ impl Default for LabOptions {
             seed: GaConfig::default().master_seed,
             generations: None,
             champions: PathBuf::from("champions"),
+            resume: None,
+            curriculum: None,
+            curriculum_generations: lab::DEFAULT_CURRICULUM_GENERATIONS,
         }
     }
 }
@@ -155,6 +174,10 @@ struct EvoApp {
     applied_rate: Option<f32>,
     /// The screenshot path has primed the run with a real generation.
     shot_primed: bool,
+    /// A run that stopped at its cap has been saved once. The terminal writes the best
+    /// genome when a watched run ends, and this is the same promise kept per run rather
+    /// than per keypress.
+    saved_end: bool,
 }
 
 impl EvoApp {
@@ -211,6 +234,7 @@ impl EvoApp {
             summary: None,
             view: ViewState::default(),
             single_step: false,
+            saved_end: false,
             genius_left: 0.0,
             note: None,
             applied_rate: None,
@@ -259,14 +283,32 @@ impl EvoApp {
                 master_seed: self.seed,
                 ..GaConfig::default()
             };
+            let plan = match self.run_plan() {
+                Ok(plan) => plan,
+                Err(err) => {
+                    self.editor.message = err;
+                    return;
+                }
+            };
             match Lab::start(
                 &self.editor.level,
                 cfg,
                 lab::DEFAULT_BEST_LANES,
                 lab::DEFAULT_RANDOM_LANES,
-                self.options.generations,
+                plan,
+                self.options.champions.clone(),
             ) {
-                Ok(lab) => self.lab = Some(lab),
+                Ok(lab) => {
+                    // A run handed a population from somewhere else says so once: the
+                    // numbers on screen are a claim about a level, and a checkpoint from
+                    // a different one is exactly the thing a viewer must not have to
+                    // guess.
+                    if let Some(origin) = lab.origin() {
+                        self.note = Some((origin.to_string(), 12.0));
+                    }
+                    self.lab = Some(lab);
+                    self.saved_end = false;
+                }
                 Err(err) => {
                     // A worker that cannot start is a status message, not a lost window.
                     self.editor.message = err;
@@ -283,6 +325,29 @@ impl EvoApp {
         }
         self.mode = Mode::Evolve;
         self.fit_pending = true;
+    }
+
+    /// The run the command line asked for: how long, from where, and what to do when it
+    /// stalls.
+    ///
+    /// The easier level is loaded here rather than by the worker, so a level that cannot
+    /// be read is reported where the viewer is looking instead of inside a thread that is
+    /// already training. Both paths are the terminal's: `--curriculum` is a startup error
+    /// there too, and both front-ends must accept and refuse the same command lines.
+    fn run_plan(&self) -> Result<lab::RunPlan, String> {
+        let curriculum = match &self.options.curriculum {
+            Some(path) => Some(lab::Curriculum {
+                level: Level::from_json_file(path)
+                    .map_err(|e| format!("--curriculum {}: {e}", path.display()))?,
+                generations: self.options.curriculum_generations.max(1),
+            }),
+            None => None,
+        };
+        Ok(lab::RunPlan {
+            cap: self.options.generations,
+            resume: self.options.resume.clone(),
+            curriculum,
+        })
     }
 
     /// Start a fresh population on the level as it stands, on the next seed up.
@@ -302,6 +367,7 @@ impl EvoApp {
         self.summary = None;
         self.single_step = false;
         self.view.scrub = None;
+        self.saved_end = false;
         self.applied_rate = Some(self.view.mutation_rate);
         self.note = Some((format!("{why} (seed {})", self.seed), 6.0));
     }
@@ -331,6 +397,7 @@ impl EvoApp {
             }
         }
 
+        let mut ended = false;
         if let Some(lanes) = self.lab.as_mut().and_then(|lab| lab.take()) {
             let packet = lanes.packet().clone();
             if packet.genius {
@@ -347,6 +414,11 @@ impl EvoApp {
             self.summary = Some(self.summarise(&packet));
             self.packet = Some(packet);
             self.lanes = Some(lanes);
+            ended = self.packet.as_ref().is_some_and(|packet| packet.finished);
+        }
+
+        if ended {
+            self.save_if_run_ended();
         }
 
         let Some(lanes) = &mut self.lanes else {
@@ -399,6 +471,21 @@ impl EvoApp {
         summary
     }
 
+    /// Write the run's champion out if the run has reached its cap.
+    ///
+    /// A watched run is a real run — the terminal's rule — so the best genome it found is
+    /// saved when it stops, and watching instead of training wastes nothing. Only a
+    /// *capped* run ends by itself, and a cap is something the viewer asked for, so this
+    /// cannot write a file nobody wanted. Once per run: a run that is over stays over
+    /// until it is restarted, and a file rewritten every frame would be a disk spinner.
+    fn save_if_run_ended(&mut self) {
+        if self.saved_end || !self.packet.as_ref().is_some_and(|packet| packet.finished) {
+            return;
+        }
+        self.saved_end = true;
+        self.save_champion();
+    }
+
     /// Write the best-ever genome the same way `train-cli train` writes one, so watching
     /// instead of training wastes nothing: the file is the same format, with the same
     /// provenance, and `train-cli replay` can re-verify it.
@@ -408,8 +495,11 @@ impl EvoApp {
             self.note = Some(("nothing to save: no generation has been scored".into(), 6.0));
             return;
         };
-        let dir = self.options.champions.clone();
-        let stem = slug(&lab.level().name);
+        // The run names its own files (`lab::stem`), so the champion a viewer saves
+        // while watching is the same file, in the same place, as the one the terminal
+        // writes for the same level.
+        let dir = lab.out_dir().to_path_buf();
+        let stem = lab.stem();
         let note = match lab::save_champion(&best, lab.level(), lab.config(), &dir, &stem) {
             Ok(path) => format!(
                 "saved champion gen {} fitness {:.2} -> {}",
@@ -466,7 +556,12 @@ impl EvoApp {
         if grid {
             self.grid = !self.grid;
         }
-        if fit {
+        // `f` is one key with two meanings, split by mode rather than by modifier: in the
+        // editor it fits the level in the window, and in the evolution view it is the
+        // terminal's follow/whole-level toggle. Both are the same idea — "show me all of
+        // it" against "put me on the thing that matters" — and following re-fits when it
+        // is switched off, which is what makes the two modes agree about the key.
+        if fit && self.mode != Mode::Evolve {
             self.fit_pending = true;
         }
         if save {
@@ -496,6 +591,9 @@ impl EvoApp {
                 if play || evolve || escape {
                     self.mode = Mode::Edit;
                 }
+                if fit {
+                    self.apply(Command::ToggleFollow);
+                }
                 self.evolve_keys(ctx);
             }
         }
@@ -505,8 +603,9 @@ impl EvoApp {
     ///
     /// They are the terminal watch mode's own bindings (`space` pauses, `-`/`+` change
     /// speed, `m`/`M` change the mutation rate, `n` steps one generation, `left`/`right`
-    /// walk the record, `h` returns to live, `s` saves the champion) — two front-ends for
-    /// one game teaching two different keyboards would be a bug, not a feature.
+    /// walk the record, `h` returns to live, `s` saves the champion, `f` follows the
+    /// leader) — two front-ends for one game teaching two different keyboards would be a
+    /// bug, not a feature.
     fn evolve_keys(&mut self, ctx: &Context) {
         let keys = ctx.input(|i| panel::Keys {
             pause: i.key_pressed(egui::Key::Space),
@@ -516,6 +615,7 @@ impl EvoApp {
             mutate_up: i.key_pressed(egui::Key::M) && i.modifiers.shift,
             mutate_down: i.key_pressed(egui::Key::M) && !i.modifiers.shift,
             live: i.key_pressed(egui::Key::H),
+            follow: i.key_pressed(egui::Key::F),
             save: i.key_pressed(egui::Key::S) && !i.modifiers.command,
             older: i.key_pressed(egui::Key::ArrowLeft),
             newer: i.key_pressed(egui::Key::ArrowRight),
@@ -572,6 +672,11 @@ impl EvoApp {
         for _ in 0..40 {
             self.evolve_step(1.0 / 60.0);
         }
+        // The scripted path took its generations without passing through the take that
+        // normally notices a capped run ending, so the same end-of-run save is offered
+        // here: a `--screenshot --generations N` run leaves the same artifacts a session
+        // at the keyboard would.
+        self.save_if_run_ended();
     }
 
     /// The right-hand panel in the evolution view.
@@ -618,6 +723,9 @@ impl EvoApp {
         if actions.resume {
             self.apply(Command::Live);
         }
+        if actions.follow {
+            self.apply(Command::ToggleFollow);
+        }
         if actions.scrub_delta != 0 {
             self.apply(Command::Scrub(actions.scrub_delta));
         }
@@ -644,6 +752,15 @@ impl EvoApp {
             Command::Restart => self.restart_run("restarted"),
             Command::Save => self.save_champion(),
             Command::Live => self.view.scrub = None,
+            Command::ToggleFollow => {
+                self.view.follow = !self.view.follow;
+                // Leaving follow gives the whole level back rather than leaving the camera
+                // wherever the last agent stood: the two states of one key should be the
+                // two views, not a zoom level the viewer has to fix by hand.
+                if !self.view.follow {
+                    self.fit_pending = true;
+                }
+            }
             Command::Scrub(delta) => self.scrub_by(delta),
             Command::Speed(step) => {
                 self.view.speed = lab::step_speed(self.view.speed, step > 0);
@@ -666,7 +783,7 @@ impl EvoApp {
         // An untitled level saves by its own name, into the levels directory.
         let target = path.or_else(|| {
             self.editor.path.clone().or_else(|| {
-                Some(self.levels_dir.join(format!("{}.json", slug(&self.editor.level.name))))
+                Some(self.levels_dir.join(format!("{}.json", lab::slug(&self.editor.level.name))))
             })
         });
         if let Err(err) = self.editor.save(target) {
@@ -920,6 +1037,14 @@ impl EvoApp {
         }
         self.last_pointer = hover;
 
+        // Following is a camera rule, applied after the viewer's own gestures so the frame
+        // being drawn is the frame the camera is on rather than the one before it. It is
+        // the terminal's `f`: earlier only because an eighty-column frame cannot hold a
+        // whole level, and here it is the viewer choosing to look at one agent.
+        if self.mode == Mode::Evolve && self.view.follow && !self.fit_pending {
+            self.follow_leader();
+        }
+
         // --- draw ------------------------------------------------------------
         view::draw_background(&painter, rect, &self.camera, &self.editor.level);
         let opts = self.opts();
@@ -942,6 +1067,40 @@ impl EvoApp {
         if self.mode == Mode::Edit {
             self.canvas_edit_gestures(ui, &response, rect, &painter);
         }
+    }
+
+    /// Put the camera on the leader: the agent the terminal mode's `f` follows, or the
+    /// end of the route being scrubbed.
+    ///
+    /// A scrubbed route is centred on where it stopped, because that ending is the
+    /// obstacle the moment being shown is about — the same rule the terminal view uses,
+    /// so the two views point at the same place for the same recorded generation.
+    fn follow_leader(&mut self) {
+        let Some(lab) = &self.lab else {
+            return;
+        };
+        let level = lab.level().clone();
+        let target = match self.view.scrub {
+            Some(generation) => self
+                .packet
+                .as_ref()
+                .and_then(|packet| packet.traces.iter().find(|t| t.generation == generation))
+                .and_then(|trace| trace.end())
+                .map(|p| Vec2::new(p.x, p.y)),
+            // The rule itself is `lab`'s, so the window and the terminal cannot pick
+            // different agents to follow and it is covered by a test that needs no window.
+            None => self
+                .lanes
+                .as_ref()
+                .and_then(lab::leader_centre)
+                .map(|(x, y)| Vec2::new(x, y)),
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.camera.centre = target;
+        self.camera.zoom = self.camera.zoom.max(FOLLOW_ZOOM);
+        self.camera.clamp_to(&level, 2.0);
     }
 
     /// The evolution canvas: the level the run is training on, then the generation's
@@ -1275,20 +1434,3 @@ impl eframe::App for EvoApp {
     }
 }
 
-/// A file-name-safe version of a level name.
-fn slug(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if matches!(ch, ' ' | '_' | '-') && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "untitled".to_string()
-    } else {
-        trimmed
-    }
-}

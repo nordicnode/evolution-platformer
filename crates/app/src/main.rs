@@ -13,9 +13,17 @@
 //! Everything is drawn from the deterministic core: this binary owns no physics, and the
 //! trainer it hosts is the same `evo` the headless driver uses.
 //!
+//! The run the window hosts can be the terminal's run, not a simplified one: `--pop`,
+//! `--seed`, `--generations`, `--champions`, `--resume` and `--curriculum` are
+//! `train-cli watch`'s flags with the same meanings, so a run started in the window is a
+//! run the terminal can resume and a checkpoint written by either front-end is readable
+//! by the other.
+//!
 //! ```text
 //! evo-app [--level levels/l6-marathon.json] [--assets assets] [--evolve]
 //!         [--pop 200] [--seed 1] [--generations 300] [--champions champions]
+//!         [--resume champions/l5-tightrope.population.json]
+//!         [--curriculum levels/l3-gauntlet.json] [--curriculum-generations 40]
 //!         [--screenshot out.png]
 //! ```
 
@@ -45,7 +53,14 @@ OPTIONS:
     --pop <N>             Population size for that run.        [default 200]
     --seed <N>            Master seed; every run is reproducible from it. [default 1]
     --generations <N>     Stop after N generations.            [default: until closed]
-    --champions <DIR>     Where Save champion writes.          [default champions]
+    --champions <DIR>     Where Save champion writes, and where a stalled run writes
+                          its checkpoint.                     [default champions]
+    --resume <PATH>       Start from a population checkpoint instead of a fresh
+                          population (as `train-cli watch --resume` does).
+    --curriculum <PATH>   Easier level to fall back to on the first stall.
+    --curriculum-generations <N>
+                          Generations to spend there before returning.
+                                                                 [default 40]
     --screenshot <PATH>   Render one frame, write it as a PNG, and exit. Used to
                           verify the renderer without a human watching; with
                           --evolve it waits for a real generation first.
@@ -103,6 +118,18 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
                 lab.generations = Some(generations as u32);
             }
             "--champions" => lab.champions = PathBuf::from(value("--champions")?),
+            "--resume" => lab.resume = Some(PathBuf::from(value("--resume")?)),
+            // The easier level is *not* read here: whether it exists is the app's answer,
+            // because it is the run that needs it, and a run that is never started must
+            // not fail over a file it would never have opened.
+            "--curriculum" => lab.curriculum = Some(PathBuf::from(value("--curriculum")?)),
+            "--curriculum-generations" => {
+                let generations = number("--curriculum-generations")?;
+                if generations == 0 {
+                    return Err("usage: --curriculum-generations must be at least 1".into());
+                }
+                lab.curriculum_generations = generations as u32;
+            }
             other => return Err(format!("unknown option {other:?} (try --help)")),
         }
         i += 1;
