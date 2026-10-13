@@ -14,8 +14,13 @@ pub mod champion;
 pub mod fitness;
 pub mod ga;
 pub mod genome;
+pub mod population;
 
-pub use champion::{ChampionFile, ChampionMetadata, NetworkSpec, CHAMPION_FORMAT, CHAMPION_VERSION};
+pub use champion::{
+    check_reproducibility, ChampionFile, ChampionMetadata, NetworkSpec, TrainingSummary,
+    CHAMPION_FORMAT, CHAMPION_VERSION,
+};
+pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};
 pub use fitness::{
     run_episode, score, EpisodeResult, EpisodeRunner, EvalConfig, ACTION_REPEAT, FITNESS_VERSION,
 };

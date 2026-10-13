@@ -41,7 +41,8 @@ use crossterm::terminal::{
     LeaveAlternateScreen,
 };
 use evo::{
-    ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, ShowcaseLane, Trainer,
+    ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, PopulationFile,
+    ShowcaseLane, Trainer,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
 use render::chart::{
@@ -78,7 +79,18 @@ const WATCH_OPTS: &[&str] = &[
     "death-window",
     "frames",
     "headless",
+    "curriculum",
+    "curriculum-generations",
+    "resume",
 ];
+
+/// Generations spent on the easier level when a run stalls (§12 M5, finding 22).
+///
+/// Measured, not guessed: a 40-generation detour was the cheapest that rescued both
+/// stalled seeds tried, and the longer ones were strictly worse on the seed that was
+/// going to solve anyway (L5 seed 3 won at overall generation 100 with 40 detour
+/// generations, and at 284 and 321 with 100 and 200).
+const DEFAULT_CURRICULUM_GENERATIONS: u32 = 40;
 
 /// The speed ladder. `+`/`-` step through it rather than doubling forever, so the
 /// range the plan asks for (1x-50x, §10 Tier 1.4) is seven keystrokes wide and no
@@ -147,6 +159,29 @@ pub fn watch(a: &Args) -> Result<(), String> {
     let death_window = usage(a.usize_opt("death-window", 25))? as u32;
     let out_dir = a.string("out", "champions");
 
+    // Curriculum and resume (§12 M5, finding 22). The easier level is loaded up
+    // front so a typo is a usage error at startup rather than a surprise forty
+    // generations into a stalled run.
+    let resume_path = a.opt("resume").map(|s| s.to_string());
+    let curriculum_level = match a.opt("curriculum") {
+        Some(path) => Some(load_level(path)?),
+        None => None,
+    };
+    let curriculum_generations =
+        usage(a.usize_opt("curriculum-generations", DEFAULT_CURRICULUM_GENERATIONS as usize))?
+            as u32;
+    if curriculum_level.is_some() && curriculum_generations == 0 {
+        return Err("usage: --curriculum-generations must be at least 1".into());
+    }
+    // Champion mode replays one saved genome and never trains, so both of these
+    // would be accepted and then quietly do nothing.
+    if champion_path.is_some() && (curriculum_level.is_some() || resume_path.is_some()) {
+        return Err(
+            "usage: --curriculum and --resume train a population; --champion replays one genome"
+                .into(),
+        );
+    }
+
     let mut live = LiveState {
         speed: nearest_speed(usage(a.usize_opt("speed", DEFAULT_SPEED as usize))? as u32),
         ..LiveState::default()
@@ -213,10 +248,28 @@ pub fn watch(a: &Args) -> Result<(), String> {
         oracle_line(&level)
     );
 
-    let mut trainer = Trainer::new(cfg);
+    // A run started from a checkpoint is the plan's "restart from where it got
+    // stuck": the population, its genome ids (part of every episode seed) and the
+    // generation number all continue from the file.
+    let mut trainer = match resume_path.as_deref() {
+        Some(path) => {
+            let checkpoint = PopulationFile::load(path)?;
+            println!("resuming {}", checkpoint.summary());
+            if let Some(note) = checkpoint.level_note(&level) {
+                println!("note    {note}");
+            }
+            Trainer::resume(
+                cfg.clone(),
+                checkpoint.to_genomes()?,
+                checkpoint.generation,
+            )?
+        }
+        None => Trainer::new(cfg),
+    };
     let eval: EvalConfig = trainer.config.eval_config();
     let pop_size = trainer.config.pop_size;
     let mut history: Vec<HistoryPoint> = Vec::new();
+    let mut curriculum_taken: Option<String> = None;
     let mut deaths: Vec<(f32, f32, u32)> = Vec::new();
     let mut traces = TraceLog::new();
     let mut note: Option<String> = None;
@@ -295,6 +348,27 @@ pub fn watch(a: &Args) -> Result<(), String> {
             live.save_requested = false;
             note = Some(save_champion(&trainer, &level, &stem, &out_dir)?);
         }
+
+        // The stall the view has just reported is the trigger for the run's one
+        // curriculum step (§12 M5: stall detector -> death-spot highlight ->
+        // curriculum resume). It uses the *same* stall rule the status line shows,
+        // so the run cannot act on a stall the viewer is not being told about.
+        if curriculum_taken.is_none() {
+            if let (Some(stall), Some(easier)) = (fitness_stall(&history), &curriculum_level) {
+                let summary = run_curriculum_step(
+                    &mut trainer,
+                    &level,
+                    easier,
+                    curriculum_generations,
+                    &live,
+                    &stem,
+                    &out_dir,
+                    stall,
+                )?;
+                note = Some(summary.clone());
+                curriculum_taken = Some(summary);
+            }
+        }
     }
 
     // A watched run is a real run: its best genome is saved exactly like `train`'s,
@@ -304,7 +378,14 @@ pub fn watch(a: &Args) -> Result<(), String> {
     } else {
         None
     };
-    finish_training(&mut screen, &level, &stem, &trainer, saved, &out_dir)
+    finish_training(&mut screen, &level, &stem, &trainer, saved, &out_dir)?;
+    // Printed after the summary, and always: a run whose shape changed mid-flight
+    // should say so where the numbers are, not only in a frame the viewer may have
+    // scrolled past.
+    if let Some(summary) = &curriculum_taken {
+        println!("{summary}");
+    }
+    Ok(())
 }
 
 /// A terminal failure is a runtime error, not a usage error.
@@ -1389,6 +1470,79 @@ fn save_champion(
     ))
 }
 
+/// One curriculum step: checkpoint the stuck population, train it on the easier
+/// level for a while, and hand it back to the run it came from (§12 M5).
+///
+/// The excursion is **not animated**, deliberately. At pop 200 a generation costs
+/// about 14 ms, so the whole detour is over in well under a second, while forty
+/// seconds of a *different level* on screen would bury the thing the viewer is
+/// actually waiting for — the hard level's next generation. What the viewer gets
+/// instead is a note naming what happened, and a run whose population has changed.
+///
+/// The population is trained on the easier level by a separate trainer and adopted
+/// back, so the run keeps its own chart, its own best-ever champion and its own RNG
+/// stream: those belong to the run, not to whichever level the population last saw.
+///
+/// Returns the note to show. Errors only for real failures (a checkpoint that cannot
+/// be written, a population that cannot be adopted) — a detour that learns nothing is
+/// a result, not an error.
+#[allow(clippy::too_many_arguments)]
+fn run_curriculum_step(
+    trainer: &mut Trainer,
+    main_level: &Level,
+    curriculum_level: &Level,
+    generations: u32,
+    live: &LiveState,
+    stem: &str,
+    out_dir: &str,
+    stall: Stall,
+) -> Result<String, String> {
+    // The stuck population on disk, before anything moves it: this is the plan's
+    // "checkpoint at the stuck point", and it is what makes an unrepeatable run
+    // repeatable — `watch --resume` is the way back in.
+    let checkpoint = PopulationFile::new(
+        &trainer.genomes,
+        trainer.generation,
+        main_level,
+        &trainer.config,
+        format!("stalled: {}", stall.label()),
+    );
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("cannot create {out_dir}: {e}"))?;
+    let path = Path::new(out_dir).join(format!("{stem}.population.json"));
+    checkpoint.save(&path)?;
+
+    // A real training run on the easier level, from the population that is stuck:
+    // same genomes, same ids (they are part of every episode seed), same
+    // hyperparameters — including the mutation rate the viewer has dialled in.
+    let mut cfg = trainer.config.clone();
+    cfg.mutation_rate = live.mut_rate;
+    let mut excursion = Trainer::resume(cfg, trainer.genomes.clone(), trainer.generation)?;
+    let mut best = f32::NEG_INFINITY;
+    let mut flag_at = None;
+    for _ in 0..generations {
+        let report = excursion.step(curriculum_level);
+        best = best.max(report.max_fitness);
+        if report.wins > 0 && flag_at.is_none() {
+            flag_at = Some(excursion.generation);
+        }
+    }
+    let spent = excursion.generation.saturating_sub(trainer.generation);
+    trainer.adopt(excursion.genomes.clone())?;
+
+    Ok(format!(
+        "curriculum: {spent} generations on {} from the stalled population \
+         (checkpoint -> {}, best there {}, {}); back on {}",
+        curriculum_level.name,
+        path.display(),
+        format_fitness(best),
+        match flag_at {
+            Some(g) => format!("flag reached at its generation {g}"),
+            None => "flag not reached there yet".to_string(),
+        },
+        main_level.name
+    ))
+}
+
 fn finish_training(
     screen: &mut Screen,
     level: &Level,
@@ -2350,6 +2504,170 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- curriculum resume (§12 M5) -------------------------------------------
+
+    /// A stalled run checkpoints itself, steps back to the easier level, and can be
+    /// restarted from that checkpoint: one test, because the point is that the file
+    /// one half writes is the file the other half reads.
+    #[test]
+    fn a_stalled_run_checkpoints_itself_and_can_be_restarted_from_it() {
+        let dir = tmpdir("curriculum");
+        let out = dir.to_string_lossy().to_string();
+        let stalled = wpath("levels/l5-tightrope.json");
+        let easier = wpath("levels/l1-flat-run.json");
+
+        // L5 at pop 2 does not improve for the 25 generations the stall rule asks
+        // for, which is exactly the trigger. L1 is the easier level: a random
+        // population wins it at generation 0, so the detour is cheap to run.
+        let stalled_args = a(&[
+            "watch",
+            "--level",
+            &stalled,
+            "--pop",
+            "2",
+            "--generations",
+            "40",
+            "--curriculum",
+            &easier,
+            "--curriculum-generations",
+            "2",
+            "--out",
+            &out,
+            "--headless",
+            "--frames",
+            "1",
+        ]);
+        watch(&stalled_args).expect("a stalled run with a curriculum completes");
+
+        let path = dir.join("l5-tightrope.population.json");
+        assert!(path.exists(), "the stuck population is written down");
+        let checkpoint = evo::PopulationFile::load(&path).expect("the checkpoint loads");
+        assert_eq!(checkpoint.networks.len(), 2);
+        assert!(
+            checkpoint.note.contains("stalled"),
+            "the checkpoint records why it exists: {:?}",
+            checkpoint.note
+        );
+        let ids: Vec<u32> = checkpoint.genome_ids.clone();
+
+        // Restart from it, on the level it came from.
+        let resumed_out = tmpdir("curriculum-resumed");
+        let out2 = resumed_out.to_string_lossy().to_string();
+        let resumed_args = a(&[
+            "watch",
+            "--level",
+            &stalled,
+            "--resume",
+            path.to_string_lossy().as_ref(),
+            "--generations",
+            "3",
+            "--out",
+            &out2,
+            "--headless",
+            "--frames",
+            "1",
+        ]);
+        watch(&resumed_args).expect("a run restarted from a checkpoint completes");
+
+        // The champion it saved has to come out of the population it was handed:
+        // an id from the checkpoint, never a fresh one, and never a generation
+        // earlier than the checkpoint's own.
+        let level = load_level(&stalled).expect("level loads");
+        let champion = evo::ChampionFile::load_for_level(
+            resumed_out.join("l5-tightrope.json"),
+            &level,
+        )
+        .expect("the resumed run saved a champion for this level");
+        assert!(
+            ids.contains(&champion.metadata.genome_id),
+            "champion id {} is not one of the resumed population's {:?}",
+            champion.metadata.genome_id,
+            ids
+        );
+        assert!(
+            champion.metadata.generation >= checkpoint.generation,
+            "a resumed run continues the checkpoint's generation numbering, not its own"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&resumed_out);
+    }
+
+    #[test]
+    fn the_curriculum_is_off_unless_asked_for_and_an_impossible_one_is_a_usage_error() {
+        // No `--curriculum`: a stalled run must behave exactly as it did before the
+        // knob existed — no checkpoint file appears as a side effect.
+        let dir = tmpdir("curriculum-off");
+        let out = dir.to_string_lossy().to_string();
+        let stalled_args = a(&[
+            "watch",
+            "--level",
+            &wpath("levels/l5-tightrope.json"),
+            "--pop",
+            "2",
+            "--generations",
+            "30",
+            "--out",
+            &out,
+            "--headless",
+            "--frames",
+            "1",
+        ]);
+        watch(&stalled_args).expect("runs");
+        assert!(!dir.join("l5-tightrope.population.json").exists());
+
+        // A curriculum level that cannot be loaded is refused before training.
+        let resumed_args = a(&[
+            "watch",
+            "--level",
+            &wpath("levels/l5-tightrope.json"),
+            "--generations",
+            "1",
+            "--curriculum",
+            &wpath("levels/does-not-exist.json"),
+            "--headless",
+        ]);
+        assert!(watch(&resumed_args).is_err(), "a missing curriculum level is an error");
+
+        // Zero detour generations would be a silent no-op.
+        let zero_args = a(&[
+            "watch",
+            "--level",
+            &wpath("levels/l5-tightrope.json"),
+            "--generations",
+            "1",
+            "--curriculum",
+            &wpath("levels/l1-flat-run.json"),
+            "--curriculum-generations",
+            "0",
+            "--headless",
+        ]);
+        assert!(watch(&zero_args).is_err());
+
+        // Neither knob means anything in champion-replay mode, and saying nothing
+        // while ignoring them is exactly the silent no-op this CLI refuses to do.
+        let d = a(&[
+            "watch",
+            "--champion",
+            &wpath("champions/l1-flat-run.json"),
+            "--curriculum",
+            &wpath("levels/l1-flat-run.json"),
+            "--headless",
+        ]);
+        assert!(watch(&d).is_err());
+        let e = a(&[
+            "watch",
+            "--champion",
+            &wpath("champions/l1-flat-run.json"),
+            "--resume",
+            &wpath("champions/l1-flat-run.population.json"),
+            "--headless",
+        ]);
+        assert!(watch(&e).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- the record (Tier 2.7) -----------------------------------------------

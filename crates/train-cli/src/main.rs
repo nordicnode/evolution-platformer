@@ -154,10 +154,22 @@ WATCH OPTIONS:
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
     --mut-rate, --mut-sigma, --elite, --tournament, --crossover, --action-repeat,
     --trials              As for `train`.
+    --curriculum <PATH>   Easier level to fall back to when the run stalls.
+    --curriculum-generations <N>
+                          Generations spent there before returning.        [default 40]
+    --resume <PATH>       Start from a population checkpoint instead of a fresh one.
+
+STALLING (watch):
+    With --curriculum, the first stall writes the stuck population to
+    <out>/<level>.population.json and trains it on the easier level for
+    --curriculum-generations, then resumes the original level with that population.
+    One step per run. The chart, the stall line and the saved champion stay
+    measurements of the original level.
 
 KEYS (watch):
-    space pause/resume   -/+ speed   n next generation   f follow/whole level
-    s save the best-ever champion   q quit
+    space pause/resume   -/+ speed   m/M mutation rate   n next generation
+    left/right scrub the recorded champion routes   h back to live
+    f follow/whole level   s save the best-ever champion   q quit
 
 REACH OPTIONS:
     --level <PATH>        One level to check.

@@ -54,6 +54,75 @@ impl NetworkSpec {
             outputs: self.n_outputs,
         }
     }
+
+    /// The dimension and activation rules a loadable network has to satisfy.
+    ///
+    /// `kind` names the artifact the caller is loading, so the message says what to
+    /// look at; the rules themselves are shared with the population checkpoint, so a
+    /// resumed population cannot be validated more loosely than a champion.
+    pub fn check_compat(&self, kind: &str) -> Result<(), String> {
+        if self.n_inputs != sensors::N_INPUTS {
+            return Err(format!(
+                "{kind} network takes {} inputs but the sensor version expects {}",
+                self.n_inputs,
+                sensors::N_INPUTS
+            ));
+        }
+        if self.n_outputs != sim::physics::AgentAction::COUNT {
+            return Err(format!(
+                "{kind} network has {} outputs but the action set has {}",
+                self.n_outputs,
+                sim::physics::AgentAction::COUNT
+            ));
+        }
+        if self.activation_hidden != "tanh" || self.activation_output != "tanh" {
+            return Err(format!(
+                "unsupported activations ({:?} / {:?}); this build only implements tanh",
+                self.activation_hidden, self.activation_output
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The guards that make a saved artifact reproducible (§8).
+///
+/// Extracted so the champion file and the population checkpoint enforce *the same*
+/// rules rather than two similar sets: a version bump that is refused for a champion
+/// must not slip through as a resumable population.
+pub fn check_reproducibility(
+    kind: &str,
+    sim_version: &str,
+    sensor_version: u32,
+    fitness_version: u32,
+    level_format_version: u32,
+    action_repeat: u32,
+) -> Result<(), String> {
+    if sim_version != SIM_VERSION {
+        return Err(format!(
+            "sim_version mismatch: {kind} {sim_version} vs build {SIM_VERSION}"
+        ));
+    }
+    if sensor_version != sensors::VERSION {
+        return Err(format!(
+            "sensor_version mismatch: {kind} {sensor_version} vs build {}",
+            sensors::VERSION
+        ));
+    }
+    if fitness_version != FITNESS_VERSION {
+        return Err(format!(
+            "fitness_version mismatch: {kind} {fitness_version} vs build {FITNESS_VERSION}"
+        ));
+    }
+    if level_format_version != LEVEL_FORMAT_VERSION {
+        return Err(format!(
+            "level_format_version mismatch: {kind} {level_format_version} vs build {LEVEL_FORMAT_VERSION}"
+        ));
+    }
+    if action_repeat == 0 {
+        return Err(format!("{kind} records action_repeat = 0"));
+    }
+    Ok(())
 }
 
 /// Training provenance. Everything needed to reproduce, or to explain why you cannot.
@@ -182,48 +251,15 @@ impl ChampionFile {
                 self.version
             ));
         }
-        if self.metadata.sim_version != SIM_VERSION {
-            return Err(format!(
-                "sim_version mismatch: champion {} vs build {SIM_VERSION}",
-                self.metadata.sim_version
-            ));
-        }
-        if self.metadata.sensor_version != sensors::VERSION {
-            return Err(format!(
-                "sensor_version mismatch: champion {} vs build {}",
-                self.metadata.sensor_version,
-                sensors::VERSION
-            ));
-        }
-        if self.metadata.fitness_version != FITNESS_VERSION {
-            return Err(format!(
-                "fitness_version mismatch: champion {} vs build {FITNESS_VERSION}",
-                self.metadata.fitness_version
-            ));
-        }
-        if self.metadata.level_format_version != LEVEL_FORMAT_VERSION {
-            return Err(format!(
-                "level_format_version mismatch: champion {} vs build {}",
-                self.metadata.level_format_version, LEVEL_FORMAT_VERSION
-            ));
-        }
-        if self.metadata.action_repeat == 0 {
-            return Err("champion records action_repeat = 0".into());
-        }
-        if self.network.n_inputs != sensors::N_INPUTS {
-            return Err(format!(
-                "champion network takes {} inputs but the sensor version expects {}",
-                self.network.n_inputs,
-                sensors::N_INPUTS
-            ));
-        }
-        if self.network.n_outputs != sim::physics::AgentAction::COUNT {
-            return Err(format!(
-                "champion network has {} outputs but the action set has {}",
-                self.network.n_outputs,
-                sim::physics::AgentAction::COUNT
-            ));
-        }
+        check_reproducibility(
+            "champion",
+            &self.metadata.sim_version,
+            self.metadata.sensor_version,
+            self.metadata.fitness_version,
+            self.metadata.level_format_version,
+            self.metadata.action_repeat,
+        )?;
+        self.network.check_compat("champion")?;
         if self.metadata.level_hash != level.content_hash_string() {
             return Err(format!(
                 "level_hash mismatch: champion was trained on {} ({}) but this level hashes to {}",

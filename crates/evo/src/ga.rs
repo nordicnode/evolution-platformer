@@ -270,6 +270,45 @@ impl Trainer {
         })
     }
 
+    /// Replace the population with `genomes`, keeping everything the **run** owns.
+    ///
+    /// This is what a curriculum step returns through (§12 M5): the excursion trains
+    /// a population on an easier level and hands it back, and the run it came from has
+    /// to continue — the chart history it has drawn, the best-ever genome it will
+    /// save as the champion, the genius baseline and the RNG stream all belong to the
+    /// run, not to the population. [`Trainer::resume`] cannot do this, because it
+    /// builds a *fresh* trainer and therefore forgets all of it.
+    ///
+    /// Genome ids are the one thing that cannot simply be swapped in: they are part
+    /// of every `episode_seed`, so duplicates would make two members of the population
+    /// share episodes, and a stale `next_id` would hand a new genome an id that is
+    /// already in use. Both are checked here rather than trusted.
+    pub fn adopt(&mut self, genomes: Vec<Genome>) -> Result<(), String> {
+        if genomes.len() != self.config.pop_size {
+            return Err(format!(
+                "cannot adopt {} genomes into a population of {}",
+                genomes.len(),
+                self.config.pop_size
+            ));
+        }
+        for g in &genomes {
+            g.validate()?;
+        }
+        let mut ids: Vec<u32> = genomes.iter().map(|g| g.id).collect();
+        ids.sort_unstable();
+        if let Some(dup) = ids.windows(2).find(|w| w[0] == w[1]) {
+            return Err(format!("adopted population has duplicate genome id {}", dup[0]));
+        }
+        if let Some(max) = ids.last() {
+            // Ids at or above the current `next_id` are the excursion's own; ids
+            // below it are the ones this run issued. Either way, nothing already in
+            // use may be handed out again.
+            self.next_id = self.next_id.max(max.saturating_add(1));
+        }
+        self.genomes = genomes;
+        Ok(())
+    }
+
     pub fn history(&self) -> &[GenRow] {
         &self.history
     }
@@ -545,6 +584,97 @@ mod tests {
     /// evolution; a flat runway cannot, because it is solved by a constant policy.
     fn pit_level() -> Level {
         crate::fixture::gap_runway("ga-pit-fixture", 24, 22, &[(10, 3)])
+    }
+
+    #[test]
+    fn adopting_a_population_changes_the_run_without_resetting_it() {
+        // What a curriculum excursion depends on: the population comes back changed,
+        // and everything the *run* owns — the chart it has drawn, the champion it
+        // will save, the ids it must never reissue — survives the swap.
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 11,
+            ..GaConfig::default()
+        };
+        let mut run = Trainer::new(cfg.clone());
+        for _ in 0..3 {
+            run.step(&level);
+        }
+        let history_before = run.history().to_vec();
+        let best_before = run
+            .best_ever()
+            .map(|b| (b.generation, b.result.fitness, b.genome.id));
+        let next_id_before = run.next_id();
+
+        // Stand in for the excursion: someone else's population, with ids of its own.
+        let mut excursion = Trainer::resume(cfg.clone(), run.genomes.clone(), run.generation)
+            .expect("resumes the population");
+        for _ in 0..2 {
+            excursion.step(&level);
+        }
+        let adopted = excursion.genomes.clone();
+        assert_ne!(
+            adopted.iter().map(|g| g.id).collect::<Vec<_>>(),
+            run.genomes.iter().map(|g| g.id).collect::<Vec<_>>(),
+            "a generation of evolution must have happened in the excursion"
+        );
+        run.adopt(adopted).expect("adopts a full population");
+
+        assert_eq!(
+            run.history(),
+            history_before.as_slice(),
+            "the chart belongs to the run, not to the population"
+        );
+        assert_eq!(
+            run.best_ever().map(|b| (
+                b.generation,
+                b.result.fitness,
+                b.genome.id
+            )),
+            best_before,
+            "the champion is the best of *this* level's evaluations"
+        );
+        assert!(
+            run.next_id() >= next_id_before,
+            "ids already issued may never be handed out again"
+        );
+
+        // And the adopted population is the one that breeds from here.
+        let report = run.step(&level);
+        assert_eq!(report.results.len(), cfg.pop_size);
+        assert_eq!(run.history().len(), history_before.len() + 1);
+    }
+
+    #[test]
+    fn adopt_refuses_a_population_that_would_break_the_run() {
+        let cfg = GaConfig {
+            pop_size: 4,
+            master_seed: 2,
+            ..GaConfig::default()
+        };
+        let mut run = Trainer::new(cfg);
+        let ok = run.genomes.clone();
+
+        let mut short = ok.clone();
+        short.pop();
+        assert!(run.adopt(short).unwrap_err().contains("cannot adopt 3 genomes"));
+
+        let mut dupes = ok.clone();
+        dupes[2].id = dupes[0].id;
+        assert!(run
+            .adopt(dupes)
+            .unwrap_err()
+            .contains("duplicate genome id"));
+
+        let mut broken = ok.clone();
+        broken[1].weights.clear();
+        assert!(run.adopt(broken).is_err(), "a malformed genome is refused");
+
+        // Every refusal left the population it already had.
+        run.adopt(ok.clone()).expect("the original still fits");
+        assert_eq!(run.genomes.len(), 4);
+        assert_eq!(run.genomes.iter().map(|g| g.id).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
     }
 
     #[test]

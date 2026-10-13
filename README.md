@@ -15,8 +15,8 @@ currently does and where it deviates.
 | **M0** scaffolding | done |
 | **M1** sim + hand-written levels | done |
 | **M2** GA + headless training + reachability oracle | done |
-| **M3** watch mode + fun gate | **Tier 1 done, fun gate open** — the owner's call |
-| M4 editor, M5 web/release | not started |
+| **M3** watch mode + fun gate | **Tiers 1 and 2 done, fun gate open** — the owner's call |
+| M4 editor, M5 web/release | not started — except M5's stall chain, done early (findings 19–22) |
 
 The deterministic core, the evolution loop, the reachability oracle and the Tier 1
 watch mode are implemented and tested. `train-cli watch` grows a population on
@@ -25,7 +25,11 @@ pause, death markers and the genius-agent splash. The level pack behind it is no
 six levels wide, and its two hardest are *hard* (findings 15–18) — hard enough that
 they sometimes stall, which the view reports with a stall line naming how long the
 population has been stuck and which obstacle it keeps dying on (finding 19), and
-offers a live mutation-rate knob to try instead (finding 20). Every generation that
+offers a live mutation-rate knob to try instead (finding 20). A run can also be told
+which easier level to fall back to: the first stall writes the stuck population out
+as a checkpoint and trains it there for a while before returning, which turns one
+run that never solved L5 in any number of generations into one that solves it
+(finding 22). Every generation that
 improves the best also has its champion route recorded, and the arrow keys scrub
 back through those routes — position by position — to the moment a jump was first
 learned (finding 21). What
@@ -125,7 +129,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 207 tests
+cargo test --workspace                 # 216 tests
 cargo build --release
 
 # Can this level be beaten at all? Milliseconds, no training.
@@ -136,6 +140,14 @@ cargo build --release
 #   space pause   -/+ speed   m/M mutation rate   n next generation
 #   left/right scrub the recorded champions   h back to live
 #   f follow/whole level   s save champion   q quit
+
+# A run that stalls checkpoints itself and steps back to an easier level, then
+# returns to the hard one with the population it grew there (finding 22).
+./target/release/train-cli watch --level levels/l5-tightrope.json \
+    --curriculum levels/l3-gauntlet.json
+# Restart from a checkpoint written by such a step, on whatever level you like.
+./target/release/train-cli watch --resume champions/l5-tightrope.population.json \
+    --level levels/l5-tightrope.json
 
 # Evolve headlessly, print the fitness chart, save a champion.
 ./target/release/train-cli train --level levels/l3-gauntlet.json \
@@ -267,7 +279,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-207 tests, all green. `cargo test --workspace`.
+216 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -286,6 +298,18 @@ something (finding 17's off-grid walker is the mistake that test exists for). Th
 pack's difficulty is pinned by `crates/evo/tests/difficulty.rs`: a random
 population must win L1/L2 at generation 0, must win none of L3–L6 on any of four
 seeds, and L4 must still fall to evolution inside 60 generations at pop 64.
+
+The checkpoint gets five: a population round-trips with its ids and weights intact,
+stale versions and wrong network shapes are refused, a duplicated or missing genome
+is refused, a *different* level is reported rather than refused (that is the whole
+point of resuming one), and a nested path that does not exist yet is created on save.
+`Trainer::adopt` — how the curriculum hands its population back — is pinned by two
+more: the adoption changes the next generation while leaving the chart, the champion
+and the id counter untouched, and a population that would break the run (wrong size,
+duplicate ids, malformed genome) is refused. Watch mode's own end-to-end test runs a
+stalled L5 through `--curriculum`, asserts the checkpoint exists and names the stall
+that produced it, then restarts from that very file and asserts the champion it saves
+carries an id out of the checkpoint.
 
 The recorded champion paths get six of their own in `render::trace` — the log keeps
 an improvement and drops the flat generations, refuses a non-finite fitness (a NaN
@@ -476,6 +500,53 @@ deliberate, documented decision — not drift.
    point on an easier level, M5), not a different schedule. The ladder is clamped to
    the plan's own 0.03–0.10 and snaps `--mut-rate` onto it, so the number in the
    header is always the number being used.
+22. **A stalled population is the best starting material a run has: move it, do not
+   reset it.** The last item in the plan's stall chain (§12 M5) is curriculum resume
+   — "restart training from a checkpoint at the stuck point" — and since findings 19
+   and 20 had already shown that the stall is real and that neither patience nor a
+   mutation-rate change ends it, this is the lever that was left. Measured on
+   L5-tightrope, pop 200, 420 generations, headless `watch`, one 40-generation detour
+   taken the first time the stall fires:
+
+   | seed | no detour | `--curriculum l3-gauntlet` | `--curriculum l4-rhythm` |
+   |---|---|---|---|
+   | 5 | **never solved** (best 587, flat from generation 38) | **solved at generation 163** | solved at generation 418 |
+   | 3 | solved at generation 397 | solved at 184 | solved at 313 |
+
+   The effect is **not extra compute**: seed 5 given 460 generations — the arm's 420
+   plus its 40 detour generations — still never solves, and given 840, double the
+   compute, its best is 589.82 against 586.98 at 420. The plateau is a fixed point;
+   the detour is what breaks it. Nor is it that the excursion solves the level for
+   the run: the detour reaches the *easier* level's flag at its own generation 71
+   (L3) and 103 (L4), which says the stalled population can already perform the jump
+   where the approach is shorter — L4 contains exactly L5's obstacle (4-tile gap,
+   2-tile island, 4-tile gap) and the two differ only in the run-up, 27 tiles there
+   against 30 here. That is a hypothesis about *why*; what is measured is that the
+   population improves on the return and that the excursion learns on the easier
+   level rather than merely being shaken.
+
+   The design follows from what those numbers say, and each choice above is a
+   decision not to do something:
+
+   * **The checkpoint holds the population, not the champion.** A champion file
+     records one genome and would have to fabricate a population around it; a
+     checkpoint records all N genomes with their ids, because the ids are part of
+     every `episode_seed` and a renumbered population is a different run (§5).
+   * **The excursion is a separate trainer whose population is adopted back**, so
+     the run keeps its chart, its best-ever champion and its RNG stream. That is
+     what keeps the saved champion honest — every number in it was earned on *this*
+     level, where a single shared trainer would have quietly contaminated them with
+     the easier level's evaluations.
+   * **The excursion is not animated** (0.6 s at pop 200, announced by a note). Forty
+     seconds of a *different* level on screen would bury the generation the viewer is
+     waiting for.
+   * **One step per run**, because a second step from a population that has already
+     had the easier level's lesson is unmeasured, and shipping an unmeasured policy is
+     how a tool starts lying.
+   * **A checkpoint's level hash is a note, not a gate**, unlike a champion's: a
+     different level is what a curriculum *is*, so `--resume` prints which level the
+     checkpoint came from and says plainly that the fitnesses either side are not
+     comparable.
 21. **A timeline is worth keeping only where it changed.** Tier 2.7 asks watch mode
    to record the champion's trajectory per generation and let the viewer scrub back
    to the moment the jump was learned. Recording every generation would keep 420
@@ -556,6 +627,13 @@ measurement has not been taken.
    when chosen at launch, and switching it *at* a stall did not rescue one. The next
    lever is therefore not a slider but a different landscape — resume from the stuck
    point on an easier level.
+7. **Move the stuck population somewhere it can learn.** — *done, see finding 22.*
+   `--curriculum <easier level>` makes the first stall checkpoint the population, train
+   it there for 40 generations and hand it back, and `watch --resume` restarts from that
+   checkpoint. On the seed that never solved L5 in any number of generations, this
+   solves it (generation 163 via L3, 418 via L4). This closes the plan's stall chain —
+   detector, death-spot highlight, resume, honest charts — with the measurement the
+   plan asked for and the numbers the README can be held to.
 6. **Show how the route changed, not just how the number did.** — *done, see finding
    21.* Tier 2.7's timeline scrubber: watch mode records the champion's route — one
    position every 4 frames — for each generation that improves the best, and
