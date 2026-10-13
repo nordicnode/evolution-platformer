@@ -41,14 +41,17 @@ use crossterm::terminal::{
     LeaveAlternateScreen,
 };
 use evo::{
-    ChampionFile, EpisodeRunner, EvalConfig, GaConfig, LaneKind, ShowcaseLane, Trainer,
+    ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, ShowcaseLane, Trainer,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
 use render::chart::{
     death_cluster, death_strip, fitness_chart, fitness_stall, fitness_trend, format_fitness,
     progress_bar, Stall,
 };
-use render::{render_scene, Body, HistoryPoint, Scene, Viewport, FRAME_TIME};
+use render::{
+    render_scene, Body, ChampionTrace, HistoryPoint, Scene, TraceLog, TracePoint, Viewport,
+    FRAME_TIME, TRACE_SAMPLE_FRAMES,
+};
 use sim::{Level, Outcome};
 
 use crate::args::Args;
@@ -215,6 +218,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
     let pop_size = trainer.config.pop_size;
     let mut history: Vec<HistoryPoint> = Vec::new();
     let mut deaths: Vec<(f32, f32, u32)> = Vec::new();
+    let mut traces = TraceLog::new();
     let mut note: Option<String> = None;
     let mut generations_run = 0usize;
 
@@ -238,6 +242,23 @@ pub fn watch(a: &Args) -> Result<(), String> {
 
         let lanes = trainer.showcase(&report, &population, best_k, random_k);
         let info = lane_info(&lanes);
+
+        // Record this generation's champion route when it is an improvement (Tier
+        // 2.7). Asked *before* paying: the recording costs one extra episode, and a
+        // stalled run — the case the scrubber exists for — improves on almost no
+        // generation at all.
+        if traces.would_record(report.max_fitness) {
+            if let Some(lane) = lanes.first() {
+                traces.observe(record_trace(
+                    &level,
+                    &eval,
+                    &population[lane.index],
+                    lane.seed,
+                    report.generation,
+                    report.max_fitness,
+                ));
+            }
+        }
         let mut runners: Vec<EpisodeRunner<'_>> = lanes
             .iter()
             .map(|lane| EpisodeRunner::new(&level, &population[lane.index], &eval, lane.seed))
@@ -252,6 +273,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
             history: &history,
             deaths: &deaths,
             note: note.as_deref(),
+            traces: &traces,
         };
         animate_lanes(&mut screen, &level, &mut runners, &info, &ctx, &mut live)
             .map_err(io_error)?;
@@ -404,6 +426,68 @@ fn lane_glyph(label: char, finished: bool, outcome: Outcome) -> char {
 }
 
 // ---------------------------------------------------------------------------
+// recorded champion paths (§10 Tier 2.7)
+// ---------------------------------------------------------------------------
+
+/// Record one generation's champion route, in full.
+///
+/// Run as its **own** episode rather than sampled off the animation, for the same
+/// reason the lanes run their own: the record has to be a fact about the run, not
+/// about how long the viewer happened to watch. A paused, skipped or frame-capped
+/// animation would truncate the path — and on a stalled run, exactly the run this
+/// feature exists for, the viewer is the most likely to have walked away.
+///
+/// The caller asks [`TraceLog::would_record`] first, so this costs one episode per
+/// *improvement*: at pop 200 a generation is 200 episodes, so a recorded generation
+/// is ~0.5% more expensive and every other generation pays nothing.
+fn record_trace(
+    level: &Level,
+    eval: &EvalConfig,
+    genome: &Genome,
+    seed: u64,
+    generation: u32,
+    max_fitness: f32,
+) -> ChampionTrace {
+    let mut runner = EpisodeRunner::new(level, genome, eval, seed);
+    let mut points = Vec::new();
+    loop {
+        let frames = runner.sim().stats().frames;
+        if frames % TRACE_SAMPLE_FRAMES == 0 {
+            let p = runner.sim().player();
+            points.push(TracePoint {
+                frame: frames,
+                x: p.x,
+                y: p.y,
+            });
+        }
+        if runner.is_finished() {
+            break;
+        }
+        runner.step();
+    }
+
+    // The final position is the one that matters most — the flag, or the grave — and
+    // an episode rarely ends on a sample boundary, so it is recorded exactly rather
+    // than rounded to the nearest sample.
+    let p = runner.sim().player();
+    let end = TracePoint {
+        frame: runner.sim().stats().frames,
+        x: p.x,
+        y: p.y,
+    };
+    if points.last().map(|q| (q.x, q.y)) != Some((end.x, end.y)) {
+        points.push(end);
+    }
+
+    ChampionTrace {
+        generation,
+        max_fitness,
+        won: runner.sim().outcome() == Outcome::Won,
+        points,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // live controls
 // ---------------------------------------------------------------------------
 
@@ -417,6 +501,13 @@ struct LiveState {
     paused: bool,
     /// Follow the leading agent's camera, or hold the whole level still.
     follow: bool,
+    /// The recorded generation being shown, or `None` for the live view (§10
+    /// Tier 2.7).
+    ///
+    /// Held as a **generation**, never as an index into the record: the log drops
+    /// its oldest entry when it fills, which shifts every index by one and would
+    /// silently re-point the cursor at a different route than the viewer chose.
+    trace_cursor: Option<u32>,
     quit: bool,
     /// `s` was pressed; the caller must save and then show a note.
     save_requested: bool,
@@ -429,6 +520,7 @@ impl Default for LiveState {
             mut_rate: GaConfig::default().mutation_rate,
             paused: false,
             follow: true,
+            trace_cursor: None,
             quit: false,
             save_requested: false,
         }
@@ -451,6 +543,21 @@ impl LiveState {
             next_mut_rate_down(self.mut_rate)
         };
     }
+
+    /// Scrub one recorded improvement older, stopping at the oldest.
+    fn step_trace_back(&mut self, traces: &TraceLog) {
+        self.trace_cursor = traces.step_back(self.trace_cursor);
+    }
+
+    /// Scrub one newer; one step past the newest returns to the live view.
+    fn step_trace_forward(&mut self, traces: &TraceLog) {
+        self.trace_cursor = traces.step_forward(self.trace_cursor);
+    }
+
+    /// Back to live, whatever the scrubber was showing.
+    fn trace_live(&mut self) {
+        self.trace_cursor = None;
+    }
 }
 
 /// What one keypress means. Split out of the event loop so the whole key map is
@@ -462,6 +569,10 @@ enum KeyAction {
     SpeedDown,
     MutRateUp,
     MutRateDown,
+    /// Walk the recorded champion paths (§10 Tier 2.7).
+    TraceBack,
+    TraceForward,
+    TraceLive,
     TogglePause,
     ToggleFollow,
     SkipGeneration,
@@ -483,15 +594,30 @@ fn key_action(code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
         }
         KeyCode::Char('f') | KeyCode::Char('F') => KeyAction::ToggleFollow,
         KeyCode::Char('s') | KeyCode::Char('S') => KeyAction::Save,
+        KeyCode::Left => KeyAction::TraceBack,
+        KeyCode::Right => KeyAction::TraceForward,
+        KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Home => KeyAction::TraceLive,
         _ => KeyAction::None,
     }
 }
 
 /// Apply a keypress, returning whether the viewer asked to skip this generation's
 /// animation.
-fn apply_key(action: KeyAction, live: &mut LiveState) -> bool {
+fn apply_key(action: KeyAction, live: &mut LiveState, traces: &TraceLog) -> bool {
     match action {
         KeyAction::None => false,
+        KeyAction::TraceBack => {
+            live.step_trace_back(traces);
+            false
+        }
+        KeyAction::TraceForward => {
+            live.step_trace_forward(traces);
+            false
+        }
+        KeyAction::TraceLive => {
+            live.trace_live();
+            false
+        }
         KeyAction::SpeedUp => {
             live.step_speed(true);
             false
@@ -609,17 +735,43 @@ struct Layout {
 }
 
 /// Fixed rows: two status lines, the generation bar, the death strip and two hint
-/// lines. The genius splash, the save note and the stall line each add one.
+/// lines.
 const FIXED_ROWS: usize = 6;
+
+/// The optional rows, each of which is a fact worth a line of its own.
+///
+/// A struct rather than four positional booleans: the layout is asked for one of
+/// these in half a dozen places, and `layout(rows, true, false, false, true)` is a
+/// call nobody can check at a glance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExtraRows {
+    /// The genius splash (Tier 1.3).
+    genius: bool,
+    /// The save note.
+    note: bool,
+    /// The stall line (finding 19).
+    stalled: bool,
+    /// The recorded-champion row (Tier 2.7) — also the only place the scrub keys
+    /// are advertised, because the two hint lines have no room left at 80 columns.
+    recorded: bool,
+}
+
+impl ExtraRows {
+    fn count(self) -> usize {
+        usize::from(self.genius)
+            + usize::from(self.note)
+            + usize::from(self.stalled)
+            + usize::from(self.recorded)
+    }
+}
 
 /// The chart takes a third of the spare rows, the level view the rest.
 ///
 /// On a terminal too short for both minimums the sections keep their minimums and
 /// the frame is truncated at draw time: losing the hint lines is survivable, losing
 /// the level view is not.
-fn layout(rows: usize, genius: bool, has_note: bool, stalled: bool) -> Layout {
-    let reserved = FIXED_ROWS + usize::from(genius) + usize::from(has_note) + usize::from(stalled);
-    let spare = rows.saturating_sub(reserved);
+fn layout(rows: usize, extra: ExtraRows) -> Layout {
+    let spare = rows.saturating_sub(FIXED_ROWS + extra.count());
     let chart_rows = (spare / 3).clamp(MIN_CHART_ROWS, MAX_CHART_ROWS);
     Layout {
         chart_rows,
@@ -650,6 +802,10 @@ struct Frame<'a> {
     stall: Option<Stall>,
     /// The tile column deaths cluster at, in the same death window the strip uses.
     cluster: Option<(i32, usize)>,
+    /// The recorded champion routes the scrubber walks (Tier 2.7).
+    traces: &'a TraceLog,
+    /// The recorded generation being shown, or `None` while the view is live.
+    scrub: Option<u32>,
     progress: Progress,
 }
 
@@ -670,16 +826,33 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
     // (`PAUSED`, `whole level`) are the difference between a viewer waiting and a
     // viewer thinking the thing has hung, and double spacing was enough to clip
     // them off once the live mutation rate joined the line.
-    let mut head = format!(
-        "{:<14} gen {}/{} lanes {}/{} alive speed {} mut {}",
-        clip(f.level_name, 14),
-        f.generation,
-        f.generations.max(1),
-        f.alive,
-        f.lane_count,
-        speed_label(f.live.speed),
-        mut_label(f.live.mut_rate)
-    );
+    // A scrubbed view describes the *record*, not the live run: the numbers printed
+    // beside a picture have to belong to it (Tier 2.7).
+    let record = f.scrub.and_then(|g| f.traces.get(g));
+    let mut head = match record {
+        Some(trace) => format!(
+            "{:<14} record {}/{}: gen {}  max {}  {}",
+            clip(f.level_name, 14),
+            f.traces
+                .index_of(trace.generation)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            f.traces.len(),
+            trace.generation,
+            format_fitness(trace.max_fitness),
+            if trace.won { "solved" } else { "not solved" }
+        ),
+        None => format!(
+            "{:<14} gen {}/{} lanes {}/{} alive speed {} mut {}",
+            clip(f.level_name, 14),
+            f.generation,
+            f.generations.max(1),
+            f.alive,
+            f.lane_count,
+            speed_label(f.live.speed),
+            mut_label(f.live.mut_rate)
+        ),
+    };
     if f.live.paused {
         head.push_str("  PAUSED");
     }
@@ -725,6 +898,38 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
             None => stall.label(),
         };
         lines.push(clip(&line, cols));
+    }
+
+    // 3b. The record the scrubber walks (Tier 2.7): how many improvements are kept
+    //     and the span they cover, or which one is on screen. This row is also where
+    //     the scrub keys live, because the two hint lines below have no room left at
+    //     80 columns and an undocumented control is not a control.
+    if let Some(trace) = record {
+        let index = f
+            .traces
+            .index_of(trace.generation)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        // The trail's glyph is named here, on the row that owns it: the death strip
+        // at the bottom of the frame uses the same character for "one death in this
+        // column", and two meanings for one glyph in one frame is a defect unless
+        // the frame says which is which.
+        lines.push(clip(
+            &format!(
+                "record {}/{}   left/right scrub   h live   : marks the route",
+                index,
+                f.traces.len()
+            ),
+            cols,
+        ));
+    } else if let Some((first, last)) = f.traces.span() {
+        lines.push(clip(
+            &format!(
+                "record {} improvements kept (gen {first}..{last})   left/right scrub   h live",
+                f.traces.len()
+            ),
+            cols,
+        ));
     }
 
     // 4. The genius splash (Tier 1.3) — the one deliberate piece of drama.
@@ -804,6 +1009,7 @@ struct GenCtx<'a> {
     history: &'a [HistoryPoint],
     deaths: &'a [(f32, f32, u32)],
     note: Option<&'a str>,
+    traces: &'a TraceLog,
 }
 
 /// Frames a generation is allowed to draw at this speed: enough to watch the whole
@@ -840,7 +1046,7 @@ fn animate_lanes(
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
-                if apply_key(key_action(key.code, key.modifiers), live) {
+                if apply_key(key_action(key.code, key.modifiers), live, ctx.traces) {
                     skip = true;
                 }
             }
@@ -903,7 +1109,13 @@ fn draw_state(
     // so there is exactly one place that can disagree about them.
     let stall = fitness_stall(ctx.history);
     let cluster = stall.and_then(|_| death_cluster(ctx.deaths, level.width));
-    let l = layout(rows, ctx.genius, ctx.note.is_some(), stall.is_some());
+    let extra = ExtraRows {
+        genius: ctx.genius,
+        note: ctx.note.is_some(),
+        stalled: stall.is_some(),
+        recorded: !ctx.traces.is_empty(),
+    };
+    let l = layout(rows, extra);
 
     // Lane bodies, and the walkers of the lane the camera is on. Walkers come from
     // exactly one lane: eight walker sprites overlapping in a smear would be a worse
@@ -963,12 +1175,26 @@ fn draw_state(
     }
     bodies.extend(lane_bodies.iter().skip(1));
 
-    let (cx, cy) = match leader {
-        Some(i) => {
-            let p = runners[i].sim().player();
-            (p.x + p.w * 0.5, p.y + p.h * 0.5)
-        }
-        None => (level.width as f32 * 0.5, level.height as f32 * 0.5),
+    // What the level view shows: the live lanes, or one recorded champion route
+    // (Tier 2.7). The two never mix — a past route drawn among live agents would be
+    // a picture of two different generations at once, and the numbers beside it
+    // would belong to neither.
+    let recorded = live.trace_cursor.and_then(|g| ctx.traces.get(g));
+
+    let (cx, cy) = match recorded {
+        // A scrubbed view centres on where the route stopped: that is the obstacle
+        // the moment being shown is about.
+        Some(trace) => match trace.end() {
+            Some(p) => (p.x, p.y),
+            None => (level.width as f32 * 0.5, level.height as f32 * 0.5),
+        },
+        None => match leader {
+            Some(i) => {
+                let p = runners[i].sim().player();
+                (p.x + p.w * 0.5, p.y + p.h * 0.5)
+            }
+            None => (level.width as f32 * 0.5, level.height as f32 * 0.5),
+        },
     };
     // "Whole level" is the same camera rule with the centre pinned to the middle of
     // the level, so it is a genuine whole-level view whenever the level fits.
@@ -979,7 +1205,13 @@ fn draw_state(
     };
     let view = Viewport::following_body(level, cx, cy, cols as u16, l.scene_rows as u16);
 
-    let scene = Scene::new(level, bodies);
+    let scene = Scene::new(
+        level,
+        match recorded {
+            Some(trace) => trace.bodies(),
+            None => bodies,
+        },
+    );
     let scene_lines: Vec<String> = render_scene(&scene, view)
         .lines()
         .map(|s| s.to_string())
@@ -1002,6 +1234,8 @@ fn draw_state(
         genius: ctx.genius,
         stall,
         cluster,
+        traces: ctx.traces,
+        scrub: live.trace_cursor,
         progress,
     };
     screen.draw(&render_frame(&frame, cols, rows, l))
@@ -1048,6 +1282,10 @@ fn watch_champion(
         avg_fitness: champion.fitness,
         wins: usize::from(champion.metadata.outcome == "won"),
     }];
+    // Champion mode replays one saved genome, so it has no record to scrub: a
+    // record exists to compare a population's improvements against each other, and
+    // there is exactly one route here.
+    let traces = TraceLog::new();
     let ctx = GenCtx {
         generation: champion.metadata.generation,
         generations: 1,
@@ -1057,6 +1295,7 @@ fn watch_champion(
         history: &history,
         deaths: &[],
         note: None,
+        traces: &traces,
     };
     let mut runners = vec![EpisodeRunner::new(
         level,
@@ -1223,6 +1462,9 @@ struct Screen {
     interactive: bool,
     drawn: usize,
     cap: Option<usize>,
+    /// The most recent frame, kept so a test can assert on what was actually drawn
+    /// — the composition, not just the rows it was composed from.
+    last: String,
 }
 
 impl Screen {
@@ -1238,6 +1480,7 @@ impl Screen {
             interactive,
             drawn: 0,
             cap,
+            last: String::new(),
         })
     }
 
@@ -1257,6 +1500,7 @@ impl Screen {
     }
 
     fn draw(&mut self, frame: &str) -> io::Result<()> {
+        self.last = frame.to_string();
         self.drawn += 1;
         let (cols, _) = self.size();
         let mut stdout = io::stdout();
@@ -1324,6 +1568,15 @@ mod tests {
             mean_fitness: 90.0 - rank as f32,
             seed: 7 + rank as u64,
         }
+    }
+
+    /// [`apply_key`] against an empty record.
+    ///
+    /// The scrub keys are the only ones that read the record, and they get their
+    /// own test with a real one — so everything else can keep the two-argument
+    /// shape it had before there was a record to scrub.
+    fn press(action: KeyAction, live: &mut LiveState) -> bool {
+        apply_key(action, live, &TraceLog::new())
     }
 
     // -- keys -----------------------------------------------------------------
@@ -1457,30 +1710,30 @@ mod tests {
     #[test]
     fn keys_drive_the_live_state() {
         let mut live = LiveState::default();
-        assert!(!apply_key(
+        assert!(!press(
             key_action(KeyCode::Char(' '), KeyModifiers::NONE),
             &mut live
         ));
         assert!(live.paused);
-        assert!(!apply_key(
+        assert!(!press(
             key_action(KeyCode::Char(' '), KeyModifiers::NONE),
             &mut live
         ));
         assert!(!live.paused);
 
-        assert!(!apply_key(
+        assert!(!press(
             key_action(KeyCode::Char('f'), KeyModifiers::NONE),
             &mut live
         ));
         assert!(!live.follow);
 
-        assert!(apply_key(
+        assert!(press(
             key_action(KeyCode::Char('n'), KeyModifiers::NONE),
             &mut live
         ));
         assert!(!live.quit, "skipping a generation is not quitting");
 
-        assert!(!apply_key(
+        assert!(!press(
             key_action(KeyCode::Char('s'), KeyModifiers::NONE),
             &mut live
         ));
@@ -1490,19 +1743,19 @@ mod tests {
         // top; down three times, then pinned at the bottom.
         let default_rate = LiveState::default().mut_rate;
         for _ in 0..2 {
-            apply_key(
+            press(
                 key_action(KeyCode::Char('m'), KeyModifiers::NONE),
                 &mut live,
             );
         }
         assert_eq!(live.mut_rate, *MUT_RATES.last().expect("ladder"));
-        apply_key(
+        press(
             key_action(KeyCode::Char('m'), KeyModifiers::NONE),
             &mut live,
         );
         assert_eq!(live.mut_rate, *MUT_RATES.last().expect("ladder"));
         for _ in 0..5 {
-            apply_key(
+            press(
                 key_action(KeyCode::Char('M'), KeyModifiers::NONE),
                 &mut live,
             );
@@ -1513,7 +1766,7 @@ mod tests {
             "the default has to have a rung below it or the slider only goes one way"
         );
 
-        apply_key(
+        press(
             key_action(KeyCode::Char('q'), KeyModifiers::NONE),
             &mut live,
         );
@@ -1643,8 +1896,53 @@ mod tests {
             .collect()
     }
 
-    fn frame(cols: usize, rows: usize, genius: bool, note: Option<&str>) -> String {
-        frame_with(cols, rows, genius, note, None)
+    fn frame(cols: usize, rows: usize, genius: bool, note: Option<&'static str>) -> String {
+        frame_with(
+            cols,
+            rows,
+            FrameOpts {
+                genius,
+                note,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A record of three improvements, with gaps between them: 0, 40 and 97 were
+    /// improvements and the generations in between were not, which is what a real
+    /// record looks like.
+    fn recorded_log() -> TraceLog {
+        let mut log = TraceLog::new();
+        for (generation, max_fitness) in [(0u32, 100.0f32), (40, 200.0), (97, 400.0)] {
+            log.observe(ChampionTrace {
+                generation,
+                max_fitness,
+                won: generation == 97,
+                points: vec![TracePoint {
+                    frame: 0,
+                    x: 2.0,
+                    y: 12.0,
+                }],
+            });
+        }
+        log
+    }
+
+    /// Options for [`frame_with`], all off by default.
+    ///
+    /// Five positional arguments (two of them `Option`s of different meanings) was
+    /// the shape this had before the record row existed; naming the fields instead
+    /// makes each call site say what it is actually asking for.
+    #[derive(Default)]
+    struct FrameOpts {
+        genius: bool,
+        note: Option<&'static str>,
+        history: Option<Vec<HistoryPoint>>,
+        /// Attach the recorded improvements from [`recorded_log`].
+        record: bool,
+        /// Show this recorded generation instead of the live view. Implies
+        /// `record` even when the caller forgot to ask for one.
+        scrub: Option<u32>,
     }
 
     /// A frame with an optional stall built from `history(9)` plus `extra` flat
@@ -1662,25 +1960,38 @@ mod tests {
                 wins: 0,
             });
         }
-        frame_with(cols, rows, false, None, Some(h))
+        frame_with(
+            cols,
+            rows,
+            FrameOpts {
+                history: Some(h),
+                ..Default::default()
+            },
+        )
     }
 
-    /// `override_history` rather than `history`: the test module has a `history(n)`
-    /// helper, and a parameter of that name would shadow it into an `Option`.
-    fn frame_with(
-        cols: usize,
-        rows: usize,
-        genius: bool,
-        note: Option<&str>,
-        override_history: Option<Vec<HistoryPoint>>,
-    ) -> String {
+    fn frame_with(cols: usize, rows: usize, opts: FrameOpts) -> String {
         let level = load_level(&wpath("levels/l3-gauntlet.json")).expect("level loads");
-        let owned = override_history.unwrap_or_else(|| history(9));
+        let genius = opts.genius;
+        let note = opts.note;
+        let owned = opts.history.unwrap_or_else(|| history(9));
+        let traces = if opts.record || opts.scrub.is_some() {
+            recorded_log()
+        } else {
+            TraceLog::new()
+        };
+        let scrub = opts.scrub;
         let deaths = vec![(10.0, 12.0, 3u32), (10.4, 12.0, 4), (44.0, 12.0, 5)];
         let stall = fitness_stall(&owned);
         let cluster = stall.and_then(|_| death_cluster(&deaths, level.width));
         let stalled = stall.is_some();
-        let scene: Vec<String> = (0..layout(rows, genius, note.is_some(), stalled).scene_rows)
+        let extra = ExtraRows {
+            genius,
+            note: note.is_some(),
+            stalled,
+            recorded: !traces.is_empty(),
+        };
+        let scene: Vec<String> = (0..layout(rows, extra).scene_rows)
             .map(|i| format!("scene row {i}"))
             .collect();
         let f = Frame {
@@ -1700,12 +2011,14 @@ mod tests {
             genius,
             stall,
             cluster,
+            traces: &traces,
+            scrub,
             progress: Progress {
                 index: 120,
                 budget: 675,
             },
         };
-        render_frame(&f, cols, rows, layout(rows, genius, note.is_some(), stalled))
+        render_frame(&f, cols, rows, layout(rows, extra))
     }
 
     #[test]
@@ -1750,6 +2063,7 @@ mod tests {
         let cluster = death_cluster(deaths, level.width);
         assert!(cluster.is_none(), "this helper is for the empty window");
         let scene: Vec<String> = vec!["scene".to_string()];
+        let traces = TraceLog::new();
         let f = Frame {
             level_name: &level.name,
             level_width_tiles: level.width,
@@ -1767,12 +2081,25 @@ mod tests {
             genius: false,
             stall: Some(stall),
             cluster,
+            traces: &traces,
+            scrub: None,
             progress: Progress {
                 index: 1,
                 budget: 60,
             },
         };
-        render_frame(&f, cols, rows, layout(rows, false, false, true))
+        render_frame(
+            &f,
+            cols,
+            rows,
+            layout(
+                rows,
+                ExtraRows {
+                    stalled: true,
+                    ..Default::default()
+                },
+            ),
+        )
     }
 
     /// The stall cutoff, read from the chart module so the watch view and this test
@@ -1801,7 +2128,14 @@ mod tests {
                 wins: 0,
             });
         }
-        let stalled = frame_with(100, 34, false, None, Some(h.clone()));
+        let stalled = frame_with(
+            100,
+            34,
+            FrameOpts {
+                history: Some(h.clone()),
+                ..Default::default()
+            },
+        );
         assert!(stalled.contains("stalled"));
         h.push(HistoryPoint {
             generation: h.len() as u32,
@@ -1809,7 +2143,14 @@ mod tests {
             avg_fitness: best,
             wins: 0,
         });
-        let recovered = frame_with(100, 34, false, None, Some(h));
+        let recovered = frame_with(
+            100,
+            34,
+            FrameOpts {
+                history: Some(h),
+                ..Default::default()
+            },
+        );
         assert!(
             !recovered.contains("stalled"),
             "a new best ends the stall: {recovered}"
@@ -1822,19 +2163,24 @@ mod tests {
             for genius in [false, true] {
                 for note in [false, true] {
                     for stalled in [false, true] {
-                        let l = layout(rows, genius, note, stalled);
-                        let reserved = FIXED_ROWS
-                            + usize::from(genius)
-                            + usize::from(note)
-                            + usize::from(stalled);
-                        assert_eq!(
-                            l.chart_rows + l.scene_rows + reserved,
-                            rows,
-                            "rows {rows} genius {genius} note {note} stalled {stalled} \
-                             must use the whole screen"
-                        );
-                        assert!(l.chart_rows >= MIN_CHART_ROWS);
-                        assert!(l.scene_rows >= MIN_SCENE_ROWS);
+                        for recorded in [false, true] {
+                            let extra = ExtraRows {
+                                genius,
+                                note,
+                                stalled,
+                                recorded,
+                            };
+                            let l = layout(rows, extra);
+                            let reserved = FIXED_ROWS + extra.count();
+                            assert_eq!(
+                                l.chart_rows + l.scene_rows + reserved,
+                                rows,
+                                "rows {rows} genius {genius} note {note} stalled {stalled} \
+                                 recorded {recorded} must use the whole screen"
+                            );
+                            assert!(l.chart_rows >= MIN_CHART_ROWS);
+                            assert!(l.scene_rows >= MIN_SCENE_ROWS);
+                        }
                     }
                 }
             }
@@ -1843,7 +2189,7 @@ mod tests {
         // minimums and the frame is truncated, rather than the level view shrinking
         // to nothing.
         for rows in [8usize, 12] {
-            let l = layout(rows, false, false, false);
+            let l = layout(rows, ExtraRows::default());
             assert!(l.chart_rows >= MIN_CHART_ROWS);
             assert!(l.scene_rows >= MIN_SCENE_ROWS);
             let text = frame(100, rows, false, None);
@@ -1925,6 +2271,7 @@ mod tests {
         let level = load_level(&wpath("levels/l1-flat-run.json")).expect("level loads");
         let h = history(5);
         let scene = vec!["row".to_string()];
+        let traces = TraceLog::new();
         let f = Frame {
             level_name: &level.name,
             level_width_tiles: level.width,
@@ -1948,12 +2295,14 @@ mod tests {
             genius: false,
             stall: None,
             cluster: None,
+            traces: &traces,
+            scrub: None,
             progress: Progress {
                 index: 1,
                 budget: 60,
             },
         };
-        let text = render_frame(&f, 80, 24, layout(24, false, false, false));
+        let text = render_frame(&f, 80, 24, layout(24, ExtraRows::default()));
         assert!(text.contains("PAUSED"));
         assert!(text.contains("whole level"));
         assert!(text.contains("speed 50x"));
@@ -2003,6 +2352,267 @@ mod tests {
         }
     }
 
+    // -- the record (Tier 2.7) -----------------------------------------------
+
+    #[test]
+    fn the_record_keeps_the_route_the_run_actually_scored() {
+        // The record must be a fact about the *run*, not about the animation: the
+        // route is re-simulated from the genome and seed the champion lane was
+        // scored with, and has to reproduce that episode's outcome, its final
+        // position and its length. If this drifts, the scrubber would be showing a
+        // different episode than the fitness printed beside it.
+        let level = load_level(&wpath("levels/l2-first-gap.json")).expect("level loads");
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 3,
+            ..GaConfig::default()
+        };
+        let eval = cfg.eval_config();
+        let mut trainer = Trainer::new(cfg);
+        let (report, population) = trainer.step_verbose(&level);
+        let lanes = trainer.showcase(&report, &population, 4, 4);
+        let lane = lanes.first().expect("a showcase always has a champion");
+
+        let trace = record_trace(
+            &level,
+            &eval,
+            &population[lane.index],
+            lane.seed,
+            report.generation,
+            report.max_fitness,
+        );
+        assert_eq!(trace.generation, report.generation);
+        assert_eq!(trace.max_fitness, report.max_fitness);
+        assert!(!trace.points.is_empty(), "a route has at least one position");
+
+        // The same episode, driven independently.
+        let mut runner = EpisodeRunner::new(&level, &population[lane.index], &eval, lane.seed);
+        while !runner.is_finished() {
+            runner.step();
+        }
+        let end = {
+            let p = runner.sim().player();
+            (p.x, p.y)
+        };
+        let scored = runner.result();
+        assert_eq!(trace.won, scored.won(), "the record agrees about the outcome");
+        assert_eq!(
+            trace.frames(),
+            scored.frames,
+            "the route ends on the scored episode's last frame"
+        );
+        let last = trace.end().expect("non-empty");
+        assert_eq!(
+            (last.x, last.y),
+            end,
+            "the route ends where the episode ended, not at a rounded sample"
+        );
+
+        // Samples land on the documented interval; only the final one is exact.
+        for pair in trace.points.windows(2) {
+            if pair[1].frame == trace.frames() {
+                continue;
+            }
+            assert_eq!(pair[1].frame - pair[0].frame, TRACE_SAMPLE_FRAMES);
+        }
+    }
+
+    #[test]
+    fn the_scrub_keys_walk_the_record_and_return_to_live() {
+        assert_eq!(
+            key_action(KeyCode::Left, KeyModifiers::NONE),
+            KeyAction::TraceBack
+        );
+        assert_eq!(
+            key_action(KeyCode::Right, KeyModifiers::NONE),
+            KeyAction::TraceForward
+        );
+        assert_eq!(
+            key_action(KeyCode::Char('h'), KeyModifiers::NONE),
+            KeyAction::TraceLive
+        );
+
+        let log = recorded_log(); // improvements at generations 0, 40 and 97
+        let mut live = LiveState::default();
+        assert_eq!(live.trace_cursor, None, "a fresh view is live");
+
+        let press_key = |live: &mut LiveState, code: KeyCode| {
+            apply_key(key_action(code, KeyModifiers::NONE), live, &log);
+        };
+
+        // Left from live lands on the newest improvement, then walks back.
+        press_key(&mut live, KeyCode::Left);
+        assert_eq!(live.trace_cursor, Some(97));
+        press_key(&mut live, KeyCode::Left);
+        assert_eq!(live.trace_cursor, Some(40));
+        press_key(&mut live, KeyCode::Left);
+        assert_eq!(live.trace_cursor, Some(0));
+        // The oldest is a hard stop, not a wrap to the newest: a scrubber that
+        // circled would make it impossible to tell you were at the beginning.
+        press_key(&mut live, KeyCode::Left);
+        assert_eq!(live.trace_cursor, Some(0));
+
+        // Right walks forward, and one step past the newest is live again.
+        press_key(&mut live, KeyCode::Right);
+        assert_eq!(live.trace_cursor, Some(40));
+        press_key(&mut live, KeyCode::Right);
+        assert_eq!(live.trace_cursor, Some(97));
+        press_key(&mut live, KeyCode::Right);
+        assert_eq!(live.trace_cursor, None);
+        press_key(&mut live, KeyCode::Right);
+        assert_eq!(live.trace_cursor, None, "still live");
+
+        // `h` comes back from anywhere in the record.
+        press_key(&mut live, KeyCode::Left);
+        press_key(&mut live, KeyCode::Left);
+        assert_eq!(live.trace_cursor, Some(40));
+        press_key(&mut live, KeyCode::Char('h'));
+        assert_eq!(live.trace_cursor, None);
+
+        // With nothing recorded the scrub keys are inert rather than a panic.
+        let mut empty = LiveState::default();
+        apply_key(
+            key_action(KeyCode::Left, KeyModifiers::NONE),
+            &mut empty,
+            &TraceLog::new(),
+        );
+        assert_eq!(empty.trace_cursor, None);
+    }
+
+    #[test]
+    fn the_record_row_reports_the_record_and_labels_the_scrubbed_view() {
+        // Live, with a record available: how many improvements, and from when. The
+        // row is also the only advertisement for the scrub keys.
+        let live = frame_with(
+            100,
+            34,
+            FrameOpts {
+                record: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            live.contains("record 3 improvements kept (gen 0..97)"),
+            "a live view with a record says what it has: {live}"
+        );
+        assert!(live.contains("left/right scrub"));
+        assert!(live.contains("h live"));
+        assert!(
+            live.contains("lanes 6/8 alive"),
+            "the live view still describes the live run: {live}"
+        );
+
+        // Scrubbed: the head describes the record, not the live run. A number next
+        // to a picture has to belong to that picture.
+        let scrubbed = frame_with(
+            100,
+            34,
+            FrameOpts {
+                scrub: Some(40),
+                ..Default::default()
+            },
+        );
+        assert!(
+            scrubbed.contains("record 2/3: gen 40  max 200.0  not solved"),
+            "the head names the record being shown: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("record 2/3   left/right scrub   h live   : marks the route"),
+            "the row names the trail glyph it owns: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("lanes 6/8 alive"),
+            "the live lane count must not sit beside a recorded route: {scrubbed}"
+        );
+
+        // The newest entry is the one that solved the level, and it says so.
+        let solved = frame_with(
+            100,
+            34,
+            FrameOpts {
+                scrub: Some(97),
+                ..Default::default()
+            },
+        );
+        assert!(solved.contains("record 3/3: gen 97  max 400.0  solved"), "{solved}");
+
+        // The record row is paid for out of the chart and the scene, exactly like
+        // the stall and genius rows: the frame keeps its height either way.
+        assert_eq!(live.lines().count(), 34);
+        assert_eq!(scrubbed.lines().count(), 34);
+    }
+
+    #[test]
+    fn a_scrubbed_view_draws_the_recorded_route_without_the_live_lanes() {
+        // The glue rather than the parts: with a cursor set, what reaches the screen
+        // is the recorded route over the level, labelled as the record.
+        use render::trace::GLYPH_TRAIL;
+        let level = load_level(&wpath("levels/l3-gauntlet.json")).expect("level loads");
+        let cfg = GaConfig {
+            pop_size: 4,
+            master_seed: 1,
+            ..GaConfig::default()
+        };
+        let eval = cfg.eval_config();
+        let genome = Genome::zeros(0, cfg.shape.clone());
+        let lanes = vec![LaneInfo {
+            label: '1',
+            best: true,
+            genome_id: 0,
+            rank: 0,
+            fitness: 0.0,
+            mean_fitness: 0.0,
+        }];
+        let history: Vec<HistoryPoint> = Vec::new();
+        // A route built by hand, so the test does not depend on what evolution
+        // happens to do: sixteen samples walking right along the ground.
+        let mut traces = TraceLog::new();
+        assert!(traces.observe(ChampionTrace {
+            generation: 7,
+            max_fitness: 42.0,
+            won: false,
+            points: (0..16)
+                .map(|i| TracePoint {
+                    frame: i * TRACE_SAMPLE_FRAMES,
+                    x: 2.0 + i as f32 * 0.5,
+                    y: 12.0,
+                })
+                .collect(),
+        }));
+        let ctx = GenCtx {
+            generation: 7,
+            generations: 10,
+            pop_size: 4,
+            wins: 0,
+            genius: false,
+            history: &history,
+            deaths: &[],
+            note: None,
+            traces: &traces,
+        };
+        let mut screen = Screen::open(true, Some(1)).expect("headless screen");
+        let mut live = LiveState {
+            trace_cursor: Some(7),
+            ..LiveState::default()
+        };
+        let mut runners = vec![EpisodeRunner::new(&level, &genome, &eval, 1)];
+        animate_lanes(&mut screen, &level, &mut runners, &lanes, &ctx, &mut live).expect("draws");
+
+        let drawn = screen.last.clone();
+        assert!(
+            drawn.contains("record 1/1: gen 7  max 42.00  not solved"),
+            "a scrubbed frame says what it is showing: {drawn}"
+        );
+        assert!(
+            drawn.contains(GLYPH_TRAIL),
+            "the recorded route is drawn: {drawn}"
+        );
+        assert!(
+            !drawn.contains("lanes 1/1 alive"),
+            "the live lanes are not what is on screen: {drawn}"
+        );
+    }
+
     // -- the animation loop ---------------------------------------------------
 
     /// A one-lane generation, ready to animate: the smallest real call into
@@ -2029,6 +2639,7 @@ mod tests {
             mean_fitness: 0.0,
         }];
         let history: Vec<HistoryPoint> = Vec::new();
+        let traces = TraceLog::new();
         let ctx = GenCtx {
             generation: 0,
             generations: 10,
@@ -2038,6 +2649,7 @@ mod tests {
             history: &history,
             deaths: &[],
             note: None,
+            traces: &traces,
         };
         let mut screen = Screen::open(true, Some(frames)).expect("headless screen");
         let mut live = live;

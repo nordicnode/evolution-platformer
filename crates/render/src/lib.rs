@@ -16,10 +16,16 @@
 //! text out, so the learning arc can be rendered, and unit-tested, by code that has
 //! no opinion about physics. Watch mode is therefore a composition of a scene view
 //! and a chart, not a fourth renderer.
+//!
+//! [`trace`] is the second exception, for the same reason: a recorded champion
+//! route is a list of positions in, drawable markers out. It borrows nothing from
+//! `sim` (no `&Sim`, no physics) and never advances an episode -- running the
+//! episode that produces the positions is the caller's job, in `evo`.
 
 pub mod ascii;
 pub mod chart;
 pub mod play;
+pub mod trace;
 
 pub use ascii::{
     frame, frame_in, header, legend, render_scene, Body, Scene, Viewport, GLYPHS, GLYPH_UNKNOWN,
@@ -29,3 +35,7 @@ pub use chart::{
     Trend,
 };
 pub use play::{play, hint, PlaySummary, FRAME_TIME};
+pub use trace::{
+    ChampionTrace, TraceLog, TracePoint, GLYPH_TRAIL, TRACE_CAP, TRACE_IMPROVEMENT,
+    TRACE_SAMPLE_FRAMES,
+};

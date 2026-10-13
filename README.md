@@ -25,7 +25,10 @@ pause, death markers and the genius-agent splash. The level pack behind it is no
 six levels wide, and its two hardest are *hard* (findings 15–18) — hard enough that
 they sometimes stall, which the view reports with a stall line naming how long the
 population has been stuck and which obstacle it keeps dying on (finding 19), and
-offers a live mutation-rate knob to try instead (finding 20). What
+offers a live mutation-rate knob to try instead (finding 20). Every generation that
+improves the best also has its champion route recorded, and the arrow keys scrub
+back through those routes — position by position — to the moment a jump was first
+learned (finding 21). What
 remains of M3 is the part no test can answer — whether watching it is fun — and
 that needs a human at a keyboard. See [The M3 problem](#the-m3-problem).
 
@@ -122,7 +125,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 197 tests
+cargo test --workspace                 # 207 tests
 cargo build --release
 
 # Can this level be beaten at all? Milliseconds, no training.
@@ -131,6 +134,7 @@ cargo build --release
 # Watch it learn: chart, best-4 + random-4 agents, deaths, genius splashes.
 ./target/release/train-cli watch --level levels/l5-tightrope.json
 #   space pause   -/+ speed   m/M mutation rate   n next generation
+#   left/right scrub the recorded champions   h back to live
 #   f follow/whole level   s save champion   q quit
 
 # Evolve headlessly, print the fitness chart, save a champion.
@@ -263,7 +267,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-197 tests, all green. `cargo test --workspace`.
+207 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -283,7 +287,13 @@ pack's difficulty is pinned by `crates/evo/tests/difficulty.rs`: a random
 population must win L1/L2 at generation 0, must win none of L3–L6 on any of four
 seeds, and L4 must still fall to evolution inside 60 generations at pop 64.
 
-Watch mode adds seven that hold its honesty in place:
+The recorded champion paths get six of their own in `render::trace` — the log keeps
+an improvement and drops the flat generations, refuses a non-finite fitness (a NaN
+would refuse every later trace, an infinity would freeze the record), steps between
+recorded generations rather than counting up by one, stops at the oldest instead of
+wrapping, returns to live when the record it was showing ages out, and draws one
+marker per cell with the end on top. Watch mode adds eleven that hold its honesty
+in place:
 `every_showcase_lane_replays_the_episode_that_was_evaluated` (a lane animates the
 episode that was scored, seed for seed, so the picture and the numbers agree),
 `watching_does_not_change_what_is_evolved` (the showcase's RNG is separate, so
@@ -297,7 +307,15 @@ it). Two more hold the live mutation knob honest: `the_live_mutation_rate_change
 the_offspring` presses `m` and asserts the *next generation's genomes* actually
 differ from the unpressed run — the key changes the evolution rather than the label
 — and `the_mutation_ladder_stays_inside_the_plans_range` pins every rung to the
-documented 0.03–0.10 and checks the ends clamp instead of wrapping.
+documented 0.03–0.10 and checks the ends clamp instead of wrapping. Four more cover
+the scrubber: `the_record_keeps_the_route_the_run_actually_scored` re-simulates the
+recorded episode from the genome and seed it was scored with and asserts the route
+ends on that episode's last frame and outcome (the same fidelity rule the lanes
+live by), `the_scrub_keys_walk_the_record_and_return_to_live` drives `←`/`→`/`h`,
+`the_record_row_reports_the_record_and_labels_the_scrubbed_view` checks that a
+scrubbed frame describes the record and never the live lane count, and
+`a_scrubbed_view_draws_the_recorded_route_without_the_live_lanes` asserts on the
+frame that actually reaches the screen.
 The watch layout itself is testable without a TTY because `--headless` renders
 plain text frames; `cargo test` exercises the whole frame composition that way.
 
@@ -458,6 +476,28 @@ deliberate, documented decision — not drift.
    point on an easier level, M5), not a different schedule. The ladder is clamped to
    the plan's own 0.03–0.10 and snaps `--mut-rate` onto it, so the number in the
    header is always the number being used.
+21. **A timeline is worth keeping only where it changed.** Tier 2.7 asks watch mode
+   to record the champion's trajectory per generation and let the viewer scrub back
+   to the moment the jump was learned. Recording every generation would keep 420
+   near-identical routes on the seed that stalls (finding 19) — the rescue is
+   invisible in exactly the case the scrubber exists for — so the record keeps the
+   generations that moved the best by at least 1% and drops the rest. Measured on
+   the two hardest seeds at pop 200 for 420 generations: **8 entries spanning `gen
+   0..38`** on seed 5 (the seed whose best never moves again) and **5 entries
+   spanning `gen 0..76`** on seed 1, whose solve at generation 76 is therefore the
+   record's *last entry*. Two independent measurements agreeing on the same
+   boundary is the strongest check this feature has: the record's span is the
+   plateau, so a viewer who reads `record 8 improvements kept (gen 0..38)` at
+   generation 400 is being told the same thing the stall line says, from data that
+   was collected by different code. The cap is 64 entries (~1 MB), which those runs
+   never reach; when it does fill, the oldest entry is dropped and the row shows the
+   span, so a record that no longer reaches back to generation 0 says so rather than
+   looking complete. Two smaller decisions are recorded here because they are the
+   kind that get silently re-litigated: each recorded route is re-simulated as its
+   own episode rather than sampled off the animation (a paused, skipped or
+   frame-capped animation would truncate the path exactly when a viewer has walked
+   away), and the trail's `:` is named on the row that owns it because the death
+   strip already uses `:` for "one death in this column".
 18. **The oracle's jump windows are a lower bound, not a difficulty meter.** The
    canonical model jumps from a standing start at full run speed; the sim also
    allows a take-off inside the 4-tick coyote window *after* walking off a ledge,
@@ -516,6 +556,14 @@ measurement has not been taken.
    when chosen at launch, and switching it *at* a stall did not rescue one. The next
    lever is therefore not a slider but a different landscape — resume from the stuck
    point on an easier level.
+6. **Show how the route changed, not just how the number did.** — *done, see finding
+   21.* Tier 2.7's timeline scrubber: watch mode records the champion's route — one
+   position every 4 frames — for each generation that improves the best, and
+   `←`/`→` scrub back through them, drawing the recorded route over the level with
+   `:` and ending it at the flag or at the grave. It is the one view that answers
+   "what changed when it stopped being stuck", and on the shipped pack its span *is*
+   the stall: seed 5's record runs `gen 0..38`, exactly the generation finding 19
+   measured as the last improvement.
 
 ## Deliberately deferred
 
