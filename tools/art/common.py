@@ -170,18 +170,30 @@ PINE_FAR_LIGHT = (140, 180, 182)
 PINE_FAR = (130, 170, 174)
 
 # The rank on the *near* hills: the same conifer, one band closer, so the haze is
-# mostly off it. Saturated green rather than the far rank's blue-green, and darker
-# than the far rank tone for tone — that ordering is the depth cue — but not darker
-# in luminance than the far rank used to be: a near tree is the most present tree
-# in the backdrop, and a present thing drawn near-black is the "too dark" mistake
-# again, one band nearer. Its body sits at about the far rank's old luminance with
-# the blue taken out and the green put in. Three tones only: the fourth thing a
-# pine needs is a trunk, and a trunk is not a shade of foliage — the near rank's
-# is drawn in `BARK`, with the foreground trees below, because at this size the
-# trunk is visible and a green one reads as a pole (see `props.pine`).
-PINE_NEAR_LIGHT = (104, 176, 104)
-PINE_NEAR = (84, 158, 88)
-PINE_NEAR_DARK = (68, 138, 74)
+# mostly off it — but only mostly, and the "mostly" matters. The first version of
+# this palette was the conifer at full saturation (84, 158, 88 with a lime light
+# tone), and at that strength a near tree stops being backdrop: it is the most
+# saturated thing in the scene, it stands in front of a hazed hill in an unhazed
+# green, and the eye reads it as a foreground object that happens to be standing
+# on the horizon. So these tones are that same green mixed half way to the near
+# hills' own colour as the renderer draws it (`view::HILL_NEAR`, 96, 146, 132) —
+# the far rank's own method, a shorter walk. Green stays the strongest channel
+# and the rank stays darker and more saturated than the far rank tone for tone
+# (that ordering is the depth cue), but the blue channel comes up by twenty-odd
+# points, the lime goes out of the light tone, and the spread between the light
+# and dark tones halves: less internal contrast is flatter, and flatter is
+# farther.
+PINE_NEAR_LIGHT = (100, 161, 118)
+PINE_NEAR = (90, 152, 110)
+PINE_NEAR_DARK = (82, 142, 103)
+
+# The near rank's trunk: the foreground trees' `BARK` (118, 82, 54) faded the
+# same way in spirit but not in direction. Mixing bark towards the hills would
+# turn it green — the exact complaint the brown trunk replaced — because the
+# hills are green; so it is faded towards its own grey instead: same warm
+# ordering (red over green over blue), about half the saturation, which is a
+# bark seen through air rather than a bark in the hand.
+PINE_NEAR_TRUNK = (108, 88, 72)
 
 # --- props, decor and effects -------------------------------------------
 LEAF_LIGHT = (132, 204, 96)

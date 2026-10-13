@@ -50,6 +50,7 @@ from .common import (
     PINE_NEAR,
     PINE_NEAR_DARK,
     PINE_NEAR_LIGHT,
+    PINE_NEAR_TRUNK,
     PINE_SHADE,
     TRANSPARENT,
     DIRT_DARK,
@@ -586,23 +587,25 @@ def pine(shape: int, far: bool = False, near: bool = False) -> Image.Image:
     trunk would be one pixel of it.
 
     `far` draws the rank *behind* the far tree-line, in the two-tone haze of
-    `common.PINE_FAR_*`, and `near` draws the rank on the near hills, in the saturated
+    `common.PINE_FAR_*`, and `near` draws the rank on the near hills, in the hazed
     green of `common.PINE_NEAR_*`. The silhouette is the same one in every rank, because
     the difference between the ranks is distance rather than species and a second species
     is invisible at this size — what changes is the palette, and how much of it there is:
     four tones of shading on the rank three hills away is detail nobody gets to see.
 
-    One part of the palette is *not* the rank's: the near rank's trunk is `BARK`,
-    the foreground trees' brown. At the far ranks' size a trunk is three rows of
-    silhouette and a foliage tone is all it can be, but a near pine stands up to
-    two tiles tall and its trunk is a visible piece of the picture — drawn in the
-    foliage's shade, which is what this did at first, it is a green pole with a
-    tree on it. A trunk is bark, at any distance where a trunk can be seen.
+    One part of the palette is *not* the rank's: the near rank's trunk is
+    `PINE_NEAR_TRUNK`, the foreground trees' bark faded towards its own grey.
+    At the far ranks' size a trunk is three rows of silhouette and a foliage
+    tone is all it can be, but a near pine stands up to two tiles tall and its
+    trunk is a visible piece of the picture — drawn in the foliage's shade,
+    which is what this did at first, it is a green pole with a tree on it. A
+    trunk is bark, at any distance where a trunk can be seen; a *faded* bark,
+    because this trunk is a hillside away rather than beside the viewer.
     """
     if far:
         bar, shadow, lit, stem = (PINE_FAR_LIGHT, PINE_FAR, PINE_FAR_LIGHT, PINE_FAR)
     elif near:
-        bar, shadow, lit, stem = (PINE_NEAR, PINE_NEAR_DARK, PINE_NEAR_LIGHT, BARK)
+        bar, shadow, lit, stem = (PINE_NEAR, PINE_NEAR_DARK, PINE_NEAR_LIGHT, PINE_NEAR_TRUNK)
     else:
         bar, shadow, lit, stem = (PINE, PINE_DARK, PINE_LIGHT, PINE_SHADE)
     img = cell()
@@ -751,7 +754,7 @@ def sprites() -> list[tuple[str, Image.Image]]:
         ("butterfly_b_2", butterfly(1, 1)),
         # The tree-line's ranks: the one standing on the far ridge, the hazier one
         # behind it that turns the row of trees into a forest edge, and the one on
-        # the near hills — a band closer, so it gets its own saturated palette and
+        # the near hills — a band closer, so it gets its own hazed palette and
         # its own sprites rather than the far rank's art drawn bigger.
         ("pine_a", pine(0)),
         ("pine_b", pine(1)),

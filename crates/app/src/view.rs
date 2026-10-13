@@ -106,15 +106,15 @@ const PINE_FAR_LIGHT: Color32 = Color32::from_rgb(140, 180, 182);
 #[cfg(test)]
 const PINE_FAR: Color32 = Color32::from_rgb(130, 170, 174);
 /// The near hills' tree-line: the same conifer one band closer, in `common.py`'s
-/// `PINE_NEAR_*` tones. Saturated green and darker *as a hue* than the far rank —
-/// that ordering is the depth cue the fade test holds — but no darker in luminance
-/// than the far rank used to be, because a near tree drawn near-black is the "too
-/// dark" mistake again, one band nearer. Only the lit tone and the body are listed:
-/// those are the two a runner can fill a frame against.
+/// `PINE_NEAR_*` tones — the saturated green hazed half way to the near hills'
+/// own colour, so the rank sits in the backdrop's distance rather than standing
+/// out of it, while staying darker than its hill and stronger than the far rank:
+/// that ordering is the depth cue the fade test holds. Only the lit tone and the
+/// body are listed: those are the two a runner can fill a frame against.
 #[cfg(test)]
-const PINE_NEAR_LIGHT: Color32 = Color32::from_rgb(104, 176, 104);
+const PINE_NEAR_LIGHT: Color32 = Color32::from_rgb(100, 161, 118);
 #[cfg(test)]
-const PINE_NEAR: Color32 = Color32::from_rgb(84, 158, 88);
+const PINE_NEAR: Color32 = Color32::from_rgb(90, 152, 110);
 /// Tiles between one dome and the next in a band.
 ///
 /// Five, and every band's shortest dome is at least half of that, so two neighbours always
@@ -1596,7 +1596,7 @@ const RANKS: [Rank; 2] = [
     },
 ];
 
-/// The near hills' tree-line: one rank, in the `pine_near_*` sprites' saturated green.
+/// The near hills' tree-line: one rank, in the `pine_near_*` sprites' hazed green.
 ///
 /// The near band stood bare while the range behind it was forested, which is
 /// backwards — a nearer hillside shows *more* of its trees, not fewer. One rank

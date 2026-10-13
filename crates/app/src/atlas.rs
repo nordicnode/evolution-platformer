@@ -1112,20 +1112,26 @@ mod tests {
         }
     }
 
-    /// A near pine's trunk is bark-brown, not a shade of its own foliage.
+    /// A near pine's trunk is faded bark-brown, not a shade of its own foliage,
+    /// and not full-strength foreground bark either.
     ///
     /// The far ranks are silhouettes and their trunks are foliage tones on
     /// purpose — three rows of haze cannot be anything else. The near rank
     /// stands up to two tiles tall on the near hills, its trunk is a visible
     /// piece of the picture, and the first version of it drew that trunk in
     /// the foliage's darkest green: a green pole with a tree on it, in the
-    /// one rank where a trunk can be seen. So the shipped pixels are asked,
-    /// not the palette: the two centre columns at the cell's floor — the part
-    /// of the trunk below the lowest skirt, which is the part that shows —
-    /// are the foreground trees' `BARK` (118, 82, 54), and they are not green.
+    /// one rank where a trunk can be seen. The second version swung to the
+    /// other fault and used the foreground trees' `BARK` at full strength,
+    /// which stood out of the hazed backdrop with the rest of that palette.
+    /// So the shipped pixels are asked, not the palette: the two centre
+    /// columns at the cell's floor — the part of the trunk below the lowest
+    /// skirt, which is the part that shows — are `BARK` faded towards its
+    /// own grey (108, 88, 72: red over green over blue, at about half the
+    /// saturation), because a bark seen a hillside away is a muted bark, not
+    /// a green one and not a near one.
     #[test]
     fn the_near_pines_have_brown_trunks() {
-        const BARK: [u8; 4] = [118, 82, 54, 255];
+        const FADED_BARK: [u8; 4] = [108, 88, 72, 255];
         let pixels = Pixels::load();
         for name in ["pine_near_a", "pine_near_b"] {
             let sprite = pixels.sprite(name);
@@ -1133,9 +1139,9 @@ mod tests {
                 for x in [7, 8] {
                     let pixel = sprite.at(x, y);
                     assert_eq!(
-                        pixel, BARK,
-                        "{name}'s trunk at ({x}, {y}) is {pixel:?}, not bark: a near \
-                         pine's trunk is the part of it that is not foliage"
+                        pixel, FADED_BARK,
+                        "{name}'s trunk at ({x}, {y}) is {pixel:?}, not faded bark: a \
+                         near pine's trunk is the part of it that is not foliage"
                     );
                     assert!(
                         pixel[0] > pixel[1] && pixel[1] > pixel[2],
