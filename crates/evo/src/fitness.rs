@@ -103,9 +103,14 @@ impl EpisodeResult {
 /// exactly **one** implementation. Watch mode drives this directly to animate a
 /// genome; if it re-implemented the cadence, a watched champion could disagree
 /// with the fitness the trainer recorded for it.
+///
+/// It **owns** its genome rather than borrowing it. A viewer draws a whole
+/// generation at once, so it holds a pool of runners beside the genomes they came
+/// from; if a runner borrowed its genome, that pool would be a self-referential
+/// struct, which is the one shape the owner of both cannot express.
 #[derive(Debug)]
-pub struct EpisodeRunner<'a> {
-    genome: &'a Genome,
+pub struct EpisodeRunner {
+    genome: Genome,
     sim: Sim,
     scratch: ActScratch,
     action: AgentAction,
@@ -116,8 +121,8 @@ pub struct EpisodeRunner<'a> {
     guard: u32,
 }
 
-impl<'a> EpisodeRunner<'a> {
-    pub fn new(level: &Level, genome: &'a Genome, cfg: &EvalConfig, seed: u64) -> Self {
+impl EpisodeRunner {
+    pub fn new(level: &Level, genome: Genome, cfg: &EvalConfig, seed: u64) -> Self {
         let repeat = cfg.action_repeat.max(1);
         let sim = Sim::new(level, seed);
         // `max_frames` is the sim's own cap; the extra slack is a belt-and-braces
@@ -146,7 +151,7 @@ impl<'a> EpisodeRunner<'a> {
     }
 
     pub fn genome(&self) -> &Genome {
-        self.genome
+        &self.genome
     }
 
     /// One physics tick. Queries the network every `action_repeat` ticks.
@@ -208,7 +213,7 @@ pub fn run_episode(
     cfg: &EvalConfig,
     seed: u64,
 ) -> EpisodeResult {
-    let mut runner = EpisodeRunner::new(level, genome, cfg, seed);
+    let mut runner = EpisodeRunner::new(level, genome.clone(), cfg, seed);
     while !runner.is_finished() {
         runner.step();
     }
@@ -249,7 +254,7 @@ mod tests {
 
             let whole = run_episode(&level, &g, &cfg, seed);
 
-            let mut runner = EpisodeRunner::new(&level, &g, &cfg, seed);
+            let mut runner = EpisodeRunner::new(&level, g.clone(), &cfg, seed);
             let mut ticks = 0u32;
             while !runner.is_finished() {
                 runner.step();
@@ -270,7 +275,7 @@ mod tests {
         for repeat in [1u32, 3, 4, 6, 16] {
             let cfg = EvalConfig { action_repeat: repeat };
             let whole = run_episode(&level, &g, &cfg, 5);
-            let mut runner = EpisodeRunner::new(&level, &g, &cfg, 5);
+            let mut runner = EpisodeRunner::new(&level, g.clone(), &cfg, 5);
             while !runner.is_finished() {
                 runner.step();
             }

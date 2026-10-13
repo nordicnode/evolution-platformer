@@ -87,6 +87,21 @@ impl GaConfig {
     }
 }
 
+/// The mutation-rate ladder the front-ends expose (§10 Tier 2.9's slider, inside §7.5's
+/// documented 0.03–0.10).
+///
+/// It lives beside the hyperparameter it tunes rather than in each front-end, because
+/// the terminal's `m`/`M` keys and the window's slider are the same control: two copies
+/// of a ladder are two chances for the two views to disagree about which rates are even
+/// reachable. A ladder rather than a continuous dial, so every value on screen is a
+/// value the other front-end can get back to and no keypress can drive a run somewhere
+/// §7.5 does not document. 0.05 is the trainer's default, so a fresh run starts in the
+/// middle and both directions are available — which is the point of having a control at
+/// all. The two reasons to reach for it are opposite: a population that has converged
+/// onto an obstacle needs shaking *up* (finding 16's plateau), and one that keeps
+/// destroying the genome that nearly solved the level needs calming *down*.
+pub const MUTATION_RATES: [f32; 4] = [0.03, 0.05, 0.08, 0.10];
+
 /// One row of the fitness chart (§10 Tier 1.2) and of the CSV export (§10 Tier 2.10).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GenRow {
@@ -573,6 +588,23 @@ fn lane(
 mod tests {
     use super::*;
     use sim::hash::StateHasher;
+
+    /// The ladder is the range §7.5 documents, and the trainer's own default is a rung,
+    /// so a fresh run starts *on* the control rather than beside it.
+    #[test]
+    fn the_mutation_ladder_is_the_documented_range() {
+        let default = GaConfig::default().mutation_rate;
+        assert!(
+            MUTATION_RATES.contains(&default),
+            "the default rate must be one of the rungs: {MUTATION_RATES:?}"
+        );
+        for pair in MUTATION_RATES.windows(2) {
+            assert!(pair[0] < pair[1], "the ladder must rise: {MUTATION_RATES:?}");
+        }
+        for rate in MUTATION_RATES {
+            assert!((0.03..=0.10).contains(&rate), "{rate} is outside §7.5");
+        }
+    }
 
     fn flat_level() -> Level {
         crate::fixture::flat_runway("ga-fixture", 24, 22)

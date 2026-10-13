@@ -2,27 +2,35 @@
 //!
 //! One window, three things to do in it:
 //!
-//! * **Edit** — drag tiles and entities out of a palette onto the level, paint with
-//!   the brush, watch the reachability oracle say whether what you drew is beatable.
+//! * **Edit** — drag tiles and entities out of a palette onto the level, paint with the
+//!   brush, watch the reachability oracle say whether what you drew is beatable.
 //! * **Play** — take the keyboard and try it yourself, with the same physics and the
 //!   same action set the evolution sees.
-//! * **Watch** — (next, with `evo` wired in) evolve a population on the level and
-//!   watch it learn.
+//! * **Evolve** — the M3 watch mode, in the window: a population trains on the level on
+//!   its own thread while the generation it just finished is animated over the terrain,
+//!   with the fitness chart, the run's readings and the recorded champion routes.
 //!
-//! Everything is drawn from the deterministic core: this binary owns no physics.
+//! Everything is drawn from the deterministic core: this binary owns no physics, and the
+//! trainer it hosts is the same `evo` the headless driver uses.
 //!
 //! ```text
-//! evo-app [--level levels/l6-marathon.json] [--assets assets] [--screenshot out.png]
+//! evo-app [--level levels/l6-marathon.json] [--assets assets] [--evolve]
+//!         [--pop 200] [--seed 1] [--generations 300] [--champions champions]
+//!         [--screenshot out.png]
 //! ```
 
 mod app;
 mod atlas;
 mod editor;
+mod lab;
+mod panel;
 mod play;
 mod view;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use app::LabOptions;
 
 const USAGE: &str = "\
 evo-app — the evolution-platformer desktop shell
@@ -33,8 +41,14 @@ USAGE:
 OPTIONS:
     --level <PATH>        Level to open.                       [default l1-flat-run]
     --assets <DIR>        Directory holding tileset.json/png.  [default assets]
+    --evolve              Open in the evolution view and start training at once.
+    --pop <N>             Population size for that run.        [default 200]
+    --seed <N>            Master seed; every run is reproducible from it. [default 1]
+    --generations <N>     Stop after N generations.            [default: until closed]
+    --champions <DIR>     Where Save champion writes.          [default champions]
     --screenshot <PATH>   Render one frame, write it as a PNG, and exit. Used to
-                          verify the renderer without a human watching.
+                          verify the renderer without a human watching; with
+                          --evolve it waits for a real generation first.
     --help, -h            Show this text.
 ";
 
@@ -42,12 +56,14 @@ struct Options {
     level: PathBuf,
     assets: PathBuf,
     screenshot: Option<PathBuf>,
+    lab: LabOptions,
 }
 
 fn parse(raw: &[String]) -> Result<Option<Options>, String> {
     let mut level = None;
     let mut assets = None;
     let mut screenshot = None;
+    let mut lab = LabOptions::default();
     let mut i = 0;
     while i < raw.len() {
         let arg = raw[i].as_str();
@@ -57,11 +73,36 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
                 .cloned()
                 .ok_or_else(|| format!("{name} needs a value"))
         };
+        let mut number = |name: &str| -> Result<u64, String> {
+            let text = value(name)?;
+            text.parse::<u64>()
+                .map_err(|_| format!("{name} needs a number, got {text:?}"))
+        };
         match arg {
             "--help" | "-h" => return Ok(None),
             "--level" => level = Some(PathBuf::from(value("--level")?)),
             "--assets" => assets = Some(PathBuf::from(value("--assets")?)),
             "--screenshot" => screenshot = Some(PathBuf::from(value("--screenshot")?)),
+            // A population of one has no selection pressure, and a zero-generation run
+            // would never score anything: both are refused rather than clamped, because a
+            // scripted `--generations 0` is a mistake in the script, not a preference.
+            "--evolve" => lab.evolve = true,
+            "--pop" => {
+                let pop = number("--pop")?;
+                if pop < 2 {
+                    return Err("usage: --pop must be at least 2".into());
+                }
+                lab.pop_size = pop as usize;
+            }
+            "--seed" => lab.seed = number("--seed")?,
+            "--generations" => {
+                let generations = number("--generations")?;
+                if generations == 0 {
+                    return Err("usage: --generations must be at least 1".into());
+                }
+                lab.generations = Some(generations as u32);
+            }
+            "--champions" => lab.champions = PathBuf::from(value("--champions")?),
             other => return Err(format!("unknown option {other:?} (try --help)")),
         }
         i += 1;
@@ -87,6 +128,7 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
         level,
         assets,
         screenshot,
+        lab,
     }))
 }
 
@@ -104,7 +146,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match app::run(options.level, options.assets, options.screenshot) {
+    match app::run(options.level, options.assets, options.screenshot, options.lab) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");

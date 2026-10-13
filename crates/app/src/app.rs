@@ -1,16 +1,18 @@
-//! The window: panels, the canvas, and the two things you do on it.
+//! The window: panels, the canvas, and the three things you do on it.
 //!
 //! Layout, top to bottom and left to right:
 //!
 //! ```text
 //! +---------------------------------------------------------------+
-//! | level name   New  Open  Save | Undo Redo | Edit/Play | Fit     |
+//! | level name   New  Open  Save | Undo Redo | Edit/Play/Evolve   |
 //! +---------+-------------------------------------------+---------+
 //! | palette |                                           | verdict |
-//! | (drag   |              the level                    | physics |
+//! | (drag   |         the level, or the run             | physics |
 //! |  these) |                                           | counts  |
-//! | resize  |                                           |         |
+//! | resize  |                                           | lanes   |
 //! +---------+-------------------------------------------+---------+
+//! | fitness chart (evolution only)                                 |
+//! +---------------------------------------------------------------+
 //! | status: message, tile under the cursor, zoom                   |
 //! +---------------------------------------------------------------+
 //! ```
@@ -20,26 +22,71 @@
 //! lands on the wrong tile is worse than no brush at all. Holding the drag state
 //! here means the canvas can draw the ghost sprite at the exact tile the release
 //! will commit to, so what the user sees is what they get.
+//!
+//! The evolution view is the terminal's watch mode with the frame drawing replaced by
+//! this window's: `crate::lab` owns the trainer on its own thread and hands over one
+//! finished generation at a time, `crate::panel` draws what the run is doing, and this
+//! module is where the two meet the keys. The one rule it inherits intact is that a run
+//! advances **when the viewer has finished watching, not when a timer fires**.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use egui::{Color32, Context, Pos2, Rect, Sense, Stroke, Vec2};
+use evo::{ChampionFile, GaConfig};
 use sim::Tile;
 
 use crate::atlas::Atlas;
 use crate::editor::{Brush, Editor};
+use crate::lab::{self, Lab, Lanes, Packet};
+use crate::panel::{self, BestLine, Command, RunSummary, ViewState};
 use crate::play;
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
+use render::chart::HistoryPoint;
 
-/// Which half of the tool the canvas is showing.
+/// Height of the fitness chart's strip at the bottom of the window.
+const CHART_PANEL_HEIGHT: f32 = 150.0;
+
+/// Which of the three things the window is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Edit,
     Play,
+    Evolve,
+}
+
+/// How a run is set up, from the command line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabOptions {
+    /// Open in the evolution view rather than the editor.
+    pub evolve: bool,
+    pub pop_size: usize,
+    pub seed: u64,
+    /// Stop after this many generations. `None` runs until the window is closed.
+    pub generations: Option<u32>,
+    /// Where `Save champion` writes.
+    pub champions: PathBuf,
+}
+
+impl Default for LabOptions {
+    fn default() -> Self {
+        LabOptions {
+            evolve: false,
+            pop_size: GaConfig::default().pop_size,
+            seed: GaConfig::default().master_seed,
+            generations: None,
+            champions: PathBuf::from("champions"),
+        }
+    }
 }
 
 /// Open the window and run until the user closes it.
-pub fn run(level: PathBuf, assets: PathBuf, screenshot: Option<PathBuf>) -> Result<(), String> {
+pub fn run(
+    level: PathBuf,
+    assets: PathBuf,
+    screenshot: Option<PathBuf>,
+    lab: LabOptions,
+) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 800.0])
@@ -47,19 +94,15 @@ pub fn run(level: PathBuf, assets: PathBuf, screenshot: Option<PathBuf>) -> Resu
             .with_title("evolution platformer"),
         ..Default::default()
     };
-    let shot = screenshot.clone();
     eframe::run_native(
         "evolution platformer",
         options,
         Box::new(move |cc| {
-            let app = EvoApp::new(cc, level, assets, screenshot)?;
+            let app = EvoApp::new(cc, level, assets, screenshot, lab)?;
             Ok(Box::new(app))
         }),
     )
     .map_err(|e| format!("cannot open a window: {e}"))
-    .map(|_| {
-        let _ = shot;
-    })
 }
 
 struct EvoApp {
@@ -84,6 +127,34 @@ struct EvoApp {
     shot_requested: bool,
     frames: u32,
     fit_pending: bool,
+
+    // --- the evolution view ------------------------------------------------
+    options: LabOptions,
+    /// The seed the *current* run is using. Restart bumps it, so pressing Restart
+    /// twice gives two populations rather than the same one twice — while the number
+    /// stays on screen, so a run worth keeping can be reproduced from it.
+    seed: u64,
+    lab: Option<Lab>,
+    /// The generation being animated, when one is on screen.
+    lanes: Option<Lanes>,
+    /// The newest finished generation. Held rather than reached for through `lanes`,
+    /// because the panel, the death map and `Save champion` all need it after the
+    /// animation of it has ended.
+    packet: Option<Packet>,
+    summary: Option<RunSummary>,
+    view: ViewState,
+    /// `n`: run exactly one generation, then pause.
+    single_step: bool,
+    /// Seconds left on the genius note (§10 Tier 1.3). The panel's own genius flag lasts
+    /// as long as its generation does; a splash has to outlive the packet to be seen.
+    genius_left: f32,
+    /// A transient status note and its remaining seconds.
+    note: Option<(String, f32)>,
+    /// The mutation rate the run has actually been told about, so the worker is not
+    /// woken every frame to be told the same number again.
+    applied_rate: Option<f32>,
+    /// The screenshot path has primed the run with a real generation.
+    shot_primed: bool,
 }
 
 impl EvoApp {
@@ -92,6 +163,7 @@ impl EvoApp {
         level_path: PathBuf,
         assets: PathBuf,
         screenshot: Option<PathBuf>,
+        options: LabOptions,
     ) -> Result<EvoApp, String> {
         let ctx = &cc.egui_ctx;
         ctx.set_visuals(egui::Visuals::dark());
@@ -114,7 +186,7 @@ impl EvoApp {
         };
         let pending_size = (editor.level.width, editor.level.height);
 
-        Ok(EvoApp {
+        let mut app = EvoApp {
             atlas,
             sprites,
             camera: Camera::default(),
@@ -131,7 +203,23 @@ impl EvoApp {
             shot_requested: false,
             frames: 0,
             fit_pending: true,
-        })
+            seed: options.seed,
+            options,
+            lab: None,
+            lanes: None,
+            packet: None,
+            summary: None,
+            view: ViewState::default(),
+            single_step: false,
+            genius_left: 0.0,
+            note: None,
+            applied_rate: None,
+            shot_primed: false,
+        };
+        if app.options.evolve {
+            app.enter_evolve();
+        }
+        Ok(app)
     }
 
     fn opts(&self) -> RenderOpts {
@@ -140,7 +228,7 @@ impl EvoApp {
                 grid: self.grid,
                 ..RenderOpts::editing()
             },
-            Mode::Play => RenderOpts::playing(),
+            Mode::Play | Mode::Evolve => RenderOpts::playing(),
         }
     }
 
@@ -154,15 +242,227 @@ impl EvoApp {
         self.session = None;
     }
 
-    /// Act on the keys that are not part of playing: undo, save, mode switching.
+    // -----------------------------------------------------------------------
+    // the evolution view
+    // -----------------------------------------------------------------------
+
+    /// Show the evolution view, starting a run the first time and after any edit that
+    /// moved the level out from under the run that is already going.
+    ///
+    /// Leaving and coming back keeps a live run: the population, its chart and its
+    /// record are worth preserving across a look at the editor, and this is the only way
+    /// to look at the run and the level it is training on side by side.
+    fn enter_evolve(&mut self) {
+        if self.lab.is_none() {
+            let cfg = GaConfig {
+                pop_size: self.options.pop_size,
+                master_seed: self.seed,
+                ..GaConfig::default()
+            };
+            match Lab::start(
+                &self.editor.level,
+                cfg,
+                lab::DEFAULT_BEST_LANES,
+                lab::DEFAULT_RANDOM_LANES,
+                self.options.generations,
+            ) {
+                Ok(lab) => self.lab = Some(lab),
+                Err(err) => {
+                    // A worker that cannot start is a status message, not a lost window.
+                    self.editor.message = err;
+                    return;
+                }
+            }
+        } else if !self
+            .lab
+            .as_ref()
+            .is_some_and(|lab| lab.trained_on(&self.editor.level))
+        {
+            // The numbers on screen are a claim about a level that no longer exists.
+            self.restart_run("the level changed, so this is a fresh run on the edit");
+        }
+        self.mode = Mode::Evolve;
+        self.fit_pending = true;
+    }
+
+    /// Start a fresh population on the level as it stands, on the next seed up.
+    ///
+    /// The seed is bumped rather than reused: a Restart that reproduced the identical
+    /// run would be a button with no effect. Bumping it keeps every run reproducible from
+    /// the number the status bar shows.
+    fn restart_run(&mut self, why: &str) {
+        self.seed = self.seed.wrapping_add(1);
+        let Some(lab) = &mut self.lab else {
+            return;
+        };
+        lab.restart(&self.editor.level, self.seed);
+        lab.set_mutation_rate(self.view.mutation_rate);
+        self.lanes = None;
+        self.packet = None;
+        self.summary = None;
+        self.single_step = false;
+        self.view.scrub = None;
+        self.applied_rate = Some(self.view.mutation_rate);
+        self.note = Some((format!("{why} (seed {})", self.seed), 6.0));
+    }
+
+    /// One frame of the evolution view: ask for the next generation when the viewer has
+    /// finished watching this one, take it when the worker has produced it, and animate
+    /// whatever is on screen.
+    fn evolve_step(&mut self, dt: f32) {
+        if let Some((_, left)) = &mut self.note {
+            *left -= dt;
+        }
+        if self.note.as_ref().is_some_and(|(_, left)| *left <= 0.0) {
+            self.note = None;
+        }
+        if self.genius_left > 0.0 {
+            self.genius_left -= dt;
+        }
+
+        // The run's rate limit, and the reason a paused window costs nothing: while a
+        // generation is on screen — or while the viewer is paused or scrubbing — nothing
+        // asks the worker for another one, so it stays parked instead of training ahead.
+        if self.lanes.is_none() && !self.view.paused && self.view.scrub.is_none() {
+            if let Some(lab) = &mut self.lab {
+                if !lab.asked() {
+                    lab.request_next();
+                }
+            }
+        }
+
+        if let Some(lanes) = self.lab.as_mut().and_then(|lab| lab.take()) {
+            let packet = lanes.packet().clone();
+            if packet.genius {
+                self.genius_left = 6.0;
+            }
+            // A scrubbed route the record has since dropped is no longer somewhere the
+            // viewer can be: the log keeps the most recent improvements and forgets the
+            // oldest, so a cursor left on one of those would show a route that is gone.
+            if let Some(generation) = self.view.scrub {
+                if !packet.traces.iter().any(|t| t.generation == generation) {
+                    self.view.scrub = None;
+                }
+            }
+            self.summary = Some(self.summarise(&packet));
+            self.packet = Some(packet);
+            self.lanes = Some(lanes);
+        }
+
+        let Some(lanes) = &mut self.lanes else {
+            return;
+        };
+        if !self.view.paused {
+            lanes.advance(dt, self.view.speed);
+        }
+        if lanes.is_finished() {
+            self.lanes = None;
+            if self.single_step {
+                self.single_step = false;
+                self.view.paused = true;
+            }
+        }
+    }
+
+    /// What the panel says about a finished generation.
+    ///
+    /// The two facts a packet cannot carry are added here, each from whoever has them:
+    /// the level's width (the death-cluster rule needs it to know which marks are even
+    /// inside the level) and the champion's episode, which lives in `evo`'s best-ever
+    /// record rather than in the report.
+    fn summarise(&self, packet: &Packet) -> RunSummary {
+        let mut summary = RunSummary::new(packet, &packet.history);
+        let Some(lab) = &self.lab else {
+            return summary;
+        };
+        summary = summary.with_level(lab.level().width);
+        if let Some(best) = &packet.best {
+            // The flag's own column, for the "tiles to go" number: fitness is a weighted
+            // progress score and cannot be read as distance on a level nobody has seen.
+            let goal_x = lab
+                .level()
+                .goals
+                .first()
+                .map(|goal| goal.x)
+                .unwrap_or(0.0);
+            summary = summary.with_champion(BestLine::from_episode(
+                best.generation,
+                best.genome.id,
+                best.result.fitness,
+                best.result.outcome.as_str(),
+                best.result.won(),
+                best.result.frames,
+                best.result.best_x,
+                goal_x,
+            ));
+        }
+        summary
+    }
+
+    /// Write the best-ever genome the same way `train-cli train` writes one, so watching
+    /// instead of training wastes nothing: the file is the same format, with the same
+    /// provenance, and `train-cli replay` can re-verify it.
+    fn save_champion(&mut self) {
+        let best = self.packet.as_ref().and_then(|packet| packet.best.clone());
+        let (Some(best), Some(lab)) = (best, self.lab.as_ref()) else {
+            self.note = Some(("nothing to save: no generation has been scored".into(), 6.0));
+            return;
+        };
+        let champion = ChampionFile::new(
+            &best.genome,
+            &best.result,
+            lab.level(),
+            best.generation,
+            lab.config(),
+        );
+        let dir = self.options.champions.clone();
+        let path = dir.join(format!("{}.json", slug(&lab.level().name)));
+        let note = match std::fs::create_dir_all(&dir).and_then(|()| {
+            champion
+                .save(&path)
+                .map_err(std::io::Error::other)
+        }) {
+            Ok(()) => format!(
+                "saved champion gen {} fitness {:.2} -> {}",
+                best.generation,
+                best.result.fitness,
+                path.display()
+            ),
+            Err(err) => format!("not saved: {err}"),
+        };
+        self.note = Some((note, 8.0));
+    }
+
+    /// Walk the recorded improvements, one route at a time.
+    fn scrub_by(&mut self, delta: i32) {
+        let Some(summary) = &self.summary else {
+            return;
+        };
+        let generations: Vec<u32> = summary.recorded.iter().map(|r| r.generation).collect();
+        if generations.is_empty() {
+            return;
+        }
+        let steps = delta.unsigned_abs();
+        for _ in 0..steps {
+            self.view.scrub = if delta < 0 {
+                panel::scrub_back(&generations, self.view.scrub)
+            } else {
+                panel::scrub_forward(&generations, self.view.scrub)
+            };
+        }
+    }
+
+    /// Act on the keys that are not part of playing: undo, save, mode switching, and the
+    /// evolution view's own controls.
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let (undo, redo, grid, play, fit, save, restart) = ctx.input(|i| {
+        let (undo, redo, grid, play, evolve, fit, save, restart) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Z) && i.modifiers.command,
                 (i.key_pressed(egui::Key::Y) && i.modifiers.command)
                     || (i.key_pressed(egui::Key::Z) && i.modifiers.command && i.modifiers.shift),
                 i.key_pressed(egui::Key::G),
                 i.key_pressed(egui::Key::P),
+                i.key_pressed(egui::Key::E),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::S) && i.modifiers.command,
                 i.key_pressed(egui::Key::R),
@@ -183,20 +483,191 @@ impl EvoApp {
         if save {
             self.save(None);
         }
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         match self.mode {
             Mode::Edit => {
                 if play {
                     self.enter_play();
                 }
+                if evolve {
+                    self.enter_evolve();
+                }
             }
             Mode::Play => {
-                if play || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if play || escape {
                     self.leave_play();
                 }
                 if restart {
                     if let Some(session) = &mut self.session {
                         session.restart(&self.editor.level);
                     }
+                }
+            }
+            Mode::Evolve => {
+                if play || evolve || escape {
+                    self.mode = Mode::Edit;
+                }
+                self.evolve_keys(ctx);
+            }
+        }
+    }
+
+    /// The evolution view's keys.
+    ///
+    /// They are the terminal watch mode's own bindings (`space` pauses, `-`/`+` change
+    /// speed, `m`/`M` change the mutation rate, `n` steps one generation, `left`/`right`
+    /// walk the record, `h` returns to live, `s` saves the champion) — two front-ends for
+    /// one game teaching two different keyboards would be a bug, not a feature.
+    fn evolve_keys(&mut self, ctx: &Context) {
+        let keys = ctx.input(|i| panel::Keys {
+            pause: i.key_pressed(egui::Key::Space),
+            step: i.key_pressed(egui::Key::N),
+            faster: i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+            slower: i.key_pressed(egui::Key::Minus),
+            mutate_up: i.key_pressed(egui::Key::M) && i.modifiers.shift,
+            mutate_down: i.key_pressed(egui::Key::M) && !i.modifiers.shift,
+            live: i.key_pressed(egui::Key::H),
+            save: i.key_pressed(egui::Key::S) && !i.modifiers.command,
+            older: i.key_pressed(egui::Key::ArrowLeft),
+            newer: i.key_pressed(egui::Key::ArrowRight),
+        });
+        // What a key means is `panel::commands_for`'s business; this is only the reading.
+        let commands = panel::commands_for(keys, &self.view);
+        for command in commands {
+            self.apply(command);
+        }
+    }
+
+    /// Prime a scripted frame with a real run.
+    ///
+    /// Two things have to be true of a `--screenshot` of this view or it verifies nothing:
+    /// there has to be a *generation* on screen (eight agents, a chart with a point on it),
+    /// and with `--generations` there has to be a **history**, because a chart of one
+    /// generation is a single dot. So the cap is run out first, taking each generation
+    /// without animating it — the population advances exactly as it would have, and nobody
+    /// watches the frames in between, which is the terminal mode's headless behaviour — and
+    /// then the newest generation is left running for a moment so its agents are off the
+    /// spawn.
+    fn prime_scripted_run(&mut self) {
+        let target = self.options.generations;
+        let mut rounds = 0u32;
+        loop {
+            let Some(lanes) = self
+                .lab
+                .as_mut()
+                .and_then(|lab| lab.wait_for_first(Duration::from_secs(120)))
+            else {
+                return;
+            };
+            let packet = lanes.packet().clone();
+            if packet.genius {
+                self.genius_left = 6.0;
+            }
+            self.summary = Some(self.summarise(&packet));
+            let last = packet.finished || target.is_none();
+            self.packet = Some(packet);
+            self.lanes = Some(lanes);
+            if last {
+                break;
+            }
+            self.lanes = None;
+            if let Some(lab) = &mut self.lab {
+                lab.request_next();
+            }
+            rounds += 1;
+            if rounds > 10_000 {
+                // A cap that never reports itself finished must not hang a scripted run.
+                return;
+            }
+        }
+        for _ in 0..40 {
+            self.evolve_step(1.0 / 60.0);
+        }
+    }
+
+    /// The right-hand panel in the evolution view.
+    fn evolve_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(summary) = self.summary.take() else {
+            // Before the first generation lands there is nothing to summarise, and a
+            // panel of zeros would read as a run that is going nowhere rather than one
+            // that has not started.
+            ui.heading("Evolution");
+            match &self.lab {
+                Some(lab) => {
+                    ui.label(format!("{}: evaluating the first generation…", lab.level_name()));
+                    ui.small(format!("pop {}   seed {}", lab.pop_size(), self.seed));
+                }
+                None => {
+                    ui.label("no run on this level yet");
+                    if ui.button("Start a run").clicked() {
+                        self.enter_evolve();
+                    }
+                }
+            }
+            return;
+        };
+
+        let changed = self
+            .lab
+            .as_ref()
+            .is_some_and(|lab| !lab.trained_on(&self.editor.level));
+        let actions = panel::lab_panel(ui, &summary, &mut self.view, changed);
+        self.summary = Some(summary);
+
+        if actions.pause {
+            self.apply(Command::TogglePause);
+        }
+        if actions.step {
+            self.apply(Command::StepOne);
+        }
+        if actions.restart {
+            self.apply(Command::Restart);
+        }
+        if actions.save {
+            self.apply(Command::Save);
+        }
+        if actions.resume {
+            self.apply(Command::Live);
+        }
+        if actions.scrub_delta != 0 {
+            self.apply(Command::Scrub(actions.scrub_delta));
+        }
+        if self.applied_rate != Some(self.view.mutation_rate) {
+            self.apply(Command::MutationRate(self.view.mutation_rate));
+        }
+    }
+
+    /// Do one thing the viewer asked for, from a button, a key or the sliders.
+    ///
+    /// The two front-ends differ only in how they read the request; what a request *means*
+    /// lives here, once.
+    fn apply(&mut self, command: Command) {
+        match command {
+            Command::TogglePause => {
+                self.view.paused = !self.view.paused;
+                self.single_step = false;
+            }
+            Command::StepOne => {
+                // Inspecting, not watching: run a generation and then hold still.
+                self.view.paused = false;
+                self.single_step = true;
+            }
+            Command::Restart => self.restart_run("restarted"),
+            Command::Save => self.save_champion(),
+            Command::Live => self.view.scrub = None,
+            Command::Scrub(delta) => self.scrub_by(delta),
+            Command::Speed(step) => {
+                self.view.speed = lab::step_speed(self.view.speed, step > 0);
+            }
+            Command::MutationRate(rate) => {
+                self.view.mutation_rate = rate;
+                // The run's rate, not the view's: the worker applies it from the next
+                // generation on, so a change shows up in the very next offspring.
+                if self.applied_rate != Some(rate) {
+                    if let Some(lab) = &mut self.lab {
+                        lab.set_mutation_rate(rate);
+                    }
+                    self.applied_rate = Some(rate);
                 }
             }
         }
@@ -267,10 +738,20 @@ impl EvoApp {
             let mut mode = self.mode;
             ui.selectable_value(&mut mode, Mode::Edit, "Edit");
             ui.selectable_value(&mut mode, Mode::Play, "Play");
+            ui.selectable_value(&mut mode, Mode::Evolve, "Evolve");
             if mode != self.mode {
                 match mode {
                     Mode::Play => self.enter_play(),
-                    Mode::Edit => self.leave_play(),
+                    Mode::Evolve => self.enter_evolve(),
+                    Mode::Edit => {
+                        if self.mode == Mode::Play {
+                            self.leave_play();
+                        } else {
+                            // The run keeps going — paused and parked — so coming back to
+                            // it does not mean starting from generation zero again.
+                            self.mode = Mode::Edit;
+                        }
+                    }
                 }
             }
             if self.mode == Mode::Play && ui.button("Restart (R)").clicked() {
@@ -466,10 +947,71 @@ impl EvoApp {
                     view::draw_sim(sheet, session.sim(), opts, session.clock);
                 }
             }
+            Mode::Evolve => self.canvas_evolve(sheet),
         }
 
         if self.mode == Mode::Edit {
             self.canvas_edit_gestures(ui, &response, rect, &painter);
+        }
+    }
+
+    /// The evolution canvas: the level the run is training on, then the generation's
+    /// agents over it, then whatever else the view is showing.
+    ///
+    /// The level comes from the **run**, not from the editor: a lane has to be drawn on
+    /// the terrain its episode was evaluated on. When the two have diverged, the panel
+    /// says so and offers a restart — drawing the edit under an old run's agents would be
+    /// the one thing worse than saying nothing.
+    fn canvas_evolve(&self, sheet: Sheet<'_>) {
+        let Some(lab) = &self.lab else {
+            return;
+        };
+        view::draw_level(sheet, lab.level(), self.opts(), None);
+
+        if let Some(generation) = self.view.scrub {
+            // A recorded route replaces the live lanes rather than joining them: the two
+            // are answers to different questions (where a past champion got to, and where
+            // this generation is now), and overlaid they answer neither.
+            if let Some(trace) = self
+                .packet
+                .as_ref()
+                .and_then(|packet| packet.traces.iter().find(|t| t.generation == generation))
+            {
+                view::draw_route(sheet, trace);
+            }
+            return;
+        }
+
+        if let Some(lanes) = &self.lanes {
+            // The champion solid, the rest ghosted: eight agents in one place is a smear
+            // otherwise, and which one is which is what the panel's lane list is for.
+            for i in 0..lanes.len() {
+                let lane = &lanes.lanes()[i];
+                let alpha = if lane.rank == 0 {
+                    255
+                } else if lane.best {
+                    190
+                } else {
+                    110
+                };
+                view::draw_agents(
+                    sheet,
+                    lanes.sim(i),
+                    lanes.clock(),
+                    Color32::from_white_alpha(alpha),
+                );
+                view::draw_lane_tag(
+                    sheet,
+                    lanes.sim(i),
+                    Color32::from_rgb(lane.colour[0], lane.colour[1], lane.colour[2]),
+                );
+            }
+        }
+
+        if self.view.show_deaths {
+            if let Some(packet) = &self.packet {
+                view::draw_deaths(sheet, &packet.deaths, packet.generation, lab::DEATH_WINDOW);
+            }
         }
     }
 
@@ -558,9 +1100,41 @@ impl EvoApp {
         let _ = rect;
     }
 
+    /// The status line in the evolution view: where the run is, and what the viewer just
+    /// did to it.
+    fn evolve_status(&self) -> String {
+        let speed = format!("{}x", self.view.speed);
+        let paused = if self.view.paused { "  paused" } else { "" };
+        match (&self.lanes, &self.packet) {
+            (Some(lanes), _) => format!(
+                "generation {} — {} of {} lanes still running — {:.1}s animated — {} — seed {}{}",
+                lanes.packet().generation + 1,
+                lanes.running(),
+                lanes.len(),
+                lanes.clock(),
+                speed,
+                self.seed,
+                paused
+            ),
+            (None, Some(packet)) => format!(
+                "generation {} scored — watching it finished — {} — seed {}{}",
+                packet.generation + 1,
+                speed,
+                self.seed,
+                paused
+            ),
+            (None, None) => format!("evaluating the first generation… — {} — seed {}", speed, self.seed),
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if let Some(session) = &self.session {
+            if self.mode == Mode::Evolve {
+                ui.label(self.evolve_status());
+                if let Some((note, _)) = &self.note {
+                    ui.colored_label(Color32::from_rgb(250, 214, 102), note.clone());
+                }
+            } else if let Some(session) = &self.session {
                 ui.label(session.summary());
             } else {
                 ui.label(if self.editor.message.is_empty() {
@@ -648,15 +1222,43 @@ impl eframe::App for EvoApp {
             }
             ctx.request_repaint();
         }
+        if self.mode == Mode::Evolve {
+            self.evolve_step(dt);
+            // A run is always moving, so the window redraws whether or not egui thinks
+            // anything changed.
+            ctx.request_repaint();
+        }
 
         egui::TopBottomPanel::top("top")
             .show(ctx, |ui| self.top_bar(ui));
-        egui::SidePanel::left("palette")
-            .default_width(190.0)
-            .show(ctx, |ui| egui::ScrollArea::vertical().show(ui, |ui| self.palette(ui)));
+        // The palette is editing furniture; the evolution view would rather have the
+        // width for the level.
+        if self.mode == Mode::Edit {
+            egui::SidePanel::left("palette")
+                .default_width(190.0)
+                .show(ctx, |ui| egui::ScrollArea::vertical().show(ui, |ui| self.palette(ui)));
+        }
         egui::SidePanel::right("inspector")
-            .default_width(250.0)
-            .show(ctx, |ui| egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui)));
+            .default_width(if self.mode == Mode::Evolve { 310.0 } else { 250.0 })
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| match self.mode {
+                    Mode::Evolve => self.evolve_panel(ui),
+                    Mode::Edit | Mode::Play => self.inspector(ui),
+                })
+            });
+        if self.mode == Mode::Evolve {
+            egui::TopBottomPanel::bottom("chart")
+                .exact_height(CHART_PANEL_HEIGHT)
+                .show(ctx, |ui| {
+                    // The run's *own* history, from the newest packet: re-deriving it from
+                    // the trainer would be a second answer to the same question.
+                    let history: &[HistoryPoint] = match &self.packet {
+                        Some(packet) => &packet.history,
+                        None => &[],
+                    };
+                    panel::chart_panel(ui, history, CHART_PANEL_HEIGHT - 22.0, self.view.scrub);
+                });
+        }
         egui::TopBottomPanel::bottom("status")
             .show(ctx, |ui| self.status_bar(ui));
 
@@ -670,6 +1272,11 @@ impl eframe::App for EvoApp {
 
         if self.mode == Mode::Play {
             self.follow_player(canvas_rect);
+        }
+
+        if self.screenshot.is_some() && self.mode == Mode::Evolve && !self.shot_primed {
+            self.shot_primed = true;
+            self.prime_scripted_run();
         }
 
         if let Err(err) = self.handle_screenshot(ctx) {

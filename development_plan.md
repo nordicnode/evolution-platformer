@@ -332,13 +332,18 @@ Priority-ordered. Tier 1 is the M3 exit gate.
 - **Exit:** fun-gate passed (owner's call); Tier 1 watch UX complete; champion round-trip test green.
 
 ### M4 — Editor + content (2–3 weeks) — started
-The window, the painter, the playtest and live validation are in `crates/app`; the new
-entity types and the curated pack are open. README findings 24–25 record the choices.
+The window, the painter, the playtest, live validation **and the evolution view** are in
+`crates/app`; the new entity types and the curated pack are open. README findings 24–27
+record the choices. M3's watch mode is hosted here rather than reimplemented: `crate::lab`
+runs the `evo::Trainer` on its own thread and hands the window one finished generation at
+a time, so the fun gate can now be sat in front of a real window — with the chart, the
+lanes, the death map, the route scrubber and champion saving in it.
 - egui tile painter: paint/erase tiles, entity palette (walker, spikes, goal, spawn), undo, save/load JSON. **Done** — drag out of the palette onto the level, plus grid resize; saving goes through `sim`'s writer, which can only emit documents the loader accepts.
 - Human playtest mode inside the editor. **Done** — in-canvas, and it shares `render::play::action_for` with the terminal mode so the two cannot diverge.
 - Reachability validation live in the editor (warn on unreachable goal, highlight first failing jump). **Done** — the verdict, the culprit jump and the unreachable tint, re-run whenever the level's content hash changes.
 - New entities: flyer enemy, moving platform (horizontal/vertical, deterministic — driven by tick count, not wall-clock). **Open.**
 - Curated starter level pack (8–12 levels, easy→brutal) built with the editor. **Open** — L1–L6 are hand-written so far.
+- Watch mode in the window (§10 Tier 1, M3's deliverable) — **done**, not in the plan's M4 list: the trainer runs off-thread, the chart is real geometry from `render`'s readings, and the recorded routes scrub by generation. The curriculum step (findings 19–22) is the one watch feature still terminal-only.
 - **Exit:** a non-developer can build a level, validate it, and evolve a solver without touching JSON.
 
 ### M5 — Evolution polish + web + release (2–3 weeks)

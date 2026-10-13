@@ -41,8 +41,8 @@ use crossterm::terminal::{
     LeaveAlternateScreen,
 };
 use evo::{
-    ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, PopulationFile,
-    ShowcaseLane, Trainer,
+    ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, MUTATION_RATES,
+    PopulationFile, ShowcaseLane, Trainer,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
 use render::chart::{
@@ -105,19 +105,6 @@ const DEFAULT_SPEED: u32 = 8;
 /// Extra frames past `level_max / speed` before a generation is abandoned, so an
 /// agent that survives to the episode cap cannot hold the view hostage.
 const SLACK_FRAMES: usize = 30;
-
-/// The mutation-rate ladder (§10 Tier 2.9's slider, inside §7.5's 0.03–0.10 range).
-///
-/// A ladder for the same reason the speed control is one: every keypress lands on a
-/// rung the viewer can get back to, and no keypress can drive the run somewhere the
-/// plan does not document. 0.05 is the trainer's default, so a fresh run starts in
-/// the middle and both directions are available — which is the point of the slider.
-/// The two reasons to reach for it are opposite: a population that has converged
-/// onto an obstacle needs shaking *up* (finding 16's plateau), and one that keeps
-/// destroying the genome that nearly solved the level needs calming *down*. The
-/// boxcar2d lesson the plan quotes is that this tuning is itself part of the fun,
-/// which is why it is a key and not a restart flag.
-const MUT_RATES: [f32; 4] = [0.03, 0.05, 0.08, 0.10];
 
 const MIN_CHART_ROWS: usize = 4;
 const MAX_CHART_ROWS: usize = 10;
@@ -312,9 +299,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
                 ));
             }
         }
-        let mut runners: Vec<EpisodeRunner<'_>> = lanes
+        let mut runners: Vec<EpisodeRunner> = lanes
             .iter()
-            .map(|lane| EpisodeRunner::new(&level, &population[lane.index], &eval, lane.seed))
+            .map(|lane| EpisodeRunner::new(&level, population[lane.index].clone(), &eval, lane.seed))
             .collect();
 
         let ctx = GenCtx {
@@ -529,7 +516,7 @@ fn record_trace(
     generation: u32,
     max_fitness: f32,
 ) -> ChampionTrace {
-    let mut runner = EpisodeRunner::new(level, genome, eval, seed);
+    let mut runner = EpisodeRunner::new(level, genome.clone(), eval, seed);
     let mut points = Vec::new();
     loop {
         let frames = runner.sim().stats().frames;
@@ -577,7 +564,7 @@ fn record_trace(
 struct LiveState {
     speed: u32,
     /// Per-gene mutation probability, adjustable while the run is on screen
-    /// (§10 Tier 2.9), always one of [`MUT_RATES`].
+    /// (§10 Tier 2.9), always one of [`MUTATION_RATES`].
     mut_rate: f32,
     paused: bool,
     /// Follow the leading agent's camera, or hold the whole level still.
@@ -770,13 +757,13 @@ fn mut_label(rate: f32) -> String {
 /// Snap an arbitrary rate onto the ladder, so `--mut-rate 0.07` behaves like the
 /// nearest keypress rather than creating a rate no key can get back to. The
 /// trainer's own `sanitized` clamp is a backstop, not the contract: the contract is
-/// that the value on screen is always one of [`MUT_RATES`].
+/// that the value on screen is always one of [`MUTATION_RATES`].
 fn nearest_mut_rate(requested: f32) -> f32 {
     if !requested.is_finite() {
         return GaConfig::default().mutation_rate;
     }
-    let mut best = MUT_RATES[0];
-    for rate in MUT_RATES {
+    let mut best = MUTATION_RATES[0];
+    for rate in MUTATION_RATES {
         if (rate - requested).abs() < (best - requested).abs() {
             best = rate;
         }
@@ -785,13 +772,13 @@ fn nearest_mut_rate(requested: f32) -> f32 {
 }
 
 fn next_mut_rate_up(rate: f32) -> f32 {
-    let i = MUT_RATES.iter().position(|r| *r >= rate).unwrap_or(0);
-    MUT_RATES[(i + 1).min(MUT_RATES.len() - 1)]
+    let i = MUTATION_RATES.iter().position(|r| *r >= rate).unwrap_or(0);
+    MUTATION_RATES[(i + 1).min(MUTATION_RATES.len() - 1)]
 }
 
 fn next_mut_rate_down(rate: f32) -> f32 {
-    let i = MUT_RATES.iter().rposition(|r| *r <= rate).unwrap_or(0);
-    MUT_RATES[i.saturating_sub(1)]
+    let i = MUTATION_RATES.iter().rposition(|r| *r <= rate).unwrap_or(0);
+    MUTATION_RATES[i.saturating_sub(1)]
 }
 
 /// Push the live knobs into the trainer, which breeds the *next* generation from
@@ -1105,7 +1092,7 @@ fn frame_budget(level_max_frames: u32, speed: u32) -> usize {
 fn animate_lanes(
     screen: &mut Screen,
     level: &Level,
-    runners: &mut [EpisodeRunner<'_>],
+    runners: &mut [EpisodeRunner],
     lanes: &[LaneInfo],
     ctx: &GenCtx<'_>,
     live: &mut LiveState,
@@ -1178,7 +1165,7 @@ fn animate_lanes(
 fn draw_state(
     screen: &mut Screen,
     level: &Level,
-    runners: &[EpisodeRunner<'_>],
+    runners: &[EpisodeRunner],
     lanes: &[LaneInfo],
     ctx: &GenCtx<'_>,
     live: &LiveState,
@@ -1380,7 +1367,7 @@ fn watch_champion(
     };
     let mut runners = vec![EpisodeRunner::new(
         level,
-        &genome,
+        genome.clone(),
         &eval,
         champion.metadata.episode_seed,
     )];
@@ -1736,30 +1723,17 @@ mod tests {
     // -- keys -----------------------------------------------------------------
 
     #[test]
-    fn the_mutation_ladder_stays_inside_the_plans_range() {
-        // §7.5 documents 0.03–0.10; the plan's slider (Tier 2.9) is that range, so a
-        // keypress must not be able to leave it, and the default must be reachable.
+    fn the_mutation_keys_walk_the_shared_ladder() {
+        // The ladder itself is asserted where it lives, in `evo::ga` — this is only
+        // about what the *keys* do with it.
         let default = GaConfig::default().mutation_rate;
-        assert!(
-            MUT_RATES.contains(&default),
-            "the default rate must be one of the rungs, not between two: {MUT_RATES:?}"
-        );
-        for pair in MUT_RATES.windows(2) {
-            assert!(pair[0] < pair[1], "the ladder must rise: {MUT_RATES:?}");
-        }
-        for rate in MUT_RATES {
-            assert!(
-                (0.03..=0.10).contains(&rate),
-                "{rate} is outside the range the plan documents for the slider"
-            );
-        }
 
         // Snapping, so `--mut-rate 0.07` behaves like a keypress rather than creating
         // a rate no key can return to.
         assert_eq!(nearest_mut_rate(0.07), 0.08);
         assert_eq!(nearest_mut_rate(0.031), 0.03);
         assert_eq!(nearest_mut_rate(99.0), 0.10);
-        assert_eq!(nearest_mut_rate(-4.0), MUT_RATES[0]);
+        assert_eq!(nearest_mut_rate(-4.0), MUTATION_RATES[0]);
         assert_eq!(nearest_mut_rate(f32::NAN), default);
 
         // Both ends are hard stops, not wraparounds.
@@ -1786,11 +1760,11 @@ mod tests {
         let mut live = LiveState::default();
         apply_live_config(&mut quiet, &live);
 
-        live.mut_rate = *MUT_RATES.last().expect("ladder");
+        live.mut_rate = *MUTATION_RATES.last().expect("ladder");
         apply_live_config(&mut lively, &live);
         assert_eq!(
             lively.config.mutation_rate,
-            *MUT_RATES.last().expect("ladder")
+            *MUTATION_RATES.last().expect("ladder")
         );
 
         quiet.step(&level);
@@ -1902,21 +1876,21 @@ mod tests {
                 &mut live,
             );
         }
-        assert_eq!(live.mut_rate, *MUT_RATES.last().expect("ladder"));
+        assert_eq!(live.mut_rate, *MUTATION_RATES.last().expect("ladder"));
         press(
             key_action(KeyCode::Char('m'), KeyModifiers::NONE),
             &mut live,
         );
-        assert_eq!(live.mut_rate, *MUT_RATES.last().expect("ladder"));
+        assert_eq!(live.mut_rate, *MUTATION_RATES.last().expect("ladder"));
         for _ in 0..5 {
             press(
                 key_action(KeyCode::Char('M'), KeyModifiers::NONE),
                 &mut live,
             );
         }
-        assert_eq!(live.mut_rate, MUT_RATES[0]);
+        assert_eq!(live.mut_rate, MUTATION_RATES[0]);
         assert!(
-            default_rate > MUT_RATES[0],
+            default_rate > MUTATION_RATES[0],
             "the default has to have a rung below it or the slider only goes one way"
         );
 
@@ -2439,7 +2413,7 @@ mod tests {
                 paused: true,
                 follow: false,
                 speed: 50,
-                mut_rate: *MUT_RATES.last().expect("ladder"),
+                mut_rate: *MUTATION_RATES.last().expect("ladder"),
                 ..LiveState::default()
             },
             history: &h,
@@ -2704,7 +2678,8 @@ mod tests {
         assert!(!trace.points.is_empty(), "a route has at least one position");
 
         // The same episode, driven independently.
-        let mut runner = EpisodeRunner::new(&level, &population[lane.index], &eval, lane.seed);
+        let mut runner =
+            EpisodeRunner::new(&level, population[lane.index].clone(), &eval, lane.seed);
         while !runner.is_finished() {
             runner.step();
         }
@@ -2913,7 +2888,7 @@ mod tests {
             trace_cursor: Some(7),
             ..LiveState::default()
         };
-        let mut runners = vec![EpisodeRunner::new(&level, &genome, &eval, 1)];
+        let mut runners = vec![EpisodeRunner::new(&level, genome.clone(), &eval, 1)];
         animate_lanes(&mut screen, &level, &mut runners, &lanes, &ctx, &mut live).expect("draws");
 
         let drawn = screen.last.clone();
@@ -2971,7 +2946,7 @@ mod tests {
         };
         let mut screen = Screen::open(true, Some(frames)).expect("headless screen");
         let mut live = live;
-        let mut runners = vec![EpisodeRunner::new(level, &genome, &eval, 1)];
+        let mut runners = vec![EpisodeRunner::new(level, genome.clone(), &eval, 1)];
         animate_lanes(&mut screen, level, &mut runners, &lanes, &ctx, &mut live).expect("draws");
         (
             live,
@@ -3053,7 +3028,7 @@ mod tests {
         let champion = ChampionFile::new(&genome, &full, &level, 0, &cfg);
         assert_eq!(replay_verdict(&full, &champion), ReplayVerdict::Verified);
 
-        let mut runner = EpisodeRunner::new(&level, &genome, &eval, 7);
+        let mut runner = EpisodeRunner::new(&level, genome.clone(), &eval, 7);
         for _ in 0..10 {
             runner.step();
         }

@@ -16,7 +16,7 @@ currently does and where it deviates.
 | **M1** sim + hand-written levels | done |
 | **M2** GA + headless training + reachability oracle | done |
 | **M3** watch mode + fun gate | **Tiers 1 and 2 done, fun gate open** — the owner's call |
-| **M4** editor + content | **started: the game shell exists** — pixel renderer, generated art, full drag-and-drop editor, in-editor playtest (findings 24–25). Not yet: evolving or watching *inside* it, and the curated starter pack |
+| **M4** editor + content | **the shell and the evolution view work** — pixel renderer, generated art, drag-and-drop editor, in-editor playtest, and watch mode hosted in the window (chart, lanes, route scrubber, champion saving, findings 24–27). Not yet: the curated starter pack and a browsable level shelf |
 | M5 web/release | not started — except M5's stall chain, done early (findings 19–22) |
 
 The deterministic core, the evolution loop, the reachability oracle and the Tier 1
@@ -36,6 +36,14 @@ back through those routes — position by position — to the moment a jump was 
 learned (finding 21). What
 remains of M3 is the part no test can answer — whether watching it is fun — and
 that needs a human at a keyboard. See [The M3 problem](#the-m3-problem).
+
+The same run now happens in the window. `cargo run --release -p app -- --evolve`
+puts the trainer on its own thread, animates the generation it just finished over the
+terrain (champion solid, the other seven lanes ghosted and colour-tagged), draws the
+fitness chart as real geometry rather than a character plot, and lets the arrow keys
+scrub the recorded champion routes. It is the terminal mode's own design — one
+generation, then the animation, then the next — not a second evolution loop
+(findings 26–27).
 
 ## Measured numbers
 
@@ -139,7 +147,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 253 tests
+cargo test --workspace                 # 282 tests
 cargo build --release
 
 # The game: draw a level, drag tiles out of a palette, play it yourself.
@@ -150,6 +158,14 @@ cargo run --release -p app -- --level levels/l6-marathon.json
 #   right-drag erases   middle-drag (or alt-drag) pans   wheel zooms
 #   ctrl+Z / ctrl+Y undo   G grid   F fit   ctrl+S save   P play/pause-mode
 #   in play: arrows or W/A/S/D move and jump, R restarts, P or Esc returns
+
+# The same run inside the window: train on the level you are editing and watch it.
+cargo run --release -p app -- --evolve --level levels/l2-first-gap.json
+#   space pause   n one generation   -/+ speed   m/M mutation rate
+#   left/right scrub the recorded champions   h back to live
+#   s save the best-ever champion   P or Esc back to the editor
+cargo run --release -p app -- --evolve --pop 60 --seed 5 --generations 8 \
+    --screenshot out/evolve.png
 
 # Render one frame to a PNG and exit (how the renderer is verified without a human).
 cargo run --release -p app -- --screenshot out/frame.png
@@ -301,7 +317,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-253 tests, all green. `cargo test --workspace`.
+282 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -380,7 +396,7 @@ L1, and a player who jumps when they see an obstacle must clear the first gap at
 reaction latency inside 240 ms. That last one is the M1 exit criterion in executable
 form, as far as a model of a player can carry it.
 
-The desktop shell gets eighteen, and they exist because two of its failure modes are
+The desktop shell gets forty-six, and they exist because two of its failure modes are
 invisible from the outside. `crates/sim`'s editing API has twelve of its own, the one
 that matters being `every_shipped_level_round_trips_through_the_writer_with_the_same
 _hash` — the hash covers the name, the grid, the spawn and every entity box, so a
@@ -398,6 +414,24 @@ beatable/not-beatable verdict is the oracle's answer following a spike curtain d
 across the approach. Its playtest tests pin the accumulator (a 30 ms frame must not
 lose physics, a two-second hitch must not teleport the player), that holding right
 beats L1 through the real input path, and that a restart is the same seeded episode.
+
+The evolution view adds twenty-five more, and they are about the two things that
+would make it a lie. The first is *fidelity*: `a_lane_replays_the_episode_that_was_scored`
+animates a real generation's lanes to their end and checks each one's own score against
+the fitness printed beside it, and `a_recorded_route_ends_where_the_champion_ended`
+re-runs a recorded route's genome and seed and requires the same ending — the numbers on
+screen have to be the numbers being drawn. The second is *rate*:
+`a_run_waits_for_the_viewer_between_generations` parks a real worker thread, sleeps 200
+ms, and requires that nothing else was trained — a run that trains on a timer is the one
+behaviour the whole design forbids — then asks for the next generation and requires it.
+The rest cover the packing (labels counted within their group, deaths tagged with their
+generation and forgotten after the window), the ladders stopping at both ends, the
+chart's geometry (a flat run, a single generation, non-finite values skipped, the highest
+point highest, wins marked on the top rule only), a headless draw of the panel and the
+lanes so a frame that renders nothing fails a test rather than shipping, and the key map
+itself — every documented key to the command its button produces — which is asserted as
+data precisely because pressing a real key in a real window is the one thing no test here
+can do.
 
 ## Findings and deviations from the plan
 
@@ -720,6 +754,56 @@ with three deliberate properties:
    they land. Counting draw *calls* would not have caught this — the calls were all
    there; only the rectangles were wrong.
 
+26. **The window hosts the run; it does not reimplement it.** `crate::lab` owns an
+   `evo::Trainer` on its own thread and hands the window **one finished generation at a
+   time** — the population snapshot, the eight showcase lanes with the exact seeds they
+   were scored with, the whole history, the deaths, the recorded routes and the best-ever
+   genome. The window animates that generation with `evo::EpisodeRunner`, and only when
+   the animation ends does it ask for the next one, so the terminal mode's central
+   property survives the move: the GA's RNG stream sees the same draws whether anyone is
+   watching or not, and a **paused window trains nothing at all** (asserted on a real
+   thread, see Testing). The thread exists for the same reason the packet does: a
+   generation at pop 200 is tens of milliseconds across every core, and a window that
+   blocks on it drops frames exactly while the user is trying to look at it.
+
+   Three smaller decisions follow from the boundary rules. The chart is drawn as geometry
+   rather than by calling `render::chart::fitness_chart`, which composes a *text* plot:
+   `render` decides what the numbers mean (trend, stall, death cluster, the formatter) and
+   the GUI decides where the lines go, which is the plan's own split — and it keeps the
+   band the terminal's chart draws from drifting away from the one the window draws. The
+   lanes are distinguished by outline colour and a bar at their feet rather than by eight
+   glyphs, because a terminal is a character grid and a pixel view is not: eight sprite
+   agents in one tile smear. And the mutation ladder moved into `evo` beside the
+   hyperparameter it tunes (`evo::MUTATION_RATES`), because the terminal's `m`/`M` keys and
+   the window's slider are the same control, and two copies of a ladder are two chances for
+   the two front-ends to disagree about which rates are reachable.
+
+   Inside the window, the same reasoning applies one level down: the panel's buttons, the
+   sliders and the keys all produce `panel::Command` values, and one `apply` decides what
+   each one means. The first draft of this view had the buttons' handling in one method and
+   the keys' in another, which is two chances for "pause" to grow two meanings — and the
+   mapping from pressed keys to commands is plain data (`panel::Keys` →
+   `panel::commands_for`), so the part no test could otherwise reach is covered.
+
+27. **Two bugs the new tests caught, both of the "looks fine, is wrong" kind.** The
+   mutation ladder's nearest-rung search compared distances as *integers*, so 0.07, 0.05
+   and 0.02 all truncated to zero, every rung looked equidistant, and the search returned
+   the first one: pressing "up" at the top rate walked *back down* to the middle of the
+   ladder. The behaviour was in the code that the terminal's keys reach through — but only
+   the window's own ladder test pressed a rate that was already on a rung and stepped, and
+   it failed immediately. The fix is `total_cmp` on the distances, and the test still
+   asserts both ends.
+
+   The second is a test-shape lesson. The new sprite-counting test asked for the
+   *image-textured* vertices and compared a frame drawn with the editor's opaque options
+   against one drawn with the play options plus agents: 492 versus 492, no agents — except
+   the numbers matched for an accidental reason, because the editor frame drew one extra
+   sprite (the spawn marker) and the run frame drew one agent. Tightening the assertion to
+   `base + 4` — one agent is exactly one quad, and a level with no walkers is exactly one
+   agent — is what made the frames comparable, and it now fails if a lane ever draws the
+   whole population at once. Counting something is not the same as counting the right
+   thing, which is finding 25's lesson one level up.
+
 ## The M3 problem
 
 The plan's M3 gate is "watch evolution for 10+ minutes and decide whether it is
@@ -800,11 +884,12 @@ NEAT/speciation, survival-analysis difficulty estimation, online champion
 sharing, sound, mobile, powerups, achievements/tutorial, threaded WASM, and the
 web build. See the plan's §12 for the gates.
 
-No longer deferred: the pixel renderer and the editor existed as a terminal view
-and hand-written JSON through M1–M3, and are now a real window (`crates/app`).
-Still open inside it, in the order worth doing: **evolve and watch from the app**
-(the whole point of the game — the view, the chart and the route scrubber already
-exist in `render`, they need hosting in a panel), the level list as a browsable
-shelf rather than an Open menu, and the curated starter pack (M4's exit: a
-non-developer builds a level, validates it and evolves a solver without touching
-JSON — the middle third works, the last third is the missing panel).
+No longer deferred: the pixel renderer, the editor and the watch mode. All three
+existed as a terminal view and hand-written JSON through M1–M3, and are now a real
+window (`crates/app`) — which means a non-developer can build a level, validate it,
+play it and **evolve a solver on it without touching JSON** (the last third of M4's
+exit criterion, in place as of finding 26). Still open inside it, in the order worth
+doing: the curated starter pack M4 exits on (built with the editor, not by hand), the
+level list as a browsable shelf rather than an Open menu, and the curriculum step
+(finding 22) in the window — the stall line and the death cluster are already there,
+but a stalled run in the app can only be restarted, not handed an easier level.

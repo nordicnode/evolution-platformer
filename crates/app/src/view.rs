@@ -30,6 +30,12 @@ const SPAWN_LINE: Color32 = Color32::from_rgb(120, 92, 30);
 const UNREACHED_TINT: Color32 = Color32::from_rgba_premultiplied(90, 20, 24, 96);
 const CULPRIT_LINE: Color32 = Color32::from_rgb(226, 154, 40);
 const FRONTIER_LINE: Color32 = Color32::from_rgb(210, 90, 60);
+/// Where the population keeps dying. Warm, so a corpse never reads as terrain.
+const DEATH_MARK: [u8; 3] = [235, 70, 60];
+/// A recorded champion route: its trail, and the two ways it can end.
+const ROUTE_TRAIL: Color32 = Color32::from_rgba_premultiplied(34, 28, 56, 150);
+const ROUTE_FLAG: Color32 = Color32::from_rgb(110, 220, 130);
+const ROUTE_GRAVE: Color32 = Color32::from_rgb(235, 70, 60);
 
 /// Zoom limits, in points per tile. Below the minimum the grid is unreadable, above
 /// the maximum a single tile fills the window.
@@ -275,7 +281,16 @@ impl<'a> Sheet<'a> {
 
     /// Draw one sprite cell.
     pub fn image(&self, rect: Rect, uv: Rect) {
-        self.painter.image(self.texture, rect, uv, Color32::WHITE);
+        self.image_tinted(rect, uv, Color32::WHITE);
+    }
+
+    /// Draw one sprite cell multiplied by `tint`.
+    ///
+    /// This is how the evolution view shows eight agents at once: the champion is drawn
+    /// opaque, the rest translucent, and the eye can still tell them apart where they
+    /// overlap. A tint of `WHITE` is the plain sprite.
+    pub fn image_tinted(&self, rect: Rect, uv: Rect, tint: Color32) {
+        self.painter.image(self.texture, rect, uv, tint);
     }
 }
 
@@ -466,6 +481,20 @@ pub fn draw_reach_overlay(sheet: Sheet<'_>, level: &Level, report: &ReachReport)
 /// every walker, alive or squashed.
 pub fn draw_sim(sheet: Sheet<'_>, sim: &Sim, opts: RenderOpts, clock: f32) {
     draw_level(sheet, sim.level(), opts, None);
+    draw_agents(sheet, sim, clock, Color32::WHITE);
+}
+
+/// Draw just an episode's agents — the player and every walker — leaving the terrain
+/// alone.
+///
+/// Split from [`draw_sim`] for the evolution view, which draws the level **once** and
+/// then eight agents from eight different episodes over it: eight copies of the terrain
+/// would be eight times the draw calls for one identical picture, and their tile edges
+/// would shimmer against each other.
+///
+/// `tint` multiplies every sprite, which is how a lane is faded without a second set of
+/// art. `WHITE` is the plain, fully opaque sprite.
+pub fn draw_agents(sheet: Sheet<'_>, sim: &Sim, clock: f32, tint: Color32) {
     let sprites = sheet.sprites;
 
     for walker in sim.walkers() {
@@ -476,7 +505,7 @@ pub fn draw_sim(sheet: Sheet<'_>, sim: &Sim, opts: RenderOpts, clock: f32) {
         } else {
             sprites.walker_b
         };
-        sheet.image(sheet.world(walker.x, walker.y, walker.w, walker.h), uv);
+        sheet.image_tinted(sheet.world(walker.x, walker.y, walker.w, walker.h), uv, tint);
     }
 
     let p = sim.player();
@@ -491,7 +520,110 @@ pub fn draw_sim(sheet: Sheet<'_>, sim: &Sim, opts: RenderOpts, clock: f32) {
     } else {
         sprites.player_stand
     };
-    sheet.image(sheet.world(p.x, p.y, p.w, p.h), uv);
+    sheet.image_tinted(sheet.world(p.x, p.y, p.w, p.h), uv, tint);
+}
+
+/// A small bar under an agent's feet in the lane's own colour.
+///
+/// The panel lists the lanes with their colours, and eight translucent agents on one
+/// level are otherwise hard to tell apart where they overlap. A tag at the feet rather
+/// than an outline around the body keeps the sprite itself readable.
+pub fn draw_lane_tag(sheet: Sheet<'_>, sim: &Sim, colour: Color32) {
+    let p = sim.player();
+    let feet = sheet.world(p.x, p.y + p.h, p.w.max(0.5), 0.0);
+    let bar = Rect::from_min_size(
+        Pos2::new(feet.left(), feet.top()),
+        Vec2::new(feet.width(), (sheet.camera.zoom * 0.12).clamp(1.5, 4.0)),
+    );
+    sheet
+        .painter
+        .rect_filled(bar, egui::CornerRadius::ZERO, colour);
+}
+
+/// How opaque a death marker is, by how many generations ago it happened.
+///
+/// Recent corpses are the ones that say where the population is stuck *now*, so they are
+/// near-opaque and the older ones fade most of the way out inside the window the map
+/// keeps: a forty-generation-old death is history, not a diagnosis.
+pub fn death_alpha(age: u32, window: u32) -> u8 {
+    if window == 0 {
+        return 255;
+    }
+    let t = age.min(window) as f32 / window as f32;
+    (240.0 * (1.0 - 0.75 * t)).round() as u8
+}
+
+/// Mark where the population has been dying, on the terrain it died on.
+///
+/// This is the plan's death map (§10 Tier 1.6) in the medium the window has: the
+/// terminal prints a strip of intensity glyphs under the level, and here the same marks
+/// land on the tile itself — which is what a level designer actually needs, since the
+/// answer to "where do they die" is "at that ledge", not "at column 33".
+///
+/// `newest` is the generation being drawn, so the fade is measured in generations and
+/// stays honest while a run is paused.
+pub fn draw_deaths(sheet: Sheet<'_>, marks: &[(f32, f32, u32)], newest: u32, window: u32) {
+    let painter = sheet.painter;
+    let radius = (sheet.camera.zoom * 0.16).clamp(1.5, 6.0);
+    for (x, y, generation) in marks {
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        let alpha = death_alpha(newest.saturating_sub(*generation), window);
+        let centre = sheet.camera.to_screen(x + 0.5, y + 0.5, sheet.viewport);
+        painter.circle_filled(
+            centre,
+            radius,
+            Color32::from_rgba_unmultiplied(DEATH_MARK[0], DEATH_MARK[1], DEATH_MARK[2], alpha),
+        );
+    }
+}
+
+/// The recorded route as drawable cells, `(tile_x, tile_y, is_end)`.
+///
+/// The folding rule is `render`'s, taken from [`ChampionTrace::bodies`] rather than
+/// re-derived: consecutive samples that land in one tile are one marker, because a route
+/// is a path and not a smear, while coming back through a tile *is* recorded twice. That
+/// method also puts the end marker first, which is what makes the end the last thing
+/// drawn here — where the route stopped is the one thing that must never be hidden.
+pub fn route_cells(trace: &render::trace::ChampionTrace) -> Vec<(i32, i32, bool)> {
+    trace
+        .bodies()
+        .iter()
+        .filter_map(|body| {
+            body.tile_bounds()
+                .map(|(tx0, _tx1, ty0, _ty1)| (tx0, ty0, body.alive))
+        })
+        .collect()
+}
+
+/// Draw a recorded champion route over the level.
+///
+/// A trail of dim marks and one bright end: green at the flag, red in a grave. The
+/// vocabulary is the view's own rather than the terminal's glyphs, but it says the same
+/// thing the scrubber's `!` and `+` do, so the two views read alike.
+pub fn draw_route(sheet: Sheet<'_>, trace: &render::trace::ChampionTrace) {
+    let painter = sheet.painter;
+    let mut cells = route_cells(trace);
+    // The end is first in `bodies()`; draw it last, on top of the trail it ends.
+    cells.sort_by_key(|(_, _, is_end)| *is_end);
+    for (tx, ty, is_end) in cells {
+        let rect = sheet.tile(tx, ty);
+        if is_end {
+            let colour = if trace.won { ROUTE_FLAG } else { ROUTE_GRAVE };
+            painter.rect_filled(
+                rect.shrink(rect.width() * 0.16),
+                egui::CornerRadius::same(2),
+                colour,
+            );
+        } else {
+            painter.rect_filled(
+                rect.shrink(rect.width() * 0.34),
+                egui::CornerRadius::ZERO,
+                ROUTE_TRAIL,
+            );
+        }
+    }
 }
 
 /// Which of two walker frames is showing. Slow enough to read as walking, and a pure
@@ -509,6 +641,7 @@ fn player_frame(clock: f32) -> i64 {
 mod tests {
     use super::*;
     use egui::{Pos2, Rect, Vec2};
+    use render::trace::{ChampionTrace, TracePoint};
 
     fn assets_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets")
@@ -564,6 +697,181 @@ mod tests {
             }
         }
         (vertices, bounds)
+    }
+
+    /// Draw a level, optionally with the evolution view's own layers, and report how many
+    /// vertices reached the frame: the image-textured ones (sprites) and all of them.
+    ///
+    /// Both numbers are needed. The agents are sprites, but the lane tag, the death map
+    /// and a recorded route are drawn shapes — they land in egui's non-textured mesh, so a
+    /// counter that only looked at sprite vertices would call a frame with three of the
+    /// four layers missing a correct one.
+    fn headless_evolve_vertices(level: &Level, size: Vec2, layers: bool) -> (usize, usize) {
+        let ctx = egui::Context::default();
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
+        let viewport = Rect::from_min_size(Pos2::ZERO, size);
+        let camera = Camera::fit(level, viewport, 24.0);
+        let route = ChampionTrace {
+            generation: 4,
+            max_fitness: 900.0,
+            won: false,
+            points: vec![
+                TracePoint {
+                    frame: 0,
+                    x: 1.0,
+                    y: 6.0,
+                },
+                TracePoint {
+                    frame: 60,
+                    x: 8.0,
+                    y: 6.0,
+                },
+            ],
+        };
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::default())
+                    .show(ctx, |ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let painter = ui.painter_at(rect);
+                        let sheet = Sheet::new(&painter, &atlas, &sprites, &camera, rect);
+                        draw_level(sheet, level, RenderOpts::playing(), None);
+                        if layers {
+                            let sim = Sim::new(level, 1);
+                            draw_agents(sheet, &sim, 0.0, Color32::from_white_alpha(120));
+                            draw_lane_tag(sheet, &sim, Color32::from_rgb(250, 214, 102));
+                            draw_deaths(sheet, &[(3.0, 6.0, 4), (8.0, 6.0, 1)], 4, 25);
+                            draw_route(sheet, &route);
+                        }
+                    });
+            },
+        );
+
+        let font = egui::TextureId::default();
+        let (mut images, mut total) = (0usize, 0usize);
+        for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+            if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                total += mesh.vertices.len();
+                if mesh.texture_id != font {
+                    images += mesh.vertices.len();
+                }
+            }
+        }
+        (images, total)
+    }
+
+    /// The evolution layers have to reach the tessellator, not merely compile: a lane's
+    /// agent, its tag, the death map and a recorded route all draw over the terrain.
+    #[test]
+    fn the_evolution_layers_draw_over_the_level() {
+        let level = shipped("l1-flat-run");
+        let size = Vec2::new(900.0, 600.0);
+        let (base_images, base_total) = headless_evolve_vertices(&level, size, false);
+        let (images, total) = headless_evolve_vertices(&level, size, true);
+
+        // L1 has no walkers, so one lane is one agent: exactly four sprite vertices. A
+        // lane that drew the whole population, or none of it, would show up here.
+        assert_eq!(
+            images,
+            base_images + 4,
+            "one agent sprite per lane: {base_images} -> {images}"
+        );
+        // The tag, the deaths and the route are drawn shapes rather than sprites, so they
+        // are counted in the frame's total.
+        assert!(
+            total > base_total,
+            "the lane tag, the death map and the route should reach the frame: \
+             {base_total} -> {total}"
+        );
+    }
+
+    /// A route's shape is `render`'s, so the window and the terminal cannot disagree
+    /// about it: consecutive samples in one tile are one marker, coming back through a
+    /// tile is recorded twice, and exactly one marker is the end.
+    #[test]
+    fn a_route_folds_into_one_marker_per_tile() {
+        let trace = ChampionTrace {
+            generation: 3,
+            max_fitness: 12.5,
+            won: false,
+            points: vec![
+                TracePoint {
+                    frame: 0,
+                    x: 1.0,
+                    y: 4.0,
+                },
+                TracePoint {
+                    frame: 6,
+                    x: 1.4,
+                    y: 4.4,
+                },
+                TracePoint {
+                    frame: 12,
+                    x: 2.0,
+                    y: 4.0,
+                },
+                TracePoint {
+                    frame: 18,
+                    x: 3.0,
+                    y: 4.0,
+                },
+                TracePoint {
+                    frame: 24,
+                    x: 2.4,
+                    y: 4.4,
+                },
+            ],
+        };
+        let cells = route_cells(&trace);
+        let trail: Vec<(i32, i32)> = cells
+            .iter()
+            .filter(|c| !c.2)
+            .map(|c| (c.0, c.1))
+            .collect();
+        assert_eq!(trail, vec![(1, 4), (2, 4), (3, 4), (2, 4)]);
+        assert_eq!(
+            cells.iter().filter(|c| c.2).count(),
+            1,
+            "exactly one end marker"
+        );
+
+        // A route that never moved still has its end. `bodies` puts the end first and
+        // does not fold the trail against it, which is why this is two markers, not one:
+        // "where it ended" and "where it went" are different facts even in one tile.
+        let still = ChampionTrace {
+            generation: 0,
+            max_fitness: 0.0,
+            won: false,
+            points: vec![TracePoint {
+                frame: 0,
+                x: 2.0,
+                y: 3.0,
+            }],
+        };
+        let cells = route_cells(&still);
+        assert_eq!(cells.iter().filter(|c| c.2).count(), 1);
+        assert!(cells.iter().any(|c| !c.2));
+    }
+
+    #[test]
+    fn death_markers_fade_out_over_the_window() {
+        assert_eq!(death_alpha(0, 25), 240, "the newest death is fully drawn");
+        assert!(death_alpha(12, 25) < death_alpha(0, 25));
+        assert!(death_alpha(25, 25) < death_alpha(12, 25));
+        assert_eq!(
+            death_alpha(400, 25),
+            death_alpha(25, 25),
+            "older than the window is just the oldest"
+        );
+        // A zero window is nonsense input, not a panic.
+        assert_eq!(death_alpha(3, 0), 255);
     }
 
     #[test]

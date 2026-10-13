@@ -25,8 +25,8 @@ pub use fitness::{
     run_episode, score, EpisodeResult, EpisodeRunner, EvalConfig, ACTION_REPEAT, FITNESS_VERSION,
 };
 pub use ga::{
-    evaluate_population, BestEver, GaConfig, GenerationReport, GenRow, LaneKind, ShowcaseLane,
-    Trainer,
+    evaluate_population, BestEver, GaConfig, GenerationReport, GenRow, LaneKind, MUTATION_RATES,
+    ShowcaseLane, Trainer,
 };
 pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
 
