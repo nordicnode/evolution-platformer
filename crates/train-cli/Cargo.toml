@@ -1,0 +1,18 @@
+[package]
+name = "train-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless training, reachability, replay and terminal play."
+
+[[bin]]
+name = "train-cli"
+path = "src/main.rs"
+
+[dependencies]
+sim.workspace = true
+evo.workspace = true
+render.workspace = true
+serde.workspace = true
+serde_json.workspace = true

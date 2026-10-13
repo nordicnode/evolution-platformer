@@ -1,0 +1,14 @@
+[package]
+name = "evo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Fixed-topology neuroevolution: genome, GA, fitness v1."
+
+[dependencies]
+sim.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand_xoshiro.workspace = true
+rayon.workspace = true
