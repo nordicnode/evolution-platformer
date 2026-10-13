@@ -466,6 +466,14 @@ deliberate, documented decision — not drift.
    be `sensors::VERSION` 2, so this is documented and pinned by a test rather than
    changed, and the shipped-level tests now refuse entities outside the grid or
    standing on nothing.
+18. **The oracle's jump windows are a lower bound, not a difficulty meter.** The
+   canonical model jumps from a standing start at full run speed; the sim also
+   allows a take-off inside the 4-tick coyote window *after* walking off a ledge,
+   which is strictly more reach than the oracle samples. So a lone 4-tile pit is
+   crossable in the oracle from only ~3 sub-tile positions at its ledge column,
+   while evolution crosses it at generation 0 — the real window is far wider. Hence
+   the split of duties: the oracle answers "beatable at all", and the population
+   answers "how hard" (§9's own suggestion).
 19. **A stall needs saying out loud, and the label has to be present-tense.** The
    plan schedules stall UX for M5, but the shipped hard levels stall in practice, so
    the watch view reports it now: `stalled: no new best in a long time` on the status
@@ -500,6 +508,28 @@ deliberate, documented decision — not drift.
    point on an easier level, M5), not a different schedule. The ladder is clamped to
    the plan's own 0.03–0.10 and snaps `--mut-rate` onto it, so the number in the
    header is always the number being used.
+21. **A timeline is worth keeping only where it changed.** Tier 2.7 asks watch mode
+   to record the champion's trajectory per generation and let the viewer scrub back
+   to the moment the jump was learned. Recording every generation would keep 420
+   near-identical routes on the seed that stalls (finding 19) — the rescue is
+   invisible in exactly the case the scrubber exists for — so the record keeps the
+   generations that moved the best by at least 1% and drops the rest. Measured on
+   the two hardest seeds at pop 200 for 420 generations: **8 entries spanning `gen
+   0..38`** on seed 5 (the seed whose best never moves again) and **5 entries
+   spanning `gen 0..76`** on seed 1, whose solve at generation 76 is therefore the
+   record's *last entry*. Two independent measurements agreeing on the same
+   boundary is the strongest check this feature has: the record's span is the
+   plateau, so a viewer who reads `record 8 improvements kept (gen 0..38)` at
+   generation 400 is being told the same thing the stall line says, from data that
+   was collected by different code. The cap is 64 entries (~1 MB), which those runs
+   never reach; when it does fill, the oldest entry is dropped and the row shows the
+   span, so a record that no longer reaches back to generation 0 says so rather than
+   looking complete. Two smaller decisions are recorded here because they are the
+   kind that get silently re-litigated: each recorded route is re-simulated as its
+   own episode rather than sampled off the animation (a paused, skipped or
+   frame-capped animation would truncate the path exactly when a viewer has walked
+   away), and the trail's `:` is named on the row that owns it because the death
+   strip already uses `:` for "one death in this column".
 22. **A stalled population is the best starting material a run has: move it, do not
    reset it.** The last item in the plan's stall chain (§12 M5) is curriculum resume
    — "restart training from a checkpoint at the stuck point" — and since findings 19
@@ -547,36 +577,6 @@ deliberate, documented decision — not drift.
      different level is what a curriculum *is*, so `--resume` prints which level the
      checkpoint came from and says plainly that the fitnesses either side are not
      comparable.
-21. **A timeline is worth keeping only where it changed.** Tier 2.7 asks watch mode
-   to record the champion's trajectory per generation and let the viewer scrub back
-   to the moment the jump was learned. Recording every generation would keep 420
-   near-identical routes on the seed that stalls (finding 19) — the rescue is
-   invisible in exactly the case the scrubber exists for — so the record keeps the
-   generations that moved the best by at least 1% and drops the rest. Measured on
-   the two hardest seeds at pop 200 for 420 generations: **8 entries spanning `gen
-   0..38`** on seed 5 (the seed whose best never moves again) and **5 entries
-   spanning `gen 0..76`** on seed 1, whose solve at generation 76 is therefore the
-   record's *last entry*. Two independent measurements agreeing on the same
-   boundary is the strongest check this feature has: the record's span is the
-   plateau, so a viewer who reads `record 8 improvements kept (gen 0..38)` at
-   generation 400 is being told the same thing the stall line says, from data that
-   was collected by different code. The cap is 64 entries (~1 MB), which those runs
-   never reach; when it does fill, the oldest entry is dropped and the row shows the
-   span, so a record that no longer reaches back to generation 0 says so rather than
-   looking complete. Two smaller decisions are recorded here because they are the
-   kind that get silently re-litigated: each recorded route is re-simulated as its
-   own episode rather than sampled off the animation (a paused, skipped or
-   frame-capped animation would truncate the path exactly when a viewer has walked
-   away), and the trail's `:` is named on the row that owns it because the death
-   strip already uses `:` for "one death in this column".
-18. **The oracle's jump windows are a lower bound, not a difficulty meter.** The
-   canonical model jumps from a standing start at full run speed; the sim also
-   allows a take-off inside the 4-tick coyote window *after* walking off a ledge,
-   which is strictly more reach than the oracle samples. So a lone 4-tile pit is
-   crossable in the oracle from only ~3 sub-tile positions at its ledge column,
-   while evolution crosses it at generation 0 — the real window is far wider. Hence
-   the split of duties: the oracle answers "beatable at all", and the population
-   answers "how hard" (§9's own suggestion).
 
 ## The M3 problem
 
