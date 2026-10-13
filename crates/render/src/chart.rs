@@ -17,10 +17,18 @@
 //! | max rising, avg flat | a few good agents, the rest floundering |
 //! | both flat | converged |
 //! | max falling | degenerating |
+//! | no new best for [`STALL_GENERATIONS`] | **stalled** |
 //!
 //! [`fitness_trend`] classifies those in code so the watch mode can label the
-//! chart instead of leaving the player to eyeball it, and so a stall detector can
-//! reuse the same judgement later.
+//! chart instead of leaving the player to eyeball it. The last row is the one the
+//! plan's four readings cannot express: "both flat" describes the *shape* of the
+//! last few generations, while a stall is a question about time — how long since
+//! the population found anything genuinely better — and that is the reading which
+//! decides whether a session is still worth watching. [`fitness_stall`] answers it,
+//! and the watch view reports it together with the place agents keep dying,
+//! because "no new best for 27 generations, deaths cluster at x 33" is a statement
+//! about the *level*: §13 asks for stalling to be framed as difficulty information,
+//! and §12 M5 is the stall UX.
 //!
 //! ## The one hard case: max and avg are orders of magnitude apart
 //!
@@ -108,6 +116,9 @@ pub enum Trend {
     Converged,
     /// The best agent is getting worse.
     Degenerating,
+    /// No new best for [`STALL_GENERATIONS`]: the run has stopped finding anything
+    /// better, whatever the last few generations happen to look like.
+    Stalled,
     /// An agent reached the flag. Outranks every other reading.
     Solved,
 }
@@ -121,6 +132,7 @@ impl Trend {
             Trend::FewGoodAgents => "few good agents: max rising, average flat",
             Trend::Converged => "converged: fitness flat",
             Trend::Degenerating => "degenerating: max falling",
+            Trend::Stalled => "stalled: no new best in a long time",
             Trend::Solved => "solved: an agent reached the flag",
         }
     }
@@ -196,6 +208,15 @@ pub fn fitness_trend(history: &[HistoryPoint]) -> Trend {
         return Trend::Solved;
     }
 
+    // A stall outranks the shape of the tail. Both can be true at once — a run that
+    // improved once, long ago, can still show a rising maximum *inside* the last ten
+    // generations while never coming close to its own best — and in that case the
+    // shape of the tail is the misleading half: "few good agents: max rising" beside
+    // "nothing better for 40 generations" reads as an invitation to keep waiting.
+    if fitness_stall(history).is_some() {
+        return Trend::Stalled;
+    }
+
     let maxes: Vec<f32> = tail.iter().map(|p| p.max_fitness).collect();
     let avgs: Vec<f32> = tail.iter().map(|p| p.avg_fitness).collect();
     let max_dir = direction(&maxes);
@@ -219,6 +240,134 @@ pub fn fitness_trend(history: &[HistoryPoint]) -> Trend {
         },
         Direction::Falling => Trend::Degenerating,
     }
+}
+
+/// How many generations without a meaningful improvement to the best fitness make
+/// a run *stalled*.
+///
+/// A number had to be picked, so it is picked from the measured ladder rather than
+/// from taste: the slowest shipped level solves at a median of 68 generations
+/// (README, "the M3 problem"), so 25 flat generations is more than a third of a
+/// complete solve on the hardest level in the pack. That is long enough that
+/// ordinary noise — a walker's patrol phase re-rolled for an elite, so the
+/// generation's max can fall on a level that is still improving (finding 14) —
+/// cannot trigger it, and short enough to be useful while somebody is still
+/// watching. The two hardest shipped levels stall on real seeds, so this fires in
+/// practice, not only in tests.
+pub const STALL_GENERATIONS: u32 = 25;
+
+/// A run whose best fitness has stopped moving.
+///
+/// Plain data, no text: the watch view composes the line, and tests can assert on
+/// the numbers instead of on a phrase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stall {
+    /// Generations since the best last improved, counted from the newest point.
+    pub generations: u32,
+    /// Generation that set the standing best.
+    pub since_generation: u32,
+    /// The standing best max-fitness.
+    pub ceiling: f32,
+}
+
+impl Stall {
+    /// The stall's figures as one phrase, for the watch view's status area.
+    ///
+    /// Deliberately without a "stalled:" prefix: [`Trend::Stalled`] already says
+    /// that on the line above, and repeating it wastes the width a terminal does not
+    /// have. This half carries the numbers the reading cannot — how long, and how
+    /// good the best that nobody can beat is.
+    pub fn label(&self) -> String {
+        format!(
+            "no new best in {} generations (best {} set at gen {})",
+            self.generations,
+            format_fitness(self.ceiling),
+            self.since_generation
+        )
+    }
+}
+
+/// Detect a stall, or answer `None` while the run is still finding improvements.
+///
+/// "No new best" is judged with [`TREND_TOLERANCE`] *relative to the standing best*,
+/// the same rule [`direction`] uses to call a series flat: a run that wobbles by a
+/// pixel a generation while going nowhere is stalled, and a run that gains a percent
+/// of its own best is not. Relative on purpose, for the reason given on
+/// [`TREND_TOLERANCE`] — fitness here spans -120 to +11 000, so one absolute
+/// threshold cannot mean the same thing at both ends.
+///
+/// It looks at the **whole** history rather than the [`TREND_TAIL`] window, which is
+/// the point: the tail answers "what shape is the last stretch", and a stall is a
+/// question about how long ago the population last found something better, which is
+/// invisible in any fixed window once the answer exceeds it.
+///
+/// A win is never a stall. Once an agent has reached the flag the job is done, and a
+/// flat stretch *after* a win on a walker level is the elite re-rolling its episode
+/// (finding 14), not a population that cannot get further.
+pub fn fitness_stall(history: &[HistoryPoint]) -> Option<Stall> {
+    let first = history.first()?;
+    let newest = history.last()?;
+    if newest.wins > 0 {
+        return None;
+    }
+
+    let mut best = first.max_fitness;
+    let mut best_generation = first.generation;
+    for point in history.iter().skip(1) {
+        let threshold = best.abs().max(1.0) * TREND_TOLERANCE;
+        if point.max_fitness > best + threshold {
+            best = point.max_fitness;
+            best_generation = point.generation;
+        }
+    }
+
+    let generations = newest.generation.saturating_sub(best_generation);
+    if generations < STALL_GENERATIONS {
+        return None;
+    }
+    Some(Stall {
+        generations,
+        since_generation: best_generation,
+        ceiling: best,
+    })
+}
+
+/// The level tile where deaths are piling up, with how many fell there.
+///
+/// [`death_strip`] already shows this as intensity glyphs, and this is the same data
+/// as a number: "deaths cluster at x 33" names the obstacle a viewer could also
+/// squint at a row of `#` to find, and it is what a level designer needs in order to
+/// do something about it. Ties go to the leftmost column, so the answer is stable.
+///
+/// Marks outside the level (or with a non-finite x) are ignored exactly as in
+/// [`death_strip`], so the two always agree about where the population died.
+pub fn death_cluster(marks: &[(f32, f32, u32)], level_width_tiles: i32) -> Option<(i32, usize)> {
+    if level_width_tiles <= 0 {
+        return None;
+    }
+    let mut counts = vec![0usize; level_width_tiles as usize];
+    for (x, _y, _generation) in marks {
+        if !x.is_finite() || *x < 0.0 || *x >= level_width_tiles as f32 {
+            continue;
+        }
+        counts[*x as usize] += 1;
+    }
+    let mut busiest: Option<(i32, usize)> = None;
+    for (tile, count) in counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        // Strictly greater, scanning left to right, so a tie keeps the leftmost
+        // obstacle: the one the population met first is the one to fix first.
+        let better = match busiest {
+            Some((_, n)) => *count > n,
+            None => true,
+        };
+        if better {
+            busiest = Some((tile as i32, *count));
+        }
+    }
+    busiest
 }
 
 /// Which row of a `rows`-tall plot a value belongs on, with row 0 at the top.
@@ -868,11 +1017,179 @@ mod tests {
             Trend::FewGoodAgents,
             Trend::Converged,
             Trend::Degenerating,
+            Trend::Stalled,
             Trend::Solved,
         ] {
             assert!(!trend.label().is_empty());
             assert!(trend.label().chars().count() <= 48, "{:?}", trend);
         }
         assert_ne!(Trend::Learning.label(), Trend::Converged.label());
+        assert_ne!(Trend::Stalled.label(), Trend::Converged.label());
+    }
+
+    /// A run whose best was reached at generation 1 and has not moved since, with
+    /// exactly `stalled` generations after that.
+    ///
+    /// The generation arithmetic lives in here so the tests below read as statements
+    /// about the cutoff rather than about indices.
+    fn stalled_for(best: f32, stalled: u32) -> Vec<HistoryPoint> {
+        let mut h = vec![HistoryPoint {
+            generation: 0,
+            max_fitness: best * 0.5,
+            avg_fitness: best * 0.2,
+            wins: 0,
+        }];
+        for i in 1..=stalled + 1 {
+            h.push(HistoryPoint {
+                generation: i,
+                max_fitness: best,
+                avg_fitness: best * 0.3,
+                wins: 0,
+            });
+        }
+        h
+    }
+
+    #[test]
+    fn a_stall_starts_exactly_at_the_cutoff() {
+        assert_eq!(
+            fitness_stall(&stalled_for(1000.0, STALL_GENERATIONS - 1)),
+            None,
+            "one generation short of the cutoff is not a stall"
+        );
+        let stall = fitness_stall(&stalled_for(1000.0, STALL_GENERATIONS)).expect("stalled");
+        assert_eq!(stall.generations, STALL_GENERATIONS);
+        assert_eq!(stall.ceiling, 1000.0);
+        assert_eq!(
+            stall.since_generation, 1,
+            "the best was set by generation 1; the flat run is counted from there"
+        );
+        let label = stall.label();
+        assert!(
+            label.contains("no new best in 25 generations"),
+            "the label has to carry the number the viewer is watching for: {label}"
+        );
+        assert!(
+            label.contains("1.00k") && label.contains("gen 1"),
+            "and where the best was set, in the chart's own number format: {label}"
+        );
+        // A history too short to hold a stall cannot report one whatever it says.
+        assert_eq!(fitness_stall(&[]), None);
+        assert_eq!(fitness_stall(&stalled_for(1000.0, 1)), None);
+        let single = vec![HistoryPoint {
+            generation: 7,
+            max_fitness: 42.0,
+            avg_fitness: 1.0,
+            wins: 0,
+        }];
+        assert_eq!(fitness_stall(&single), None);
+    }
+
+    #[test]
+    fn noise_does_not_end_a_stall_but_a_real_improvement_does() {
+        // A ceiling of 1000 with TREND_TOLERANCE 0.05: a full 5% is an improvement, a
+        // pixel is not. Both are asserted, because that tolerance is the only thing
+        // stopping walker noise from resetting the clock forever (finding 14).
+        let mut noisy = stalled_for(1000.0, STALL_GENERATIONS);
+        let last = noisy.len() - 1;
+        noisy[last].max_fitness = 1002.0;
+        assert!(
+            fitness_stall(&noisy).is_some(),
+            "two points better than the standing best is a wobble, not progress"
+        );
+
+        let mut h = stalled_for(1000.0, STALL_GENERATIONS);
+        let end = h.len() as u32;
+        h.push(HistoryPoint {
+            generation: end,
+            max_fitness: 1100.0,
+            avg_fitness: 300.0,
+            wins: 0,
+        });
+        assert_eq!(
+            fitness_stall(&h),
+            None,
+            "10% better than the standing best ends the stall"
+        );
+
+        // And a fresh stall is measured from the improvement, not from generation 0.
+        for i in 1..=STALL_GENERATIONS {
+            h.push(HistoryPoint {
+                generation: end + i,
+                max_fitness: 1100.0,
+                avg_fitness: 300.0,
+                wins: 0,
+            });
+        }
+        let again = fitness_stall(&h).expect("stalled again");
+        assert_eq!(again.since_generation, end);
+        assert_eq!(again.generations, STALL_GENERATIONS);
+        assert_eq!(again.ceiling, 1100.0);
+    }
+
+    #[test]
+    fn a_stall_outranks_a_rising_tail_and_a_win_outranks_both() {
+        // The awkward case the extra reading exists for: the best is ancient, the
+        // last ten generations are climbing, and nothing has come near the best.
+        let mut h = vec![HistoryPoint {
+            generation: 0,
+            max_fitness: 2000.0,
+            avg_fitness: 400.0,
+            wins: 0,
+        }];
+        for i in 1..=STALL_GENERATIONS {
+            h.push(HistoryPoint {
+                generation: i,
+                max_fitness: 500.0 + i as f32 * 40.0,
+                avg_fitness: 300.0,
+                wins: 0,
+            });
+        }
+        assert!(
+            direction(&h[1..].iter().map(|p| p.max_fitness).collect::<Vec<_>>())
+                == Direction::Rising,
+            "the tail really is rising, or this test proves nothing"
+        );
+        assert_eq!(
+            fitness_trend(&h),
+            Trend::Stalled,
+            "a rising tail under an out-of-reach best must not read as learning"
+        );
+
+        // A win beats everything, including a stall: the job is done.
+        h.last_mut().expect("non-empty").wins = 1;
+        assert_eq!(fitness_trend(&h), Trend::Solved);
+        assert_eq!(
+            fitness_stall(&h),
+            None,
+            "a winning run is not a stalled one"
+        );
+    }
+
+    #[test]
+    fn death_cluster_names_the_busiest_tile() {
+        let marks = [
+            (10.0, 12.0, 1u32),
+            (10.4, 12.0, 2),
+            (10.9, 12.0, 3),
+            (44.0, 12.0, 4),
+            (44.2, 12.0, 5),
+        ];
+        assert_eq!(
+            death_cluster(&marks, 60),
+            Some((10, 3)),
+            "x = 10.0, 10.4 and 10.9 are one tile-column cluster"
+        );
+        // Ties go to the leftmost obstacle, which is the one met first.
+        assert_eq!(death_cluster(&[(5.0, 1.0, 1), (30.0, 1.0, 2)], 60), Some((5, 1)));
+        // Outside the level, non-finite, or a level with no width: not attributable.
+        assert_eq!(
+            death_cluster(&[(-1.0, 1.0, 1), (99.0, 1.0, 2), (f32::NAN, 1.0, 3)], 60),
+            None
+        );
+        assert_eq!(death_cluster(&[], 60), None);
+        assert_eq!(death_cluster(&[(1.0, 1.0, 1)], 0), None);
+        // The last column is inside the level; the strip and this agree about it.
+        assert_eq!(death_cluster(&[(59.5, 1.0, 1)], 60), Some((59, 1)));
     }
 }

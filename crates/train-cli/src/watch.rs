@@ -44,7 +44,10 @@ use evo::{
     ChampionFile, EpisodeRunner, EvalConfig, GaConfig, LaneKind, ShowcaseLane, Trainer,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
-use render::chart::{death_strip, fitness_chart, fitness_trend, format_fitness, progress_bar};
+use render::chart::{
+    death_cluster, death_strip, fitness_chart, fitness_stall, fitness_trend, format_fitness,
+    progress_bar, Stall,
+};
 use render::{render_scene, Body, HistoryPoint, Scene, Viewport, FRAME_TIME};
 use sim::{Level, Outcome};
 
@@ -518,7 +521,7 @@ struct Layout {
 }
 
 /// Fixed rows: two status lines, the generation bar, the death strip and two hint
-/// lines. The genius splash and the save note each add one.
+/// lines. The genius splash, the save note and the stall line each add one.
 const FIXED_ROWS: usize = 6;
 
 /// The chart takes a third of the spare rows, the level view the rest.
@@ -526,8 +529,8 @@ const FIXED_ROWS: usize = 6;
 /// On a terminal too short for both minimums the sections keep their minimums and
 /// the frame is truncated at draw time: losing the hint lines is survivable, losing
 /// the level view is not.
-fn layout(rows: usize, genius: bool, has_note: bool) -> Layout {
-    let reserved = FIXED_ROWS + usize::from(genius) + usize::from(has_note);
+fn layout(rows: usize, genius: bool, has_note: bool, stalled: bool) -> Layout {
+    let reserved = FIXED_ROWS + usize::from(genius) + usize::from(has_note) + usize::from(stalled);
     let spare = rows.saturating_sub(reserved);
     let chart_rows = (spare / 3).clamp(MIN_CHART_ROWS, MAX_CHART_ROWS);
     Layout {
@@ -554,6 +557,11 @@ struct Frame<'a> {
     scene_lines: &'a [String],
     note: Option<&'a str>,
     genius: bool,
+    /// Set once the best fitness has stopped moving (§13: frame stalling as
+    /// difficulty information, not as a failure of the run).
+    stall: Option<Stall>,
+    /// The tile column deaths cluster at, in the same death window the strip uses.
+    cluster: Option<(i32, usize)>,
     progress: Progress,
 }
 
@@ -604,7 +612,29 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
         None => lines.push(clip("warming up: no generation scored yet", cols)),
     }
 
-    // 3. The genius splash (Tier 1.3) — the one deliberate piece of drama.
+    // 3. Why the numbers stopped moving, when they have. This is the one piece of
+    //    the view that talks about the *level* rather than the population: the
+    //    stall count says the search is out of new ideas, and the death cluster says
+    //    which obstacle it is out of ideas about. Deaths go first because a
+    //    truncated line must keep the actionable half.
+    if let Some(stall) = f.stall {
+        let line = match f.cluster {
+            // Deaths first: a truncated line must keep the actionable half, and
+            // "where they die" is what a level author can act on.
+            Some((tile, deaths)) => format!(
+                "deaths cluster at x {tile} ({deaths} in {})   {}",
+                f.deaths.len(),
+                stall.label()
+            ),
+            // No deaths in the window is not a fact worth a phrase of its own: the
+            // strip below already shows an empty row, and a line reporting the
+            // absence of evidence beside a stall invites reading it as the cause.
+            None => stall.label(),
+        };
+        lines.push(clip(&line, cols));
+    }
+
+    // 4. The genius splash (Tier 1.3) — the one deliberate piece of drama.
     if f.genius {
         lines.push(clip(
             "*** GENIUS AGENT: best fitness jumped more than 1.5x in one generation ***",
@@ -615,10 +645,10 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
         lines.push(clip(note, cols));
     }
 
-    // 4. The chart.
+    // 5. The chart.
     lines.append(&mut fitness_chart(f.history, cols, l.chart_rows));
 
-    // 5. Which generation, and how far into its animation we are.
+    // 6. Which generation, and how far into its animation we are.
     let fraction = (f.generation as f32 + 1.0) / f.generations.max(1) as f32;
     let bar_width = cols.saturating_sub(34).clamp(8, 40);
     lines.push(clip(
@@ -633,7 +663,7 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
         cols,
     ));
 
-    // 6. The level, padded to a fixed height so the death strip cannot wander.
+    // 7. The level, padded to a fixed height so the death strip cannot wander.
     for row in f.scene_lines.iter().take(l.scene_rows) {
         lines.push(clip(row, cols));
     }
@@ -641,10 +671,10 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
         lines.push(String::new());
     }
 
-    // 7. Where they died, across the whole level (Tier 2.6).
+    // 8. Where they died, across the whole level (Tier 2.6).
     lines.push(death_strip(f.deaths, f.level_width_tiles, cols));
 
-    // 8. What the viewer can do, and what the glyphs mean.
+    // 9. What the viewer can do, and what the glyphs mean.
     lines.push(clip(
         "keys  space pause   -/+ speed   n next generation   f follow/whole   s save champion   q quit",
         cols,
@@ -775,7 +805,12 @@ fn draw_state(
     progress: Progress,
 ) -> io::Result<()> {
     let (cols, rows) = screen.size();
-    let l = layout(rows, ctx.genius, ctx.note.is_some());
+    // Stall and death-cluster are derived here rather than passed in: they are a
+    // pure function of the history and the death window the frame already carries,
+    // so there is exactly one place that can disagree about them.
+    let stall = fitness_stall(ctx.history);
+    let cluster = stall.and_then(|_| death_cluster(ctx.deaths, level.width));
+    let l = layout(rows, ctx.genius, ctx.note.is_some(), stall.is_some());
 
     // Lane bodies, and the walkers of the lane the camera is on. Walkers come from
     // exactly one lane: eight walker sprites overlapping in a smear would be a worse
@@ -872,6 +907,8 @@ fn draw_state(
         scene_lines: &scene_lines,
         note: ctx.note,
         genius: ctx.genius,
+        stall,
+        cluster,
         progress,
     };
     screen.draw(&render_frame(&frame, cols, rows, l))
@@ -1407,10 +1444,43 @@ mod tests {
     }
 
     fn frame(cols: usize, rows: usize, genius: bool, note: Option<&str>) -> String {
+        frame_with(cols, rows, genius, note, None)
+    }
+
+    /// A frame with an optional stall built from `history(9)` plus `extra` flat
+    /// generations, which is how a stalled run actually looks: the history keeps
+    /// growing while the best stops moving.
+    fn stalled_frame(cols: usize, rows: usize, flat: u32) -> String {
+        let mut h = history(9);
+        let best = h.last().expect("non-empty").max_fitness;
+        let start = h.len() as u32;
+        for i in 0..flat {
+            h.push(HistoryPoint {
+                generation: start + i,
+                max_fitness: best,
+                avg_fitness: best * 0.5,
+                wins: 0,
+            });
+        }
+        frame_with(cols, rows, false, None, Some(h))
+    }
+
+    /// `override_history` rather than `history`: the test module has a `history(n)`
+    /// helper, and a parameter of that name would shadow it into an `Option`.
+    fn frame_with(
+        cols: usize,
+        rows: usize,
+        genius: bool,
+        note: Option<&str>,
+        override_history: Option<Vec<HistoryPoint>>,
+    ) -> String {
         let level = load_level(&wpath("levels/l3-gauntlet.json")).expect("level loads");
-        let h = history(9);
+        let owned = override_history.unwrap_or_else(|| history(9));
         let deaths = vec![(10.0, 12.0, 3u32), (10.4, 12.0, 4), (44.0, 12.0, 5)];
-        let scene: Vec<String> = (0..layout(rows, genius, note.is_some()).scene_rows)
+        let stall = fitness_stall(&owned);
+        let cluster = stall.and_then(|_| death_cluster(&deaths, level.width));
+        let stalled = stall.is_some();
+        let scene: Vec<String> = (0..layout(rows, genius, note.is_some(), stalled).scene_rows)
             .map(|i| format!("scene row {i}"))
             .collect();
         let f = Frame {
@@ -1423,17 +1493,127 @@ mod tests {
             pop_size: 200,
             wins: 1,
             live: LiveState::default(),
-            history: &h,
+            history: &owned,
             deaths: &deaths,
             scene_lines: &scene,
             note,
             genius,
+            stall,
+            cluster,
             progress: Progress {
                 index: 120,
                 budget: 675,
             },
         };
-        render_frame(&f, cols, rows, layout(rows, genius, note.is_some()))
+        render_frame(&f, cols, rows, layout(rows, genius, note.is_some(), stalled))
+    }
+
+    #[test]
+    fn the_stall_line_names_the_stall_and_the_death_cluster() {
+        let text = stalled_frame(100, 34, CUTOFF);
+        assert!(
+            text.contains("no new best in 25 generations (best"),
+            "a stalled run must say so: {text}"
+        );
+        assert!(
+            text.contains("deaths cluster at x 10 (2 in 3)"),
+            "x=10 and x=10.4 are the same tile, so they are one cluster of two: {text}"
+        );
+        // The reading is the stall, not the tail's shape: an improvement 34
+        // generations ago must not still be captioned as learning.
+        assert!(!text.contains("learning: max and avg both rising"));
+        assert!(text.contains("stalled: no new best in a long time"));
+        // The extra row comes out of the chart and the scene, like the genius
+        // splash and the save note: the frame keeps the height it was given.
+        assert_eq!(text.lines().count(), 34);
+        // And with no deaths in the window the row does not invent a cluster to
+        // report — the strip below already shows an empty row.
+        let no_deaths = frame_with_stall(100, 34, &[]);
+        assert!(no_deaths.contains("no new best in 25 generations (best"));
+        assert!(!no_deaths.contains("deaths cluster"));
+    }
+
+    /// A stalled frame with an explicit death window, for the no-deaths case.
+    fn frame_with_stall(cols: usize, rows: usize, deaths: &[(f32, f32, u32)]) -> String {
+        let level = load_level(&wpath("levels/l3-gauntlet.json")).expect("level loads");
+        let mut h = history(9);
+        let best = h.last().expect("non-empty").max_fitness;
+        for _ in 0..CUTOFF {
+            h.push(HistoryPoint {
+                generation: h.len() as u32,
+                max_fitness: best,
+                avg_fitness: best * 0.5,
+                wins: 0,
+            });
+        }
+        let stall = fitness_stall(&h).expect("stalled");
+        let cluster = death_cluster(deaths, level.width);
+        assert!(cluster.is_none(), "this helper is for the empty window");
+        let scene: Vec<String> = vec!["scene".to_string()];
+        let f = Frame {
+            level_name: &level.name,
+            level_width_tiles: level.width,
+            generation: 30,
+            generations: 100,
+            alive: 8,
+            lane_count: 8,
+            pop_size: 200,
+            wins: 0,
+            live: LiveState::default(),
+            history: &h,
+            deaths,
+            scene_lines: &scene,
+            note: None,
+            genius: false,
+            stall: Some(stall),
+            cluster,
+            progress: Progress {
+                index: 1,
+                budget: 60,
+            },
+        };
+        render_frame(&f, cols, rows, layout(rows, false, false, true))
+    }
+
+    /// The stall cutoff, read from the chart module so the watch view and this test
+    /// cannot disagree about it while both passing.
+    const CUTOFF: u32 = render::chart::STALL_GENERATIONS;
+
+    #[test]
+    fn the_stall_line_waits_for_the_cutoff_and_clears_on_an_improvement() {
+        let early = stalled_frame(100, 34, CUTOFF - 1);
+        assert!(
+            !early.contains("stalled"),
+            "{CUTOFF} flat generations is the cutoff, so {} is not a stall yet",
+            CUTOFF - 1
+        );
+        let late = stalled_frame(100, 34, CUTOFF);
+        assert!(late.contains("stalled"), "one more generation is");
+
+        // An improvement resets the clock, even after a long flat stretch.
+        let mut h = history(9);
+        let best = h.last().expect("non-empty").max_fitness;
+        for _ in 0..CUTOFF {
+            h.push(HistoryPoint {
+                generation: h.len() as u32,
+                max_fitness: best,
+                avg_fitness: best * 0.5,
+                wins: 0,
+            });
+        }
+        let stalled = frame_with(100, 34, false, None, Some(h.clone()));
+        assert!(stalled.contains("stalled"));
+        h.push(HistoryPoint {
+            generation: h.len() as u32,
+            max_fitness: best * 2.0,
+            avg_fitness: best,
+            wins: 0,
+        });
+        let recovered = frame_with(100, 34, false, None, Some(h));
+        assert!(
+            !recovered.contains("stalled"),
+            "a new best ends the stall: {recovered}"
+        );
     }
 
     #[test]
@@ -1441,15 +1621,21 @@ mod tests {
         for rows in [20usize, 24, 34, 60] {
             for genius in [false, true] {
                 for note in [false, true] {
-                    let l = layout(rows, genius, note);
-                    let reserved = FIXED_ROWS + usize::from(genius) + usize::from(note);
-                    assert_eq!(
-                        l.chart_rows + l.scene_rows + reserved,
-                        rows,
-                        "rows {rows} genius {genius} note {note} must use the whole screen"
-                    );
-                    assert!(l.chart_rows >= MIN_CHART_ROWS);
-                    assert!(l.scene_rows >= MIN_SCENE_ROWS);
+                    for stalled in [false, true] {
+                        let l = layout(rows, genius, note, stalled);
+                        let reserved = FIXED_ROWS
+                            + usize::from(genius)
+                            + usize::from(note)
+                            + usize::from(stalled);
+                        assert_eq!(
+                            l.chart_rows + l.scene_rows + reserved,
+                            rows,
+                            "rows {rows} genius {genius} note {note} stalled {stalled} \
+                             must use the whole screen"
+                        );
+                        assert!(l.chart_rows >= MIN_CHART_ROWS);
+                        assert!(l.scene_rows >= MIN_SCENE_ROWS);
+                    }
                 }
             }
         }
@@ -1457,7 +1643,7 @@ mod tests {
         // minimums and the frame is truncated, rather than the level view shrinking
         // to nothing.
         for rows in [8usize, 12] {
-            let l = layout(rows, false, false);
+            let l = layout(rows, false, false, false);
             assert!(l.chart_rows >= MIN_CHART_ROWS);
             assert!(l.scene_rows >= MIN_SCENE_ROWS);
             let text = frame(100, rows, false, None);
@@ -1556,12 +1742,14 @@ mod tests {
             scene_lines: &scene,
             note: None,
             genius: false,
+            stall: None,
+            cluster: None,
             progress: Progress {
                 index: 1,
                 budget: 60,
             },
         };
-        let text = render_frame(&f, 80, 24, layout(24, false, false));
+        let text = render_frame(&f, 80, 24, layout(24, false, false, false));
         assert!(text.contains("PAUSED"));
         assert!(text.contains("whole level"));
         assert!(text.contains("speed 50x"));

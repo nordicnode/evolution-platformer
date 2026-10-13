@@ -22,9 +22,11 @@ The deterministic core, the evolution loop, the reachability oracle and the Tier
 watch mode are implemented and tested. `train-cli watch` grows a population on
 screen: fitness chart, best-4 + random-4 agents per generation, speed control,
 pause, death markers and the genius-agent splash. The level pack behind it is now
-six levels wide, and its two hardest are *hard* (findings 15–18). What remains of
-M3 is the part no test can answer — whether watching it is fun — and that needs a
-human at a keyboard. See [The M3 problem](#the-m3-problem).
+six levels wide, and its two hardest are *hard* (findings 15–18) — hard enough that
+they sometimes stall, which the view reports with a stall line naming how long the
+population has been stuck and which obstacle it keeps dying on (finding 19). What
+remains of M3 is the part no test can answer — whether watching it is fun — and
+that needs a human at a keyboard. See [The M3 problem](#the-m3-problem).
 
 ## Measured numbers
 
@@ -119,7 +121,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 189 tests
+cargo test --workspace                 # 195 tests
 cargo build --release
 
 # Can this level be beaten at all? Milliseconds, no training.
@@ -260,7 +262,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-189 tests, all green. `cargo test --workspace`.
+195 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
@@ -280,12 +282,17 @@ pack's difficulty is pinned by `crates/evo/tests/difficulty.rs`: a random
 population must win L1/L2 at generation 0, must win none of L3–L6 on any of four
 seeds, and L4 must still fall to evolution inside 60 generations at pop 64.
 
-Watch mode adds three that hold its honesty in place:
+Watch mode adds five that hold its honesty in place:
 `every_showcase_lane_replays_the_episode_that_was_evaluated` (a lane animates the
 episode that was scored, seed for seed, so the picture and the numbers agree),
 `watching_does_not_change_what_is_evolved` (the showcase's RNG is separate, so
-training is identical whether or not anyone is looking), and `pausing_freezes_the
-physics_and_stops_burning_the_frame_budget` (a paused generation may not advance).
+training is identical whether or not anyone is looking), `pausing_freezes_the
+physics_and_stops_burning_the_frame_budget` (a paused generation may not advance),
+and two on the stall line: `the_stall_line_waits_for_the_cutoff_and_clears_on_an_
+improvement` (25 flat generations, no fewer, and a new best removes it again) and
+`the_stall_line_names_the_stall_and_the_death_cluster` (the row carries the count,
+the place deaths pile up, and replaces the trend caption instead of contradicting
+it).
 The watch layout itself is testable without a TTY because `--headless` renders
 plain text frames; `cargo test` exercises the whole frame composition that way.
 
@@ -412,6 +419,21 @@ deliberate, documented decision — not drift.
    be `sensors::VERSION` 2, so this is documented and pinned by a test rather than
    changed, and the shipped-level tests now refuse entities outside the grid or
    standing on nothing.
+19. **A stall needs saying out loud, and the label has to be present-tense.** The
+   plan schedules stall UX for M5, but the shipped hard levels stall in practice, so
+   the watch view reports it now: `stalled: no new best in a long time` on the status
+   line, and a row under it with the count and the standing best — plus, when the
+   rolling death window has anything in it, the tile column deaths cluster at.
+   Measured windows at pop 200: L5 seed 1 stands still from
+   generation 29 to 75 and *then* solves at 76; L5 seed 3 stalls three separate
+   times (31–90, 116–183, 209–238) and still wins; L5 seed 5 never moves after
+   generation 38. So the row is a statement about the present, never a verdict — a
+   stalled run is worth continuing to watch, and its breakthrough is exactly the
+   drama the M3 gate is asking about. The rule is "no improvement of 5% over the
+   standing best for 25 generations", both numbers taken from those measurements:
+   with a strict flatness test instead, the elite re-rolling its episode on a walker
+   level (finding 14) would reset the clock forever, and a shorter cutoff would fire
+   on runs that are simply slow.
 18. **The oracle's jump windows are a lower bound, not a difficulty meter.** The
    canonical model jumps from a standing start at full run speed; the sim also
    allows a take-off inside the 4-tick coyote window *after* walking off a ledge,
@@ -450,6 +472,12 @@ arc to watch unless something changes. The levers, in the order worth trying:
    the champion-only view would hide. Best-4 + random-4 (Tier 1.5) makes it visible,
    and the death strip turns "where is it stuck" into a picture rather than a
    guess.
+4. **Say when it has stopped moving.** — *done, see finding 19.* A stall line that
+   reports how long since the population last found anything better, and which tile
+   column its agents keep dying on. It is the difference between watching a level
+   that is being learned and watching one that is not, and on the shipped pack it
+   fires for real: 47 frames of a watch run on L5 seed 1, from generation 29, then
+   gone once the flag falls at 76.
 
 What is *not* answered by any of that is the gate itself. Tier 1 is complete and
 exercised, and the instrument is now calibrated — a pack whose hard levels are 3.6
