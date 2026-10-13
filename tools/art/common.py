@@ -175,11 +175,13 @@ PINE_FAR = (130, 170, 174)
 # in luminance than the far rank used to be: a near tree is the most present tree
 # in the backdrop, and a present thing drawn near-black is the "too dark" mistake
 # again, one band nearer. Its body sits at about the far rank's old luminance with
-# the blue taken out and the green put in.
+# the blue taken out and the green put in. Three tones only: the fourth thing a
+# pine needs is a trunk, and a trunk is not a shade of foliage — the near rank's
+# is drawn in `BARK`, with the foreground trees below, because at this size the
+# trunk is visible and a green one reads as a pole (see `props.pine`).
 PINE_NEAR_LIGHT = (104, 176, 104)
 PINE_NEAR = (84, 158, 88)
 PINE_NEAR_DARK = (68, 138, 74)
-PINE_NEAR_SHADE = (66, 132, 70)
 
 # --- props, decor and effects -------------------------------------------
 LEAF_LIGHT = (132, 204, 96)

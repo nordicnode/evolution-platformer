@@ -50,7 +50,6 @@ from .common import (
     PINE_NEAR,
     PINE_NEAR_DARK,
     PINE_NEAR_LIGHT,
-    PINE_NEAR_SHADE,
     PINE_SHADE,
     TRANSPARENT,
     DIRT_DARK,
@@ -592,11 +591,18 @@ def pine(shape: int, far: bool = False, near: bool = False) -> Image.Image:
     the difference between the ranks is distance rather than species and a second species
     is invisible at this size — what changes is the palette, and how much of it there is:
     four tones of shading on the rank three hills away is detail nobody gets to see.
+
+    One part of the palette is *not* the rank's: the near rank's trunk is `BARK`,
+    the foreground trees' brown. At the far ranks' size a trunk is three rows of
+    silhouette and a foliage tone is all it can be, but a near pine stands up to
+    two tiles tall and its trunk is a visible piece of the picture — drawn in the
+    foliage's shade, which is what this did at first, it is a green pole with a
+    tree on it. A trunk is bark, at any distance where a trunk can be seen.
     """
     if far:
         bar, shadow, lit, stem = (PINE_FAR_LIGHT, PINE_FAR, PINE_FAR_LIGHT, PINE_FAR)
     elif near:
-        bar, shadow, lit, stem = (PINE_NEAR, PINE_NEAR_DARK, PINE_NEAR_LIGHT, PINE_NEAR_SHADE)
+        bar, shadow, lit, stem = (PINE_NEAR, PINE_NEAR_DARK, PINE_NEAR_LIGHT, BARK)
     else:
         bar, shadow, lit, stem = (PINE, PINE_DARK, PINE_LIGHT, PINE_SHADE)
     img = cell()

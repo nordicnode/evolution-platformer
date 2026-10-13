@@ -1112,6 +1112,41 @@ mod tests {
         }
     }
 
+    /// A near pine's trunk is bark-brown, not a shade of its own foliage.
+    ///
+    /// The far ranks are silhouettes and their trunks are foliage tones on
+    /// purpose — three rows of haze cannot be anything else. The near rank
+    /// stands up to two tiles tall on the near hills, its trunk is a visible
+    /// piece of the picture, and the first version of it drew that trunk in
+    /// the foliage's darkest green: a green pole with a tree on it, in the
+    /// one rank where a trunk can be seen. So the shipped pixels are asked,
+    /// not the palette: the two centre columns at the cell's floor — the part
+    /// of the trunk below the lowest skirt, which is the part that shows —
+    /// are the foreground trees' `BARK` (118, 82, 54), and they are not green.
+    #[test]
+    fn the_near_pines_have_brown_trunks() {
+        const BARK: [u8; 4] = [118, 82, 54, 255];
+        let pixels = Pixels::load();
+        for name in ["pine_near_a", "pine_near_b"] {
+            let sprite = pixels.sprite(name);
+            for y in [14, 15] {
+                for x in [7, 8] {
+                    let pixel = sprite.at(x, y);
+                    assert_eq!(
+                        pixel, BARK,
+                        "{name}'s trunk at ({x}, {y}) is {pixel:?}, not bark: a near \
+                         pine's trunk is the part of it that is not foliage"
+                    );
+                    assert!(
+                        pixel[0] > pixel[1] && pixel[1] > pixel[2],
+                        "{name}'s trunk at ({x}, {y}) is {pixel:?}: brown is red over \
+                         green over blue, and a green trunk is the bug this is for"
+                    );
+                }
+            }
+        }
+    }
+
     /// The vines hang from the tile above rather than standing on the one below, so they
     /// are the mirror image of the rule above: opaque in the cell's *first* row, where the
     /// platform they grow out of touches them, and reaching well past halfway so the cell
