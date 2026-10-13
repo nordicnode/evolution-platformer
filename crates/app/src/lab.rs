@@ -31,11 +31,14 @@
 //! values the terminal mode offers, deliberately: two front-ends for one game should
 //! not disagree about what 8x means or which mutation rates are reachable.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use evo::{BestEver, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, Trainer};
+use evo::{
+    BestEver, ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, Trainer,
+};
 use render::chart::HistoryPoint;
 use render::trace::{ChampionTrace, TraceLog, TracePoint, TRACE_SAMPLE_FRAMES};
 use sim::{Level, Outcome, Sim};
@@ -106,6 +109,31 @@ pub struct Lane {
     pub genome: Genome,
     /// The exact seed the evaluator used.
     pub seed: u64,
+}
+
+/// Write a run's best-ever genome out as a champion file, exactly as `train-cli train`
+/// writes one.
+///
+/// This lives here rather than in the window because it is the one thing the view does
+/// that touches the disk, and the window is the one part of the crate a test cannot
+/// drive. It is the same `ChampionFile` the terminal writes, with the same provenance
+/// copied from a real evaluation — so a champion saved while *watching* is a champion
+/// `train-cli replay` can re-verify, and watching instead of training wastes nothing.
+///
+/// The file is named after the level, which is how a level's champion is always found in
+/// the same place whatever produced it.
+pub fn save_champion(
+    best: &BestEver,
+    level: &Level,
+    config: &GaConfig,
+    dir: &Path,
+    stem: &str,
+) -> Result<PathBuf, String> {
+    let champion = ChampionFile::new(&best.genome, &best.result, level, best.generation, config);
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{stem}.json"));
+    champion.save(&path)?;
+    Ok(path)
 }
 
 /// One generation, packaged for the window.
@@ -1055,6 +1083,36 @@ mod tests {
         let first = wait_for(&mut lab, Duration::from_secs(30)).expect("the fresh run reports");
         assert_eq!(first.packet().generation, 0);
         assert_eq!(first.packet().level_name, shipped("l3-gauntlet").name);
+    }
+
+    /// The window's one write to disk, driven end to end: a real run's best-ever genome
+    /// goes out as a champion file and comes back as one this build will replay.
+    #[test]
+    fn a_champion_saved_from_a_run_loads_back_on_the_level_it_came_from() {
+        let mut generator = new_generator("l3-gauntlet", Some(1));
+        let packet = generator.next_packet();
+        let best = packet
+            .best
+            .clone()
+            .expect("a scored generation has a best-ever genome");
+
+        let dir = std::env::temp_dir().join(format!("evo-app-champion-{}", std::process::id()));
+        let path = save_champion(&best, generator.level(), &tiny_config(), &dir, "l3-gauntlet")
+            .expect("the champion file is written");
+        let loaded = ChampionFile::load_for_level(&path, generator.level())
+            .expect("the file this run wrote loads back against its own level");
+
+        assert_eq!(loaded.metadata.genome_id, best.genome.id);
+        assert_eq!(loaded.metadata.generation, best.generation);
+        assert_eq!(loaded.fitness, best.result.fitness);
+        assert_eq!(
+            loaded.metadata.level_hash,
+            generator.level().content_hash_string()
+        );
+        assert_eq!(loaded.metadata.outcome, best.result.outcome.as_str());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use egui::{Color32, Context, Pos2, Rect, Sense, Stroke, Vec2};
-use evo::{ChampionFile, GaConfig};
+use evo::GaConfig;
 use sim::Tile;
 
 use crate::atlas::Atlas;
@@ -408,21 +408,10 @@ impl EvoApp {
             self.note = Some(("nothing to save: no generation has been scored".into(), 6.0));
             return;
         };
-        let champion = ChampionFile::new(
-            &best.genome,
-            &best.result,
-            lab.level(),
-            best.generation,
-            lab.config(),
-        );
         let dir = self.options.champions.clone();
-        let path = dir.join(format!("{}.json", slug(&lab.level().name)));
-        let note = match std::fs::create_dir_all(&dir).and_then(|()| {
-            champion
-                .save(&path)
-                .map_err(std::io::Error::other)
-        }) {
-            Ok(()) => format!(
+        let stem = slug(&lab.level().name);
+        let note = match lab::save_champion(&best, lab.level(), lab.config(), &dir, &stem) {
+            Ok(path) => format!(
                 "saved champion gen {} fitness {:.2} -> {}",
                 best.generation,
                 best.result.fitness,

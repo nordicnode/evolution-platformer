@@ -147,7 +147,7 @@ renderer.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 282 tests
+cargo test --workspace                 # 283 tests
 cargo build --release
 
 # The game: draw a level, drag tiles out of a palette, play it yourself.
@@ -317,7 +317,7 @@ report as impassable (finding 6).
 
 ## Testing
 
-282 tests, all green. `cargo test --workspace`.
+283 tests, all green. `cargo test --workspace`.
 
 The load-bearing ones: `determinism_hash` (10 000 frames twice → identical hash,
 plus a pinned golden), `parallel_determinism` (1 thread vs 6 → identical fitness
