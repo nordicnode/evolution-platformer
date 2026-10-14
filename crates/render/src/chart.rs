@@ -246,14 +246,14 @@ pub fn fitness_trend(history: &[HistoryPoint]) -> Trend {
 /// a run *stalled*.
 ///
 /// A number had to be picked, so it is picked from the measured ladder rather than
-/// from taste: the slowest shipped level solves at a median of 68 generations
-/// (README, "the M3 problem"), so 25 flat generations is more than a third of a
-/// complete solve on the hardest level in the pack. That is long enough that
-/// ordinary noise — a walker's patrol phase re-rolled for an elite, so the
-/// generation's max can fall on a level that is still improving (finding 14) —
-/// cannot trigger it, and short enough to be useful while somebody is still
-/// watching. The two hardest shipped levels stall on real seeds, so this fires in
-/// practice, not only in tests.
+/// from taste: the slowest shipped level solves at a median of 20 generations (L3,
+/// FINDINGS.md, the difficulty ladder), so 25 flat generations is longer than the *median*
+/// solve on every level in the pack — a run that goes that long without improving is
+/// not merely between improvements. It is long enough that ordinary noise — a
+/// walker's patrol phase re-rolled for an elite, so the generation's max can fall on
+/// a level that is still improving (finding 14) — cannot trigger it, and short enough
+/// to fire inside the pack's real stalls: L7 seed 12 stands still for 89 generations
+/// before its wall climb is found, and this line reports the first 64 of them.
 pub const STALL_GENERATIONS: u32 = 25;
 
 /// A run whose best fitness has stopped moving.

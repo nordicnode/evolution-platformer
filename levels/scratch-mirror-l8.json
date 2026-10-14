@@ -1,0 +1,41 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 1,
+  "name": "MIRROR-l8-long-jump",
+  "width": 60,
+  "height": 15,
+  "spawn": {
+    "x": 57,
+    "y": 12
+  },
+  "tiles": [
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "##########.....###############.....#########################",
+    "##########.....###############.....#########################"
+  ],
+  "entities": [
+    {
+      "type": "walker",
+      "x": 27,
+      "y": 12
+    },
+    {
+      "type": "goal",
+      "x": 2,
+      "y": 12
+    }
+  ],
+  "_notes": "Two five-tile pits: ground 0-24, pit 25-29, ground 30-34, pit 35-39, ground 40-59; a walker patrolling 30-34; goal 57. Five tiles is inside a sprint jump's 6.00 and outside a running jump's 4.00, and both pits offer far more than the 1.125 tiles of run-up a sprint needs, so the level is about one decision made twice: hold sprint, and press jump at the lip rather than when the gap first shows up. The middle landing is five tiles with a walker on it, so the second decision has to be made while the first one is still being survived. The reachability oracle refuses this level with sprint disabled, and only this one; measured first win: median 9.5 generations over 12 seeds at pop 200 (12 of 12 solved, 1-16)."
+}

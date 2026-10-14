@@ -179,13 +179,13 @@ fn trials_over_distinct_seeds_can_disagree_on_a_level_with_walkers() {
         let seed = episode_seed(20261012, 0, 7, trial);
         let mut sim = Sim::new(&lv, seed);
         // A fixed, mildly capable policy: run, and jump when the sensor says the
-        // ground ahead runs out. Enough to make the walker encounter matter.
+        // ground to the right runs out. Enough to make the walker encounter matter.
         let mut jumped_at = 0u32;
         while !sim.outcome().is_finished() {
             let obs = sim.observation();
-            let gap_ahead = obs[83] > 0.5;
+            let gap_right = obs[83] > 0.5;
             let frames = sim.stats().frames;
-            let action = if gap_ahead && frames > jumped_at + 12 {
+            let action = if gap_right && frames > jumped_at + 12 {
                 jumped_at = frames;
                 AgentAction::RunJump
             } else if jumped_at != 0 && frames < jumped_at + 10 {

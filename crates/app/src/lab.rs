@@ -216,6 +216,23 @@ pub struct Packet {
     /// `max > 1.5 × previous max` — the "genius agent" splash (§10 Tier 1.3).
     pub genius: bool,
     pub pop_size: usize,
+    /// The mutation step the children bred after this generation were given.
+    ///
+    /// A reading rather than a setting: a run with a fixed sigma holds it at one value — the
+    /// default — and a run with `adaptive_sigma` moves it between generations, down while its
+    /// children stop beating their parents and up while they mostly do. The panel wants it
+    /// because it is the one number that says how big a move the search is making, which no
+    /// chart of the population's score can show.
+    pub mutation_sigma: f32,
+    /// Generations since the best fitness last improved.
+    ///
+    /// The trainer's own counter, carried rather than re-derived: the panel's stall rule
+    /// reads the *history*, and this is the live process that produced it.
+    pub stagnation: u32,
+    /// Fresh random genomes bred in after that stagnation, which is non-zero only after a
+    /// stall — so a non-zero value is also the statement that the run has stopped moving and
+    /// done something about it.
+    pub immigrants: usize,
     pub lanes: Vec<Lane>,
     /// Every agent the generation scored, in population order, index-aligned with the
     /// report's own results.
@@ -679,6 +696,12 @@ impl Generator {
             wins: report.wins,
             genius: report.genius,
             pop_size: self.cfg.pop_size,
+            // Read off the generation the trainer just produced, not recomputed here: the
+            // step the children were bred with, the run's own staleness counter, and what
+            // that counter bought.
+            mutation_sigma: report.mutation_sigma,
+            stagnation: self.trainer.stagnation(),
+            immigrants: report.immigrants,
             lanes,
             agents,
             history: self.history.clone(),
@@ -726,14 +749,20 @@ fn record_trace(
 
     // The final position is the one that matters most — the flag, or the grave — and an
     // episode rarely ends on a sample boundary, so it is recorded exactly rather than
-    // rounded to the nearest sample.
+    // rounded to the nearest sample. It is skipped only when it *is* the previous sample,
+    // frame and all: comparing positions alone dropped the true last frame whenever the body
+    // stopped moving between the final sample and the end, which is exactly what a body at
+    // the flag and a grave both are.
     let p = runner.sim().player();
     let end = TracePoint {
         frame: runner.sim().stats().frames,
         x: p.x,
         y: p.y,
     };
-    if points.last().map(|q| (q.x, q.y)) != Some((end.x, end.y)) {
+    let already_recorded = points.last().is_some_and(|q| {
+        q.frame == end.frame && q.x == end.x && q.y == end.y
+    });
+    if !already_recorded {
         points.push(end);
     }
 

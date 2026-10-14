@@ -32,5 +32,5 @@
       "y": 12
     }
   ],
-  "_notes": "ground 0-15; spikes 16-17 (2w); ground 18-29; pit 30-33 (4w); ground 34-35; pit 36-39 (4w); ground 40-53; spikes 54-55 (2w); ground 56-69; goal 68 -- spikes on both sides of the boss: every hazard sits on the pad rhythm. measured first win: median 68 generations over 12 seeds at pop 200 (10 of 12 solved, 41-279) -- the hardest level of the pack. See README 'The M3 problem'."
+  "_notes": "ground 0-15; spikes 16-17 (2w); ground 18-29; pit 30-33 (4w); ground 34-35; pit 36-39 (4w); ground 40-53; spikes 54-55 (2w); ground 56-69; goal 68 -- spikes on both sides of the boss: every hazard sits on the pad rhythm. measured first win: median 14.5 generations over 12 seeds at pop 200 (12 of 12 solved, 5-53). The champion crosses both pits with sprint jumps, which is why the median fell from 68 when sprint arrived (README finding 44); the pits themselves are still lethal to a body that walks in. See README 'the difficulty ladder'."
 }

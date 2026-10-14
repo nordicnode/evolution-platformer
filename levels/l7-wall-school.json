@@ -1,0 +1,36 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 1,
+  "name": "L7-wall-school",
+  "width": 60,
+  "height": 15,
+  "spawn": {
+    "x": 2,
+    "y": 12
+  },
+  "tiles": [
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "....................###.....................................",
+    "....................###.....................................",
+    "....................###.....................................",
+    "############################################################",
+    "############################################################"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 21,
+      "y": 9
+    }
+  ],
+  "_notes": "The wall jump, on its own. Floor at row 13; a three-tile plateau at columns 20-22 with the goal on its top at x 21. A full jump reaches 2.375 tiles and the top is 3.0 up, so the flag is reachable one way only: run into the face, jump, and wall jump out of the cling. Nothing else is asked for and the walk from spawn is 18 tiles, so the move is the whole level and it pays the moment it happens (the 10 000-point flag is three tiles above the floor). This is the level to train before l7-ascent: the ascent asks for the same climb twice, and its second instance is a separate discovery (README finding 45). measured first win: median 2.5 generations over 12 seeds at pop 200 (12 of 12 solved, 0-8); one seed in twelve contains a genome that does the move at generation 0."
+}

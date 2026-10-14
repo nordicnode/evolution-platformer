@@ -342,7 +342,7 @@ lanes, the death map, the route scrubber and champion saving in it.
 - Human playtest mode inside the editor. **Done** — in-canvas, and it shares `render::play::action_for` with the terminal mode so the two cannot diverge.
 - Reachability validation live in the editor (warn on unreachable goal, highlight first failing jump). **Done** — the verdict, the culprit jump and the unreachable tint, re-run whenever the level's content hash changes.
 - New entities: flyer enemy, moving platform (horizontal/vertical, deterministic — driven by tick count, not wall-clock). **Open.**
-- Curated starter level pack (8–12 levels, easy→brutal) built with the editor. **Open** — L1–L6 are hand-written so far.
+- Curated starter level pack (8–12 levels, easy→brutal) built with the editor. **Open** — L1–L8 are hand-written so far (finding 44: L7 and L8 are the two that need the movement abilities).
 - Watch mode in the window (§10 Tier 1, M3's deliverable) — **done in full**, not in the plan's M4 list: the trainer runs off-thread, the chart is real geometry from `render`'s readings, the recorded routes scrub by generation, champions save, and the stall chain's last item (curriculum resume, findings 19–22) is hosted here too — `evo::curriculum_step` is called by both front-ends, and the window takes `--resume`, `--curriculum` and `--curriculum-generations` with the terminal's meanings (finding 28). Nothing in the watch mode is terminal-only any more.
 - Art pass: the tileset is generated from rules rather than drawn tile by tile — a 4-bit
   mask per solid tile (`ground_N` / `deep_N`), a parallaxed sky, scattered scenery and a

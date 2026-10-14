@@ -432,15 +432,19 @@ pub fn header(sim: &Sim) -> String {
     let stats = sim.stats();
     let alive = sim.walkers().iter().filter(|w| w.alive).count();
     let total = sim.walkers().len();
-    let progress_pct = if level.width_pixels() > 0.0 {
-        100.0 * stats.progress_pixels / level.width_pixels()
+    // The fraction of the *way to the flag*, not of the level's width. The objective is the
+    // distance closed on the goal, so a tower has to read 0 → 100 the same way a corridor
+    // does; dividing by the width made every vertical level look like it was at 0% while the
+    // body was climbing it. A spawn on top of the flag has nothing to close, hence 100.
+    let progress_pct = if stats.goal_distance_pixels > 0.0 {
+        100.0 * stats.progress_pixels / stats.goal_distance_pixels
     } else {
-        0.0
+        100.0
     };
 
     let mut lines = Vec::with_capacity(2);
     lines.push(format!(
-        "{name}  frame {frame}/{cap}  {outcome}  x {x:.2}  progress {px:.0}px ({pct:.0}%)  stomps {stomps}  walkers {alive}/{total}  state {hash:016x}",
+        "{name}  frame {frame}/{cap}  {outcome}  x {x:.2}  progress {px:.0}px ({pct:.0}%)  stomps {stomps}  jumps {jumps}  zones {checkpoints}  walkers {alive}/{total}  state {hash:016x}",
         name = level.name.as_str(),
         frame = stats.frames,
         cap = sim.max_frames(),
@@ -449,6 +453,15 @@ pub fn header(sim: &Sim) -> String {
         px = stats.progress_pixels,
         pct = progress_pct,
         stomps = stats.stomps,
+        // Reported next to the stomps because it is the statistic that makes "this agent
+        // bounces everywhere" visible rather than a feeling, and because `evo`'s fitness
+        // charges for it (fitness v2).
+        jumps = stats.jumps,
+        // Safe landing zones reached past a hazard. The companion to `jumps` on a hazard
+        // level: `jumps` is the body trying, this is what trying bought, and the two
+        // disagreeing (many jumps, no zones) is the shape of an agent bouncing into the
+        // same spike over and over — which is exactly what the owner's report described.
+        checkpoints = stats.checkpoints,
         alive = alive,
         total = total,
         hash = sim.state_hash(),
@@ -733,17 +746,24 @@ mod tests {
 
     #[test]
     fn a_goal_never_erases_terrain() {
-        let level = fixture(
-            &["......", "..G...", "######"],
-            (1, 1),
-            &[("goal", 2, 0)],
-        );
+        // The flag stands with its pole's foot in the floor row, so the two cells its marker
+        // covers are the floor itself and the air above it. Goals are drawn over *empty*
+        // tiles only, so the floor keeps its glyph and the flag appears above it.
+        //
+        // This fixture used to carry a `G` tile *and* a goal entity, which is two goals — a
+        // level has one — so the sugar and the entity are the same case now, and the overlap
+        // with the terrain is what the test is actually about.
+        let level = fixture(&["......", "......", "######"], (1, 1), &[("goal", 2, 2)]);
         let rows = rows_of(&render_scene(
             &Scene::new(&level, vec![]),
             Viewport::whole(&level),
         ));
-        assert_eq!(rows[2], "######");
-        assert!(rows.join("\n").contains(GLYPH_GOAL));
+        assert_eq!(rows[2], "######", "the floor under the flag survives");
+        assert!(
+            rows[1].contains(GLYPH_GOAL),
+            "and the flag is drawn in the air above it: {:?}",
+            rows[1]
+        );
     }
 
     #[test]

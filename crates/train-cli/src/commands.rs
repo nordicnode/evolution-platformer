@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use evo::champion::replay as replay_champion;
+use evo::ga::MUTATION_SIGMA_RANGE;
 use evo::{ChampionFile, GaConfig, Trainer, FITNESS_VERSION};
 use sim::physics::{AgentAction, PHYSICS};
 use sim::reach;
@@ -23,6 +24,11 @@ const TRAIN_OPTS: &[&str] = &[
     "tournament",
     "crossover",
     "action-repeat",
+    "fine-children",
+    "stagnation",
+    "immigrants",
+    "reheat-factor",
+    "adaptive-sigma",
     "trials",
     "out",
     "csv",
@@ -74,20 +80,7 @@ pub fn train(a: &Args) -> Result<(), String> {
         None => None,
     };
 
-    let cfg = GaConfig {
-        pop_size: usage(a.usize_opt("pop", 200))?,
-        elite: usage(a.usize_opt("elite", 4))?,
-        tournament: usage(a.usize_opt("tournament", 4))?,
-        mutation_rate: usage(a.f32_opt("mut-rate", 0.05))?,
-        mutation_sigma: usage(a.f32_opt("mut-sigma", 0.30))?,
-        crossover_rate: usage(a.f32_opt("crossover", 0.75))?,
-        action_repeat: usage(a.usize_opt("action-repeat", 4))? as u32,
-        // Trials are only distinguishable on levels that are actually stochastic
-        // (those with walkers): elsewhere every trial is the same episode.
-        trials: usage(a.usize_opt("trials", 1))? as u32,
-        master_seed: usage(a.u64_opt("seed", 1))?,
-        ..GaConfig::default()
-    };
+    let cfg = train_config(a)?;
 
     if !quiet {
         println!("level   {} ({}x{})", level.name, level.width, level.height);
@@ -100,6 +93,23 @@ pub fn train(a: &Args) -> Result<(), String> {
             "ga      pop {}  elite {}  tournament {}  sigma {:.2}  rate {:.3}  crossover {:.2}  action_repeat {}  trials {}",
             cfg.pop_size, cfg.elite, cfg.tournament, cfg.mutation_sigma,
             cfg.mutation_rate, cfg.crossover_rate, cfg.action_repeat, cfg.trials
+        );
+        // The search's own shape, printed because it is what the run will *do* rather than
+        // what it starts from: fine children are the second, local mutation scale, the
+        // immigrants are reheated from the run's best-ever genome, and with adaptive sigma the
+        // printed 0.30 is a starting value the run moves on its own.
+        println!(
+            "search  fine {}  sigma {}  immigrants {} reheated at {:.2}x ({:.2}) after {} still generations",
+            cfg.fine_children,
+            if cfg.adaptive_sigma {
+                format!("self-tuning {:.2}-{:.2} from {:.2}", MUTATION_SIGMA_RANGE[0], MUTATION_SIGMA_RANGE[1], cfg.mutation_sigma)
+            } else {
+                format!("fixed at {:.2}", cfg.mutation_sigma)
+            },
+            cfg.immigrants,
+            cfg.reheat_factor,
+            cfg.reheat_sigma(),
+            cfg.stagnation_generations
         );
         if cfg.trials > 1 && level.walkers.is_empty() {
             println!(
@@ -115,8 +125,8 @@ pub fn train(a: &Args) -> Result<(), String> {
             FITNESS_VERSION
         );
         println!(
-            "\n{:>4}  {:>10}  {:>10}  {:>10}  {:>9}  {:>7}",
-            "gen", "max", "avg", "min", "wins", "secs"
+            "\n{:>4}  {:>10}  {:>10}  {:>10}  {:>9}  {:>5}  {:>7}",
+            "gen", "max", "avg", "min", "wins", "sigma", "secs"
         );
     }
 
@@ -138,13 +148,14 @@ pub fn train(a: &Args) -> Result<(), String> {
 
         if !quiet {
             println!(
-                "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>7.2}{}",
+                "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}{}",
                 report.generation,
                 report.max_fitness,
                 report.avg_fitness,
                 report.min_fitness,
                 report.wins,
                 effective.pop_size,
+                report.mutation_sigma,
                 secs,
                 if report.genius { "  <-- GENIUS AGENT" } else { "" }
             );
@@ -214,14 +225,34 @@ pub fn train(a: &Args) -> Result<(), String> {
             champion.fitness
         ),
     }
+    // What the search did with its own knobs, not just what it scored. A run that never
+    // stalled and a run that stalled twice look identical on a fitness chart that has
+    // already flattened out, and "did it recover" is exactly what a reader is asking.
+    let immigrants: usize = trainer.history().iter().map(|r| r.immigrants).sum();
+    let bursts = trainer.history().iter().filter(|r| r.immigrants > 0).count();
     println!(
-        "best    gen {} id {} fitness {:.2} ({} after {} frames, best_x {:.1})",
+        "search  sigma {:.2} -> {:.3}  {}  reheated {} in {} burst{}",
+        effective.mutation_sigma,
+        trainer.mutation_sigma(),
+        if effective.adaptive_sigma {
+            "self-tuned"
+        } else {
+            "fixed"
+        },
+        immigrants,
+        bursts,
+        if bursts == 1 { "" } else { "s" }
+    );
+    println!(
+        "best    gen {} id {} fitness {:.2} ({} after {} frames, best_x {:.1}, jumps {}, checkpoints {})",
         champion.metadata.generation,
         champion.metadata.genome_id,
         champion.fitness,
         champion.metadata.outcome,
         champion.metadata.frames,
-        champion.metadata.best_x
+        champion.metadata.best_x,
+        champion.metadata.jumps,
+        champion.metadata.checkpoints
     );
     println!(
         "timing  {:>7.3} s/gen mean | {:>7.3} median | {:>7.3} best | {} generations in {:.1} s",
@@ -241,18 +272,59 @@ pub fn train(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// The GA configuration a `train` invocation asks for.
+///
+/// Factored out so the flag defaults have exactly **one** home ([`GaConfig::default`]) and a test
+/// can compare the two directly. That is not tidiness: this function's predecessor wrote its own
+/// `1.0` beside the flag name, the trainer's default later moved to `3.0`, and the command line
+/// quietly went on asking for the old temperature for every run that did not name one — a whole
+/// sweep's result that never reached a user, found only by reading the header of a real run.
+fn train_config(a: &Args) -> Result<GaConfig, String> {
+    let default = GaConfig::default();
+    Ok(GaConfig {
+        pop_size: usage(a.usize_opt("pop", default.pop_size))?,
+        elite: usage(a.usize_opt("elite", default.elite))?,
+        tournament: usage(a.usize_opt("tournament", default.tournament))?,
+        mutation_rate: usage(a.f32_opt("mut-rate", default.mutation_rate))?,
+        mutation_sigma: usage(a.f32_opt("mut-sigma", default.mutation_sigma))?,
+        crossover_rate: usage(a.f32_opt("crossover", default.crossover_rate))?,
+        fine_children: usage(a.usize_opt("fine-children", default.fine_children))?,
+        adaptive_sigma: a.has_flag("adaptive-sigma"),
+        stagnation_generations: usage(
+            a.usize_opt("stagnation", default.stagnation_generations as usize),
+        )? as u32,
+        immigrants: usage(a.usize_opt("immigrants", default.immigrants))?,
+        reheat_factor: usage(a.f32_opt("reheat-factor", default.reheat_factor))?,
+        action_repeat: usage(a.usize_opt("action-repeat", default.action_repeat as usize))? as u32,
+        // Trials are only distinguishable on levels that are actually stochastic
+        // (those with walkers): elsewhere every trial is the same episode.
+        trials: usage(a.usize_opt("trials", default.trials as usize))? as u32,
+        master_seed: usage(a.u64_opt("seed", default.master_seed))?,
+        ..GaConfig::default()
+    })
+}
+
 fn write_csv(path: &str, history: &[evo::GenRow]) -> Result<(), String> {
-    let mut out = String::from("generation,max_fitness,avg_fitness,min_fitness,wins,best_id,genius\n");
+    // The last two columns are the search's own reading rather than the run's score, and
+    // they are in the CSV for the same reason they are on the chart: `mutation_sigma` is the
+    // self-tuning size as it stood when that generation's children were bred, and
+    // `immigrants` is how many random genomes were injected after it — the two facts that
+    // separate "the run plateaued" from "the run plateaued and did something about it".
+    let mut out = String::from(
+        "generation,max_fitness,avg_fitness,min_fitness,wins,best_id,genius,mutation_sigma,immigrants\n",
+    );
     for row in history {
         out.push_str(&format!(
-            "{},{:.4},{:.4},{:.4},{},{},{}\n",
+            "{},{:.4},{:.4},{:.4},{},{},{},{:.4},{}\n",
             row.generation,
             row.max_fitness,
             row.avg_fitness,
             row.min_fitness,
             row.wins,
             row.best_id,
-            row.genius as u8
+            row.genius as u8,
+            row.mutation_sigma,
+            row.immigrants
         ));
     }
     if let Some(dir) = Path::new(path).parent() {
@@ -401,12 +473,14 @@ pub fn replay(a: &Args) -> Result<(), String> {
     let actual = format!("{:016x}", result.trajectory_hash);
 
     println!(
-        "replayed {} after {} frames, fitness {:.2}, best_x {:.1}, stomps {}",
+        "replayed {} after {} frames, fitness {:.2}, best_x {:.1}, stomps {}, jumps {}, checkpoints {}",
         result.outcome.as_str(),
         result.frames,
         result.fitness,
         result.best_x,
-        result.stomps
+        result.stomps,
+        result.jumps,
+        result.checkpoints
     );
 
     if actual != expected {
@@ -533,16 +607,24 @@ pub fn sensors(a: &Args) -> Result<(), String> {
         }
     }
 
+    // The action table is stamped with the **sim** version, not the sensor one: the two
+    // numbers move together only by coincidence (§8), and the action set lives in
+    // `sim::physics` — a table printed under the wrong number is how a reader ends up
+    // believing a champion was trained on a game it was not. This readout was printing the
+    // sensor version here, which was wrong before it was misleading: the table gained its
+    // two leftward sprinting arms in 0.6.0, when the pair happened to share a number.
     println!(
-        "\nactions v1: {} discrete macro-actions, argmax over network outputs",
-        AgentAction::COUNT
+        "\nactions: {} discrete macro-actions (sim {}), argmax over network outputs",
+        AgentAction::COUNT,
+        sim::SIM_VERSION
     );
-    for (i, (name, input, jump)) in sim::sensors::action_summary().iter().enumerate() {
+    for (i, (name, input, jump, sprint)) in sim::sensors::action_summary().iter().enumerate() {
         println!(
-            "  [{i}] {:<14} input_x {:+}  jump {}",
+            "  [{i}] {:<14} input_x {:+}  jump {:<4} sprint {}",
             name,
             input,
-            if *jump { "held" } else { "-" }
+            if *jump { "held" } else { "-" },
+            if *sprint { "yes" } else { "-" }
         );
     }
 
@@ -563,13 +645,46 @@ pub fn sensors(a: &Args) -> Result<(), String> {
         "  jump distance       {:.3} tiles (max_jump_distance)",
         PHYSICS.max_jump_distance()
     );
+    println!(
+        "  sprint              {:.2} tiles/tick cap, {:.0} ticks of ramp, {:.3} tiles of run-up to earn it",
+        PHYSICS.sprint_speed,
+        PHYSICS.sprint_ramp_ticks(),
+        PHYSICS.runway_to_speed(PHYSICS.sprint_speed)
+    );
+    println!(
+        "  sprint jump         {:.3} tiles (sprint_jump_distance)",
+        PHYSICS.sprint_jump_distance()
+    );
     println!("  tap jump height     {:.3} tiles", PHYSICS.min_jump_height());
     println!(
-        "\nfitness v{FITNESS_VERSION}: +{:.1}/pixel progress, +{:.2}/frame survived, {:.0} on death, +{:.0} on goal",
+        "  jump buffer         {} ticks (a press this early still fires on landing)",
+        PHYSICS.jump_buffer_ticks
+    );
+    println!(
+        "  wall slide          {:.2} tiles/tick fall while clinging",
+        PHYSICS.wall_slide_fall
+    );
+    println!(
+        "  wall jump           {:.3} tiles up, {:.2} tiles/tick away, {}-tick input lock",
+        PHYSICS.wall_jump_height(),
+        PHYSICS.wall_jump_push,
+        PHYSICS.wall_jump_lock
+    );
+    println!(
+        "\nfitness v{FITNESS_VERSION}: +{:.1}/pixel progress, {:.0} on death, +{:.0} on goal, {:.1} per jump, +{:.0} per checkpoint",
         evo::fitness::PROGRESS_PER_PIXEL,
-        evo::fitness::SURVIVAL_PER_FRAME,
         evo::fitness::DEATH_PENALTY,
-        evo::fitness::GOAL_BONUS
+        evo::fitness::GOAL_BONUS,
+        evo::fitness::JUMP_PENALTY,
+        evo::fitness::CHECKPOINT_BONUS
+    );
+    println!(
+        "  no survival term: standing still earns nothing, so a frontier only moves by \
+         crossing what is in front of it (fitness v3, the park trap)"
+    );
+    println!(
+        "  checkpoints: paid per safe landing zone the body *stood on* past a hazard or a \
+         hole, so a leap that ends in the air keeps its frontier and earns none of this"
     );
     println!(
         "  episode cap {} frames/tile, stuck after {} frames without new ground",
@@ -725,6 +840,32 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The guard for the whole class of bug, not only the instance that was found: a flag the
+    /// user did not give must leave the trainer's own default in place. The defect this catches
+    /// was real — `--reheat-factor` carried a second copy of its default, the trainer's moved to
+    /// 3.0, and the command line went on asking for 1.0 for every run that did not name one.
+    #[test]
+    fn the_command_lines_defaults_are_the_trainers_defaults() {
+        let level = wpath("levels/l1-flat-run.json");
+        let args = a(&["train", "--level", &level]);
+        let cli = train_config(&args).expect("a bare train invocation parses");
+        let default = GaConfig::default();
+        assert_eq!(cli.pop_size, default.pop_size);
+        assert_eq!(cli.elite, default.elite);
+        assert_eq!(cli.tournament, default.tournament);
+        assert_eq!(cli.mutation_rate, default.mutation_rate);
+        assert_eq!(cli.mutation_sigma, default.mutation_sigma);
+        assert_eq!(cli.crossover_rate, default.crossover_rate);
+        assert_eq!(cli.fine_children, default.fine_children);
+        assert_eq!(cli.adaptive_sigma, default.adaptive_sigma);
+        assert_eq!(cli.stagnation_generations, default.stagnation_generations);
+        assert_eq!(cli.immigrants, default.immigrants);
+        assert_eq!(cli.reheat_factor, default.reheat_factor);
+        assert_eq!(cli.action_repeat, default.action_repeat);
+        assert_eq!(cli.trials, default.trials);
+        assert_eq!(cli.master_seed, default.master_seed);
+    }
+
     fn csv_has_rows(path: &str, rows: usize) -> bool {
         match fs::read_to_string(path) {
             Ok(text) => {
@@ -782,7 +923,16 @@ mod tests {
     fn replay_rejects_a_tampered_champion() {
         let (_, champion_path, dir) = tiny_run("tamper", "1", "8");
         let text = fs::read_to_string(&champion_path).expect("read");
-        let tampered = text.replace("\"fitness_version\": 1", "\"fitness_version\": 2");
+        // Tampered to a version this build cannot be, read from the constant rather than
+        // written as a literal: a hard-coded "the wrong version" pair goes stale the moment
+        // the version moves, and did — when fitness v2 landed, this test's literal 2 became
+        // the *correct* version and the tampered file replayed happily.
+        let current = format!("\"fitness_version\": {FITNESS_VERSION}");
+        assert!(
+            text.contains(&current),
+            "the fixture records its fitness version: {current}"
+        );
+        let tampered = text.replace(&current, &format!("\"fitness_version\": {}", FITNESS_VERSION + 1));
         assert_ne!(tampered, text, "fixture must actually change the file");
         let bad = dir.join("tampered.json");
         fs::write(&bad, tampered).expect("write");
@@ -837,16 +987,17 @@ mod tests {
         assert!(reach(&a(&["reach", "--level", "/nonexistent/level.json"])).is_err());
     }
 
-    /// A six-tile pit between the start ledge (columns 0–6) and the ledge holding
-    /// the goal (columns 13–15): wider than the 4.0-tile full-speed jump distance,
-    /// so no canonical take-off clears it and the goal is unreachable on foot.
+    /// A seven-tile pit between the start ledge (columns 0–5) and the ledge holding
+    /// the goal (columns 13–15): wider than the 6.0-tile **sprint** jump distance, so
+    /// no canonical take-off clears it and the goal is unreachable on foot.
     ///
-    /// It has to be six. The fixture used to be four tiles wide with the goal one
-    /// column past the far ledge, and a coarse take-off sweep happened to call it
-    /// unbeatable — but a 4-tile pit is exactly the widest jump the physics bible
-    /// allows, and a finer sweep found both the crossing take-off and a mid-air
-    /// touch of the floating goal. The test was passing for the wrong reason: its
-    /// pit was crossable and the goal was simply not standing on anything.
+    /// The width follows the abilities, and this fixture has had to grow twice. It was
+    /// four tiles, chosen when the plan's 4.0-tile full-speed jump was the whole reach of
+    /// the game — and a coarse take-off sweep called that unbeatable for the wrong reason
+    /// (the pit was crossable; the goal was simply floating). Six tiles fixed that, and
+    /// then sprint arrived and made six crossable too: a sprinting take-off from the last
+    /// column covers 6.0 tiles and lands on the far ledge. Seven is one past the sprint,
+    /// which is what "unbeatable on foot" means in a game with two gears.
     const UNREACHABLE: &str = "{
       \"format\": \"evo-platformer-level\",
       \"level_format_version\": 1,
@@ -860,8 +1011,8 @@ mod tests {
         \"....................\",
         \"....................\",
         \"....................\",
-        \"#######......###....\",
-        \"#######......###....\"
+        \"######.......###....\",
+        \"######.......###....\"
       ],
       \"entities\": [{\"type\": \"goal\", \"x\": 14, \"y\": 5}]
     }";

@@ -1,0 +1,36 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 1,
+  "name": "L7-ascent",
+  "width": 60,
+  "height": 15,
+  "spawn": {
+    "x": 2,
+    "y": 12
+  },
+  "tiles": [
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "........................#####################...............",
+    "........................#####################...............",
+    "........................#####################...............",
+    "..........#####################.............................",
+    "..........#####################.............................",
+    "..........#####################.............................",
+    "############################################################",
+    "############################################################"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 40,
+      "y": 6
+    }
+  ],
+  "_notes": "Two three-tile wall climbs. Floor at row 13; ledge 1 rises to row 10 at columns 10-30; ledge 2 rises to row 7 at columns 24-44, with the goal on it at column 40. A rise of three tiles is past the 2.37 a discrete full jump reaches, so neither ledge can be jumped onto: each one is a wall jump off its left face. The face is a dead end for a policy that just runs right, which is exactly why the move is discoverable - running into it and pressing jump is a wall jump. The reachability oracle refuses this level with wall jumps disabled, and only this one; measured first win: median 12.5 generations over 12 seeds at pop 200 (12 of 12 solved, 1-90). The slowest seed stalls for 89 generations at the first ledge before finding the climb."
+}

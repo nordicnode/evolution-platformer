@@ -132,6 +132,17 @@ pub struct RunSummary {
     pub max_fitness: f32,
     pub avg_fitness: f32,
     pub min_fitness: f32,
+    /// The mutation step the children of this generation were bred with.
+    ///
+    /// Carried through from the packet rather than derived here: it is a fact about the
+    /// search, not a reading of the history. Constant unless the run was started with
+    /// `adaptive_sigma`, and even then it is the run's own number rather than the panel's.
+    pub mutation_sigma: f32,
+    /// Generations since the best fitness last improved, straight from the trainer.
+    pub stagnation: u32,
+    /// Genomes reheated from the run's best-ever copy and bred in after that stagnation.
+    /// Non-zero only after a stall.
+    pub immigrants: usize,
     pub best: Option<BestLine>,
     /// What `render`'s own rule makes of the history.
     pub trend: Trend,
@@ -185,6 +196,9 @@ impl RunSummary {
             max_fitness: packet.max_fitness,
             avg_fitness: packet.avg_fitness,
             min_fitness: packet.min_fitness,
+            mutation_sigma: packet.mutation_sigma,
+            stagnation: packet.stagnation,
+            immigrants: packet.immigrants,
             best: None,
             trend: fitness_trend(history),
             stall: fitness_stall(history),
@@ -438,6 +452,31 @@ pub fn commands_for(keys: Keys, view: &ViewState) -> Vec<Command> {
 }
 
 /// The right-hand panel: what the run is doing, and every control on it.
+/// The panel's one line about the search itself: the step, and — only when it has something
+/// to say — how long the best has stood still and what that bought.
+///
+/// A pure function of the summary so the three shapes can be checked without a window, the
+/// same way [`chart_geometry`] is split out of the chart's drawing. The clauses after the
+/// step are conditional because a run that is still finding new bests has neither a stall to
+/// report nor a restart to explain, and `still for 0   +0 reheated genomes` beside its score
+/// would be noise dressed as information.
+///    /// `sigma` is a constant on a run with a fixed step — the default — and there the line is
+    /// still worth its row: with reheated genomes only ever arriving after a stall, the line is
+    /// where a viewer sees the restarts happen.
+pub fn search_line(summary: &RunSummary) -> String {
+    match (summary.stagnation, summary.immigrants) {
+        (0, 0) => format!("search   sigma {:.3}", summary.mutation_sigma),
+        (stagnation, 0) => format!(
+            "search   sigma {:.3}   still for {stagnation}",
+            summary.mutation_sigma
+        ),
+        (stagnation, immigrants) => format!(
+            "search   sigma {:.3}   still for {stagnation}   +{immigrants} reheated genomes",
+            summary.mutation_sigma
+        ),
+    }
+}
+
 pub fn lab_panel(
     ui: &mut egui::Ui,
     summary: &RunSummary,
@@ -494,6 +533,8 @@ pub fn lab_panel(
     if summary.genius {
         ui.colored_label(WIN_TICK, "genius agent: max jumped by more than half");
     }
+    // What the search is doing to itself (see [`search_line`]).
+    ui.colored_label(TEXT_DIM, search_line(summary));
     // The run's own account of the one detour it took, in the words `evo` gave it: the
     // window has no opinion about how the step went, it only has to say it happened.
     if let Some(note) = &summary.curriculum {
@@ -1224,6 +1265,11 @@ mod tests {
             wins: if won { 3 } else { 0 },
             genius: false,
             pop_size: 200,
+            // A quiet, fixed-sigma run: the panel's search line then has nothing to say
+            // beyond the step itself, which is the common case a fixture should be.
+            mutation_sigma: 0.30,
+            stagnation: 0,
+            immigrants: 0,
             lanes: vec![lane(0, 12, 431.2), lane(1, 40, 120.0)],
             // The population the replay ghosts. The chart tests are about the run's shape,
             // so the roster they never draw is empty here.
@@ -1443,6 +1489,40 @@ mod tests {
         // rather than as a negative distance.
         let past = BestLine::from_episode(8, 41, 300.0, "died", false, 100, 70.0, 58.0);
         assert_eq!(past.distance_to_goal, 0.0);
+    }
+
+    #[test]
+    fn the_search_line_says_the_step_and_nothing_it_has_not_earned() {
+        // A run that is still finding new bests: the step, and no stall to report. This is
+        // the default configuration's usual shape, since the reheated batch only ever arrives
+        // after a plateau.
+        let points = history(&[(0, 10.0, 5.0, 0), (4, 411.0, 60.0, 0)]);
+        let quiet = RunSummary::new(&packet(points.clone(), Vec::new(), false), &points);
+        assert_eq!(search_line(&quiet), "search   sigma 0.300");
+
+        // A plateau, and then the plateau with the burst it bought.
+        let mut stalled = summary_with_search(7, 0);
+        assert_eq!(search_line(&stalled), "search   sigma 0.300   still for 7");
+        stalled = summary_with_search(21, 8);
+        assert_eq!(
+            search_line(&stalled),
+            "search   sigma 0.300   still for 21   +8 reheated genomes"
+        );
+
+        // The step is the run's own number, not a constant of the panel: a tuned run's reading
+        // has to reach the line unchanged.
+        let mut tuned = summary_with_search(0, 0);
+        tuned.mutation_sigma = 0.091;
+        assert_eq!(search_line(&tuned), "search   sigma 0.091");
+    }
+
+    /// A summary whose only interesting fact is what the search is doing to itself.
+    fn summary_with_search(stagnation: u32, immigrants: usize) -> RunSummary {
+        let points = history(&[(0, 10.0, 5.0, 0), (4, 411.0, 60.0, 0)]);
+        let mut summary = RunSummary::new(&packet(points.clone(), Vec::new(), false), &points);
+        summary.stagnation = stagnation;
+        summary.immigrants = immigrants;
+        summary
     }
 
     #[test]

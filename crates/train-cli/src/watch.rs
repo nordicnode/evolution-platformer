@@ -70,6 +70,11 @@ const WATCH_OPTS: &[&str] = &[
     "elite",
     "tournament",
     "crossover",
+    "fine-children",
+    "stagnation",
+    "immigrants",
+    "reheat-factor",
+    "adaptive-sigma",
     "action-repeat",
     "trials",
     "out",
@@ -198,6 +203,12 @@ pub fn watch(a: &Args) -> Result<(), String> {
             GaConfig::default().mutation_rate,
         ))?),
         mutation_sigma: usage(a.f32_opt("mut-sigma", 0.30))?,
+        fine_children: usage(a.usize_opt("fine-children", 8))?,
+        adaptive_sigma: a.has_flag("adaptive-sigma"),
+        stagnation_generations: usage(a.usize_opt("stagnation", 20))? as u32,
+        immigrants: usage(a.usize_opt("immigrants", 8))?,
+        // As in `train`: the default lives in the config, not in a second copy here.
+        reheat_factor: usage(a.f32_opt("reheat-factor", GaConfig::default().reheat_factor))?,
         crossover_rate: usage(a.f32_opt("crossover", 0.75))?,
         action_repeat: usage(a.usize_opt("action-repeat", 4))? as u32,
         trials: usage(a.usize_opt("trials", 1))? as u32,
@@ -306,6 +317,14 @@ pub fn watch(a: &Args) -> Result<(), String> {
             deaths: &deaths,
             note: note.as_deref(),
             traces: &traces,
+            // Read off the report the search just produced: the size these children were
+            // bred with, the run's own staleness counter, and how many immigrants that
+            // counter bought.
+            search: SearchState {
+                sigma: report.mutation_sigma,
+                stagnation: trainer.stagnation(),
+                immigrants: report.immigrants,
+            },
         };
         animate_lanes(&mut screen, &level, &mut runners, &info, &ctx, &mut live)
             .map_err(io_error)?;
@@ -797,9 +816,9 @@ struct Layout {
     scene_rows: usize,
 }
 
-/// Fixed rows: two status lines, the generation bar, the death strip and two hint
-/// lines.
-const FIXED_ROWS: usize = 6;
+/// Fixed rows: three status lines (the header, the fitness numbers and what the search
+/// is doing to itself), the generation bar, the death strip and two hint lines.
+const FIXED_ROWS: usize = 7;
 
 /// The optional rows, each of which is a fact worth a line of its own.
 ///
@@ -869,6 +888,8 @@ struct Frame<'a> {
     traces: &'a TraceLog,
     /// The recorded generation being shown, or `None` while the view is live.
     scrub: Option<u32>,
+    /// What the search is doing to itself (mutation size, stagnation, immigrants).
+    search: SearchState,
     progress: Progress,
 }
 
@@ -941,6 +962,17 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
         None => lines.push(clip("warming up: no generation scored yet", cols)),
     }
 
+    // 2b. What the search is doing to *itself*, which the fitness numbers cannot say.
+    //     `mut` on the header is the viewer's own rate; sigma is the size the children of
+    //     this generation were actually bred with, which with adaptive sigma the run has
+    //     been moving on its own. Watching it fall is watching the run stop exploring and
+    //     start polishing, and watching it rise is a plateau being attacked.
+    let mut search = format!("search  sigma {:.3}", f.search.sigma);
+    if f.search.stagnation > 0 {
+        search.push_str(&format!("   no new best in {}", f.search.stagnation));
+    }
+    lines.push(clip(&search, cols));
+
     // 3. Why the numbers stopped moving, when they have. This is the one piece of
     //    the view that talks about the *level* rather than the population: the
     //    stall count says the search is out of new ideas, and the death cluster says
@@ -959,6 +991,13 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
             // strip below already shows an empty row, and a line reporting the
             // absence of evidence beside a stall invites reading it as the cause.
             None => stall.label(),
+        };
+        // The reheated batch arrives only after a stall, so its size belongs on the line that
+        // says how long the stall has been. It is the difference between a run that has
+        // converged and a run that has converged and done something about it.
+        let line = match f.search.immigrants {
+            0 => line,
+            n => format!("{line}   +{n} reheated genomes"),
         };
         lines.push(clip(&line, cols));
     }
@@ -1073,6 +1112,29 @@ struct GenCtx<'a> {
     deaths: &'a [(f32, f32, u32)],
     note: Option<&'a str>,
     traces: &'a TraceLog,
+    /// What the search is doing to *itself* this generation: the self-tuning mutation
+    /// size, how long the best has stood still, and how many reheated genomes that bought.
+    /// Beside the fitness row rather than in it, because these are the trainer's
+    /// readings of its own search and not the population's score.
+    search: SearchState,
+}
+
+/// The trainer's own reading of its search, carried into the frame.
+///
+/// All three are read off the generation that was just scored, so a viewer watching the
+/// size fall is watching the run stop exploring and start polishing — the one thing a
+/// fitness chart cannot show, because a chart of a converged run and a chart of a run
+/// that is quietly searching a small neighbourhood look identical on it.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+struct SearchState {
+    /// The mutation size children were bred with ([`evo::GenRow::mutation_sigma`]).
+    sigma: f32,
+    /// Generations since the best fitness last improved.
+    stagnation: u32,
+    /// Genomes bred into the generation that follows the scored one, each a reheat of the
+    /// run's best-ever genome. Non-zero only after a stagnation, so it is also the signal that
+    /// the run has stopped moving and done something about it.
+    immigrants: usize,
 }
 
 /// Frames a generation is allowed to draw at this speed: enough to watch the whole
@@ -1300,6 +1362,7 @@ fn draw_state(
         traces: ctx.traces,
         scrub: live.trace_cursor,
         progress,
+        search: ctx.search,
     };
     screen.draw(&render_frame(&frame, cols, rows, l))
 }
@@ -1359,6 +1422,9 @@ fn watch_champion(
         deaths: &[],
         note: None,
         traces: &traces,
+        // A replay has no search behind it: the genome is already chosen, so the frame
+        // must not imply a mutation size is being tuned around it.
+        search: SearchState::default(),
     };
     let mut runners = vec![EpisodeRunner::new(
         level,
@@ -1370,11 +1436,13 @@ fn watch_champion(
         .map_err(|e| format!("cannot draw the champion replay: {e}"))?;
     let result = runners.pop().expect("exactly one lane").result();
     println!(
-        "replayed {} after {} frames, fitness {:.2}, best_x {:.1}",
+        "replayed {} after {} frames, fitness {:.2}, best_x {:.1}, jumps {}, checkpoints {}",
         result.outcome.as_str(),
         result.frames,
         result.fitness,
-        result.best_x
+        result.best_x,
+        result.jumps,
+        result.checkpoints
     );
     match replay_verdict(&result, &champion) {
         ReplayVerdict::Verified => println!("the animation matches the recorded episode"),
@@ -1467,13 +1535,15 @@ fn finish_training(
     println!("watched {} ({} generations)", level.name, trainer.history().len());
     if let Some(best) = trainer.best_ever() {
         println!(
-            "best    gen {} id {} fitness {:.2} ({} after {} frames, best_x {:.1})",
+            "best    gen {} id {} fitness {:.2} ({} after {} frames, best_x {:.1}, jumps {}, checkpoints {})",
             best.generation,
             best.genome.id,
             best.result.fitness,
             best.result.outcome.as_str(),
             best.result.frames,
-            best.result.best_x
+            best.result.best_x,
+            best.result.jumps,
+            best.result.checkpoints
         );
     }
     if let Some(row) = trainer.history().last() {
@@ -1993,6 +2063,9 @@ mod tests {
         /// Show this recorded generation instead of the live view. Implies
         /// `record` even when the caller forgot to ask for one.
         scrub: Option<u32>,
+        /// The search line's own state; zero sigma by default, which is what a frame
+        /// whose run has not been told anything looks like.
+        search: SearchState,
     }
 
     /// A frame with an optional stall built from `history(9)` plus `extra` flat
@@ -2031,6 +2104,7 @@ mod tests {
             TraceLog::new()
         };
         let scrub = opts.scrub;
+        let search = opts.search;
         let deaths = vec![(10.0, 12.0, 3u32), (10.4, 12.0, 4), (44.0, 12.0, 5)];
         let stall = fitness_stall(&owned);
         let cluster = stall.and_then(|_| death_cluster(&deaths, level.width));
@@ -2067,6 +2141,7 @@ mod tests {
                 index: 120,
                 budget: 675,
             },
+            search,
         };
         render_frame(&f, cols, rows, layout(rows, extra))
     }
@@ -2137,6 +2212,7 @@ mod tests {
                 index: 1,
                 budget: 60,
             },
+            search: SearchState::default(),
         };
         render_frame(
             &f,
@@ -2351,6 +2427,7 @@ mod tests {
                 index: 1,
                 budget: 60,
             },
+            search: SearchState::default(),
         };
         let text = render_frame(&f, 80, 24, layout(24, ExtraRows::default()));
         assert!(text.contains("PAUSED"));
@@ -2804,6 +2881,7 @@ mod tests {
             deaths: &[],
             note: None,
             traces: &traces,
+            search: SearchState::default(),
         };
         let mut screen = Screen::open(true, Some(1)).expect("headless screen");
         let mut live = LiveState {
@@ -2865,6 +2943,7 @@ mod tests {
             deaths: &[],
             note: None,
             traces: &traces,
+            search: SearchState::default(),
         };
         let mut screen = Screen::open(true, Some(frames)).expect("headless screen");
         let mut live = live;

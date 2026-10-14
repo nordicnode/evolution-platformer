@@ -141,6 +141,18 @@ pub struct ChampionMetadata {
     pub frames: u32,
     pub progress_pixels: f32,
     pub best_x: f32,
+    /// Jumps the recorded episode took. Provenance, not a guard — nothing about
+    /// reproducing the trajectory depends on it — which is why it is one of the two fields
+    /// with a serde default: a champion file written before this field existed still
+    /// *parses*, so it is refused by the version trio with the message that explains why
+    /// (§8) instead of failing as malformed JSON.
+    #[serde(default)]
+    pub jumps: u32,
+    /// Safe landing zones the recorded episode stood on past a hazard (fitness v4). The
+    /// second provenance field, and defaulted for the same reason: it tells a reader how
+    /// far the genome got that the frontier alone does not say.
+    #[serde(default)]
+    pub checkpoints: u32,
     pub outcome: String,
     pub trajectory_hash: String,
     pub training_config: TrainingSummary,
@@ -150,12 +162,42 @@ pub struct ChampionMetadata {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrainingSummary {
     pub pop_size: usize,
+    /// The mutation size the run *started* from. With `adaptive_sigma` the search moves it
+    /// from here as it goes, so this is the recipe rather than a constant of the champion.
     pub mutation_sigma: f32,
     pub mutation_rate: f32,
     pub elite: usize,
     pub tournament: usize,
     pub crossover_rate: f32,
     pub master_seed: u64,
+    /// Offspring per generation bred as a one-to-three-gene perturbation of the best genome.
+    /// Provenance, and defaulted for the same reason [`ChampionMetadata::jumps`] is: a
+    /// champion written before this field existed still parses, and is refused by the
+    /// version trio with the message that explains why instead of as malformed JSON.
+    #[serde(default)]
+    pub fine_children: usize,
+    /// Whether the run tuned its own mutation size. Defaulted to `false`, which is the
+    /// conservative reading: a file that does not say cannot claim the extra search.
+    #[serde(default)]
+    pub adaptive_sigma: bool,
+    /// Generations without a new best before immigrants were bred in; 0 disabled.
+    #[serde(default)]
+    pub stagnation_generations: u32,
+    /// How many arrived when that happened.
+    #[serde(default)]
+    pub immigrants: usize,
+    /// How hot that batch was, as a multiple of the run's mutation size.
+    ///
+    /// Defaulted to 1.0 rather than to `serde`'s zero for floats, and the difference matters:
+    /// 1.0 is what the mechanism shipped with, while 0.0 would claim the run was configured to
+    /// reheat at the sigma floor, which no old champion ever was.
+    #[serde(default = "default_reheat_factor")]
+    pub reheat_factor: f32,
+}
+
+/// The value a champion file written before `reheat_factor` existed is read with.
+fn default_reheat_factor() -> f32 {
+    1.0
 }
 
 impl From<&GaConfig> for TrainingSummary {
@@ -168,6 +210,11 @@ impl From<&GaConfig> for TrainingSummary {
             tournament: c.tournament,
             crossover_rate: c.crossover_rate,
             master_seed: c.master_seed,
+            fine_children: c.fine_children,
+            adaptive_sigma: c.adaptive_sigma,
+            stagnation_generations: c.stagnation_generations,
+            immigrants: c.immigrants,
+            reheat_factor: c.reheat_factor,
         }
     }
 }
@@ -210,6 +257,8 @@ impl ChampionFile {
                 frames: result.frames,
                 progress_pixels: result.progress_pixels,
                 best_x: result.best_x,
+                jumps: result.jumps,
+                checkpoints: result.checkpoints,
                 outcome: result.outcome.as_str().into(),
                 trajectory_hash: format!("{:016x}", result.trajectory_hash),
                 training_config: TrainingSummary::from(config),
@@ -310,15 +359,21 @@ impl ChampionFile {
     }
 
     /// One-line summary for CLI output.
+    ///
+    /// Carries the checkpoint count as well as the frontier, because they answer different
+    /// questions and the pair is what a hazard level's progress actually looks like: on a
+    /// floor of spikes a genome can have all the `best_x` in the world by leaping over them
+    /// and none of the landings that went with it.
     pub fn summary(&self) -> String {
         format!(
-            "gen {} id {} fitness {:.2} ({}, {} frames, best_x {:.1})",
+            "gen {} id {} fitness {:.2} ({}, {} frames, best_x {:.1}, checkpoints {})",
             self.metadata.generation,
             self.metadata.genome_id,
             self.fitness,
             self.metadata.outcome,
             self.metadata.frames,
-            self.metadata.best_x
+            self.metadata.best_x,
+            self.metadata.checkpoints
         )
     }
 }
@@ -412,6 +467,86 @@ mod tests {
         assert!(actions_agree(&g, &back, &obs));
         assert_eq!(g.weights, back.weights);
         assert_eq!(g.biases, back.biases);
+    }
+
+    /// An older champion file is *refused for the right reason*.
+    ///
+    /// Version bumps are the one place a parse error and a version error could be confused:
+    /// if a new metadata field were required, a pre-v2 champion would fail as malformed JSON
+    /// and the reader would go looking for a corrupted file instead of the version trio that
+    /// is actually doing its job.
+    #[test]
+    fn a_champion_file_without_the_new_provenance_field_still_parses() {
+        let lv = level();
+        let champ = champion_for(&lv, 8);
+        let json = champ.to_json_pretty().expect("serializes");
+        for field in ["jumps", "checkpoints"] {
+            assert!(
+                json.contains(&format!("\"{field}\"")),
+                "{field} is written: {json}"
+            );
+        }
+
+        // Every provenance field at once, which is what a file written before either of
+        // them existed actually looks like. Stripping one and not the other would leave
+        // this test passing for a file that never existed.
+        let older: String = json
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !(t.starts_with("\"jumps\"") || t.starts_with("\"checkpoints\""))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!older.contains("\"jumps\"") && !older.contains("\"checkpoints\""));
+        let back = ChampionFile::from_json_str(&older).expect("an older file still parses");
+        assert_eq!(back.metadata.jumps, 0, "and defaults to zero jumps");
+        assert_eq!(
+            back.metadata.checkpoints, 0,
+            "and to zero checkpoints"
+        );
+    }
+
+    /// The same guarantee as the provenance fields above, for the search knobs: a champion written
+    /// before they existed must *parse*, so that the version trio is what refuses it rather than a
+    /// JSON error.
+    ///
+    /// Removed through `serde_json` rather than by stripping lines the way the test above does,
+    /// because the last key of an object cannot be taken out textually without leaving a trailing
+    /// comma behind and making the file malformed for the wrong reason.
+    #[test]
+    fn a_champion_file_without_the_search_knobs_still_parses() {
+        let champ = champion_for(&level(), 8);
+        let json = champ.to_json_pretty().expect("serializes");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let config = value["metadata"]["training_config"]
+            .as_object_mut()
+            .expect("training_config is an object");
+        for field in [
+            "fine_children",
+            "adaptive_sigma",
+            "stagnation_generations",
+            "immigrants",
+            "reheat_factor",
+        ] {
+            assert!(config.remove(field).is_some(), "{field} is written");
+        }
+
+        let back = ChampionFile::from_json_str(&value.to_string()).expect("an older file parses");
+        let run = back.metadata.training_config;
+        // The fields that were always there survive the edit, so this is not passing because the
+        // whole block went missing.
+        assert_eq!(run.pop_size, GaConfig::default().pop_size);
+        assert_eq!(run.mutation_sigma, GaConfig::default().mutation_sigma);
+        assert_eq!(run.elite, GaConfig::default().elite);
+        // And the absent ones land on the values the mechanism shipped with, not on serde's zero:
+        // four honest zeros, and a reheat temperature of 1.0 — the factor the random source was
+        // replaced with, where 0.0 would claim a run configured to reheat at the sigma floor.
+        assert_eq!(run.fine_children, 0);
+        assert!(!run.adaptive_sigma);
+        assert_eq!(run.stagnation_generations, 0);
+        assert_eq!(run.immigrants, 0);
+        assert_eq!(run.reheat_factor, 1.0);
     }
 
     #[test]

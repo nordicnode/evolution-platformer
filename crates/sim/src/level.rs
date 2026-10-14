@@ -149,6 +149,27 @@ struct RawEntity {
     kind: String,
     x: i32,
     y: i32,
+    /// Carried only by a `scenery` entity, and omitted from every other entity's JSON so
+    /// an existing file's shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sprite: Option<String>,
+}
+
+/// A placed piece of scenery: an atlas sprite name, standing in a tile cell.
+///
+/// Scenery is **not simulated**. The physics never sees it, an agent's sensors cannot
+/// detect it, and no outcome depends on it. It exists so an author can *place* the same
+/// bushes, trees, rocks, flowers and vines the view already scatters by hash, which turns
+/// the dressing from a property of a tile into something a person composes. The sprite is
+/// carried as a plain name, so `sim` still depends on no renderer; a name the tileset does
+/// not carry is simply not drawn by the view rather than an error here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scenery {
+    /// The atlas sprite name to draw in the cell.
+    pub sprite: String,
+    /// The tile cell the sprite stands in.
+    pub x: i32,
+    pub y: i32,
 }
 
 /// The on-disk shape, in write order. Serializing this rather than hand-building
@@ -172,17 +193,22 @@ struct RawLevel {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResizeReport {
     pub dropped_walkers: usize,
-    pub dropped_goals: usize,
+    /// Placed scenery that fell outside the new grid. Decoration is disposable, so it is
+    /// simply dropped (like a walker) rather than clamped back in (like the goal).
+    pub dropped_scenery: usize,
     /// The spawn point fell outside the new grid and was pulled back in.
     pub spawn_moved: bool,
-    /// Every goal fell outside, so one was clamped back in: the grid has moved out
-    /// from under the goal rather than the goal being deleted.
+    /// The goal fell outside the new grid and was pulled back in.
+    ///
+    /// There is no `dropped_goals` beside this: a level has one flag, and the flag is
+    /// never dropped by a resize — losing it would leave a document that cannot be saved
+    /// or played, so the grid moves out from under it and the goal comes with it.
     pub goal_moved: bool,
 }
 
 impl ResizeReport {
     pub fn dropped_anything(&self) -> bool {
-        self.dropped_walkers > 0 || self.dropped_goals > 0
+        self.dropped_walkers > 0 || self.dropped_scenery > 0
     }
 }
 
@@ -198,8 +224,16 @@ pub struct Level {
     pub spawn: Rect,
     /// Initial walker AABBs.
     pub walkers: Vec<Rect>,
-    /// Goal trigger boxes.
+    /// The goal trigger box: **at most one**, and exactly one for a level a file on disk
+    /// describes.
+    ///
+    /// A `Vec` rather than an `Option` only because every consumer walks it — the sensors,
+    /// the oracle, the renderer — and a one-element walker list is less code than a maybe.
+    /// The one-flag rule is kept by [`Level::set_goal_tile`], [`Level::remove_goal_at`],
+    /// the loader and [`Level::validate`]; nothing else may push.
     pub goals: Vec<Rect>,
+    /// Placed scenery, in draw order. Inert: not simulated, not hashed, not sensed.
+    pub scenery: Vec<Scenery>,
 }
 
 impl Level {
@@ -260,6 +294,7 @@ impl Level {
             spawn: Rect::new(0.0, 0.0, PHYSICS.player_w, PHYSICS.player_h),
             walkers: Vec::new(),
             goals: Vec::new(),
+            scenery: Vec::new(),
         };
 
         // Spawn: bottom edge on the bottom of the spawn tile's row.
@@ -280,7 +315,31 @@ impl Level {
                     PHYSICS.walker_w,
                     PHYSICS.walker_h,
                 )),
-                "goal" => level.goals.push(goal_rect(e.x, e.y)),
+                "goal" => {
+                    // One flag per level, refused here as well as in the editor: the oracle,
+                    // the sensors and the score all answer about *the* goal, so a second one
+                    // would not be "more goal", it would be an ambiguity.
+                    if !level.goals.is_empty() {
+                        return Err("level has more than one goal: \
+                             a level has exactly one flag"
+                            .into());
+                    }
+                    level.goals.push(goal_rect(e.x, e.y));
+                }
+                // Scenery carries its own sprite name; an unnamed one is a mistake in the
+                // file rather than a piece of nothing, so it is refused like any bad entity.
+                "scenery" => {
+                    let sprite = e
+                        .sprite
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| "scenery entity has no sprite name".to_string())?;
+                    level.scenery.push(Scenery {
+                        sprite,
+                        x: e.x,
+                        y: e.y,
+                    });
+                }
                 other => return Err(format!("unknown entity type {other:?}")),
             }
         }
@@ -290,6 +349,11 @@ impl Level {
         for ty in 0..level.height {
             for tx in 0..level.width {
                 if level.get(tx, ty) == Tile::Goal {
+                    if !level.goals.is_empty() {
+                        return Err("level has more than one goal (a 'G' tile and a \
+                             goal entity): a level has exactly one flag"
+                            .into());
+                    }
                     level.goals.push(goal_rect(tx, ty));
                     level.set(tx, ty, Tile::Empty);
                 }
@@ -340,6 +404,88 @@ impl Level {
         self.get(tx, ty) == Tile::Spike
     }
 
+    /// Can a body *stand* on this tile: solid ground, with room above it and no hazard in
+    /// the room it needs?
+    ///
+    /// The hazard convention is that a floor spike occupies the row the body walks
+    /// *through*, one above the row that supports it (`levels/l3-gauntlet.json` and every
+    /// other shipped hazard level place them that way). So a supporting tile is standable
+    /// unless the row above it is a spike — a spot where the body would be standing inside
+    /// the obstacle — or is more ground, which is a buried tile inside a hill rather than a
+    /// floor anyone can be on. The body is 0.9 tiles tall, so one clear tile above the
+    /// support is exactly the headroom it needs.
+    pub fn is_standable(&self, tx: i32, surface_row: i32) -> bool {
+        self.is_solid(tx, surface_row)
+            && !self.is_spike(tx, surface_row - 1)
+            && !self.is_solid(tx, surface_row - 1)
+    }
+
+    /// The **landing zone** containing a standing tile: the run of standable tiles around
+    /// `tx`, named by the column it starts at.
+    ///
+    /// A zone rather than a tile, because a landing is not a place you aim at exactly. A
+    /// body that clears a hazard and touches down anywhere in the run beyond it has
+    /// arrived; scoring the individual tile would pay for landing on the *first* safe tile
+    /// and refuse the same crossing for landing a tile further on, which is the wrong
+    /// question and would make the reward a function of landing precision rather than of
+    /// the crossing.
+    pub fn landing_zone(&self, tx: i32, surface_row: i32) -> i32 {
+        let mut start = tx;
+        while start > 0 && self.is_standable(start - 1, surface_row) {
+            start -= 1;
+        }
+        start
+    }
+
+    /// Is the landing zone beginning at `zone_start` one the body could only have arrived at
+    /// by crossing something?
+    ///
+    /// Two ways to qualify, and the exclusions are the interesting part:
+    ///
+    /// * a **hazard at standing height** in the column just left of the zone — a spike the
+    ///   body would be inside if it stood there;
+    /// * a **hole** in that column: not ground at this row *and* not ground one row down
+    ///   either, so the body would have fallen rather than stepped.
+    ///
+    /// The second test is deliberately two rows deep. Ground one row down is a *step*, and a
+    /// step is not a crossing — counting it would pay a genome for walking up onto a ledge
+    /// and would turn most of the shipped pack's raised platforms into checkpoints, which is
+    /// not what the term is for. Measured on the pack, the two-row rule leaves `l1-flat-run`
+    /// at zero, gives `l2-first-gap` exactly one (the far side of its pit) and
+    /// `l8-long-jump` exactly two (its two pit ledges), and leaves the spike floors with one per
+    /// hazard. The one-row rule gave L2 four and L7-ascent three, all of them steps.
+    fn zone_is_checkpoint(&self, zone_start: i32, surface_row: i32) -> bool {
+        debug_assert!(zone_start > 0, "callers exclude the left-edge zone");
+        let left = zone_start - 1;
+        if self.is_spike(left, surface_row - 1) {
+            return true;
+        }
+        !self.is_solid(left, surface_row) && !self.is_solid(left, surface_row + 1)
+    }
+
+    /// If `(tx, surface_row)` is ground the body can stand on **and reaching it meant
+    /// crossing something**, the id of the checkpoint zone it belongs to; otherwise `None`.
+    ///
+    /// The zone that begins at the level's left edge is deliberately *not* a checkpoint:
+    /// nothing was crossed to reach the spawn, and paying for it would hand every episode a
+    /// free credit that the flat levels, which have no crossing to earn one with, could
+    /// never match.
+    ///
+    /// Note what this is *not*: it is not a measure of the body's x. The zone ids the body
+    /// actually stood on are what get counted, so a body that sails over a hazard and dies
+    /// in the air beyond it keeps the frontier it covered and earns nothing here.
+    pub fn checkpoint_zone(&self, tx: i32, surface_row: i32) -> Option<i32> {
+        if !self.is_standable(tx, surface_row) {
+            return None;
+        }
+        let start = self.landing_zone(tx, surface_row);
+        if start > 0 && self.zone_is_checkpoint(start, surface_row) {
+            Some(start)
+        } else {
+            None
+        }
+    }
+
     /// Tile column containing world x.
     pub fn tile_x(x: f32) -> i32 {
         x.floor() as i32
@@ -366,6 +512,10 @@ impl Level {
     /// The plan sketches a sha256; this build uses FNV-1a 64 instead so the sim
     /// crate stays dependency-light. It serves the same purpose: detecting a
     /// champion replayed against a level it was not trained on.
+    /// Placed scenery is deliberately **not** hashed: it is inert, so a champion trained on
+    /// a level and a champion trained on the same level with a tree added are the same
+    /// champion. Excluding it keeps every hash this build produced before scenery existed
+    /// valid, which keeps the champions on disk valid too.
     pub fn content_hash(&self) -> u64 {
         let mut h = StateHasher::new();
         for b in self.name.as_bytes() {
@@ -433,13 +583,94 @@ impl Level {
             spawn: Rect::new(0.0, 0.0, PHYSICS.player_w, PHYSICS.player_h),
             walkers: Vec::new(),
             goals: Vec::new(),
+            scenery: Vec::new(),
         };
         for tx in 0..width {
             level.set(tx, height - 1, Tile::Solid);
         }
         level.set_spawn_tile(1, height - 2);
-        level.add_goal_tile(width - 2, height - 2);
+        level.set_goal_tile(width - 2, height - 2);
         level
+    }
+
+    /// This level flipped left-to-right.
+    ///
+    /// The mirror of a level is the sharpest test a *directional* capability has. Every
+    /// bug this crate's neighbours have had about direction — no jump-left, no sprint-left,
+    /// a gap probe that looked the way the body happened to be drifting — is invisible on
+    /// the shipped pack, which is all rightward, and fatal on its mirror: the mirror of
+    /// `l8-long-jump` was *unbeatable in principle* while the level it mirrors is the one
+    /// that teaches sprint. So this exists to be asserted on (`levels.rs` checks that every
+    /// shipped level's mirror is still beatable, `evo`'s difficulty test that it is still
+    /// *learned*), not as an editing convenience.
+    ///
+    /// Everything an entity carries moves: tiles, the spawn, the flag and the walkers.
+    /// Scenery moves too — it is inert, but a flipped level that kept its bushes on the old
+    /// side would look like a bug in everything that draws it.
+    ///
+    /// Written through the same mutators the editor uses ([`Self::set_tile`],
+    /// [`Self::set_spawn_tile`], [`Self::set_goal_tile`]), so a mirror cannot be a level the
+    /// rules would refuse to *make*: the spawn lands on the tile the mirrored one occupies,
+    /// and the flag is moved rather than a second one appearing beside it.
+    ///
+    /// **One thing does not flip: a walker's patrol direction.** Walkers carry no direction
+    /// on disk — [`Walker::new`](crate::physics::Walker::new) builds every one of them
+    /// facing right — so a mirrored level's walkers still set off rightward. On a walker
+    /// level the mirror is therefore not a perfect reflection, and this is measurable rather
+    /// than theoretical: `l8-long-jump` versus its mirror is learned at generations 4/3/7/11
+    /// against 18/18/17/16, and with the walkers removed the same pair is 1/1/2/1 against
+    /// 5/0/5/3. That is a property of the *level format* (a walker has a position, not a
+    /// heading), not of the physics, and it is recorded in REVIEW.md rather than papered
+    /// over here.
+    pub fn mirrored_horizontal(&self) -> Level {
+        let mut out = Level::starter(
+            format!("{} mirrored", self.name),
+            self.width,
+            self.height,
+        );
+        for ty in 0..self.height {
+            for tx in 0..self.width {
+                let tile = self.get(tx, ty);
+                out.set_tile(self.width - 1 - tx, ty, tile);
+            }
+        }
+
+        let (sx, sy) = self.spawn_tile();
+        out.set_spawn_tile(self.width - 1 - sx, sy);
+
+        match self.goal_tiles().first() {
+            Some(&(gx, gy)) => {
+                out.set_goal_tile(self.width - 1 - gx, gy);
+            }
+            // A document can hold no flag (the editor's eraser leaves none). The mirror of
+            // no flag is no flag, so the starter's own placeholder comes off.
+            None => {
+                if let Some(&(gx, gy)) = out.goal_tiles().first() {
+                    out.remove_goal_at(gx, gy);
+                }
+            }
+        }
+
+        // A box is mirrored by its *far* edge: `x' = width - (x + w)`, which is the whole
+        // reason this is not just "negate x". Walkers are mirrored as raw boxes rather than
+        // through `add_walker_tile` because a walker is stored as one, sub-tile jitter and
+        // all, and re-snapping it to a lattice would move a body the physics had placed.
+        let w = self.width as f32;
+        out.walkers = self
+            .walkers
+            .iter()
+            .map(|r| Rect::new(w - (r.x + r.w), r.y, r.w, r.h))
+            .collect();
+        out.scenery = self
+            .scenery
+            .iter()
+            .map(|s| Scenery {
+                sprite: s.sprite.clone(),
+                x: self.width - 1 - s.x,
+                y: s.y,
+            })
+            .collect();
+        out
     }
 
     /// In-bounds tile, or `None` outside the grid.
@@ -473,9 +704,9 @@ impl Level {
     /// Grow or shrink the grid, anchored at the top-left.
     ///
     /// The overlap is kept, new cells get `fill`, and content that falls outside is
-    /// dropped — except the last goal, which is clamped back in, because a level
-    /// with no goal cannot be saved or played and losing one to a resize would be
-    /// losing the document.
+    /// dropped — walkers and scenery. The goal is **not** dropped: a level with no flag
+    /// cannot be saved or played, so a grid that shrinks out from under the flag drags it
+    /// back in rather than losing the document.
     pub fn resize(&mut self, width: i32, height: i32, fill: Tile) -> ResizeReport {
         let width = width.max(MIN_LEVEL_W);
         let height = height.max(MIN_LEVEL_H);
@@ -506,6 +737,11 @@ impl Level {
         });
         report.dropped_walkers = before - self.walkers.len();
 
+        let before = self.scenery.len();
+        self.scenery
+            .retain(|s| !tx_out(s.x, s.y, width, height));
+        report.dropped_scenery = before - self.scenery.len();
+
         let before = self.goals.len();
         let first_goal = self
             .goals
@@ -515,13 +751,11 @@ impl Level {
             let (tx, ty) = (tile_of_x(g.x, g.w), tile_of_bottom(g.bottom()));
             !tx_out(tx, ty, width, height)
         });
-        report.dropped_goals = before - self.goals.len();
         if self.goals.is_empty() && before > 0 {
             // Keep the level valid: the goal was pushed off the edge by a shrinking
             // grid, so pull it back in rather than deleting it.
             let (tx, ty) = first_goal.expect("before > 0 means a goal exists");
-            self.add_goal_tile(tx.clamp(0, width - 1), ty.clamp(0, height - 1));
-            report.dropped_goals = report.dropped_goals.saturating_sub(1);
+            self.set_goal_tile(tx.clamp(0, width - 1), ty.clamp(0, height - 1));
             report.goal_moved = true;
         }
         report
@@ -561,12 +795,36 @@ impl Level {
             .collect()
     }
 
-    /// Tile positions of every goal, in sim order.
+    /// The goal's tile position — one entry, or none in a document that has no flag yet.
+    ///
+    /// A goal's *anchor* tile: the cell its pole's base stands on. The marker is two cells
+    /// tall and the flag hangs in the cell above ([`Self::goal_covers`]), so this is where a
+    /// goal *is* while the cell above is still part of it.
     pub fn goal_tiles(&self) -> Vec<(i32, i32)> {
-        self.goals
-            .iter()
-            .map(|g| (tile_of_x(g.x, g.w), tile_of_bottom(g.bottom())))
-            .collect()
+        self.goals.iter().map(goal_anchor).collect()
+    }
+
+    /// Whether a goal's *marker* covers tile `(tx, ty)` — a question about two cells, not one.
+    ///
+    /// The flag is drawn two tiles tall (`crate::view::goal_cells`): the pole's base sits on
+    /// the goal's anchor and the cloth hangs in the cell above it. So the cell most people
+    /// aim at is the flag, one tile *above* the anchor, and a rule that only knew the anchor
+    /// would call that click "nothing here". Everything that has to agree with what the user
+    /// can see — the eraser, the placement check, the drop ghost — asks this instead.
+    pub fn goal_covers(&self, tx: i32, ty: i32) -> bool {
+        self.goals.iter().any(|g| goal_marker_covers(g, tx, ty))
+    }
+
+    /// Whether the goal may be anchored at `(tx, ty)`: the tile has to be on the map, and
+    /// neither of the two cells the marker would cover may already be the goal's.
+    ///
+    /// The editor asks this to colour the drop ghost, so the refusal is visible before the
+    /// mouse button comes up; [`Self::set_goal_tile`] refuses the same placements, so the
+    /// preview and the write cannot disagree.
+    pub fn goal_placeable(&self, tx: i32, ty: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height)
+            && !self.goal_covers(tx, ty)
+            && !self.goal_covers(tx, ty - 1)
     }
 
     /// Whether a walker placed at tile `(tx, ty)` would be standing on something.
@@ -596,12 +854,24 @@ impl Level {
         true
     }
 
-    /// Add a goal at a tile position, which also makes the level valid again if it
-    /// had lost its last one.
-    pub fn add_goal_tile(&mut self, tx: i32, ty: i32) -> bool {
-        if tx_out(tx, ty, self.width, self.height) {
+    /// Place **the** goal at a tile position, which also makes the level valid again if it
+    /// had none.
+    ///
+    /// A level has exactly one flag, so this *moves* it: the flag already on the map
+    /// relocates to `(tx, ty)` instead of a second one appearing beside it — the same shape
+    /// as [`Self::set_spawn_tile`], for the same reason. Returns whether the document
+    /// changed.
+    ///
+    /// Refuses a tile that is already part of the goal's own marker — the pole it stands on
+    /// *or* the cell its cloth hangs in, plus the cell whose own flag would hang in that
+    /// pole — so a click on the flag the user is looking at is a refusal that can be
+    /// explained, not a silent one-cell shift of the marker out from under the pointer.
+    /// Every rule is [`Self::goal_placeable`]'s.
+    pub fn set_goal_tile(&mut self, tx: i32, ty: i32) -> bool {
+        if !self.goal_placeable(tx, ty) {
             return false;
         }
+        self.goals.clear();
         self.goals.push(goal_rect(tx, ty));
         true
     }
@@ -618,18 +888,99 @@ impl Level {
         self.walkers.len() != before
     }
 
-    /// Remove the goal in tile `(tx, ty)`, if any.
+    /// Remove the goal whose marker covers tile `(tx, ty)`, if any.
     ///
-    /// Refuses to remove the last one: that is the one edit that cannot be
-    /// recovered by editing further, since every later save would be rejected.
+    /// Both of a goal's two cells address it ([`Self::goal_covers`]), so the eraser works
+    /// whichever half of the marker the user clicked — the flag included.
+    ///
+    /// This **can** leave the document with no goal at all, and that is deliberate. The
+    /// flag a new level starts with is the user's to delete — a locked flag is a flag you
+    /// cannot put where you want it — so the document allows the one state the writer
+    /// refuses, and says so out loud: [`Self::validate`] and [`Self::to_json_pretty`] report
+    /// "no goal", the editor's own verdict reads "NOT beatable: the level has no goal
+    /// flag", and placing a flag anywhere puts the level right again.
     pub fn remove_goal_at(&mut self, tx: i32, ty: i32) -> bool {
-        let matches = |g: &Rect| (tile_of_x(g.x, g.w), tile_of_bottom(g.bottom())) == (tx, ty);
-        if self.goals.len() <= 1 && self.goals.iter().any(matches) {
+        let before = self.goals.len();
+        self.goals.retain(|g| !goal_marker_covers(g, tx, ty));
+        self.goals.len() != before
+    }
+
+    /// Every placed scenery item, in draw order.
+    pub fn scenery(&self) -> &[Scenery] {
+        &self.scenery
+    }
+
+    /// Whether a scenery sprite may stand at tile `(tx, ty)`.
+    ///
+    /// The cell has to be **empty**: scenery drawn inside a wall is the same lie a prop
+    /// inside one would be. A tree (`*_base`) is two cells of art plus a cell of canopy, so
+    /// it also needs the cells above it clear, which is the rule [`crate::level::Level`]
+    /// already applies when the view scatters one by hash.
+    pub fn scenery_placeable(&self, sprite: &str, tx: i32, ty: i32) -> bool {
+        if self.tile(tx, ty) != Some(Tile::Empty) {
             return false;
         }
-        let before = self.goals.len();
-        self.goals.retain(|g| !matches(g));
-        self.goals.len() != before
+        if sprite.ends_with("_base") {
+            for dy in 1..=2 {
+                if self.tile(tx, ty - dy) != Some(Tile::Empty) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Place a scenery sprite at a tile. Returns whether it landed.
+    ///
+    /// Refuses a cell that already holds the same sprite, so a click is idempotent, and
+    /// cites [`Self::scenery_placeable`] for the rest of its rules.
+    pub fn add_scenery(&mut self, sprite: &str, tx: i32, ty: i32) -> bool {
+        if !self.scenery_placeable(sprite, tx, ty) {
+            return false;
+        }
+        if self
+            .scenery
+            .iter()
+            .any(|s| s.sprite == sprite && s.x == tx && s.y == ty)
+        {
+            return false;
+        }
+        self.scenery.push(Scenery {
+            sprite: sprite.to_string(),
+            x: tx,
+            y: ty,
+        });
+        true
+    }
+
+    /// The sprite placed in tile `(tx, ty)`, if any. The **topmost** one wins when several
+    /// share a cell, so what the eraser removes is what the eye sees on top.
+    pub fn scenery_at(&self, tx: i32, ty: i32) -> Option<&str> {
+        self.scenery
+            .iter()
+            .rev()
+            .find(|s| s.x == tx && s.y == ty)
+            .map(|s| s.sprite.as_str())
+    }
+
+    /// Remove one piece of scenery at a tile, if any. Returns whether it removed one.
+    ///
+    /// A piece is addressed by **any cell of the art the user can see**, the rule the goal's
+    /// flag already follows: a plain prop by its own cell, and a tree (`*_base`) by its trunk
+    /// or by either cell of the canopy drawn above it, because the leaves are the part of a
+    /// tree a person aims at. A cell holding a piece of its own wins over a canopy reaching
+    /// over it, so the eraser still takes what is under the pointer.
+    pub fn remove_scenery_at(&mut self, tx: i32, ty: i32) -> bool {
+        let exact = self.scenery.iter().rposition(|s| s.x == tx && s.y == ty);
+        let index =
+            exact.or_else(|| self.scenery.iter().rposition(|s| scenery_reaches(s, tx, ty)));
+        match index {
+            Some(index) => {
+                self.scenery.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Is this document one the loader would accept?
@@ -659,6 +1010,12 @@ impl Level {
         if self.goals.is_empty() {
             return Err("level has no goal (place a goal entity or drop a 'G' tile)".into());
         }
+        if self.goals.len() > 1 {
+            return Err(format!(
+                "level has {} goals: a level has exactly one flag",
+                self.goals.len()
+            ));
+        }
         if !(self.spawn.x.is_finite() && self.spawn.y.is_finite()) {
             return Err("spawn position is not finite".into());
         }
@@ -676,6 +1033,17 @@ impl Level {
                 }
             }
         }
+        for s in &self.scenery {
+            if s.sprite.trim().is_empty() {
+                return Err("a scenery entity has no sprite name".into());
+            }
+            if tx_out(s.x, s.y, self.width, self.height) {
+                return Err(format!(
+                    "scenery {:?} at tile ({}, {}) is outside the grid",
+                    s.sprite, s.x, s.y
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -685,12 +1053,14 @@ impl Level {
     /// produces must be a file this crate can load.
     pub fn to_json_pretty(&self) -> Result<String, String> {
         self.validate()?;
-        let mut entities: Vec<RawEntity> = Vec::with_capacity(self.walkers.len() + self.goals.len());
+        let mut entities: Vec<RawEntity> =
+            Vec::with_capacity(self.walkers.len() + self.goals.len() + self.scenery.len());
         for (tx, ty) in self.walker_tiles() {
             entities.push(RawEntity {
                 kind: "walker".into(),
                 x: tx,
                 y: ty,
+                sprite: None,
             });
         }
         for (tx, ty) in self.goal_tiles() {
@@ -698,6 +1068,15 @@ impl Level {
                 kind: "goal".into(),
                 x: tx,
                 y: ty,
+                sprite: None,
+            });
+        }
+        for s in &self.scenery {
+            entities.push(RawEntity {
+                kind: "scenery".into(),
+                x: s.x,
+                y: s.y,
+                sprite: Some(s.sprite.clone()),
             });
         }
         let (sx, sy) = self.spawn_tile();
@@ -727,6 +1106,37 @@ impl Level {
     }
 }
 
+/// How many cells above its trunk a `*_base` tree grows, and therefore how far a click on
+/// its leaves is from the entity that holds it.
+///
+/// Two, and not a view constant: it is the number [`Level::scenery_placeable`] already makes
+/// a tree prove clear before it will plant one, so the cells the art occupies and the cells
+/// the rule reserves are the same two cells by construction.
+const TREE_CANOPY_CELLS: i32 = 2;
+
+/// Whether a scenery piece's art reaches tile `(tx, ty)`: its own cell, plus the canopy above
+/// it when it is a tree.
+fn scenery_reaches(s: &Scenery, tx: i32, ty: i32) -> bool {
+    let up = if s.sprite.ends_with("_base") {
+        TREE_CANOPY_CELLS
+    } else {
+        0
+    };
+    s.x == tx && (s.y - up..=s.y).contains(&ty)
+}
+
+/// The tile a goal entity is anchored at: the cell its pole's base stands on.
+fn goal_anchor(g: &Rect) -> (i32, i32) {
+    (tile_of_x(g.x, g.w), tile_of_bottom(g.bottom()))
+}
+
+/// Whether a goal's two-cell marker covers `(tx, ty)`: the pole's base cell, or the cell the
+/// flag hangs in directly above it.
+fn goal_marker_covers(g: &Rect, tx: i32, ty: i32) -> bool {
+    let (ax, ay) = goal_anchor(g);
+    (tx, ty) == (ax, ay) || (tx, ty) == (ax, ay - 1)
+}
+
 /// Tile column containing the left edge of a body placed by the loader.
 fn tile_of_x(rect_x: f32, w: f32) -> i32 {
     (rect_x - (1.0 - w) * 0.5).round() as i32
@@ -750,13 +1160,16 @@ fn goal_rect(tx: i32, ty: i32) -> Rect {
 mod editing_tests {
     use super::*;
 
-    const PACK: [&str; 6] = [
+    const PACK: [&str; 9] = [
         "l1-flat-run",
         "l2-first-gap",
         "l3-gauntlet",
         "l4-rhythm",
         "l5-tightrope",
         "l6-marathon",
+        "l7-ascent",
+        "l7-wall-school",
+        "l8-long-jump",
     ];
 
     fn shipped(slug: &str) -> Level {
@@ -829,6 +1242,49 @@ mod editing_tests {
         assert_eq!(back.spawn_tile(), level.spawn_tile());
     }
 
+    /// Placed scenery round-trips through the writer, stays inside the grid, and does not
+    /// change the level's identity.
+    ///
+    /// Scenery is deliberately *out* of the content hash — it is inert, so decorating a
+    /// level must not invalidate a champion trained on it — which makes this test the one
+    /// that holds the file format for it.
+    #[test]
+    fn scenery_round_trips_stays_inside_the_grid_and_is_not_hashed() {
+        let mut level = Level::starter("scenery", 20, 10);
+        let bare = Level::starter("scenery", 20, 10);
+        assert!(level.add_scenery("bush_c", 4, 7));
+        assert!(level.add_scenery("tree_a_base", 10, 7));
+        assert_eq!(level.scenery_at(4, 7), Some("bush_c"));
+        assert_eq!(
+            level.content_hash(),
+            bare.content_hash(),
+            "decoration must not change the level's identity"
+        );
+
+        // Refusals: a duplicate, a solid cell, a tree with no room above it, off-grid.
+        assert!(!level.add_scenery("bush_c", 4, 7), "a duplicate is refused");
+        assert!(!level.add_scenery("bush_c", 4, 9), "that cell is solid floor");
+        level.set_tile(3, 5, Tile::Solid);
+        assert!(!level.add_scenery("tree_b_base", 3, 7), "no room for a tree");
+        assert!(!level.add_scenery("bush_c", -1, 7), "off the grid");
+
+        let json = level.to_json_pretty().expect("a decorated level is writable");
+        let back = Level::from_json_str(&json).expect("and it loads back");
+        assert_eq!(back.scenery(), level.scenery());
+        assert_eq!(back.content_hash(), level.content_hash());
+
+        // The eraser removes one sprite from a cell, then reports there is nothing left.
+        assert!(level.remove_scenery_at(4, 7));
+        assert_eq!(level.scenery_at(4, 7), None);
+        assert!(!level.remove_scenery_at(4, 7), "nothing left to remove");
+
+        // A shrinking grid drops the scenery outside it, and says so.
+        let report = level.resize(6, 8, Tile::Empty);
+        assert_eq!(report.dropped_scenery, 1);
+        assert!(report.dropped_anything());
+        assert!(level.validate().is_ok());
+    }
+
     #[test]
     fn moving_the_spawn_moves_the_player() {
         let mut level = Level::starter("spawn", 20, 10);
@@ -898,19 +1354,137 @@ mod editing_tests {
         assert_eq!(level.get(-1, 5), Tile::Solid);
     }
 
+    /// The flag a new level starts with is the user's to delete — and there is only ever one.
+    ///
+    /// The rule this replaces was the wrong way round on both counts: the document refused to
+    /// remove its last goal, so the flag `Level::starter` plants on a fresh level could not be
+    /// got rid of, and it accepted a second flag beside it without complaint.
     #[test]
-    fn remove_refuses_to_delete_the_last_goal() {
+    fn the_goal_can_be_erased_away_and_there_is_never_more_than_one() {
         let mut level = Level::starter("one-goal", 20, 10);
-        assert!(!level.remove_goal_at(18, 8), "the last goal is the document");
         assert_eq!(level.goals.len(), 1);
+
+        assert!(level.remove_goal_at(18, 8), "the starter's own flag comes off");
+        assert!(level.goals.is_empty());
+        assert!(!level.remove_goal_at(18, 8), "already gone");
+
+        // A document with no flag cannot be saved, and says why. That is the guard rail;
+        // the flag itself is not locked.
+        let err = level.validate().expect_err("no flag, no valid level");
+        assert!(err.contains("no goal"), "{err}");
+        assert!(level.to_json_pretty().is_err());
+
+        // Placing one anywhere puts it right again.
+        assert!(level.set_goal_tile(2, 8));
+        assert_eq!(level.goal_tiles(), vec![(2, 8)]);
+        assert_eq!(level.goals.len(), 1, "and there is still only one");
+        assert!(level.validate().is_ok());
+        assert!(!level.remove_goal_at(19, 19), "nothing there to remove");
+    }
+
+    /// **A level has one flag**: placing a goal *moves* the one that is there, the way
+    /// placing the spawn moves the spawn.
+    ///
+    /// What is left refused is the marker the user can see: the goal answers for both of its
+    /// cells, so a click on its own pole or cloth does not shove the marker one cell up the
+    /// screen, and the cell one row below the pole is refused because *its* flag would hang in
+    /// that pole.
+    #[test]
+    fn placing_a_goal_moves_the_one_that_is_already_there() {
+        let mut level = Level::starter("one-goal", 20, 10);
+        assert_eq!(level.goal_tiles(), vec![(18, 8)]);
+
+        assert!(level.set_goal_tile(10, 6));
+        assert_eq!(level.goal_tiles(), vec![(10, 6)], "the flag moved");
+        assert_eq!(level.goals.len(), 1, "and it did not multiply");
+        assert!(!level.goal_covers(18, 8), "nothing was left behind");
         assert!(level.validate().is_ok());
 
-        // With two, both can go in either order and the level stays valid.
-        assert!(level.add_goal_tile(2, 8));
-        assert!(level.remove_goal_at(18, 8));
-        assert_eq!(level.goal_tiles(), vec![(2, 8)]);
-        assert!(!level.remove_goal_at(2, 8));
-        assert!(level.remove_goal_at(19, 19).eq(&false), "nothing there to remove");
+        assert!(!level.set_goal_tile(10, 6), "the pole's own cell");
+        assert!(!level.set_goal_tile(10, 5), "the cell its cloth hangs in");
+        assert!(
+            !level.set_goal_tile(10, 7),
+            "the cell whose flag would hang in its pole"
+        );
+        assert_eq!(level.goal_tiles(), vec![(10, 6)], "all three left it alone");
+
+        // Two cells up is a marker of its own: the cloth is one cell tall, so the cell
+        // *above* the flag is free again.
+        assert!(
+            level.set_goal_tile(10, 4),
+            "the cell above the flag is open air"
+        );
+        assert_eq!(level.goal_tiles(), vec![(10, 4)]);
+
+        // Off the map refuses the *move*: the flag stays where it was rather than being
+        // dropped over the edge.
+        assert!(!level.set_goal_tile(-1, 4), "off the map");
+        assert!(!level.set_goal_tile(20, 4), "past the right edge");
+        assert_eq!(level.goal_tiles(), vec![(10, 4)], "the flag stayed put");
+
+        // The preview and the write agree, which is what keeps the ghost honest.
+        assert!(level.goal_placeable(14, 8));
+        assert!(!level.goal_placeable(10, 4));
+        assert!(!level.goal_placeable(10, 3));
+        assert!(!level.goal_placeable(20, 8));
+    }
+
+    /// A goal answers to both cells of its two-tile marker.
+    ///
+    /// This is the bug a user found by hand: the flag is what you aim at, the flag is drawn
+    /// one cell *above* the goal's own tile, and an eraser that only knew the tile below it
+    /// reported "nothing here" for the most obvious click in the editor.
+    #[test]
+    fn a_goal_is_addressed_by_its_flag_as_well_as_its_pole() {
+        let mut level = Level::starter("flag-cell", 20, 10);
+        // The starter's goal is anchored at (18, 8) with its cloth in (18, 7).
+        assert!(level.goal_covers(18, 8), "the pole's base cell");
+        assert!(level.goal_covers(18, 7), "the cell the flag is drawn in");
+        assert!(!level.goal_covers(18, 6), "one cell above the flag is open air");
+        assert!(!level.goal_covers(17, 7), "one column left is open air");
+
+        // Erased by its cloth — the only part of the marker with any colour in it.
+        assert!(level.remove_goal_at(18, 7), "erased by the flag, not the pole");
+        assert!(level.goals.is_empty());
+
+        // And by the pole's own cell, once the flag is back where it was.
+        assert!(level.set_goal_tile(18, 8));
+        assert!(level.remove_goal_at(18, 8), "and by the pole itself");
+        assert!(level.goals.is_empty());
+    }
+
+    /// A tree is addressed by its canopy as well as its trunk — the same rule the goal's flag
+    /// follows, for the same reason: the leaves are the part of a tree a person clicks.
+    #[test]
+    fn a_tree_is_erased_by_its_canopy_as_well_as_its_trunk() {
+        let mut level = Level::starter("canopy", 20, 10);
+        assert!(level.add_scenery("tree_a_base", 12, 7));
+        assert!(level.remove_scenery_at(12, 6), "the lower canopy cell");
+        assert_eq!(level.scenery_at(12, 7), None);
+
+        assert!(level.add_scenery("tree_b_base", 12, 7));
+        assert!(level.remove_scenery_at(12, 5), "the upper canopy cell");
+        assert_eq!(level.scenery_at(12, 7), None);
+
+        // A bush is one cell, and the air above it is not the bush.
+        assert!(level.add_scenery("bush_c", 12, 7));
+        assert!(!level.remove_scenery_at(12, 6), "air above a bush is open air");
+        assert_eq!(level.scenery_at(12, 7), Some("bush_c"));
+        assert!(level.remove_scenery_at(12, 7));
+
+        // A cell holding a piece of its own takes the pointer's target first, even when a
+        // tree's canopy reaches over it: one click, the thing under the cursor.
+        assert!(level.add_scenery("tree_a_base", 12, 7));
+        assert!(level.add_scenery("bush_c", 12, 6), "in the tree's canopy cell");
+        assert!(level.remove_scenery_at(12, 6));
+        assert_eq!(level.scenery_at(12, 6), None, "the bush under the pointer");
+        assert_eq!(
+            level.scenery_at(12, 7),
+            Some("tree_a_base"),
+            "the tree it was standing in front of survives one click"
+        );
+        assert!(level.remove_scenery_at(12, 6), "the second click takes the tree");
+        assert_eq!(level.scenery_at(12, 7), None);
     }
 
     #[test]
@@ -963,15 +1537,15 @@ mod editing_tests {
     fn resize_to_a_smaller_grid_clamps_the_spawn_and_drops_dead_entities() {
         let mut level = Level::starter("shrink", 40, 12);
         level.add_walker_tile(35, 10);
-        level.add_goal_tile(30, 10);
-        assert_eq!(level.goal_tiles(), vec![(38, 10), (30, 10)]);
+        // The flag moves where it is wanted — the same call the editor's goal brush makes.
+        assert!(level.set_goal_tile(30, 10));
+        assert_eq!(level.goal_tiles(), vec![(30, 10)]);
 
         let report = level.resize(10, 8, Tile::Empty);
-        // Both entities were past column 10, so the walker goes and one of the two
-        // goals does: the last one is never sacrificed, it is pulled back in.
+        // Both entities were past column 10, so the walker goes. The goal is the one thing a
+        // resize may not drop, whatever the new grid does to it.
         assert_eq!(report.dropped_walkers, 1, "the walker was at column 35");
-        assert_eq!(report.dropped_goals, 1, "the second goal was at column 30");
-        assert!(report.goal_moved);
+        assert!(report.goal_moved, "the goal was at column 30");
         assert!(report.dropped_anything());
         assert_eq!(level.walker_tiles(), Vec::<(i32, i32)>::new());
         assert_eq!(level.goal_tiles(), vec![(9, 7)], "clamped to the grid edge");
@@ -986,6 +1560,13 @@ mod editing_tests {
         level.goals.clear();
         let err = level.to_json_pretty().expect_err("no goal, no file");
         assert!(err.contains("no goal"), "{err}");
+
+        // Two flags: a level has exactly one, and pushing a second one into the field
+        // directly is caught at write time rather than written out.
+        let mut level = Level::starter("invalid", 20, 10);
+        level.goals.push(goal_rect(4, 8));
+        let err = level.to_json_pretty().expect_err("two goals, no file");
+        assert!(err.contains("exactly one flag"), "{err}");
 
         // A spawn dragged outside the grid is refused rather than written out.
         let mut level = Level::starter("invalid", 20, 10);

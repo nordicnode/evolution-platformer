@@ -8,8 +8,43 @@ members = [
     "crates/app",
 ]
 
+# 0.2.0: the movement work. The sim gained sprint, wall jumps and edge-triggered
+# jumping, the action set grew to nine and the sensors to 93 inputs, so the version
+# trio moved together and every pre-0.2.0 champion is refused rather than replayed
+# against physics it was not trained on (sim::SIM_VERSION is this value).
+#
+# 0.3.0: the jump ladder. `min_jump_hold` shrank from two decision blocks to one, so a
+# jump released at the first opportunity is genuinely shorter than one held for two —
+# before this the agent's first release decision was silently discarded and every jump
+# was at least two blocks long. Fitness moved to v3 in the same step (the survival term
+# removed, the death penalty resized); see `evo::fitness`. Both are changes a 0.2.0
+# champion cannot survive being replayed against, so the version trio moves again.
+#
+# 0.4.0: checkpoints. The sim now counts the safe landing zones the body has *stood on*
+# past a hazard or a hole (a new `EpisodeStats` field, and part of `state_hash`), and
+# fitness v4 pays for them; see `evo::fitness::CHECKPOINT_BONUS`. Nothing about the
+# physics moved, but the state a champion is replayed against did, so the trio moves.
+#
+# 0.5.0: the objective has no preferred direction. `progress_pixels` used to be "new
+# rightmost x", which quietly defined the game as a left-to-right side-scroller and made
+# a tower unwinnable (walking along the floor out-scored climbing, and the anti-camper
+# rule killed a body that was steadily going up). It is now distance closed on the flag,
+# the frame cap is set by the *longer* side of the level, and the goal sensor is a
+# two-axis vector instead of a horizontal sign. All three are visible to an agent, so
+# sensors v3, fitness v5 and sim 0.5.0 move together.
+#
+# 0.6.0: leftward is a first-class direction. The action table had no leftward sprint —
+# the fast gear existed only on the rightward pair — so `shift` + left was a plain
+# retreat, and the reachability oracle, which could not express the move either, called the
+# *mirror of `l8-long-jump`* unbeatable. `RetreatSprint` and `RetreatSprintJump` are
+# appended (indices 9 and 10, so no earlier index changes meaning) and the oracle now picks
+# its action by direction as well as by speed. The observation's single directional gap
+# probe went the same way: `gap_ahead` followed `sign(vx)` — "right" for a body at rest —
+# and is now `gap_right` + `gap_left` (sensors v4). Nothing about the physics constants or
+# the reward moved, but the action set and the observation did, so the trio moves and every
+# earlier champion is refused.
 [workspace.package]
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"

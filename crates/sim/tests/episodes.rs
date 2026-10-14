@@ -69,7 +69,43 @@ fn golden_state_hash_after_ten_thousand_frames() {
     // Recorded on x86-64 with rustc 1.98, no fast-math. The sim uses no libm
     // transcendentals, so this is stable across native builds on one target; it
     // is *not* promised to match a wasm32 build (§5.2 accepts that).
-    const GOLDEN_LONG_RUNWAY_HASH: u64 = 1_466_572_030_440_511;
+    //
+    // Re-recorded for 0.5.0, deliberately: progress stopped being "new rightmost x" and
+    // became "distance closed on the flag", so both the running minimum and this hash moved
+    // (the body leaves the start pointing at a flag it never quite reaches on this runway).
+    // The lesson the note below describes has now happened three times: this pin covers
+    // *rightward progress*, so a change to how progress is measured is exactly the kind of
+    // change it does catch, while a change to how the body moves (finding 47's air brake)
+    // can pass through it untouched.
+    //
+    // Re-recorded for 0.4.0 before that, deliberately: the state now carries the checkpoint
+    // zones the
+    // body has stood on, and `state_hash` folds both the count and the zone ids in, so this
+    // number moves even where no zone was ever credited. A `EpisodeStats` field is part of
+    // the state a champion is replayed against, so it is a version bump like any other.
+    //
+    // Re-recorded for 0.3.0 before that: `min_jump_hold` fell from two decision blocks to
+    // one, so the shortest jump in the game got shorter and every trajectory that used it
+    // changed. The value is not the point — the pairing is: SIM_VERSION moves in the same
+    // commit. That is the contract this constant exists to enforce, a physical change is a
+    // version bump and never a silent drift.
+    //
+    // Note the *shape* of that sentence, because it has now happened twice: two of the last
+    // three behaviour changes did **not** move this number. `brake` coming alive in the air
+    // (finding 47) and the checkpoint term do not appear here, because
+    // `common::forward_actions` only ever emits run, run_jump and jump_in_place on a
+    // hazard-free runway — the canonical episode never presses brake and never crosses
+    // anything. That is a real gap in what this pin covers rather than a reason to distrust
+    // it, and each is covered instead by a test that drives it directly
+    // (`braking_in_the_air_is_what_makes_a_short_hop_expressible` and the checkpoint tests
+    // in `tests/physics.rs`). Widening the action mix and adding a hazard to this fixture
+    // would both make the episode stop making monotone progress past the anti-camper rule,
+    // which is why the forward-only sequence on open ground is what it is.
+    //
+    // Re-recorded for 0.2.0 before that, for a longer list: jumps became edge-triggered,
+    // the speed cap became state (sprint), and the wall slide and wall memory joined the
+    // body.
+    const GOLDEN_LONG_RUNWAY_HASH: u64 = 16_244_207_928_716_265_123;
 
     let level = common::long_runway();
     let mut sim = sim::Sim::new(&level, SEED);

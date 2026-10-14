@@ -4,16 +4,52 @@
 //! budget is spent. Deliberately uses the **real** [`PlayerState::tick`] stepper
 //! and the real collision query, so the oracle can never disagree with the sim
 //! about how far a jump goes: it only disagrees about whether some *particular*
-//! jump is expressible in the six-action space, which is exactly the question.
+//! move is expressible in the action space, which is exactly the question.
 //!
 //! Live in `sim` rather than in the editor because it needs the physics bible and
 //! the tile grid; the editor is just the first consumer.
+//!
+//! **Every move the game has is modelled here, or the oracle lies.** Sprint and wall
+//! jumps are the two that forced this module to grow: a sprint changes how far a jump
+//! goes *and* what runway it costs, and a wall climb is a rhythm rather than a jump, so
+//! neither can be folded into the other's arithmetic. The reward for modelling them
+//! properly is [`ReachOptions`]: the same report can be asked for with an ability
+//! switched off, which turns "this level needs wall jumps" from a claim into a test.
 
 use crate::level::{Level, Rect};
 use crate::physics::{AgentAction, Physics, PlayerState, PHYSICS};
 
 /// How long a single canonical jump trajectory may run.
 pub const MAX_TRAJECTORY_TICKS: u32 = 240;
+
+/// How long a canonical wall climb may run: ten seconds of wall time.
+///
+/// A climb is a *rhythm*, not a jump, so it needs a budget rather than a duration: at
+/// roughly 2.4 tiles gained per 22-tick cycle it covers a 15-tile level's height in about
+/// 150 ticks, and the cap is four times that so a tall shaft is not called unclimbable
+/// because the oracle gave up early.
+pub const MAX_CLIMB_TICKS: u32 = 600;
+
+/// Which abilities the oracle is allowed to use.
+///
+/// Both are on by default: the question the oracle answers is "can the game be beaten",
+/// and the game has sprint and wall jumps. Turning one off is how a level is checked for
+/// *needing* it — a wall level should be unreachable without [`Self::wall_climb`], and
+/// that claim is worth a test rather than a comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReachOptions {
+    pub sprint: bool,
+    pub wall_climb: bool,
+}
+
+impl Default for ReachOptions {
+    fn default() -> Self {
+        ReachOptions {
+            sprint: true,
+            wall_climb: true,
+        }
+    }
+}
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -116,6 +152,109 @@ impl TakeoffDir {
     }
 }
 
+/// How fast a canonical trajectory is moving when it leaves the ground.
+///
+/// Speed is modelled as a **cost**, not a constant. A body cannot be sprinting just
+/// because sprinting would clear the gap: it needs
+/// [`Physics::runway_to_speed`] tiles of platform behind it, and
+/// [`LaunchSpeed::achievable`] is that relation. Getting this wrong in the generous
+/// direction is the expensive mistake — a level declared beatable by a sprint that has
+/// nowhere to build up is a level the player, and the population, cannot beat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchSpeed {
+    /// Standing start (a neutral jump).
+    Rest,
+    /// Full run speed, [`Physics::run_speed`].
+    Run,
+    /// Full sprint speed, [`Physics::sprint_speed`].
+    Sprint,
+}
+
+impl LaunchSpeed {
+    /// The two speeds that need `input_x` and a runway.
+    pub const MOVING: [LaunchSpeed; 2] = [LaunchSpeed::Run, LaunchSpeed::Sprint];
+
+    pub fn speed(self, ph: &Physics) -> f32 {
+        match self {
+            LaunchSpeed::Rest => 0.0,
+            LaunchSpeed::Run => ph.run_speed,
+            LaunchSpeed::Sprint => ph.sprint_speed,
+        }
+    }
+
+    /// Runway needed to reach this speed from rest, in tiles.
+    pub fn runway_tiles(self, ph: &Physics) -> f32 {
+        ph.runway_to_speed(self.speed(ph))
+    }
+
+    /// The speed actually available after accelerating across `runway` tiles:
+    /// `min(speed, sqrt(2·a·runway))`. With one tile of runway this gives a run speed of
+    /// 0.1414, which is why every level the oracle passed before still passes: the old
+    /// rule (`any runway at all means full run speed`) was the *pessimistic* end of this
+    /// relation for a run and the optimistic one for nothing at all.
+    pub fn achievable(self, ph: &Physics, runway: f32) -> f32 {
+        let reachable = (2.0 * ph.run_accel * runway.max(0.0)).sqrt();
+        reachable.min(self.speed(ph))
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LaunchSpeed::Rest => "standing",
+            LaunchSpeed::Run => "running",
+            LaunchSpeed::Sprint => "sprinting",
+        }
+    }
+
+    /// Whether a trajectory launched at this speed has to *keep asking* for it.
+    ///
+    /// The speed cap decays toward `run_speed` whenever the action stops requesting a
+    /// sprint, so a jump launched at sprint speed with `run_jump` held is a sprint for ten
+    /// ticks and then a run — the canonical trajectory has to hold the sprinting arm *of
+    /// its own direction* (`sprint_jump` to the right, `retreat_sprint_jump` to the left)
+    /// or it is not modelling the move it claims to.
+    pub fn wants_sprint(self) -> bool {
+        matches!(self, LaunchSpeed::Sprint)
+    }
+}
+
+/// A canonical take-off: which way, how hard the jump button is held, which speed was
+/// asked for, and how much of it the runway behind the take-off actually allows.
+///
+/// Kept as one value rather than as loose parameters because the four have to agree: a
+/// sprint launch that does not hold the sprint action is a run with a faster first few
+/// ticks, and a jump that claims a speed the platform cannot build is a level the oracle
+/// would call beatable for the wrong reason.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Takeoff {
+    pub dir: TakeoffDir,
+    pub hold: JumpHold,
+    pub speed: LaunchSpeed,
+    /// Horizontal velocity the body carries into the jump, after runway.
+    pub launch_vx: f32,
+}
+
+impl Takeoff {
+    /// A take-off that is allowed the full nominal speed for `speed`.
+    pub fn full(dir: TakeoffDir, hold: JumpHold, speed: LaunchSpeed, ph: &Physics) -> Takeoff {
+        Takeoff {
+            dir,
+            hold,
+            speed,
+            launch_vx: dir.sign() * speed.speed(ph),
+        }
+    }
+
+    /// A take-off from a platform that offers `runway` tiles behind it.
+    pub fn with_runway(dir: TakeoffDir, hold: JumpHold, speed: LaunchSpeed, runway: f32, ph: &Physics) -> Takeoff {
+        Takeoff {
+            dir,
+            hold,
+            speed,
+            launch_vx: dir.sign() * speed.achievable(ph, runway),
+        }
+    }
+}
+
 /// The outcome of one canonical jump.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Trajectory {
@@ -137,6 +276,8 @@ pub struct CulpritJump {
     pub takeoff_offset: f32,
     pub dir: TakeoffDir,
     pub hold: JumpHold,
+    /// The speed the jump was launched with (and asked for).
+    pub speed: LaunchSpeed,
     /// Aimed-at platform, when one exists to the goal-ward side.
     pub to: Option<usize>,
 }
@@ -207,32 +348,54 @@ fn platform_at(platforms: &[Platform], surface_row: i32, col: i32) -> Option<usi
 }
 
 /// The action a canonical trajectory issues on tick `t`.
-fn trajectory_action(dir: TakeoffDir, hold: JumpHold, hovering: bool, t: u32, ph: &Physics) -> AgentAction {
-    let holding_jump = match hold {
+///
+/// **Both axes matter.** This used to choose by speed alone — `sprint_jump` for anything
+/// launched at sprint speed, whatever direction it was launched in — which was correct
+/// only while a sprint existed in one direction. On a leftward take-off it launched the
+/// body at `-sprint_speed` and then held an action whose horizontal input is `+1`: the
+/// model decelerated the very move it was testing, and a level whose sprint gap is on the
+/// left was reported unbeatable while the sim, being asked for a move it did not have
+/// either, agreed. See `AgentAction` for the gear that fixed both halves.
+fn trajectory_action(takeoff: &Takeoff, hovering: bool, t: u32, ph: &Physics) -> AgentAction {
+    let holding_jump = match takeoff.hold {
         JumpHold::None => false,
         // "Held through the ascent" is expressed as `hovering`, which the stepper
         // clears once vertical velocity turns non-negative.
         JumpHold::Full => hovering,
         JumpHold::Short => t < ph.min_jump_hold,
     };
-    match dir {
-        // The action set has no "jump left": a leftward jump is a neutral jump
-        // that carries its pre-jump momentum, plus air acceleration afterwards.
-        TakeoffDir::Left => {
+    match (takeoff.dir, takeoff.speed.wants_sprint()) {
+        (TakeoffDir::Right, true) => {
             if holding_jump {
-                AgentAction::JumpInPlace
+                AgentAction::SprintJump
             } else {
-                AgentAction::Retreat
+                AgentAction::Sprint
             }
         }
-        TakeoffDir::Still => {
+        (TakeoffDir::Left, true) => {
+            if holding_jump {
+                AgentAction::RetreatSprintJump
+            } else {
+                AgentAction::RetreatSprint
+            }
+        }
+        // A still take-off carries no horizontal speed (`dir.sign()` is 0), so there is no
+        // gear to ask for: the neutral arms are the honest reading of "launched at rest".
+        (TakeoffDir::Still, _) => {
             if holding_jump {
                 AgentAction::JumpInPlace
             } else {
                 AgentAction::Walk
             }
         }
-        TakeoffDir::Right => {
+        (TakeoffDir::Left, false) => {
+            if holding_jump {
+                AgentAction::RetreatJump
+            } else {
+                AgentAction::Retreat
+            }
+        }
+        (TakeoffDir::Right, false) => {
             if holding_jump {
                 AgentAction::RunJump
             } else {
@@ -242,11 +405,15 @@ fn trajectory_action(dir: TakeoffDir, hold: JumpHold, hovering: bool, t: u32, ph
     }
 }
 
-/// Simulate one canonical jump with the real physics stepper (§9.3).
+/// Simulate one canonical jump with the real physics stepper (§9.3), at the **full
+/// nominal** speed for `speed`.
+///
+/// This is the form tests and explanations use ("can a running jump clear this?"). The
+/// graph builder uses [`simulate_jump_at`] with [`LaunchSpeed::achievable`] instead,
+/// because whether the body *has* the runway is the level's business, not the jump's.
 ///
 /// * `takeoff_x` — tile column to launch from.
 /// * `surface_row` — tile row the body stands on.
-/// * `run_up` — whether the body may carry full run speed into the take-off.
 pub fn simulate_jump(
     level: &Level,
     platforms: &[Platform],
@@ -254,29 +421,26 @@ pub fn simulate_jump(
     surface_row: i32,
     dir: TakeoffDir,
     hold: JumpHold,
-    run_up: bool,
+    speed: LaunchSpeed,
 ) -> Trajectory {
     simulate_jump_at(
         level,
         platforms,
         takeoff_x as f32 + (1.0 - PHYSICS.player_w) * 0.5,
         surface_row,
-        dir,
-        hold,
-        run_up,
+        &Takeoff::full(dir, hold, speed, &PHYSICS),
     )
 }
 
-/// As [`simulate_jump`], but with the body's left edge placed at an exact x, so
-/// callers can sweep the sub-tile positions [`TAKEOFF_OFFSETS`] covers.
+/// As [`simulate_jump`], but with the body's left edge placed at an exact x and the exact
+/// horizontal speed it carries into the take-off, so callers can sweep both the sub-tile
+/// positions [`TAKEOFF_OFFSETS`] covers and the runway-dependent launch speeds.
 pub fn simulate_jump_at(
     level: &Level,
     platforms: &[Platform],
     takeoff_x: f32,
     surface_row: i32,
-    dir: TakeoffDir,
-    hold: JumpHold,
-    run_up: bool,
+    takeoff: &Takeoff,
 ) -> Trajectory {
     let ph = &PHYSICS;
     let mut player = PlayerState::spawn(level, ph);
@@ -284,19 +448,23 @@ pub fn simulate_jump_at(
     player.h = ph.player_h;
     player.x = takeoff_x;
     player.y = surface_row as f32 - ph.player_h;
-    player.vx = if run_up { dir.sign() * ph.run_speed } else { 0.0 };
+    player.vx = takeoff.launch_vx;
+    // The cap has to come along with the speed: a body launched at sprint speed with a
+    // running cap would have its launch clamped away on the very first tick, and the
+    // oracle would report the sprint jump as a running one.
+    player.set_speed_cap(takeoff.launch_vx.abs().max(ph.run_speed));
     player.vy = 0.0;
     // The body is authored standing on `surface_row`, which is by construction a
     // surface tile, so a jump is legal on tick zero.
     player.grounded = true;
 
-    let mut hover = hold != JumpHold::None;
+    let mut hover = takeoff.hold != JumpHold::None;
     // A "landing" only counts once the body has actually left the ground, so
     // walking off an edge is not misreported as landing on the take-off platform
     // during the ticks it takes to clear the edge.
     let mut airborne = false;
     for t in 0..MAX_TRAJECTORY_TICKS {
-        let action = trajectory_action(dir, hold, hover, t, ph);
+        let action = trajectory_action(takeoff, hover, t, ph);
         let contact = player.tick(level, ph, action);
         if player.vy >= 0.0 {
             hover = false;
@@ -304,46 +472,13 @@ pub fn simulate_jump_at(
         if !player.grounded {
             airborne = true;
         }
-        if contact.touched_spike {
-            return Trajectory {
-                landed_on: None,
-                touched_goal: false,
-                hit_spike: true,
-                fell_out: false,
-                ticks: t + 1,
-            };
-        }
-        if level.goals.iter().any(|g| player.aabb().overlaps(g)) {
-            return Trajectory {
-                landed_on: None,
-                touched_goal: true,
-                hit_spike: false,
-                fell_out: false,
-                ticks: t + 1,
-            };
-        }
-        if player.y > level.height as f32 {
-            return Trajectory {
-                landed_on: None,
-                touched_goal: false,
-                hit_spike: false,
-                fell_out: true,
-                ticks: t + 1,
-            };
+        if let Some(end) = trajectory_terminal(level, &player, &contact, t + 1) {
+            return end;
         }
         if contact.landed && airborne {
-            let row = (player.y + player.h).floor() as i32;
-            let col = (player.x + player.w * 0.5).floor() as i32;
-            let landed_on = platform_at(platforms, row, col);
             // Landing back on the take-off platform with no forward progress is
             // not an edge; it is reported as "landed here" and filtered by BFS.
-            return Trajectory {
-                landed_on,
-                touched_goal: false,
-                hit_spike: false,
-                fell_out: false,
-                ticks: t + 1,
-            };
+            return landed_trajectory(platforms, &player, t + 1);
         }
     }
     Trajectory {
@@ -355,74 +490,280 @@ pub fn simulate_jump_at(
     }
 }
 
-/// Every canonical jump out of `platform` (§9.3).
-fn edges_from(level: &Level, platforms: &[Platform], p: &Platform) -> Vec<(Trajectory, CulpritJump)> {
+/// The outcome of a body that has just touched down, after having been airborne.
+///
+/// The body lands as a *box*, not as a point. Asking which platform is under the body's
+/// centre says a body standing with its feet on the last column of a ledge is in mid-air —
+/// and that false negative is expensive in both directions: it hides the ledge a climb
+/// ends on, and it is the same edge-straddling case every precision jump out of a pit
+/// lands in. The rule is the sim's own (`PlayerState::spawn`): supported if *any* column
+/// the body spans is solid at the row below its feet.
+fn landed_trajectory(platforms: &[Platform], player: &PlayerState, ticks: u32) -> Trajectory {
+    let row = (player.y + player.h).floor() as i32;
+    let (c0, c1) = crate::physics::tile_span(player.x, player.w);
+    Trajectory {
+        landed_on: (c0..=c1).find_map(|c| platform_at(platforms, row, c)),
+        touched_goal: false,
+        hit_spike: false,
+        fell_out: false,
+        ticks,
+    }
+}
+
+/// The ways a trajectory can end other than by landing: hazard, flag, or the void.
+///
+/// Shared by the jump and the wall climb so the two cannot disagree about what stops a
+/// body — the one thing that would make the oracle's answer depend on *how* the body got
+/// somewhere rather than where it is.
+fn trajectory_terminal(
+    level: &Level,
+    player: &PlayerState,
+    contact: &crate::physics::TickContact,
+    ticks: u32,
+) -> Option<Trajectory> {
+    if contact.touched_spike {
+        return Some(Trajectory {
+            landed_on: None,
+            touched_goal: false,
+            hit_spike: true,
+            fell_out: false,
+            ticks,
+        });
+    }
+    if level.goals.iter().any(|g| player.aabb().overlaps(g)) {
+        return Some(Trajectory {
+            landed_on: None,
+            touched_goal: true,
+            hit_spike: false,
+            fell_out: false,
+            ticks,
+        });
+    }
+    if player.y > level.height as f32 {
+        return Some(Trajectory {
+            landed_on: None,
+            touched_goal: false,
+            hit_spike: false,
+            fell_out: true,
+            ticks,
+        });
+    }
+    None
+}
+
+/// Simulate a canonical **wall climb**: press into a wall, and jump every time the body is
+/// clinging to it.
+///
+/// This is the move wall jumps exist for, and the reason the oracle cannot answer "is the
+/// wall short enough" arithmetically: a climb is a *rhythm*, and whether it gains height
+/// depends on the away-push being recoverable inside the rise, on the wall's height, and on
+/// what is above it. Only the real stepper knows, so the climb is scripted exactly as the
+/// jump edges are scripted jumps — and because it is scripted out of real actions from a
+/// real standing position, any edge it reports is a move the game really has.
+///
+/// The script is deliberately minimal — one direction, held on a fixed period — because it
+/// has to stay explainable. A script clever enough to climb anything would be a policy, and
+/// the oracle would be answering a different question.
+///
+/// * `start_x` — the body's left edge, flush against the wall.
+/// * `surface_row` — the platform row it starts standing on.
+/// * `dir` — the side the wall is on: the direction the script presses.
+pub fn simulate_wall_climb(
+    level: &Level,
+    platforms: &[Platform],
+    start_x: f32,
+    surface_row: i32,
+    dir: TakeoffDir,
+) -> Trajectory {
+    let ph = &PHYSICS;
+    let (jump, press) = match dir {
+        TakeoffDir::Left => (AgentAction::RetreatJump, AgentAction::Retreat),
+        TakeoffDir::Right => (AgentAction::RunJump, AgentAction::Run),
+        TakeoffDir::Still => (AgentAction::JumpInPlace, AgentAction::Walk),
+    };
+    // Hold through the ascent, then release for two ticks. The pause is what makes every
+    // press a *fresh* one, which is what an edge-triggered jump needs, and it is short
+    // enough that the body has barely started sliding again when the next wall jump fires.
+    let hold = (ph.air_time_ticks() * 0.5).ceil() as u32;
+    let period = hold + 2;
+
+    let mut player = PlayerState::spawn(level, ph);
+    player.w = ph.player_w;
+    player.h = ph.player_h;
+    player.x = start_x;
+    player.y = surface_row as f32 - ph.player_h;
+    // The caller chose this spot because the platform is under it, so the body starts
+    // standing — exactly as `simulate_jump_at` does for a take-off.
+    player.grounded = true;
+
+    let mut airborne = false;
+    for t in 0..MAX_CLIMB_TICKS {
+        let action = if t % period < hold { jump } else { press };
+        let contact = player.tick(level, ph, action);
+        if !player.grounded {
+            airborne = true;
+        }
+        if let Some(end) = trajectory_terminal(level, &player, &contact, t + 1) {
+            return end;
+        }
+        if contact.landed && airborne {
+            return landed_trajectory(platforms, &player, t + 1);
+        }
+    }
+    Trajectory {
+        landed_on: None,
+        touched_goal: false,
+        hit_spike: false,
+        fell_out: false,
+        ticks: MAX_CLIMB_TICKS,
+    }
+}
+
+/// Runway, in tiles, available *behind* a take-off at `col` on platform `p`.
+///
+/// Behind, not beyond: the body is already moving when it reaches the ledge it launches
+/// from. Getting this backwards silently made every pit uncrossable, because the
+/// platform's outermost column — the only one you can clear a gap from — is exactly the
+/// column with no platform to its outside.
+fn runway_behind(p: &Platform, col: i32, dir: TakeoffDir) -> f32 {
+    match dir {
+        TakeoffDir::Right => (col - p.x0) as f32,
+        TakeoffDir::Left => (p.x1 - col) as f32,
+        TakeoffDir::Still => 0.0,
+    }
+}
+
+/// Where a canonical wall climb can start from `p`: either end, when a wall stands there.
+///
+/// A wall in the middle of a surface splits it into two platforms (`extract_platforms`
+/// treats the wall's own column as a surface of its own), so a wall beside a platform is
+/// always at one of its ends.
+fn wall_climb_starts(level: &Level, p: &Platform, ph: &Physics) -> Vec<(f32, TakeoffDir)> {
+    let mut out = Vec::new();
+    let r = p.surface_row;
+    // Right: the wall's column is the first one past the platform, and the body starts
+    // flush against its face.
+    if level.is_solid(p.x1 + 1, r - 1) {
+        out.push(((p.x1 + 1) as f32 - ph.player_w, TakeoffDir::Right));
+    }
+    // Left: the body's left edge is the platform's first column, so the wall's column is
+    // the one before it.
+    if level.is_solid(p.x0 - 1, r - 1) {
+        out.push((p.x0 as f32, TakeoffDir::Left));
+    }
+    out
+}
+
+/// Every canonical move out of `platform` (§9.3): jumps at every sub-tile take-off point
+/// and launch speed, walk-offs at the ends, and wall climbs at any end that has a wall.
+fn edges_from(
+    level: &Level,
+    platforms: &[Platform],
+    p: &Platform,
+    options: &ReachOptions,
+) -> Vec<(Trajectory, CulpritJump)> {
+    let ph = &PHYSICS;
     let mut out = Vec::new();
     let cols = p.x0..=p.x1;
     for col in cols {
       for &offset in &TAKEOFF_OFFSETS {
         let x = col as f32 + offset;
         for dir in TakeoffDir::ALL {
-            // A jump needs runway *behind* the take-off, not beyond it: the body
-            // is already at full speed when it reaches the ledge it launches from.
-            // One tile is enough (accel 0.01 for 10 ticks covers ~0.5 tiles).
-            // Getting this backwards silently made every pit uncrossable, because
-            // the platform's outermost column -- the only one you can clear a gap
-            // from -- is exactly the column with no platform to its outside.
-            let has_runway = match dir {
-                TakeoffDir::Right => col > p.x0,
-                TakeoffDir::Left => col < p.x1,
-                TakeoffDir::Still => true,
-            };
+            let runway = runway_behind(p, col, dir);
             let holds: &[JumpHold] = if dir == TakeoffDir::Still {
                 &[JumpHold::Short, JumpHold::Full]
             } else {
                 &JumpHold::JUMPING
             };
+            let speeds: &[LaunchSpeed] = if dir == TakeoffDir::Still {
+                &[LaunchSpeed::Rest]
+            } else if options.sprint {
+                &LaunchSpeed::MOVING
+            } else {
+                &[LaunchSpeed::Run]
+            };
             for hold in holds {
-                let traj = simulate_jump_at(level, platforms, x, p.surface_row, dir, *hold, has_runway);
-                out.push((traj, CulpritJump {
-                    from: p.id,
-                    takeoff_x: col,
-                    takeoff_offset: offset,
-                    dir,
-                    hold: *hold,
-                    to: traj.landed_on.filter(|q| *q != p.id),
-                }));
+                for speed in speeds {
+                    let takeoff = Takeoff::with_runway(dir, *hold, *speed, runway, ph);
+                    let traj = simulate_jump_at(level, platforms, x, p.surface_row, &takeoff);
+                    out.push((traj, CulpritJump {
+                        from: p.id,
+                        takeoff_x: col,
+                        takeoff_offset: offset,
+                        dir,
+                        hold: *hold,
+                        speed: *speed,
+                        to: traj.landed_on.filter(|q| *q != p.id),
+                    }));
+                }
             }
             // Walking off the edge, only from the ends.
             let at_edge = col == p.x0 || col == p.x1;
             if at_edge && dir != TakeoffDir::Still {
-                let traj = simulate_jump_at(level, platforms, x, p.surface_row, dir, JumpHold::None, has_runway);
+                let takeoff = Takeoff::with_runway(dir, JumpHold::None, LaunchSpeed::Run, runway, ph);
+                let traj = simulate_jump_at(level, platforms, x, p.surface_row, &takeoff);
                 out.push((traj, CulpritJump {
                     from: p.id,
                     takeoff_x: col,
                     takeoff_offset: offset,
                     dir,
                     hold: JumpHold::None,
+                    speed: LaunchSpeed::Run,
                     to: traj.landed_on.filter(|q| *q != p.id),
                 }));
             }
         }
       }
     }
+    if options.wall_climb {
+        for (start_x, dir) in wall_climb_starts(level, p, ph) {
+            let traj = simulate_wall_climb(level, platforms, start_x, p.surface_row, dir);
+            out.push((traj, CulpritJump {
+                from: p.id,
+                takeoff_x: start_x.floor() as i32,
+                takeoff_offset: start_x.fract(),
+                dir,
+                // A climb is a sequence of full-height wall jumps, which is what the
+                // report should say it was rather than naming a single hold.
+                hold: JumpHold::Full,
+                speed: LaunchSpeed::Run,
+                to: traj.landed_on.filter(|q| *q != p.id),
+            }));
+        }
+    }
     out
 }
 
 /// Run the oracle: platform graph + BFS from the spawn platform to the goal (§9.4).
+///
+/// Uses every ability the game has. [`report_with`] is the same question with abilities
+/// switched off, which is how a level is checked for *needing* one.
 pub fn report(level: &Level) -> ReachReport {
+    report_with(level, ReachOptions::default())
+}
+
+/// As [`report`], with the abilities under the caller's control.
+pub fn report_with(level: &Level, options: ReachOptions) -> ReachReport {
     let platforms = extract_platforms(level);
 
     let spawn_col = (level.spawn.x + level.spawn.w * 0.5).floor() as i32;
     let spawn_surface_row = (level.spawn.y + level.spawn.h).floor() as i32;
     let start = platform_at(&platforms, spawn_surface_row, spawn_col);
 
-    let goal_rect: Rect = level.goals[0];
-    let goal_col = (goal_rect.x + goal_rect.w * 0.5).floor() as i32;
-    let goal_platform = platforms
-        .iter()
-        .find(|p| p.contains_col(goal_col) && (p.surface_row as f32) >= goal_rect.y)
-        .map(|p| p.id);
+    // The goal, and the column it stands in — `None` for a document that has lost its flag
+    // ([`Level::remove_goal_at`] allows that while editing). The oracle is asked about a
+    // level every frame in the editor, so "there is a flag" has to be answered rather than
+    // assumed: indexing an empty goal list here would be a panic, not a verdict.
+    let goal: Option<(Rect, i32)> = level
+        .goals
+        .first()
+        .map(|g| (*g, (g.x + g.w * 0.5).floor() as i32));
+    let goal_platform = goal.and_then(|(g, col)| {
+        platforms
+            .iter()
+            .find(|p| p.contains_col(col) && (p.surface_row as f32) >= g.y)
+            .map(|p| p.id)
+    });
 
     let mut reached = vec![false; platforms.len()];
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); platforms.len()];
@@ -430,7 +771,7 @@ pub fn report(level: &Level) -> ReachReport {
     let mut all_edges: Vec<Vec<CulpritJump>> = vec![Vec::new(); platforms.len()];
 
     for p in &platforms {
-        for (traj, culprit) in edges_from(level, &platforms, p) {
+        for (traj, culprit) in edges_from(level, &platforms, p, &options) {
             all_edges[p.id].push(culprit);
             if traj.touched_goal {
                 touched_goal_from[p.id] = true;
@@ -453,8 +794,10 @@ pub fn report(level: &Level) -> ReachReport {
             if touched_goal_from[id] {
                 goal_reached = true;
             }
-            if Some(id) == goal_platform && platforms[id].contains_col(goal_col) {
-                goal_reached = true;
+            if let (Some((_, col)), Some(goal_platform)) = (goal, goal_platform) {
+                if id == goal_platform && platforms[id].contains_col(col) {
+                    goal_reached = true;
+                }
             }
             for &n in &adjacency[id] {
                 if !reached[n] {
@@ -468,7 +811,12 @@ pub fn report(level: &Level) -> ReachReport {
     let (culprit, diagnosis, frontier_x) = if goal_reached {
         (None, None, None)
     } else {
-        diagnose(&platforms, &reached, &all_edges, goal_col)
+        match goal {
+            Some((_, col)) => diagnose(&platforms, &reached, &all_edges, col, &options),
+            // Nothing to reach *because there is no flag* — the honest reason, and not one to
+            // dress up as a jump that cannot be made.
+            None => (None, Some("the level has no goal flag".into()), None),
+        }
     };
 
     ReachReport {
@@ -490,6 +838,7 @@ fn diagnose(
     reached: &[bool],
     edges: &[Vec<CulpritJump>],
     goal_col: i32,
+    options: &ReachOptions,
 ) -> (Option<CulpritJump>, Option<String>, Option<i32>) {
     if platforms.is_empty() {
         return (None, Some("level has no solid ground at all".into()), None);
@@ -535,19 +884,53 @@ fn diagnose(
             let gap = (t.x0 - from.x1 - 1) as f32;
             let rise = (from.surface_row - t.surface_row) as f32;
             let ph = &PHYSICS;
+            // The platform's own length is the runway a sprint would have to build in.
+            let runway = (from.x1 - from.x0) as f32;
+            let sprint_runway = ph.runway_to_speed(ph.sprint_speed);
             if rise > ph.discrete_max_jump_height() {
                 format!(
-                    "wall too tall: the next surface rises {rise:.0} tiles, but a full jump reaches only {:.2} tiles",
-                    ph.discrete_max_jump_height()
+                    "wall too tall: the next surface rises {rise:.0} tiles, but a full jump reaches only {:.2} tiles and a wall jump climbs the same{} — lower the top surface, or leave a wall beside it to climb",
+                    ph.discrete_max_jump_height(),
+                    if options.wall_climb {
+                        ", and no wall beside the reachable set is climbable to it"
+                    } else {
+                        " (wall climbs were not modelled for this check)"
+                    }
+                )
+            } else if gap > ph.sprint_jump_distance() {
+                format!(
+                    "gap too wide: {gap:.0} empty tiles to the next surface; a running jump covers {:.2} tiles and even a sprinting one only {:.2} (and a sprint needs {sprint_runway:.2} tiles of run-up)",
+                    ph.max_jump_distance(),
+                    ph.sprint_jump_distance()
                 )
             } else if gap > ph.max_jump_distance() {
-                format!(
-                    "gap too wide: {gap:.0} empty tiles to the next surface, but a full-speed jump covers only {:.2} tiles",
-                    ph.max_jump_distance()
-                )
+                // Only a sprint clears this. Either the platform is long enough to build one
+                // and the *landing* is what fails, or it is not long enough at all — and the
+                // designer is owed the difference, because it is the difference between
+                // "move the far ledge" and "give me more run-up".
+                if !options.sprint {
+                    format!(
+                        "gap too wide to run: {gap:.0} empty tiles to the next surface; a running jump covers {:.2} and a sprinting one would cover {:.2}, but this check was run without sprints",
+                        ph.max_jump_distance(),
+                        ph.sprint_jump_distance()
+                    )
+                } else if runway >= sprint_runway {
+                    format!(
+                        "no take-off from platform {} clears the {gap:.0}-tile gap: a sprinting jump covers {:.2} tiles and must land past it",
+                        from.id,
+                        ph.sprint_jump_distance()
+                    )
+                } else {
+                    format!(
+                        "gap too wide to run: {gap:.0} empty tiles to the next surface; a running jump covers {:.2} and a sprinting one {:.2}, but a sprint needs {sprint_runway:.2} tiles of run-up and platform {} is {runway:.0} long",
+                        ph.max_jump_distance(),
+                        ph.sprint_jump_distance(),
+                        from.id
+                    )
+                }
             } else {
                 format!(
-                    "no canonical jump from platform {} reaches the next surface: {gap:.0}-tile gap, {rise:.0}-tile rise, {} take-off points tried",
+                    "no canonical move from platform {} reaches the next surface: {gap:.0}-tile gap, {rise:.0}-tile rise, {} take-off points tried",
                     from.id,
                     edges[from.id].len()
                 )
@@ -608,7 +991,10 @@ mod tests {
         "##########",
     ];
 
-    // Ground row 6 at x 0..=5 and x 11..=19: a five-tile pit, wider than d = 4.
+    // Ground row 6 at x 0..=5 and x 11..=19: a five-tile pit. Wider than the 4.00 a
+    // running jump covers, and *inside* the 6.00 a sprinting one covers, which is what
+    // makes it the fixture for the sprint: the same level is unbeatable and beatable
+    // depending only on whether the oracle is allowed to sprint.
     const GAP: &[&str] = &[
         "....................",
         "....................",
@@ -620,16 +1006,32 @@ mod tests {
         "######.....#########",
     ];
 
-    // Ground row 6 at x 0..=9, then a five-tile wall topped by a shelf at row 1.
-    const WALL: &[&str] = &[
-        "................",
-        "..........######",
-        "..........######",
-        "..........######",
-        "..........######",
-        "..........######",
-        "##########......",
-        "##########......",
+    // The same shape with a seven-tile pit: past even a sprint jump, so the diagnostic
+    // branch fires. Six tiles of runway is more than a sprint's 1.125, so the gap really
+    // is the problem and the report must not blame the run-up.
+    const GAP7: &[&str] = &[
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "######.......#######",
+        "######.......#######",
+    ];
+
+    // A six-tile tower on a short ledge: its top is four tiles up, well past the 2.24 a
+    // discrete full jump reaches, and the goal sits on top of it. Only a wall climb gets
+    // there, so this fixture is the one that proves the oracle models wall jumps at all.
+    const TOWER: &[&str] = &[
+        "..........",
+        "..........",
+        "......###.",
+        "......###.",
+        "......###.",
+        "......###.",
+        "##########",
+        "##########",
     ];
 
     #[test]
@@ -649,8 +1051,24 @@ mod tests {
         // Take off far enough back that the body has cleared the pillar's rows by
         // the time it arrives: the shelf is 2 tiles up and the body is 0.9 tall,
         // so a full jump's 2.5-tile apex leaves well under a tile of clearance.
-        let full = simulate_jump(&lv, &platforms, 3, 6, TakeoffDir::Right, JumpHold::Full, true);
-        let short = simulate_jump(&lv, &platforms, 3, 6, TakeoffDir::Right, JumpHold::Short, true);
+        let full = simulate_jump(
+            &lv,
+            &platforms,
+            3,
+            6,
+            TakeoffDir::Right,
+            JumpHold::Full,
+            LaunchSpeed::Run,
+        );
+        let short = simulate_jump(
+            &lv,
+            &platforms,
+            3,
+            6,
+            TakeoffDir::Right,
+            JumpHold::Short,
+            LaunchSpeed::Run,
+        );
         assert_eq!(
             full.landed_on,
             Some(0),
@@ -672,7 +1090,15 @@ mod tests {
     fn a_walk_off_the_edge_is_not_reported_as_a_landing_on_the_same_platform() {
         let lv = level("ladder", LADDER, (1, 5), &[("goal", 7, 3)]);
         let platforms = extract_platforms(&lv);
-        let walk = simulate_jump(&lv, &platforms, 5, 6, TakeoffDir::Right, JumpHold::None, true);
+        let walk = simulate_jump(
+            &lv,
+            &platforms,
+            5,
+            6,
+            TakeoffDir::Right,
+            JumpHold::None,
+            LaunchSpeed::Run,
+        );
         assert_ne!(
             walk.landed_on,
             Some(1),
@@ -690,22 +1116,122 @@ mod tests {
     }
 
     #[test]
-    fn a_five_tile_gap_is_reported_as_too_wide() {
-        let report = report(&level("gap", GAP, (1, 5), &[("goal", 17, 5)]));
+    fn a_five_tile_gap_needs_a_sprint_and_says_so() {
+        let lv = level("gap", GAP, (1, 5), &[("goal", 17, 5)]);
+
+        // Sprinting is enough: five tiles against a 6.00-tile sprint jump, with six tiles
+        // of runway to build it in.
+        let with = report(&lv);
+        assert!(
+            with.goal_reached,
+            "a five-tile gap is inside a sprint jump: {:?}",
+            with.diagnosis
+        );
+
+        // Take the sprint away and the same level becomes unbeatable — which is the whole
+        // point of the ability, and the reason a level can be *about* it.
+        let without = report_with(
+            &lv,
+            ReachOptions {
+                sprint: false,
+                ..ReachOptions::default()
+            },
+        );
+        assert!(!without.goal_reached);
+        let d = without.diagnosis.expect("a diagnosis");
+        assert!(d.contains("gap too wide to run"), "unexpected diagnosis: {d}");
+        assert!(d.contains("6.00"), "the sprint distance belongs in the answer: {d}");
+        assert!(
+            without.culprit.is_some(),
+            "the editor needs a jump to highlight"
+        );
+        assert_eq!(without.frontier_x, Some(5));
+    }
+
+    #[test]
+    fn a_seven_tile_gap_is_reported_as_too_wide_for_even_a_sprint() {
+        let report = report(&level("gap7", GAP7, (1, 5), &[("goal", 17, 5)]));
         assert!(!report.goal_reached);
         let d = report.diagnosis.expect("a diagnosis");
         assert!(d.contains("gap too wide"), "unexpected diagnosis: {d}");
-        assert!(report.culprit.is_some(), "the editor needs a jump to highlight");
+        assert!(
+            d.contains("even a sprinting"),
+            "the answer should rule the sprint out on distance: {d}"
+        );
+        assert!(
+            !d.contains("too wide to run"),
+            "six tiles of runway is plenty for a sprint, so the run-up is not the problem: {d}"
+        );
         assert_eq!(report.frontier_x, Some(5));
     }
 
     #[test]
-    fn a_five_tile_wall_is_reported_as_too_tall() {
-        let report = report(&level("wall", WALL, (1, 5), &[("goal", 13, 1)]));
-        assert!(!report.goal_reached);
-        let d = report.diagnosis.expect("a diagnosis");
+    fn a_wall_too_tall_to_jump_is_climbed_by_wall_jumps() {
+        let lv = level("tower", TOWER, (1, 5), &[("goal", 7, 1)]);
+
+        // With wall climbing switched off, the tower is what it looks like: too tall. The
+        // four-tile rise is past the 2.24 tiles a discrete full jump reaches.
+        let without = report_with(
+            &lv,
+            ReachOptions {
+                wall_climb: false,
+                ..ReachOptions::default()
+            },
+        );
+        assert!(!without.goal_reached);
+        let d = without.diagnosis.clone().expect("a diagnosis");
         assert!(d.contains("wall too tall"), "unexpected diagnosis: {d}");
-        assert_eq!(report.frontier_x, Some(9));
+        assert_eq!(without.frontier_x, Some(5));
+
+        // With it, the same wall is a staircase — and the goal, sitting on top of the
+        // tower, is reached. Without this the oracle would call every wall-jump level
+        // unbeatable, which is a lie that costs a designer their whole level.
+        let with = report(&lv);
+        assert!(
+            with.goal_reached,
+            "the tower should be climbable: {:?}",
+            with.diagnosis
+        );
+        assert!(with.culprit.is_none());
+    }
+
+    #[test]
+    fn a_scripted_wall_climb_gains_height_one_jump_at_a_time() {
+        let lv = level("tower", TOWER, (1, 5), &[("goal", 7, 1)]);
+        let platforms = extract_platforms(&lv);
+        let top = platforms
+            .iter()
+            .find(|p| p.surface_row == 2 && p.contains_col(7))
+            .expect("the tower top is a platform")
+            .id;
+        // Flush against the tower's face (its column is 6) on the ground platform.
+        let climb = simulate_wall_climb(&lv, &platforms, 6.0 - PHYSICS.player_w, 6, TakeoffDir::Right);
+        assert_eq!(
+            climb.landed_on,
+            Some(top),
+            "the climb should end on the tower top: {climb:?}"
+        );
+        assert!(
+            climb.ticks < MAX_CLIMB_TICKS,
+            "a four-tile climb should not need the whole budget: {} ticks",
+            climb.ticks
+        );
+        // And it really is a climb, not a leap: a single full jump from the same spot
+        // cannot reach the top.
+        let jump = simulate_jump(
+            &lv,
+            &platforms,
+            5,
+            6,
+            TakeoffDir::Right,
+            JumpHold::Full,
+            LaunchSpeed::Sprint,
+        );
+        assert_ne!(
+            jump.landed_on,
+            Some(top),
+            "the tower must be out of reach of a ground jump, or it is not a climb: {jump:?}"
+        );
     }
 
     #[test]

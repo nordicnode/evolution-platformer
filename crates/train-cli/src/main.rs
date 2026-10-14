@@ -125,7 +125,32 @@ TRAIN OPTIONS:
     --pop <N>             Population size.                          [default 200 native]
     --seed <N>            Master seed; the whole run is reproducible.        [default 1]
     --mut-rate <R>        Per-gene mutation probability (0.03-0.10).      [default 0.05]
-    --mut-sigma <S>       Gaussian mutation sigma (0.2-0.5).              [default 0.30]
+    --mut-sigma <S>       Gaussian mutation sigma when the search starts (0.2-0.5).
+                                                                          [default 0.30]
+    --adaptive-sigma      Let the run tune its own mutation size, between 0.05 and 1.00.
+                          Off by default because it was measured against a fixed sigma on
+                          this level pack and lost on the hard level: on a plateau the
+                          success rate says nothing about whether a smaller step would
+                          land, and shrinking freezes the lineage that is stuck. See
+                          `evo::ga` for the three readings that were measured, and
+                          `REVIEW.md` for the numbers.
+    --fine-children <N>   Offspring per generation bred by perturbing only one to three
+                          genes of the generation's best genome (a step) rather than the
+                          ~86 genes a normal child moves (a jump). 0 disables.  [default 8]
+    --stagnation <N>      Generations without a new best before the population is given a
+                          shake. 0 disables.                                [default 20]
+    --immigrants <N>      How many arrive when that happens. They are **reheated copies of
+                          the run's best-ever genome** — every gene moved — so the batch
+                          explores a long way from the best point found instead of
+                          restarting from noise.                        [default 8]
+    --reheat-factor <X>   How hot that batch is, as a multiple of the run's own mutation
+                          size, held inside the 0.05-1.00 sigma band. 1.0 throws it as far as
+                          an ordinary mutation step but at every gene rather than five percent
+                          of them; 2.0 reaches twice as far. Swept over the hardest level in
+                          the pack at 12 and then 24 seeds, where 3.0 solved 14 of 24 against
+                          1.0's 10 and nothing anywhere favoured a cooler batch, so 3.0 (0.90
+                          at the shipped sigma) is the default. Lower it for a run that wants
+                          the gentler batch.                            [default 3.0]
     --elite <N>           Genomes carried over unchanged.                     [default 4]
     --tournament <N>      Tournament selection size (3-5).                    [default 4]
     --crossover <R>       Crossover probability.                          [default 0.75]
@@ -152,7 +177,8 @@ WATCH OPTIONS:
     --frames <N>          Stop after N rendered frames (always on when headless).[default 6]
     --headless            Plain text frames, no keyboard. Implied without a TTY.
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
-    --mut-rate, --mut-sigma, --elite, --tournament, --crossover, --action-repeat,
+    --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --stagnation,
+    --immigrants, --reheat-factor, --elite, --tournament, --crossover, --action-repeat,
     --trials              As for `train`.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
     --curriculum-generations <N>

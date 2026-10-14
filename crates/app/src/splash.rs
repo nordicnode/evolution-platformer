@@ -18,11 +18,14 @@
 //! that can drift away from the game, and every art or physics change would have to be made
 //! twice.
 //!
-//! **It gets out of the way.** Any key or any click after the first [`ARMED`] seconds
-//! dismisses it into the editor exactly as it opens today; the window is playable from the
-//! frame after that, and nothing about the splash is reachable again except by restarting the
-//! app. A stray event from the window manager — a focus click, a key repeat — must not eat the
-//! title before a person has seen it, which is what [`ARMED`] is for.
+//! **It gets out of the way, and it leads where its sign says.** Any key or any click after
+//! the first [`ARMED`] seconds dismisses it ([`Action`]): `P` opens the playtest and `E`
+//! starts a run, and every other key — or a click — opens the editor. The keys printed on the
+//! front door therefore *do* what they say, rather than being hints for a screen that would
+//! consume the press and drop the viewer into the editor anyway. The window is playable from
+//! the frame after that, and nothing about the splash is reachable again except by restarting
+//! the app. A stray event from the window manager — a focus click, a key repeat — must not eat
+//! the title before a person has seen it, which is what [`ARMED`] is for.
 //!
 //! **Whose run it is.** If the run has a saved champion for the level this window opened on,
 //! that is what plays: the genome out of the champion file, on the terrain it was trained on,
@@ -47,10 +50,27 @@ use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 /// The words. The title is the window's own title, so the taskbar and the splash agree.
 const TITLE: &str = "EVOLUTION PLATFORMER";
 const SUBTITLE: &str = "a population learns to beat the level you draw";
-/// The invitation, and the four keys a person needs to know about to use the window at all.
-/// The app's own bindings, in the order the tabs appear in the top bar.
-const HINT: &str = "press any key";
-const KEYS: &str = "P play      E evolve      V replay      F fit the level";
+/// The invitation, and the two shortcuts worth learning on the front door. The app's own
+/// bindings, and *honest* ones: the screen dismisses into whichever of these the key
+/// names, so the hint is a doorway rather than a promise the editor would have to keep.
+const HINT: &str = "press any key to build a level";
+const KEYS: &str = "P  play it yourself        E  evolve an AI";
+
+/// What a person asked for by dismissing the screen.
+///
+/// The splash is a doorway, and a doorway should lead where the sign says. Every key
+/// opens the editor except the two the hint names, which enter the activity they name
+/// directly — so the keys printed on the front door do what they say rather than dropping
+/// the viewer into the editor to press the same key again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Open the editor.
+    Edit,
+    /// Open the playtest on the level the window is on.
+    Play,
+    /// Open the evolution view and start training.
+    Evolve,
+}
 
 /// Seconds for the camera to go from close on the runner to the whole level.
 ///
@@ -292,13 +312,16 @@ impl Splash {
         }
     }
 
-    /// Draw the screen, and say whether the viewer has asked for the game instead.
+    /// Draw the screen, and say which way the viewer asked to go — or `None` if they have not
+    /// asked yet.
     ///
     /// Any key press or any click counts, once the screen has been up for [`ARMED`] seconds:
-    /// a splash is a doorway, and a doorway that argues is a wall. Nothing else about the app
-    /// runs while this is up — the caller returns early — so the key that dismisses the splash
-    /// cannot also press a button in the editor underneath it.
-    pub fn show(&self, ctx: &Context, atlas: &Atlas, sprites: &Sprites) -> bool {
+    /// a splash is a doorway, and a doorway that argues is a wall. The two keys the invitation
+    /// names enter the activity they name ([`Action::Play`], [`Action::Evolve`]); everything
+    /// else opens the editor. Nothing else about the app runs while this is up — the caller
+    /// returns early — so the key that dismisses the splash cannot also press a button in the
+    /// editor underneath it.
+    pub fn show(&self, ctx: &Context, atlas: &Atlas, sprites: &Sprites) -> Option<Action> {
         let rect = ctx.screen_rect();
         let painter = ctx.layer_painter(egui::LayerId::background());
         let camera = self.camera(rect);
@@ -332,18 +355,34 @@ impl Splash {
         invitation(&painter, rect, self.clock, world_bottom);
         footer(&painter, rect, self.credit());
 
-        self.clock >= ARMED
-            && ctx.input(|i| {
-                i.events.iter().any(|event| {
-                    // A press, not a release: letting go of a key is not a decision, and a
-                    // pointer that has left the window has not made one either.
-                    matches!(
-                        event,
-                        egui::Event::Key { pressed: true, .. }
-                            | egui::Event::PointerButton { pressed: true, .. }
-                    )
-                })
-            })
+        if self.clock < ARMED {
+            return None;
+        }
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    // A press, not a release: letting go of a key is not a decision.
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        ..
+                    } => {
+                        return Some(match key {
+                            egui::Key::P => Action::Play,
+                            egui::Key::E => Action::Evolve,
+                            _ => Action::Edit,
+                        });
+                    }
+                    // A pointer that has left the window has not made one either; a click
+                    // on the title is "just start", which is the editor.
+                    egui::Event::PointerButton { pressed: true, .. } => {
+                        return Some(Action::Edit);
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
     }
 
     /// Where the world is drawn from: close on the runner, easing out to where the run goes.
@@ -443,10 +482,10 @@ fn level() -> Level {
     // `starter` placed the spawn and the flag on the single row it knows about; with the
     // floor a row higher they move up with it. A goal tile is the *pole* — the lower of the
     // flag's two cells, and the one that has to have ground under it — so it is row 10, the
-    // tile standing on the lawn.
-    level.goals.clear();
+    // tile standing on the lawn. A level has one flag, so both calls are *moves*: the spawn's
+    // and the goal's place in the row are what changes, not how many of them there are.
     level.set_spawn_tile(1, 10);
-    level.add_goal_tile(31, 10);
+    level.set_goal_tile(31, 10);
     // A gap three tiles wide and a step one tile high: both the widest and the tallest thing
     // the physics comfortably clears from a full run, so the runner is not relying on luck
     // and a person is not watching a near miss.
@@ -678,6 +717,21 @@ fn invitation(painter: &Painter, rect: Rect, clock: f32, world_bottom: f32) {
     // of type there is legible on every window size instead of on the ones where the fit
     // happened to leave a gap under the lawn.
     let y = invitation_line(rect, world_bottom);
+    // A soft dark band behind the words, so the invitation reads over any world rather than
+    // only over the ones whose fit happened to leave clean haze under the lawn. It fades in
+    // with the words, so the screen is not born with a bar on it.
+    let band = Rect::from_center_size(
+        Pos2::new(rect.center().x, y + title_size(rect) * 0.22),
+        Vec2::new(
+            rect.width().min(560.0),
+            title_size(rect) * 1.9,
+        ),
+    );
+    painter.rect_filled(
+        band,
+        10.0,
+        Color32::from_black_alpha((110.0 * arrived) as u8),
+    );
     painter.text(
         Pos2::new(rect.center().x, y),
         Align2::CENTER_CENTER,
@@ -935,8 +989,10 @@ mod tests {
         let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
+        // A key the screen does not name, so this test is about "any key opens the door"
+        // rather than about what a *specific* key means (that is the next test's job).
         let key = egui::Event::Key {
-            key: egui::Key::P,
+            key: egui::Key::A,
             physical_key: None,
             pressed: true,
             repeat: false,
@@ -948,12 +1004,12 @@ mod tests {
             pressed: true,
             modifiers: egui::Modifiers::default(),
         };
-        let opened = |clock: f32, events: Vec<egui::Event>| -> bool {
+        let opened = |clock: f32, events: Vec<egui::Event>| -> Option<Action> {
             let mut splash = Splash::scripted();
             while splash.clock() < clock {
                 splash.advance(sim::DT);
             }
-            let mut dismissed = false;
+            let mut dismissed = None;
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(rect),
@@ -968,25 +1024,70 @@ mod tests {
         };
 
         assert!(
-            !opened(ARMED - 0.05, vec![key.clone()]),
+            opened(ARMED - 0.05, vec![key.clone()]).is_none(),
             "a key in the first {ARMED}s dismissed the screen"
         );
         assert!(
-            !opened(ARMED - 0.05, vec![click.clone()]),
+            opened(ARMED - 0.05, vec![click.clone()]).is_none(),
             "a click in the first {ARMED}s dismissed the screen"
         );
         assert!(
-            !opened(ARMED + 0.1, Vec::new()),
+            opened(ARMED + 0.1, Vec::new()).is_none(),
             "the screen dismissed itself with nobody there"
         );
-        assert!(
+        assert_eq!(
             opened(ARMED + 0.1, vec![key]),
-            "a key does not dismiss the screen"
+            Some(Action::Edit),
+            "an unnamed key opens the editor"
         );
-        assert!(
+        assert_eq!(
             opened(ARMED + 0.1, vec![click]),
-            "a click does not dismiss the screen"
+            Some(Action::Edit),
+            "a click opens the editor"
         );
+    }
+
+    /// The front door leads where its sign says: `P` opens the playtest and `E` starts a
+    /// run, rather than both dropping the viewer into the editor to press the key again.
+    ///
+    /// This is the whole of the fix that made the title screen's key hints honest: before
+    /// it, the hints named keys the editor — not the splash — would have had to act on, and
+    /// the press that dismissed the screen was consumed by the screen, so the key did
+    /// nothing at all.
+    #[test]
+    fn the_named_keys_open_the_activity_they_name() {
+        let ctx = egui::Context::default();
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
+        let press = |key: egui::Key| -> Option<Action> {
+            let mut splash = Splash::scripted();
+            while splash.clock() < ARMED + 0.1 {
+                splash.advance(sim::DT);
+            }
+            let event = egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            };
+            let mut chosen = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events: vec![event],
+                    ..Default::default()
+                },
+                |ctx| {
+                    chosen = splash.show(ctx, &atlas, &sprites);
+                },
+            );
+            chosen
+        };
+        assert_eq!(press(egui::Key::P), Some(Action::Play));
+        assert_eq!(press(egui::Key::E), Some(Action::Evolve));
+        assert_eq!(press(egui::Key::V), Some(Action::Edit));
     }
 
     /// The champion on the title screen is the episode the file records, tick for tick.

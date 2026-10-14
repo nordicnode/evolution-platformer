@@ -1017,7 +1017,7 @@ pub fn scenery_sprite(
     // A floor is a horizontal run of tiles at one `ty`, and the low bits of this hash move
     // in step along a run: `% 100` of the whole value never once lands in 15..=17 anywhere
     // in the shipped pack, and 15..=17 is the flowers' band — three hundred and fifty-three
-    // surface tiles, six levels, and not one daisy, whatever the table said. The high bits
+    // surface tiles, and not one daisy, whatever the table said. The high bits
     // are the mixed ones (measured over the same pack: the low slice reaches 59 of the
     // hundred buckets and this slice 68), so a range of the table is a range of the level.
     let roll = (tile_hash(tx, ty, 23) >> 18) % 100;
@@ -1232,6 +1232,28 @@ pub fn hanging_sprite(
         // A vine is one cell: nothing hangs off the bottom of one.
         crown: None,
         size: 1.0,
+    })
+}
+
+/// The prop for a **placed** piece of scenery: the sprite the author named, at the size
+/// that sprite's family is drawn at.
+///
+/// The one difference from [`scenery_sprite`] is that a `*_base` sprite also carries its
+/// canopy, so a placed tree stands as tall as a scattered one. A name the tileset does not
+/// have draws nothing rather than a substitute: a placed sprite is a decision the author
+/// made, and quietly drawing a different plant would be the editor lying about what it
+/// saved.
+fn placed_prop(sprites: &Sprites, s: &sim::Scenery) -> Option<Prop> {
+    let sprite = sprites.try_get(&s.sprite)?;
+    let crown = s
+        .sprite
+        .strip_suffix("_base")
+        .and_then(|stem| sprites.try_get(&format!("{stem}_top")));
+    Some(Prop {
+        cell: (s.x, s.y),
+        sprite,
+        crown,
+        size: prop_size(&s.sprite),
     })
 }
 
@@ -2099,6 +2121,16 @@ pub fn draw_level(
         }
     }
 
+    // Placed scenery, over the terrain: a person put it there, so it is drawn where they
+    // can see it rather than behind the ground the way the hashed dressing would be. It is
+    // the same [`Prop`] the scattered props build, so a placed bush and a blurred one are
+    // the same bush.
+    for s in level.scenery() {
+        if let Some(prop) = placed_prop(sheet.sprites, s) {
+            draw_prop(sheet, &prop);
+        }
+    }
+
     // Ambient life, over the terrain and under everything that moves on its own: the
     // butterflies are the only layer of the level that is in the air, and the last thing
     // a runner should be hidden by is a butterfly.
@@ -2701,6 +2733,66 @@ mod tests {
             .join("../../levels")
             .join(format!("{slug}.json"));
         Level::from_json_file(&path).unwrap_or_else(|e| panic!("{slug}: {e}"))
+    }
+
+    /// A level taller than it is wide is framed by the same camera, and this is the property
+    /// the first vertical level needed: the fit takes the **smaller** of the two ratios, so a
+    /// 10×22 tower is zoomed out until its *height* fits rather than its width, and the whole
+    /// grid is on screen in one frame.
+    ///
+    /// The honest limit, asserted rather than implied: `fit` cannot go below `MIN_ZOOM`, so a
+    /// level taller than `viewport_height / MIN_ZOOM` rows is bigger than one screen whatever
+    /// the camera does. The window's answer to that is the follow camera panning up the shaft
+    /// (`clamp_to` bounds both axes, which is the second half of this test) rather than a fit
+    /// that claims more than it can do.
+    #[test]
+    fn a_tall_level_is_fitted_by_its_height_not_its_width() {
+        let tower = shipped("scratch-tower");
+        assert!(
+            tower.height > tower.width,
+            "the fixture is not a vertical level: {}×{}",
+            tower.width,
+            tower.height
+        );
+        let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(917.0, 613.0));
+
+        let camera = Camera::fit(&tower, viewport, 24.0);
+        let top_left = camera.to_screen(0.0, 0.0, viewport);
+        let bottom_right = camera.to_screen(tower.width as f32, tower.height as f32, viewport);
+        for (what, p) in [("top-left", top_left), ("bottom-right", bottom_right)] {
+            assert!(
+                viewport.contains(p),
+                "the {what} corner of the tower is off-screen at {p:?}: it is not fitted"
+            );
+        }
+        // The height is the binding constraint: at the width-only zoom the tower would be
+        // taller than the window, so the fitted zoom has to be strictly smaller than it.
+        let width_only = ((viewport.width() - 48.0) / tower.width as f32).floor();
+        assert!(
+            camera.zoom < width_only,
+            "the fit used the width ({width_only}) and not the height ({} zoom)",
+            camera.zoom
+        );
+        // So no row of the tower is off-screen.
+        let (_, _, ty0, ty1) = camera.visible_tiles(&tower, viewport);
+        assert_eq!(
+            (ty0, ty1),
+            (0, tower.height),
+            "the fitted camera does not cover every row of the level"
+        );
+
+        // And when the camera *is* following a body, the clamp bounds the vertical axis too:
+        // without that, a run up a shaft could follow the climber right off the top of the
+        // world and frame empty sky.
+        let mut follow = Camera::fit(&tower, viewport, 24.0);
+        follow.centre = Vec2::new(5.0, -50.0);
+        follow.clamp_to(&tower, 2.0);
+        assert!(
+            follow.centre.y >= -2.0 && follow.centre.y <= tower.height as f32 + 2.0,
+            "clamp_to left the camera at y {} on a {} row level",
+            follow.centre.y,
+            tower.height
+        );
     }
 
     /// The camera is a whole-pixel grid: every tile boundary lands on a whole point, two
@@ -4815,6 +4907,40 @@ mod tests {
 
     /// The scenery sways, because two frames of it exist; the sway is the only reason the
     /// clock reaches the terrain pass at all.
+    /// Placed scenery reaches the frame: one quad for a one-cell prop, two for a tree.
+    ///
+    /// This is finding 30's question asked of the new layer — "is the thing I placed on
+    /// the screen?" — and it is asked of the *frame* rather than of the document, because
+    /// the document was always right. A prop the renderer forgets emits zero quads, which
+    /// is exactly what a count of the difference catches.
+    #[test]
+    fn placed_scenery_is_drawn_in_the_frame() {
+        let mut level = Level::starter("scenery-frame", 30, 12);
+        let opts = RenderOpts::editing();
+        let bare = headless_sprite_quads(&level, opts).len();
+
+        // An open cell above the starter's floor: a bush is one quad...
+        let air = level.height - 2;
+        assert_eq!(level.tile(5, air), Some(Tile::Empty));
+        assert!(level.add_scenery("bush_c", 5, air));
+        let one = headless_sprite_quads(&level, opts).len();
+        assert_eq!(one, bare + 1, "a placed bush must add exactly one quad");
+
+        // ...and a tree is two: its trunk and the canopy above it.
+        assert!(level.add_scenery("tree_a_base", 15, air));
+        let two = headless_sprite_quads(&level, opts).len();
+        assert_eq!(
+            two,
+            one + 2,
+            "a placed tree must add its trunk and its canopy"
+        );
+
+        // And clearing the cells gives the quads back: the picture follows the document.
+        assert!(level.remove_scenery_at(5, air));
+        assert!(level.remove_scenery_at(15, air));
+        assert_eq!(headless_sprite_quads(&level, opts).len(), bare);
+    }
+
     #[test]
     fn scenery_sways_with_the_clock() {
         let level = shipped("l1-flat-run");
@@ -5371,6 +5497,61 @@ mod tests {
                 base.height() + top.height()
             );
         }
+    }
+
+    /// The flag is painted in the cell *above* the goal's own tile — and that cell is one of
+    /// the two the eraser answers for.
+    ///
+    /// The bug this pins was found by playing with the editor: a goal could be placed but not
+    /// deleted, because the click everyone aims at is the flag and the flag is drawn one tile
+    /// above the goal's anchor, on a cell no goal claimed. The claim here is a
+    /// *correspondence* between two halves that live in different crates — the cells
+    /// `Level::goal_covers` accepts and the cells the picture actually fills — so it cannot
+    /// hold if either half moves: draw the flag one cell lower and the tile read back changes,
+    /// narrow `goal_covers` to the anchor and the flag's own cell stops answering.
+    #[test]
+    fn the_flag_is_drawn_in_the_cell_the_eraser_addresses() {
+        let level = Level::starter("one-flag", 40, 12);
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let camera = Camera::fit(&level, viewport, 24.0);
+        let frame = headless_frame(
+            &level,
+            viewport.size(),
+            Backdrop::Sky,
+            0.0,
+            RenderOpts::playing(),
+        );
+
+        let flags = drawn_sprites(&frame, &FLAG_FRAMES);
+        let poles = drawn_sprites(&frame, &["goal_bottom"]);
+        assert_eq!(flags.len(), 1, "the starter level has exactly one flag");
+        assert_eq!(poles.len(), 1, "and exactly one pole to hang it on");
+        assert!(
+            flags[0].center().y < poles[0].center().y,
+            "the flag is drawn above the pole's foot: flag {:?}, pole {:?}",
+            flags[0],
+            poles[0]
+        );
+
+        // The cells the picture fills, read back through the camera it was drawn with...
+        let cells = [flags[0], poles[0]].map(|rect| {
+            let t = camera.to_tile(rect.center(), viewport);
+            (t.x.floor() as i32, t.y.floor() as i32)
+        });
+        // ...are cells the document answers a click on, which is what makes the flag deletable.
+        for (tx, ty) in cells {
+            assert!(
+                level.goal_covers(tx, ty),
+                "the goal art in ({tx}, {ty}) is a cell no click can reach"
+            );
+        }
+        let (ax, ay) = level.goal_tiles()[0];
+        assert_eq!(cells[1], (ax, ay), "the pole's foot stands on the anchor");
+        assert_eq!(cells[0], (ax, ay - 1), "and the cloth hangs one cell above it");
+        assert!(
+            !level.goal_covers(ax, ay - 2),
+            "a third cell up is open air, not the goal"
+        );
     }
 
     /// The scenery is drawn at its own size, and the sizes are in the right order.
@@ -6073,7 +6254,7 @@ mod tests {
         ] {
             assert!(
                 seen.contains(family),
-                "no {family} is drawn anywhere in the six shipped levels: the table pays for \
+                "no {family} is drawn anywhere in the shipped levels: the table pays for \
                  {family} and the level never sees one. Dressed families: {seen:?}"
             );
         }

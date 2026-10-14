@@ -35,6 +35,7 @@ pub struct Keys {
     pub left: bool,
     pub right: bool,
     pub jump: bool,
+    pub sprint: bool,
     pub brake: bool,
 }
 
@@ -43,17 +44,22 @@ impl Keys {
     ///
     /// A GUI reports the real key state, so unlike the terminal path there is no
     /// latch: a held key is simply held.
+    ///
+    /// Sprint is shift, read as a modifier rather than as a key: the terminal playtest has
+    /// no key event for "shift alone" either, so both paths express sprint the same way —
+    /// `shift` plus whatever you are doing.
     pub fn read(ctx: &Context) -> Keys {
         ctx.input(|i| Keys {
             left: i.key_down(Key::ArrowLeft) || i.key_down(Key::A),
             right: i.key_down(Key::ArrowRight) || i.key_down(Key::D),
             jump: i.key_down(Key::Space) || i.key_down(Key::ArrowUp) || i.key_down(Key::W),
+            sprint: i.modifiers.shift,
             brake: i.key_down(Key::ArrowDown) || i.key_down(Key::S),
         })
     }
 
     pub fn action(&self) -> AgentAction {
-        action_for(self.left, self.right, self.jump, self.brake)
+        action_for(self.left, self.right, self.jump, self.sprint, self.brake)
     }
 }
 
@@ -137,20 +143,27 @@ impl Session {
     /// The line under the canvas: how the run is going.
     pub fn summary(&self) -> String {
         let stats = self.sim.stats();
-        let level = self.sim.level();
-        let progress = if level.width_pixels() > 0.0 {
-            100.0 * stats.progress_pixels / level.width_pixels()
+        // Closer-to-the-flag rather than further-along-the-level: the score *is* the distance
+        // closed on the goal, so the readout has to be the same quantity or it contradicts
+        // the champion's own fitness (see `EpisodeStats::progress_pixels`). "flag" is how far
+        // the body has ever been from it, which is the number that means something on a level
+        // whose goal is above rather than to the right; `x` stays because it is what a
+        // side-scroller watcher is used to reading.
+        let progress = if stats.goal_distance_pixels > 0.0 {
+            100.0 * stats.progress_pixels / stats.goal_distance_pixels
         } else {
-            0.0
+            100.0
         };
         format!(
-            "{}  frame {}/{}  x {:.1}  progress {:.0}%  stomps {}  {}",
+            "{}  frame {}/{}  x {:.1}  flag {:.1} tiles  progress {:.0}%  stomps {}  jumps {}  {}",
             self.sim.outcome().as_str(),
             stats.frames,
             self.sim.max_frames(),
             stats.best_x,
+            stats.closest_approach,
             progress,
             stats.stomps,
+            stats.jumps,
             if stats.frames == 0 {
                 "ready"
             } else {
@@ -172,9 +185,15 @@ mod tests {
     /// carry two ticks is part of the fixture on purpose: it is the case where "decide once
     /// per frame" and "decide once per tick" differ, and the one the champion's cadence
     /// depends on.
+    ///
+    /// The level is the flat one, and deliberately not `l3-gauntlet` any more: holding right
+    /// plus jump used to bunny-hop over everything, and now it is one jump followed by a run
+    /// into the first pit. A policy that dies in three seconds cannot carry a 240-frame
+    /// comparison of frame sizes, and the claim here is about the session's tick discipline
+    /// rather than about the policy.
     #[test]
     fn a_held_key_and_a_fixed_decision_are_the_same_episode() {
-        let level = shipped("l3-gauntlet");
+        let level = shipped("l1-flat-run");
         let keys = Keys {
             right: true,
             jump: true,
@@ -245,22 +264,37 @@ mod tests {
     /// The desktop shell must mean the same thing by the keys as the terminal
     /// playtest: this is the one mapping both call.
     #[test]
-    fn the_action_priority_is_the_plan_s() {
+    fn the_action_priority_is_the_same_for_both_ways_of_playing() {
         use sim::AgentAction::*;
-        assert_eq!(action_for(false, false, false, false), Walk);
-        assert_eq!(action_for(true, false, false, false), Retreat);
+        assert_eq!(action_for(false, false, false, false, false), Walk);
+        assert_eq!(action_for(true, false, false, false, false), Retreat);
         assert_eq!(
-            action_for(true, true, false, false),
+            action_for(true, true, false, false, false),
             Run,
             "right beats left"
         );
-        assert_eq!(action_for(false, false, false, true), Brake);
-        assert_eq!(action_for(false, false, true, false), JumpInPlace);
-        assert_eq!(action_for(false, true, true, false), RunJump);
+        assert_eq!(action_for(false, false, false, false, true), Brake);
+        assert_eq!(action_for(false, false, true, false, false), JumpInPlace);
+        assert_eq!(action_for(false, true, true, false, false), RunJump);
         assert_eq!(
-            action_for(true, true, true, true),
-            RunJump,
-            "jump beats all"
+            action_for(true, false, true, false, false),
+            RetreatJump,
+            "a leftward jump is its own action now, not a neutral jump"
+        );
+        assert_eq!(
+            action_for(true, true, true, true, true),
+            SprintJump,
+            "sprint and jump forward beats everything else held"
+        );
+        assert_eq!(
+            action_for(false, true, false, true, false),
+            Sprint,
+            "sprint is a forward run, not a jump"
+        );
+        assert_eq!(
+            action_for(false, false, false, true, false),
+            Walk,
+            "sprint with nothing to sprint in is no gear at all"
         );
     }
 

@@ -4,13 +4,19 @@
 //! That is the point of the `sim` editing API: what the palette paints is what the
 //! physics will run, and what "save" writes is what the loader reads.
 //!
-//! Two rules the editor keeps for the user:
+//! Three rules the editor keeps for the user:
 //!
 //! * **Every stroke is one undo step.** Painting is continuous (the brush follows the
 //!   pointer), so the snapshot is taken once when the stroke starts, not per tile.
-//! * **The level is never left in a state that cannot be saved.** Deleting the last
-//!   goal is refused by the document itself, and [`Editor::save`] reports the
-//!   loader's own error text rather than writing something it cannot read back.
+//! * **A level has one flag.** [`Brush::Goal`] places *the* goal, so a later click
+//!   *relocates* it instead of adding a rival — the same shape as the spawn, which is one
+//!   point too — and the flag can be erased entirely, so the document says "no goal" rather
+//!   than keeping a marker the user cannot get out of the way.
+//! * **An unwritable document says so instead of writing.** The flag is the user's to
+//!   delete as well as to place ([`Level::remove_goal_at`] will happily leave a document
+//!   with no flag), so the level *can* stand unsaveable for a moment; [`Editor::save`]
+//!   reports the loader's own error text rather than writing something it cannot read
+//!   back, and [`Editor::verdict`] gives the same reason in the status bar first.
 
 use std::path::{Path, PathBuf};
 
@@ -38,15 +44,47 @@ pub enum Brush {
     Goal,
     /// Places a patrolling walker.
     Walker,
+    /// Places a piece of scenery (a bush, tree, rock, flower...): decoration the physics
+    /// never sees. Which sprite is decided by [`Editor::scene_sprite`], because there are
+    /// two dozen of them and two dozen palette buttons would be two dozen brushes.
+    Scenery,
     /// Removes whatever is under the cursor: entity first, then terrain.
     Erase,
 }
 
+/// The scenery a person can place, curated from the shipped art.
+///
+/// Deliberately a *list* rather than every sprite in the atlas: the scattered dressing
+/// already covers the ground in bushes and tufts, so a placement menu is for the props a
+/// person reaches for on purpose — the trees, the rocks, the flowers, the things that say
+/// what a place *is*. Sizes and the tree's canopy come from the view, so adding a name here
+/// is all it takes to place it.
+pub const SCENERY_SPRITES: &[&str] = &[
+    "bush_c",
+    "bush_e",
+    "tuft_c",
+    "tuft_e",
+    "flowers",
+    "flowers_pink",
+    "flowers_white",
+    "rock",
+    "pebble",
+    "mushroom",
+    "mushroom_pair",
+    "log",
+    "stump",
+    "reeds_a",
+    "vine_a",
+    "tree_a_base",
+    "tree_b_base",
+];
+
 impl Brush {
-    pub const ALL: [Brush; 8] = [
+    pub const ALL: [Brush; 9] = [
         Brush::Solid,
         Brush::Sand,
         Brush::Spike,
+        Brush::Scenery,
         Brush::Empty,
         Brush::Spawn,
         Brush::Goal,
@@ -66,6 +104,7 @@ impl Brush {
             Brush::Solid => "ground_1",
             Brush::Sand => "sand_1",
             Brush::Spike => "spike",
+            Brush::Scenery => "bush_c",
             Brush::Empty => "empty",
             Brush::Spawn => "spawn_marker",
             Brush::Goal => "goal_top",
@@ -79,6 +118,7 @@ impl Brush {
             Brush::Solid => "ground",
             Brush::Sand => "sand",
             Brush::Spike => "spikes",
+            Brush::Scenery => "scenery",
             Brush::Empty => "clear",
             Brush::Spawn => "spawn",
             Brush::Goal => "goal",
@@ -93,9 +133,12 @@ impl Brush {
             Brush::Solid => "Solid tile: blocks movement from every side.",
             Brush::Sand => "Sand: solid tile, same physics, drawn as a beach.",
             Brush::Spike => "Spike: not solid, lethal on contact.",
+            Brush::Scenery => "Scenery: a bush, tree, rock... decoration the physics ignores.\n\
+                Pick which one in the row under the palette.",
             Brush::Empty => "Empty space: clears a tile.",
             Brush::Spawn => "Where the player starts. Only one per level.",
-            Brush::Goal => "The flag the population has to reach.",
+            Brush::Goal => "The flag the population has to reach.\n\
+                A level has one: placing it moves it.",
             Brush::Walker => "A patrol enemy. Stompable from above.",
             Brush::Erase => "Removes the entity under the cursor, then the tile.",
         }
@@ -108,6 +151,8 @@ pub struct Editor {
     pub path: Option<PathBuf>,
     /// The active brush once something is picked, and what a drag carries.
     pub brush: Option<Brush>,
+    /// Which sprite the scenery brush places, chosen in the palette row under the brushes.
+    pub scene_sprite: &'static str,
     /// The level as the reachability oracle sees it, refreshed after every change.
     pub report: ReachReport,
     /// Human-readable result of the last action, shown in the status bar.
@@ -134,6 +179,7 @@ impl Editor {
             level,
             path,
             brush: Some(Brush::Solid),
+            scene_sprite: SCENERY_SPRITES[0],
             report,
             message: String::new(),
             dirty: false,
@@ -205,9 +251,15 @@ impl Editor {
     /// it would be accepted by the document and refused by the pack's own test. The app
     /// asks this to colour the drop ghost, so a placement that will be refused looks
     /// refused before the mouse button comes up.
+    ///
+    /// A goal joins the walker here because its refusal is not obvious from the pointer: the
+    /// marker is two cells tall, so the tile the marker already owns is often *not* the one
+    /// under the cursor but the flag's own cell one above it.
     pub fn can_place(&self, brush: Brush, tx: i32, ty: i32) -> bool {
         match brush {
             Brush::Walker => self.level.walker_stands_on_ground(tx, ty),
+            Brush::Scenery => self.level.scenery_placeable(self.scene_sprite, tx, ty),
+            Brush::Goal => self.level.goal_placeable(tx, ty),
             _ => true,
         }
     }
@@ -269,10 +321,24 @@ impl Editor {
                 true
             }
             Brush::Goal => {
-                if self.level.goal_tiles().contains(&(tx, ty)) {
+                if !self.can_place(Brush::Goal, tx, ty) {
+                    // A goal refused off the map is not reachable from the UI; a goal refused
+                    // for being on the marker that is already there is the click a user
+                    // actually makes, and the reason is the whole point of saying anything.
+                    self.message = if self.level.tile(tx, ty).is_none() {
+                        "a goal has to stand on the map".to_string()
+                    } else {
+                        "the goal is already here".to_string()
+                    };
                     return false;
                 }
-                self.level.add_goal_tile(tx, ty)
+                // One flag per level, so this is a *move*. Worth saying out loud: the flag
+                // disappears from one end of the level and appears at the other.
+                let moved = self.level.set_goal_tile(tx, ty);
+                if moved {
+                    self.message = "moved the goal here".to_string();
+                }
+                moved
             }
             Brush::Walker => {
                 if self.level.walker_tiles().contains(&(tx, ty)) {
@@ -285,7 +351,21 @@ impl Editor {
                 }
                 self.level.add_walker_tile(tx, ty)
             }
+            Brush::Scenery => {
+                if !self.can_place(Brush::Scenery, tx, ty) {
+                    self.message = "scenery needs an empty cell (and a tree needs room above)"
+                        .to_string();
+                    return false;
+                }
+                self.level.add_scenery(self.scene_sprite, tx, ty)
+            }
             Brush::Erase => {
+                // Entities before terrain, and the scenery the user can *see* before both:
+                // one click on a decorated tile clears the decoration rather than the floor
+                // under it, which is the edit the person aiming at the bush meant.
+                if self.level.remove_scenery_at(tx, ty) {
+                    return true;
+                }
                 if self.level.remove_walker_at(tx, ty) {
                     return true;
                 }
@@ -357,11 +437,11 @@ impl Editor {
                 report.dropped_walkers
             ));
         }
-        if report.dropped_goals > 0 {
-            parts.push(format!("{} goal(s) dropped", report.dropped_goals));
-        }
         if report.spawn_moved {
             parts.push("spawn moved".to_string());
+        }
+        if report.dropped_scenery > 0 {
+            parts.push(format!("{} scenery dropped", report.dropped_scenery));
         }
         if report.goal_moved {
             parts.push("goal pulled back to the edge".to_string());
@@ -546,6 +626,43 @@ mod tests {
         ed.end_stroke();
     }
 
+    /// The scenery brush places the sprite the picker chose, refuses a tree with no room,
+    /// and the eraser takes the decoration before the floor under it.
+    #[test]
+    fn the_scenery_brush_places_its_sprite_and_the_eraser_takes_it_back() {
+        let mut ed = doc();
+        let floor_row = ed.level.height - 1;
+        ed.brush = Some(Brush::Scenery);
+        ed.scene_sprite = "bush_c";
+        ed.begin_stroke();
+        assert!(ed.paint(8, floor_row - 1));
+        ed.end_stroke();
+        assert_eq!(ed.level.scenery_at(8, floor_row - 1), Some("bush_c"));
+        assert!(ed.dirty);
+
+        // A tree needs three open cells; under a ceiling it is refused and says why.
+        ed.scene_sprite = "tree_a_base";
+        ed.level.set_tile(20, floor_row - 2, Tile::Solid);
+        ed.begin_stroke();
+        assert!(!ed.paint(20, floor_row - 1));
+        ed.end_stroke();
+        assert!(ed.message.contains("scenery"), "{}", ed.message);
+        assert_eq!(ed.level.scenery_at(20, floor_row - 1), None);
+
+        // The eraser clears decoration before terrain, so one click on a bush takes the
+        // bush and leaves the floor it stands on.
+        ed.brush = Some(Brush::Erase);
+        ed.begin_stroke();
+        ed.paint(8, floor_row - 1);
+        ed.end_stroke();
+        assert_eq!(ed.level.scenery_at(8, floor_row - 1), None);
+        assert_eq!(
+            ed.level.tile(8, floor_row - 1),
+            Some(Tile::Empty),
+            "the cell under the scenery must be untouched"
+        );
+    }
+
     #[test]
     fn undo_restores_entities_and_the_spawn_too() {
         let mut ed = doc();
@@ -598,17 +715,142 @@ mod tests {
         assert_eq!(ed.level.tile(6, 10), Some(Tile::Empty));
     }
 
+    /// The flag on a new level is the user's to delete — and the editor says what a level
+    /// with no flag costs, rather than refusing the edit.
+    ///
+    /// The rule this replaces was the other way round: the document would not remove its last
+    /// goal, so the flag [`Level::starter`] plants on a fresh level could not be cleared out
+    /// of the way at all. With that gone, the document spends a moment with no flag, so the
+    /// two things that depend on one — the save and the verdict — have to answer instead.
     #[test]
-    fn the_last_goal_cannot_be_erased_away() {
+    fn the_goal_can_be_erased_away_and_the_editor_says_what_that_costs() {
         let mut ed = doc();
-        let goal = ed.level.goal_tiles()[0];
+        let (gx, gy) = ed.level.goal_tiles()[0];
         ed.brush = Some(Brush::Erase);
         ed.begin_stroke();
-        ed.paint(goal.0, goal.1);
+        assert!(ed.paint(gx, gy), "a click on the pole erased nothing");
         ed.end_stroke();
-        assert_eq!(ed.level.goals.len(), 1, "the document keeps its flag");
-        // And the document is still writable, which is the point of the rule.
+        assert!(ed.level.goals.is_empty(), "the starter's flag comes off");
+
+        // A document with no flag cannot be saved, and the refusal leaves no file behind.
+        let path = std::env::temp_dir().join(format!("evo-flagless-{}.json", std::process::id()));
+        let err = ed
+            .save(Some(path.clone()))
+            .expect_err("a flag-less level is not writable");
+        assert!(err.contains("no goal"), "{err}");
+        assert!(!path.exists(), "a refused save must not leave a file behind");
+
+        // Nor can it be beaten, and the per-frame oracle run has to survive being asked.
+        ed.refresh_report();
+        assert!(!ed.beatable());
+        assert_eq!(ed.verdict(), "NOT beatable: the level has no goal flag");
+
+        // Putting a flag down anywhere makes it a level again.
+        ed.brush = Some(Brush::Goal);
+        ed.begin_stroke();
+        assert!(ed.paint(6, 10), "a flag could not be placed");
+        ed.end_stroke();
+        assert_eq!(ed.level.goal_tiles(), vec![(6, 10)]);
         assert!(ed.level.to_json_pretty().is_ok());
+        ed.refresh_report();
+        assert!(ed.beatable(), "{}", ed.verdict());
+    }
+
+    /// The bug found by playing with it: a flag could be placed but the one already on the
+    /// map could not be deleted.
+    ///
+    /// The flag is drawn one cell *above* the goal's own tile, so the click aimed at the flag
+    /// — the only part of the marker with any colour in it — landed on a cell no goal
+    /// claimed, and the erase fell through to a tile that was already empty. Both cells
+    /// address the marker now (`Level::goal_covers`).
+    #[test]
+    fn the_eraser_takes_a_goal_by_the_flag_the_user_can_see() {
+        let mut ed = doc();
+        let (gx, gy) = ed.level.goal_tiles()[0];
+
+        // Aim at the flag, one cell above the goal's own tile.
+        ed.brush = Some(Brush::Erase);
+        ed.begin_stroke();
+        assert!(ed.paint(gx, gy - 1), "a click on the flag erased nothing");
+        ed.end_stroke();
+        assert!(ed.level.goals.is_empty());
+
+        // And the flag can then be put down where the user wanted it instead.
+        ed.brush = Some(Brush::Goal);
+        ed.begin_stroke();
+        assert!(ed.paint(4, 10));
+        ed.end_stroke();
+        assert_eq!(ed.level.goal_tiles(), vec![(4, 10)]);
+        assert!(ed.level.to_json_pretty().is_ok());
+    }
+
+    /// **One flag per level**: a goal placed anywhere else *moves* the marker there, so a
+    /// level cannot end up with two — the move is what the user sees, and the status line
+    /// says it happened, because the flag leaves one end of the level for the other.
+    #[test]
+    fn placing_a_goal_elsewhere_moves_the_one_that_is_there() {
+        let mut ed = doc();
+        let (gx, gy) = ed.level.goal_tiles()[0];
+        assert!(ed.can_place(Brush::Goal, 6, 10), "across the level is free");
+
+        ed.brush = Some(Brush::Goal);
+        ed.begin_stroke();
+        assert!(ed.paint(6, 10));
+        ed.end_stroke();
+        assert_eq!(ed.level.goals.len(), 1, "a level has one flag, not two");
+        assert_eq!(ed.level.goal_tiles(), vec![(6, 10)]);
+        assert!(!ed.level.goal_covers(gx, gy), "nothing was left behind");
+        assert!(ed.message.contains("goal"), "{}", ed.message);
+        assert!(ed.level.to_json_pretty().is_ok());
+    }
+
+    /// The marker's own two cells are refused, and the ghost says so before the click — which
+    /// matters because the cell that refuses it is usually the one *above* the cursor rather
+    /// than the one under it.
+    #[test]
+    fn the_ghost_and_the_document_agree_that_the_goal_is_already_here() {
+        let mut ed = doc();
+        let (gx, gy) = ed.level.goal_tiles()[0];
+        assert!(!ed.can_place(Brush::Goal, gx, gy), "the pole's own cell");
+        assert!(
+            !ed.can_place(Brush::Goal, gx, gy - 1),
+            "the cell the flag hangs in"
+        );
+        assert!(ed.can_place(Brush::Goal, gx - 2, gy), "two columns left is free");
+
+        ed.brush = Some(Brush::Goal);
+        ed.begin_stroke();
+        assert!(!ed.paint(gx, gy - 1), "the document refuses it too");
+        ed.end_stroke();
+        assert_eq!(ed.level.goals.len(), 1);
+        assert_eq!(ed.level.goal_tiles(), vec![(gx, gy)], "the flag did not shift");
+        assert!(
+            ed.message.contains("goal"),
+            "the refusal should say why: {:?}",
+            ed.message
+        );
+    }
+
+    /// A tree is addressed by its canopy as well as its trunk, so the eraser takes the tree
+    /// when the click lands in its leaves — the same rule, for the same reason.
+    #[test]
+    fn the_eraser_takes_a_tree_by_its_canopy() {
+        let mut ed = doc();
+        let floor_row = ed.level.height - 1;
+        ed.brush = Some(Brush::Scenery);
+        ed.scene_sprite = "tree_a_base";
+        ed.begin_stroke();
+        assert!(ed.paint(15, floor_row - 1));
+        ed.end_stroke();
+
+        ed.brush = Some(Brush::Erase);
+        ed.begin_stroke();
+        assert!(
+            ed.paint(15, floor_row - 3),
+            "a click in the leaves erased nothing"
+        );
+        ed.end_stroke();
+        assert_eq!(ed.level.scenery_at(15, floor_row - 1), None);
     }
 
     #[test]

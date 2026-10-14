@@ -96,9 +96,11 @@ impl Drop for TerminalSession {
 
 /// Play `level` with the keyboard until the episode ends or the player quits.
 ///
-/// Controls: left/right arrows or A/D to move, space/W/up to jump, down/S to
-/// brake, R to restart, Q/Esc to quit. Holding a direction while jumping gives
-/// `RunJump`; jumping alone gives `JumpInPlace`; nothing gives `Walk`.
+/// Controls: left/right arrows or A/D to move, shift to sprint, space/W/up to jump,
+/// down/S to brake, R to restart, Q/Esc to quit. Holding a direction while jumping gives
+/// the jump for that direction; jumping alone gives `JumpInPlace`; nothing gives `Walk`.
+/// Pressing into a wall while airborne slides down it, and a jump pressed there is a wall
+/// jump — no separate key, because the verb does not change.
 pub fn play(level: &Level, seed: u64) -> io::Result<PlaySummary> {
     if !io::stdout().is_terminal() {
         return Err(io::Error::other(
@@ -176,10 +178,17 @@ enum Held {
     Left,
     Right,
     Jump,
+    Sprint,
     Brake,
 }
 
-const HELD: [Held; 4] = [Held::Left, Held::Right, Held::Jump, Held::Brake];
+const HELD: [Held; 5] = [
+    Held::Left,
+    Held::Right,
+    Held::Jump,
+    Held::Sprint,
+    Held::Brake,
+];
 
 /// Keyboard state, including the held-key emulation described on [`HOLD_WINDOW`].
 ///
@@ -216,6 +225,7 @@ impl Keys {
             self.is_down(Held::Left, now),
             self.is_down(Held::Right, now),
             self.is_down(Held::Jump, now),
+            self.is_down(Held::Sprint, now),
             self.is_down(Held::Brake, now),
         )
     }
@@ -248,6 +258,13 @@ fn read_keys(keys: &mut Keys, now: Instant) -> io::Result<()> {
                 keys.release(held);
             }
         };
+        // Shift is a *modifier*, not a key: a terminal reports it attached to whichever key
+        // was pressed with it, so the sprint latch is raised by any shifted key event. That
+        // is also what makes the controls read the way they should — shift+D sprints right,
+        // and shift+space is a sprint jump.
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            hold(Held::Sprint);
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => keys.quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -268,22 +285,46 @@ fn read_keys(keys: &mut Keys, now: Instant) -> io::Result<()> {
 
 /// The action a set of held intents means.
 ///
-/// Priority is the plan's action set, not the order keys were pressed in: jump
-/// beats direction, so holding a direction while jumping is a real forward jump
-/// rather than a standing one. There is no jump-left in the action set, so a neutral
-/// jump with left held carries momentum leftward instead.
+/// Priority is the action set, not the order keys were pressed in: jump beats direction,
+/// so holding a direction while jumping is a real jump in that direction rather than a
+/// standing one, and sprint refines a forward run rather than overriding it.
+///
+/// Sprint is a *forward gear*, so on its own it means nothing: `sprint` with no direction
+/// held is `Walk`, not a sprint into the void. That mirrors the action table, where
+/// `Sprint` and `SprintJump` are both rightward.
 ///
 /// Public because there is more than one way to play: the terminal playtest learns
 /// a press from a key event and latches it, the desktop shell reads the key state
 /// directly, and both call this. One definition of the keyboard, so the two cannot
 /// drift into being different games.
-pub fn action_for(left: bool, right: bool, jump: bool, brake: bool) -> AgentAction {
-    if jump && right {
+///
+/// Sprint is a *gear*, not a direction: shift plus either arrow gives that direction's
+/// fast move. It did not, until the action table gained the leftward pair — holding shift
+/// and left produced a plain `Retreat`, so sprinting left was a move the keyboard could
+/// not ask for and the population could not use. See `sim::physics::AgentAction`.
+pub fn action_for(
+    left: bool,
+    right: bool,
+    jump: bool,
+    sprint: bool,
+    brake: bool,
+) -> AgentAction {
+    if jump && right && sprint {
+        AgentAction::SprintJump
+    } else if jump && right {
         AgentAction::RunJump
+    } else if jump && left && sprint {
+        AgentAction::RetreatSprintJump
+    } else if jump && left {
+        AgentAction::RetreatJump
     } else if jump {
         AgentAction::JumpInPlace
+    } else if right && sprint {
+        AgentAction::Sprint
     } else if right {
         AgentAction::Run
+    } else if left && sprint {
+        AgentAction::RetreatSprint
     } else if left {
         AgentAction::Retreat
     } else if brake {
@@ -294,9 +335,12 @@ pub fn action_for(left: bool, right: bool, jump: bool, brake: bool) -> AgentActi
 }
 
 /// The control hint drawn under the level view.
+///
+/// Two lines, because that is what [`HINT_ROWS`] reserves: the controls, then the glyph
+/// legend. A third line would push the level view up and clip the legend.
 pub fn hint() -> String {
     format!(
-        "arrows/A,D move   space/W/up jump (hold + direction = run-jump)   down/S brake   R restart   Q/Esc quit\n\
+        "arrows/A,D move   shift sprint   space/W/up jump (with a direction = that jump, on a wall = wall jump)   down/S brake   R restart   Q/Esc quit\n\
          {}",
         ascii::legend().replace('\n', " | ")
     )
@@ -347,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn held_intents_map_to_the_six_actions_in_priority_order() {
+    fn held_intents_map_to_the_actions_in_priority_order() {
         let now = Instant::now();
         let mut k = keys();
         assert_eq!(k.action(now), AgentAction::Walk);
@@ -362,14 +406,70 @@ mod tests {
         // Jump beats direction: holding both must be a real forward jump.
         k.press(Held::Jump, now);
         assert_eq!(k.action(now), AgentAction::RunJump);
+        // Right still outranks left, so releasing right while left is still held leaves
+        // the *leftward* jump rather than a neutral one — and only letting go of both
+        // leaves a jump in place.
         k.release(Held::Right);
+        assert_eq!(k.action(now), AgentAction::RetreatJump);
+        k.release(Held::Left);
         assert_eq!(k.action(now), AgentAction::JumpInPlace);
 
-        // The action set has no jump-left; a neutral jump carries momentum instead.
+        // Jump-left exists now, so holding left and jumping is a real leftward jump
+        // rather than a neutral jump carrying momentum — which is what makes a
+        // left-facing wall climbable from the keyboard.
         let mut left = keys();
         left.press(Held::Left, now);
         left.press(Held::Jump, now);
-        assert_eq!(left.action(now), AgentAction::JumpInPlace);
+        assert_eq!(left.action(now), AgentAction::RetreatJump);
+
+        // Sprint refines a run in either direction, and refines that direction's jump.
+        // Both halves matter: the table had no leftward sprint at all, so shift+left
+        // produced a plain run and a level whose sprint gap is on the left could not be
+        // played from the keyboard any more than it could be evolved.
+        for (dir, run_gear, jump_gear) in [
+            (Held::Right, AgentAction::Sprint, AgentAction::SprintJump),
+            (Held::Left, AgentAction::RetreatSprint, AgentAction::RetreatSprintJump),
+        ] {
+            let mut sprint = keys();
+            sprint.press(dir, now);
+            sprint.press(Held::Sprint, now);
+            assert_eq!(sprint.action(now), run_gear, "shift + {dir:?}");
+            sprint.press(Held::Jump, now);
+            assert_eq!(sprint.action(now), jump_gear, "jumping at sprint speed");
+        }
+
+        // Sprint alone is not a gear: with no direction held there is nothing to sprint
+        // in, which is the same statement the action table makes by having no neutral
+        // sprint in it.
+        let mut idle_sprint = keys();
+        idle_sprint.press(Held::Sprint, now);
+        assert_eq!(idle_sprint.action(now), AgentAction::Walk);
+        idle_sprint.press(Held::Brake, now);
+        assert_eq!(
+            idle_sprint.action(now),
+            AgentAction::Brake,
+            "sprint does not override the brake"
+        );
+    }
+
+    /// Shift raises the sprint latch against whichever key it arrives on.
+    ///
+    /// Worth a test because the terminal has no key for a modifier: the only evidence of
+    /// shift is that it came attached to another key, so the mapping is "any shifted key
+    /// event sprints", and a reader has to be able to see that stated.
+    #[test]
+    fn a_shifted_key_raises_the_sprint_latch() {
+        let now = Instant::now();
+        let mut k = keys();
+        k.press(Held::Sprint, now);
+        k.press(Held::Right, now);
+        assert_eq!(k.action(now), AgentAction::Sprint);
+        k.release(Held::Sprint);
+        assert_eq!(
+            k.action(now),
+            AgentAction::Run,
+            "releasing shift drops back to a run without losing the direction"
+        );
     }
 
     #[test]
@@ -467,7 +567,16 @@ mod tests {
     #[test]
     fn hint_mentions_every_control() {
         let h = hint();
-        for needle in ["move", "jump", "brake", "restart", "quit", "solid tile"] {
+        for needle in [
+            "move",
+            "sprint",
+            "jump",
+            "wall jump",
+            "brake",
+            "restart",
+            "quit",
+            "solid tile",
+        ] {
             assert!(h.contains(needle), "hint is missing {needle:?}: {h}");
         }
     }

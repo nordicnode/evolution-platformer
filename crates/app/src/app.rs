@@ -42,7 +42,7 @@ use crate::lab::{self, Lab, Lanes, Packet};
 use crate::panel::{self, BestLine, Command, RunSummary, ViewState};
 use crate::play;
 use crate::replay::Replay;
-use crate::splash::Splash;
+use crate::splash::{Action, Splash};
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 use render::chart::HistoryPoint;
 
@@ -490,6 +490,16 @@ impl EvoApp {
     /// record are worth preserving across a look at the editor, and this is the only way
     /// to look at the run and the level it is training on side by side.
     fn enter_evolve(&mut self) {
+        // Training needs something to reach. A document whose flag has been erased has no
+        // progress to score and no bonus to win, so a run on it is a room of agents walking
+        // into the wall under a "0 tiles to go" readout — say why instead of starting one.
+        // The flag is one click away, and the message lands in the status bar of the view the
+        // user is still in.
+        if self.editor.level.goals.is_empty() {
+            self.editor.message =
+                "no goal on this level: place the flag before training on it".into();
+            return;
+        }
         if self.lab.is_none() {
             let cfg = GaConfig {
                 pop_size: self.options.pop_size,
@@ -744,7 +754,10 @@ impl EvoApp {
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let (undo, redo, grid, play, evolve, fit, save, restart, watch) = ctx.input(|i| {
             (
-                i.key_pressed(egui::Key::Z) && i.modifiers.command,
+                // Undo excludes shift so it does not also fire on ctrl+shift+Z: that chord
+                // is the standard redo, and leaving undo on it made the pair cancel out —
+                // the undo ran and the redo immediately undid it, so the level never moved.
+                i.key_pressed(egui::Key::Z) && i.modifiers.command && !i.modifiers.shift,
                 (i.key_pressed(egui::Key::Y) && i.modifiers.command)
                     || (i.key_pressed(egui::Key::Z) && i.modifiers.command && i.modifiers.shift),
                 i.key_pressed(egui::Key::G),
@@ -762,7 +775,11 @@ impl EvoApp {
         if redo && self.editor.redo() {
             self.editor.message = "redo".into();
         }
-        if grid {
+        // Grid is the *editor's* furniture — it is only drawn in `Mode::Edit` (`opts`) — so
+        // the key belongs to that view alone. Toggling it everywhere made `G` do two things
+        // at once in the evolution view, where it also means "ghosts": the ghosts flipped on
+        // screen and the editor's grid silently flipped behind them.
+        if grid && self.mode == Mode::Edit {
             self.grid = !self.grid;
         }
         // `f` is one key with two meanings, split by mode rather than by modifier: in the
@@ -807,9 +824,9 @@ impl EvoApp {
                 if watch {
                     self.enter_replay();
                 }
-                if fit {
-                    self.apply(Command::ToggleFollow);
-                }
+                // `f` is handled by `evolve_keys` (it maps to `Command::ToggleFollow` there,
+                // like every other key); applying it here too toggled follow twice, which
+                // cancelled out. `fit` is only the editor's fit-to-window below.
                 self.evolve_keys(ctx);
             }
             Mode::Replay => {
@@ -824,9 +841,8 @@ impl EvoApp {
                         replay.restart();
                     }
                 }
-                if fit {
-                    self.apply(Command::ToggleFollow);
-                }
+                // As in the evolution view, `f` lives in `replay_keys`; applying it here as
+                // well toggled follow twice.
                 self.replay_keys(ctx);
             }
         }
@@ -918,7 +934,7 @@ impl EvoApp {
                 // machine's frame timing landed on and two runs of one command would
                 // disagree by a tick or two. Held here, the frame is the episode's
                 // 1.5 s mark every time — which is what makes the render numbers in the
-                // README a measurement rather than a coincidence. A run watched by a
+                // FINDINGS.md a measurement rather than a coincidence. A run watched by a
                 // human is not scripted and still opens playing.
                 if self.screenshot.is_some() {
                     replay.paused = true;
@@ -1240,6 +1256,19 @@ impl EvoApp {
         });
     }
 
+    /// The atlas name a palette entry draws its icon from.
+    ///
+    /// The scenery brush is the one entry whose icon is not fixed: it places whichever
+    /// sprite the picker under the palette has selected, so its button — and the drag
+    /// ghost — have to track that selection, or the palette shows a bush while the brush
+    /// plants a tree.
+    fn brush_icon(&self, brush: Brush) -> &'static str {
+        match brush {
+            Brush::Scenery => self.editor.scene_sprite,
+            _ => brush.sprite(),
+        }
+    }
+
     fn palette(&mut self, ui: &mut egui::Ui) {
         ui.label("Palette — drag onto the level, or click to select");
         ui.add_space(4.0);
@@ -1255,7 +1284,7 @@ impl EvoApp {
                 Stroke::new(1.0_f32, Color32::from_gray(90))
             };
             painter.rect_filled(rect, egui::CornerRadius::same(4), Color32::from_gray(38));
-            if let Ok(uv) = self.atlas.uv(brush.sprite()) {
+            if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
                 painter.image(
                     self.atlas.texture_id(),
                     rect.shrink(5.0),
@@ -1284,6 +1313,46 @@ impl EvoApp {
             }
             ui.label(brush.label());
             ui.add_space(2.0);
+        }
+
+        // The scenery picker, shown only while the scenery brush is the active one: two
+        // dozen thumbnails would bury the eight brushes that are used together, and the
+        // choice only matters to the one brush that needs it.
+        if self.editor.brush == Some(Brush::Scenery) {
+            ui.add_space(6.0);
+            ui.label("Which piece of scenery?");
+            ui.horizontal_wrapped(|ui| {
+                for name in crate::editor::SCENERY_SPRITES {
+                    let selected = self.editor.scene_sprite == *name;
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::click());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, egui::CornerRadius::same(3), Color32::from_gray(30));
+                    if let Ok(uv) = self.atlas.uv(name) {
+                        painter.image(
+                            self.atlas.texture_id(),
+                            rect.shrink(4.0),
+                            uv,
+                            Color32::WHITE,
+                        );
+                    }
+                    let stroke = if selected {
+                        Stroke::new(2.0_f32, Color32::from_rgb(250, 214, 102))
+                    } else {
+                        Stroke::new(1.0_f32, Color32::from_gray(70))
+                    };
+                    painter.rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(3),
+                        stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                    if response.on_hover_text(*name).clicked() {
+                        self.editor.scene_sprite = name;
+                        self.editor.message = format!("place {name}");
+                    }
+                }
+            });
         }
     }
 
@@ -1320,9 +1389,18 @@ impl EvoApp {
             physics.max_jump_height(),
             physics.max_jump_distance()
         ));
+        // The two abilities that change what a level may ask for, in the same units as
+        // the jump above: a pit wider than the running jump is a sprint jump, and a rise
+        // taller than the jump height is a wall climb. A designer reading this panel is
+        // exactly who finding 44's numbers are for.
         ui.small(format!(
-            "run speed {:.2}/tick, gravity {:.4}",
-            physics.run_speed, physics.gravity
+            "sprint jump {:.2} tiles far, wall climb {:.2} high",
+            physics.sprint_jump_distance(),
+            physics.wall_jump_height()
+        ));
+        ui.small(format!(
+            "run speed {:.2}/tick ({:.2} sprinting), gravity {:.4}",
+            physics.run_speed, physics.sprint_speed, physics.gravity
         ));
 
         ui.add_space(8.0);
@@ -1331,11 +1409,14 @@ impl EvoApp {
         let level = &self.editor.level;
         ui.small(format!("grid {}x{}", level.width, level.height));
         ui.small(format!("spawn {:?}", level.spawn_tile()));
-        ui.small(format!(
-            "{} goal(s), {} walker(s)",
-            level.goals.len(),
-            level.walkers.len()
-        ));
+        ui.small(match level.goal_tiles().first() {
+            Some((gx, gy)) => format!("goal ({gx}, {gy})"),
+            // A level has one flag, or none at all for the moment between deleting the flag
+            // and placing it again — and a flag-less document is one the writer refuses, which
+            // is worth knowing here rather than at Save.
+            None => "no goal — place one before saving".into(),
+        });
+        ui.small(format!("{} walker(s)", level.walkers.len()));
         let (mut solid, mut sand, mut spike) = (0, 0, 0);
         for ty in 0..level.height {
             for tx in 0..level.width {
@@ -1605,20 +1686,45 @@ impl EvoApp {
         if let Some(brush) = self.dragging {
             if inside {
                 let target = self.camera.tile_rect(tx, ty, rect);
-                if let Ok(uv) = self.atlas.uv(brush.sprite()) {
-                    painter.image(
-                        self.atlas.texture_id(),
-                        target,
-                        uv,
-                        Color32::from_white_alpha(170),
-                    );
-                }
+                // A goal is two tiles of art, and the ghost has to show both: the flag hangs
+                // in the cell *above* the one being clicked (`Level::goal_covers`), so a ghost
+                // drawing only the clicked cell would promise the flag in the wrong place —
+                // and hide the fact that the cell the outline is really asking about is the
+                // one above the cursor.
+                let footprint = if brush == Brush::Goal {
+                    let above = self.camera.tile_rect(tx, ty - 1, rect);
+                    for (cell, name) in [
+                        (target, "goal_bottom"),
+                        (above, "goal_top"),
+                        (above, "goal_flag_1"),
+                    ] {
+                        if let Ok(uv) = self.atlas.uv(name) {
+                            painter.image(
+                                self.atlas.texture_id(),
+                                cell,
+                                uv,
+                                Color32::from_white_alpha(170),
+                            );
+                        }
+                    }
+                    target.union(above)
+                } else {
+                    if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
+                        painter.image(
+                            self.atlas.texture_id(),
+                            target,
+                            uv,
+                            Color32::from_white_alpha(170),
+                        );
+                    }
+                    target
+                };
                 // The ghost shows the *drop*, so it has to show a refused drop too: the
                 // outline is the colour of the answer, and the sprite is faded when the
                 // answer is no.
                 let placeable = self.editor.can_place(brush, tx, ty);
                 painter.rect_stroke(
-                    target,
+                    footprint,
                     egui::CornerRadius::ZERO,
                     Stroke::new(
                         1.5_f32,
@@ -1743,12 +1849,10 @@ impl EvoApp {
         });
     }
 
-    /// One frame of the title screen, and whether the viewer has asked for the game instead.
-    fn splash_frame(&mut self, ctx: &Context) -> bool {
+    /// One frame of the title screen, and what the viewer asked for, if anything.
+    fn splash_frame(&mut self, ctx: &Context) -> Option<Action> {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        let Some(splash) = self.splash.as_mut() else {
-            return false;
-        };
+        let splash = self.splash.as_mut()?;
         splash.advance(dt);
         splash.show(ctx, &self.atlas, &self.sprites)
     }
@@ -1807,7 +1911,7 @@ impl eframe::App for EvoApp {
         // editor behind it — the same event would otherwise both close the screen and start a
         // playtest. Everything below is the frame after that.
         if self.splash.is_some() {
-            let dismissed = self.splash_frame(ctx);
+            let action = self.splash_frame(ctx);
             if let Err(err) = self.handle_screenshot(ctx) {
                 eprintln!("error: {err}");
                 std::process::exit(1);
@@ -1815,8 +1919,16 @@ impl eframe::App for EvoApp {
             // The screen is alive whether or not the viewer does anything, and a window that
             // repaints only on input would show a frozen runner to somebody deciding.
             ctx.request_repaint();
-            if dismissed {
+            if let Some(action) = action {
                 self.splash = None;
+                // The door leads where the sign says: the two keys the title screen names
+                // enter the activity they name instead of dropping the viewer into the
+                // editor to press the same key again.
+                match action {
+                    Action::Edit => {}
+                    Action::Play => self.enter_play(),
+                    Action::Evolve => self.enter_evolve(),
+                }
             }
             return;
         }

@@ -10,19 +10,24 @@ use sim::AgentAction;
 ///
 /// A table rather than a bare list, because a level's *geometry* is content. Width
 /// sets the frame cap (`width × FRAMES_PER_TILE`), and every first-win number
-/// quoted in the README was measured against exactly the level these numbers
+/// quoted in FINDINGS.md was measured against exactly the level these numbers
 /// describe, so a silent resize must fail here rather than quietly invalidate the
 /// difficulty table.
 ///
-/// The pack is ordered by measured difficulty (README, "the M3 problem"): L1 and
-/// L2 are solved by the *initial random population*, L3–L6 need evolution.
-const SHIPPED: [(&str, i32, i32, usize); 6] = [
+/// The pack is ordered by measured difficulty (FINDINGS.md, "The M3 problem"): L1 is solved
+/// by the *initial random population*, L2–L8 need evolution. L7 and L8 are the movement
+/// pass's two levels and are *about* their ability — see
+/// [`the_ability_levels_require_their_ability`].
+const SHIPPED: [(&str, i32, i32, usize); 9] = [
     ("l1-flat-run", 60, 15, 0),
     ("l2-first-gap", 60, 15, 0),
     ("l3-gauntlet", 60, 15, 1),
     ("l4-rhythm", 67, 15, 0),
     ("l5-tightrope", 70, 15, 0),
     ("l6-marathon", 80, 15, 1),
+    ("l7-ascent", 60, 15, 0),
+    ("l7-wall-school", 60, 15, 0),
+    ("l8-long-jump", 60, 15, 1),
 ];
 
 #[test]
@@ -36,7 +41,7 @@ fn all_shipped_levels_load_with_the_documented_shape() {
         assert_eq!(level.width, width, "{slug} width");
         assert_eq!(level.height, height, "{slug} height");
         assert_eq!(level.walkers.len(), walkers, "{slug} walker count");
-        assert!(!level.goals.is_empty(), "{slug} must have a goal");
+        assert_eq!(level.goals.len(), 1, "{slug} must have exactly one flag");
         assert_eq!(
             level.to_glyph_rows().len(),
             level.height as usize,
@@ -86,6 +91,64 @@ fn every_shipped_level_is_reachable_in_principle() {
             report.diagnosis
         );
     }
+}
+
+/// The two levels the movement pass added are about their ability, and this is the test
+/// that says so rather than the comment that claims it.
+///
+/// Each is reachable with the game as it is and *unreachable* with the one ability
+/// switched off, which is the strongest available statement that the level teaches that
+/// ability and that nothing else in the movement set quietly replaces it. It is also the
+/// reason [`sim::reach::ReachOptions`] exists: a claim like this is only worth making if
+/// the tool can be asked the question both ways.
+#[test]
+fn the_ability_levels_require_their_ability() {
+    use sim::reach::{report, report_with, ReachOptions};
+
+    // Two levels, one claim, checked the same way twice: the ascent (a move asked for twice)
+    // and the wall school (the move on its own, finding 45).
+    for slug in ["l7-ascent", "l7-wall-school"] {
+        let level = common::level(slug);
+        let with_walls = report(&level);
+        assert!(
+            with_walls.goal_reached,
+            "{slug} must be beatable with wall jumps: {:?}",
+            with_walls.diagnosis
+        );
+        let without_walls = report_with(
+            &level,
+            ReachOptions {
+                wall_climb: false,
+                ..ReachOptions::default()
+            },
+        );
+        assert!(
+            !without_walls.goal_reached,
+            "{slug} is three tiles up — past the 2.375 a full jump reaches — so without wall \
+             climbs the level must be unreachable; it is reachable another way, and the level \
+             no longer teaches what it is named for"
+        );
+    }
+
+    let long = common::level("l8-long-jump");
+    let with_sprint = report(&long);
+    assert!(
+        with_sprint.goal_reached,
+        "l8-long-jump must be beatable with sprint: {:?}",
+        with_sprint.diagnosis
+    );
+    let without_sprint = report_with(
+        &long,
+        ReachOptions {
+            sprint: false,
+            ..ReachOptions::default()
+        },
+    );
+    assert!(
+        !without_sprint.goal_reached,
+        "l8-long-jump's pits are five tiles and a running jump covers four, so without \
+         sprints the level must be unreachable"
+    );
 }
 
 /// Entities must lie on the map, and walkers must be standing on something.
@@ -271,6 +334,76 @@ fn malformed_levels_are_refused() {
         sim::Level::from_json_str(&no_goal).is_err(),
         "a level with no goal cannot be beaten and must be refused"
     );
+
+    // A level has one flag: two entities, or a 'G' tile beside one, are a file that cannot
+    // say which flag the population is meant to reach. The editor can hold a document with
+    // no flag mid-edit, but a level *on disk* is exactly one.
+    let two_goals = common::fixture_src(
+        "two-goals",
+        &rows,
+        (1, 0),
+        &[("goal", 3, 0), ("goal", 2, 0)],
+        1,
+    );
+    assert!(
+        sim::Level::from_json_str(&two_goals).is_err(),
+        "a second goal entity must be refused, not silently dropped"
+    );
+
+    let goal_entity_and_tile = common::fixture_src("goal-and-G", &rows, (1, 0), &goal, 1)
+        .replace("\"....\"", "\"G...\"");
+    assert!(
+        sim::Level::from_json_str(&goal_entity_and_tile).is_err(),
+        "a 'G' tile beside a goal entity is a second goal"
+    );
+}
+
+/// The mirror of every shipped level is beatable in principle too — and that is a claim about
+/// the *sim*, not about the pack.
+///
+/// The pack is entirely rightward: every level is entered at its left and its flag is
+/// somewhere to the right. That is a fine thing for a level author to do and a dangerous
+/// thing to *only* do, because a capability that exists in one direction looks complete
+/// while nothing exercises the other — the failure is invisible until somebody builds a
+/// leftward level. It has already happened once: the action table had no leftward sprint, so
+/// the mirror of `l8-long-jump` — the very level that teaches sprint — was reported
+/// unbeatable by this oracle, which could not express the move either. Every shipped level
+/// is therefore checked twice here, and the mirrored half is the half that catches a
+/// one-directional `physics`, `reach` or level-editing rule.
+#[test]
+fn every_shipped_levels_mirror_is_reachable_in_principle() {
+    for (slug, width, height, _) in SHIPPED {
+        let level = common::level(slug);
+        let mirror = level.mirrored_horizontal();
+
+        assert_eq!(mirror.width, width, "{slug}: a mirror is the same size");
+        assert_eq!(mirror.height, height, "{slug}: a mirror is the same size");
+        assert_eq!(
+            mirror.goals.len(),
+            1,
+            "{slug}: a mirrored level still holds exactly one flag"
+        );
+        let (sx, sy) = level.spawn_tile();
+        assert_eq!(
+            mirror.spawn_tile(),
+            (width - 1 - sx, sy),
+            "{slug}: the mirrored spawn is the spawn's own column, reflected"
+        );
+
+        let report = sim::reach::report(&mirror);
+        assert!(
+            report.goal_reached,
+            "{slug}'s mirror should be beatable in principle, but: {:?}. A level that is \
+             beatable only left-to-right is a capability missing from the sim, not a level \
+             design (the leftward sprint was exactly this)",
+            report.diagnosis
+        );
+        assert!(
+            report.culprit.is_none(),
+            "{slug}'s mirror is beatable, so it has no stuck jump to blame: {:?}",
+            report.culprit
+        );
+    }
 }
 
 /// Sand is a material, not a mechanic: the same level in sand simulates identically.

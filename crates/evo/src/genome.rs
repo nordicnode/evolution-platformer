@@ -142,7 +142,7 @@ pub struct Genome {
 impl Genome {
     /// Random genome with Xavier-uniform initialisation.
     ///
-    /// Xavier rather than plain uniform: with 90 inputs into 16 tanh units, a
+    /// Xavier rather than plain uniform: with 95 inputs into 16 tanh units, a
     /// uniform `[-1, 1]` start drives most hidden units straight into saturation
     /// on the very first generation, and a GA with no gradients has a hard time
     /// walking back out of that.
@@ -327,6 +327,80 @@ pub fn mutate(g: &mut Genome, sigma: f32, rate: f32, rng: &mut Rng) {
     }
 }
 
+/// Mutate at most `genes` genes, chosen uniformly over the whole genome.
+///
+/// **The fine half of a two-scale search.** [`mutate`] is a *coarse* move by
+/// construction: at the default rate it redraws five percent of a 1 723-gene genome, so
+/// every child is about eighty-six genes away from its parents — a jump, not a step. That
+/// is the right shape early, when the policy is nothing like a solution, and the wrong
+/// shape at the end, when a lineage is one gesture away from clearing the level: a
+/// coarse child of a nearly-good genome is a fresh lottery ticket rather than an
+/// improvement on it. This is the same Gaussian step applied to a handful of genes.
+///
+/// The picks are *with* replacement, so a gene can be hit twice in one call (a double
+/// step, which is a legal mutation) and the number of genes actually changed can be
+/// smaller than `genes`. Sampling without replacement would cost a shuffle and buy a
+/// guarantee nobody needs; what matters here is that the expected number of touched
+/// genes is `genes`, not 86.
+///
+/// RNG consumption is fixed by `genes` and the genome's length, so a caller cannot make
+/// the stream depend on which genes happened to be picked.
+///
+/// Returns the number of genes whose value actually changed, for tests and reporting.
+pub fn mutate_few(g: &mut Genome, genes: usize, sigma: f32, rng: &mut Rng) -> usize {
+    let n = g.weights.len() + g.biases.len();
+    if n == 0 || genes == 0 {
+        return 0;
+    }
+    let mut changed = 0usize;
+    for _ in 0..genes {
+        let slot = (next_f32(rng) * n as f32) as usize;
+        let delta = next_gaussian(rng, sigma);
+        let gene = if slot < g.weights.len() {
+            &mut g.weights[slot]
+        } else {
+            &mut g.biases[slot - g.weights.len()]
+        };
+        let before = *gene;
+        *gene = (*gene + delta).clamp(-GENE_CLAMP, GENE_CLAMP);
+        if *gene != before {
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// A **reheated** copy of a genome: every gene moved by its own Gaussian step of `sigma`.
+///
+/// **The third scale of mutation, and the only one that is not a descendant.** [`mutate`] is
+/// a coarse step from a parent *in the population*, [`mutate_few`] is a fine step from the
+/// generation's best, and both stay where the population already is. A reheat is the move for
+/// a plateau: it walks a long way from the best point the run has found while keeping that
+/// point's *shape* — the signs and relative magnitudes of 1 723 genes survive a step of a few
+/// tenths, where a fresh random genome throws all of it away. The population gets a batch of
+/// these when the trainer decides it is stuck (see `ga::Trainer::breed`), so the run explores
+/// the neighbourhood of its champion at a radius it could not reach with its ordinary step,
+/// instead of restarting from noise.
+///
+/// Every gene moves, which is what separates it from [`mutate`]: at the default rate a coarse
+/// child touches five percent of the genome, so most of it is copied verbatim from one parent.
+/// The intent here is a broad shake, not a sparse one.
+///
+/// The genome's `id` is carried over and the fitness is cleared; the caller owns ids (they are
+/// part of every `episode_seed`), exactly as it does for [`crossover`].
+///
+pub fn reheat(g: &Genome, sigma: f32, rng: &mut Rng) -> Genome {
+    let mut child = g.clone();
+    for w in child.weights.iter_mut() {
+        *w = (*w + next_gaussian(rng, sigma)).clamp(-GENE_CLAMP, GENE_CLAMP);
+    }
+    for b in child.biases.iter_mut() {
+        *b = (*b + next_gaussian(rng, sigma)).clamp(-GENE_CLAMP, GENE_CLAMP);
+    }
+    child.fitness = 0.0;
+    child
+}
+
 /// Uniform per-weight crossover (§7.5). `a` and `b` must share a shape.
 pub fn crossover(a: &Genome, b: &Genome, rng: &mut Rng) -> Genome {
     debug_assert_eq!(a.shape, b.shape);
@@ -351,14 +425,22 @@ mod tests {
     use sim::rng::rng_from_seed;
 
     #[test]
-    fn default_shape_matches_plan_v1() {
+    fn default_shape_matches_the_plan() {
         let s = default_shape();
-        assert_eq!(s.inputs, 90);
+        // v4: 95 inputs (the plan's 90, plus wall side/wall slide/sprint charge from v2,
+        // plus the goal's vertical component and the leftward gap probe) and eleven outputs
+        // (the plan's six, plus sprint, sprint_jump, retreat_jump and the two leftward
+        // sprinting arms). The pin is the *recipe* — one hidden layer of sixteen,
+        // argument-max output — with the two ends read from the sim so this test cannot
+        // disagree with the action table or the sensor layout.
+        assert_eq!(s.inputs, N_INPUTS);
+        assert_eq!(s.inputs, 95);
         assert_eq!(s.hidden, vec![16]);
-        assert_eq!(s.outputs, 6);
-        assert_eq!(s.n_weights(), 90 * 16 + 16 * 6);
-        assert_eq!(s.n_biases(), 16 + 6);
-        assert_eq!(s.n_genes(), 1558);
+        assert_eq!(s.outputs, N_OUTPUTS);
+        assert_eq!(s.outputs, 11);
+        assert_eq!(s.n_weights(), 95 * 16 + 16 * 11);
+        assert_eq!(s.n_biases(), 16 + 11);
+        assert_eq!(s.n_genes(), 95 * 16 + 16 * 11 + 16 + 11);
         s.validate().expect("shape is valid");
     }
 
@@ -429,6 +511,65 @@ mod tests {
         mutate(&mut g2, 0.0, 1.0, &mut r2);
         assert!(g2.weights.iter().any(|w| *w != 0.0));
         let _ = probe;
+    }
+
+    #[test]
+    fn a_reheat_moves_every_gene_and_keeps_the_genomes_shape() {
+        // Every gene, unlike `mutate` which touches five percent of them at the default rate:
+        // the point of a reheat is a broad shake, not a sparse one.
+        let mut rng = rng_from_seed(17);
+        let parent = Genome::random(3, default_shape(), &mut rng);
+        let mut child_rng = rng_from_seed(18);
+        let child = reheat(&parent, 0.30, &mut child_rng);
+
+        assert_eq!(child.id, parent.id, "the caller owns ids");
+        assert_eq!(child.shape, parent.shape);
+        assert_eq!(child.fitness, 0.0, "a reheat is unevaluated");
+        let moved = child
+            .weights
+            .iter()
+            .zip(&parent.weights)
+            .chain(child.biases.iter().zip(&parent.biases))
+            .filter(|(c, p)| c != p)
+            .count();
+        assert_eq!(
+            moved,
+            child.weights.len() + child.biases.len(),
+            "a reheat must touch every gene"
+        );
+        child.validate().expect("still a valid genome");
+
+        // And it keeps the parent's shape: the sign of each gene survives at a rate far above
+        // chance, where a fresh random genome sits at chance. This *is* the mechanism — the
+        // reason to walk away from the best point found rather than discard it.
+        let shape_kept = |of: &Genome| {
+            let mut same = 0usize;
+            let mut total = 0usize;
+            for (a, b) in of
+                .weights
+                .iter()
+                .zip(&parent.weights)
+                .chain(of.biases.iter().zip(&parent.biases))
+            {
+                total += 1;
+                if a.signum() == b.signum() {
+                    same += 1;
+                }
+            }
+            same as f32 / total as f32
+        };
+        let stranger = Genome::random(4, default_shape(), &mut rng_from_seed(19));
+        assert!(
+            shape_kept(&child) > shape_kept(&stranger) + 0.1,
+            "a reheat ({:.3}) is no more like its parent than a stranger is ({:.3})",
+            shape_kept(&child),
+            shape_kept(&stranger)
+        );
+
+        // The same seed and the same parent must give the same child (§5.6).
+        let again = reheat(&parent, 0.30, &mut rng_from_seed(18));
+        assert_eq!(again.weights, child.weights);
+        assert_eq!(again.biases, child.biases);
     }
 
     #[test]
