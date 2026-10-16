@@ -36,6 +36,8 @@ pub const MIN_LEVEL_H: i32 = 5;
 pub const GLYPH_EMPTY: char = '.';
 pub const GLYPH_SOLID: char = '#';
 pub const GLYPH_SAND: char = 'S';
+pub const GLYPH_BRICK: char = 'B';
+pub const GLYPH_PLANK: char = 'W';
 pub const GLYPH_SPIKE: char = '^';
 pub const GLYPH_GOAL: char = 'G';
 
@@ -60,6 +62,12 @@ pub enum Tile {
     /// `S` where it means a beach, and the renderer draws the sand family over it, which is
     /// the whole difference between "ground" and "the ground here is sand".
     Sand = 4,
+    /// Ancient stone masonry (`B`). Solid exactly as [`Tile::Solid`] and [`Tile::Sand`] are;
+    /// drawn with the stone brick autotile family.
+    Brick = 5,
+    /// Timber scaffolding / wood planks (`W`). Solid exactly as [`Tile::Solid`] is;
+    /// drawn with the wood plank autotile family.
+    Plank = 6,
 }
 
 impl Tile {
@@ -68,6 +76,8 @@ impl Tile {
             GLYPH_EMPTY => Some(Tile::Empty),
             GLYPH_SOLID => Some(Tile::Solid),
             GLYPH_SAND => Some(Tile::Sand),
+            GLYPH_BRICK => Some(Tile::Brick),
+            GLYPH_PLANK => Some(Tile::Plank),
             GLYPH_SPIKE => Some(Tile::Spike),
             GLYPH_GOAL => Some(Tile::Goal),
             _ => None,
@@ -79,13 +89,15 @@ impl Tile {
             Tile::Empty => GLYPH_EMPTY,
             Tile::Solid => GLYPH_SOLID,
             Tile::Sand => GLYPH_SAND,
+            Tile::Brick => GLYPH_BRICK,
+            Tile::Plank => GLYPH_PLANK,
             Tile::Spike => GLYPH_SPIKE,
             Tile::Goal => GLYPH_GOAL,
         }
     }
 
     pub fn is_solid(self) -> bool {
-        matches!(self, Tile::Solid | Tile::Sand)
+        matches!(self, Tile::Solid | Tile::Sand | Tile::Brick | Tile::Plank)
     }
 
     /// Is this tile only a different *material* of solid ground?
@@ -95,6 +107,14 @@ impl Tile {
     /// player goes may care what the ground is made of.
     pub fn is_sand(self) -> bool {
         matches!(self, Tile::Sand)
+    }
+
+    pub fn is_brick(self) -> bool {
+        matches!(self, Tile::Brick)
+    }
+
+    pub fn is_plank(self) -> bool {
+        matches!(self, Tile::Plank)
     }
 }
 
@@ -234,6 +254,8 @@ pub struct Level {
     pub goals: Vec<Rect>,
     /// Placed scenery, in draw order. Inert: not simulated, not hashed, not sensed.
     pub scenery: Vec<Scenery>,
+    /// Lazily computed move-graph route table for this level, shared across clones via `Arc`.
+    routes_cache: std::sync::OnceLock<std::sync::Arc<crate::reach::GoalRoutes>>,
 }
 
 impl Level {
@@ -295,6 +317,7 @@ impl Level {
             walkers: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
+            routes_cache: std::sync::OnceLock::new(),
         };
 
         // Spawn: bottom edge on the bottom of the spawn tile's row.
@@ -393,7 +416,14 @@ impl Level {
     fn set(&mut self, tx: i32, ty: i32, tile: Tile) {
         if tx >= 0 && tx < self.width && ty >= 0 && ty < self.height {
             self.tiles[(ty * self.width + tx) as usize] = tile;
+            self.routes_cache = std::sync::OnceLock::new();
         }
+    }
+
+    /// Return the move-graph route table for this level, computing and caching it on first ask.
+    pub fn routes(&self) -> &crate::reach::GoalRoutes {
+        self.routes_cache
+            .get_or_init(|| std::sync::Arc::new(crate::reach::goal_routes(self)))
     }
 
     pub fn is_solid(&self, tx: i32, ty: i32) -> bool {
@@ -430,56 +460,78 @@ impl Level {
     /// question and would make the reward a function of landing precision rather than of
     /// the crossing.
     pub fn landing_zone(&self, tx: i32, surface_row: i32) -> i32 {
+        self.landing_zone_bounds(tx, surface_row).0
+    }
+
+    /// Inclusive `(start, end)` column span of the contiguous standable zone containing `tx`
+    /// on `surface_row`.
+    pub fn landing_zone_bounds(&self, tx: i32, surface_row: i32) -> (i32, i32) {
         let mut start = tx;
         while start > 0 && self.is_standable(start - 1, surface_row) {
             start -= 1;
         }
-        start
+        let mut end = tx;
+        while end + 1 < self.width && self.is_standable(end + 1, surface_row) {
+            end += 1;
+        }
+        (start, end)
+    }
+
+    /// Is the column `edge_col` just outside a landing zone a crossing (a spike at standing
+    /// height, or a drop of at least two rows)?
+    fn edge_is_crossing(&self, edge_col: i32, surface_row: i32) -> bool {
+        if edge_col < 0 || edge_col >= self.width {
+            return false;
+        }
+        if self.is_spike(edge_col, surface_row - 1) {
+            return true;
+        }
+        !self.is_solid(edge_col, surface_row) && !self.is_solid(edge_col, surface_row + 1)
     }
 
     /// Is the landing zone beginning at `zone_start` one the body could only have arrived at
-    /// by crossing something?
-    ///
-    /// Two ways to qualify, and the exclusions are the interesting part:
-    ///
-    /// * a **hazard at standing height** in the column just left of the zone — a spike the
-    ///   body would be inside if it stood there;
-    /// * a **hole** in that column: not ground at this row *and* not ground one row down
-    ///   either, so the body would have fallen rather than stepped.
-    ///
-    /// The second test is deliberately two rows deep. Ground one row down is a *step*, and a
-    /// step is not a crossing — counting it would pay a genome for walking up onto a ledge
-    /// and would turn most of the shipped pack's raised platforms into checkpoints, which is
-    /// not what the term is for. Measured on the pack, the two-row rule leaves `l1-flat-run`
-    /// at zero, gives `l2-first-gap` exactly one (the far side of its pit) and
-    /// `l8-long-jump` exactly two (its two pit ledges), and leaves the spike floors with one per
-    /// hazard. The one-row rule gave L2 four and L7-ascent three, all of them steps.
+    /// by crossing something from the left?
     fn zone_is_checkpoint(&self, zone_start: i32, surface_row: i32) -> bool {
         debug_assert!(zone_start > 0, "callers exclude the left-edge zone");
-        let left = zone_start - 1;
-        if self.is_spike(left, surface_row - 1) {
-            return true;
-        }
-        !self.is_solid(left, surface_row) && !self.is_solid(left, surface_row + 1)
+        self.edge_is_crossing(zone_start - 1, surface_row)
     }
 
-    /// If `(tx, surface_row)` is ground the body can stand on **and reaching it meant
-    /// crossing something**, the id of the checkpoint zone it belongs to; otherwise `None`.
-    ///
-    /// The zone that begins at the level's left edge is deliberately *not* a checkpoint:
-    /// nothing was crossed to reach the spawn, and paying for it would hand every episode a
-    /// free credit that the flat levels, which have no crossing to earn one with, could
-    /// never match.
-    ///
-    /// Note what this is *not*: it is not a measure of the body's x. The zone ids the body
-    /// actually stood on are what get counted, so a body that sails over a hazard and dies
-    /// in the air beyond it keeps the frontier it covered and earns nothing here.
+    /// If `(tx, surface_row)` is ground the body can stand on **and reaching it from the left
+    /// meant crossing something**, the id of the checkpoint zone it belongs to; otherwise `None`.
     pub fn checkpoint_zone(&self, tx: i32, surface_row: i32) -> Option<i32> {
         if !self.is_standable(tx, surface_row) {
             return None;
         }
         let start = self.landing_zone(tx, surface_row);
         if start > 0 && self.zone_is_checkpoint(start, surface_row) {
+            Some(start)
+        } else {
+            None
+        }
+    }
+
+    /// Directional checkpoint query: given the column `(tx, surface_row)` the body is standing
+    /// on and the column `from_col` it started or last left a landing zone from, returns the
+    /// checkpoint zone id (`zone_start`) if arriving on this zone from `from_col` crossed a
+    /// hazard or a drop on the approached side.
+    ///
+    /// Symmetric across left-to-right and right-to-left play:
+    /// * approaching from the left (`from_col < start`) checks the zone's left edge (`start - 1`);
+    /// * approaching from the right (`from_col > end`) checks the zone's right edge (`end + 1`);
+    /// * staying inside `start..=end` on the same zone is not a crossing (`None`).
+    pub fn checkpoint_zone_from(&self, tx: i32, surface_row: i32, from_col: i32) -> Option<i32> {
+        if !self.is_standable(tx, surface_row) {
+            return None;
+        }
+        let (start, end) = self.landing_zone_bounds(tx, surface_row);
+        let crossed = if from_col < start {
+            start > 0 && self.edge_is_crossing(start - 1, surface_row)
+        } else if from_col > end {
+            end + 1 < self.width && self.edge_is_crossing(end + 1, surface_row)
+        } else {
+            false
+        };
+        if crossed {
             Some(start)
         } else {
             None
@@ -584,6 +636,7 @@ impl Level {
             walkers: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
+            routes_cache: std::sync::OnceLock::new(),
         };
         for tx in 0..width {
             level.set(tx, height - 1, Tile::Solid);
@@ -613,15 +666,25 @@ impl Level {
     /// rules would refuse to *make*: the spawn lands on the tile the mirrored one occupies,
     /// and the flag is moved rather than a second one appearing beside it.
     ///
-    /// **One thing does not flip: a walker's patrol direction.** Walkers carry no direction
-    /// on disk — [`Walker::new`](crate::physics::Walker::new) builds every one of them
-    /// facing right — so a mirrored level's walkers still set off rightward. On a walker
-    /// level the mirror is therefore not a perfect reflection, and this is measurable rather
-    /// than theoretical: `l8-long-jump` versus its mirror is learned at generations 4/3/7/11
-    /// against 18/18/17/16, and with the walkers removed the same pair is 1/1/2/1 against
-    /// 5/0/5/3. That is a property of the *level format* (a walker has a position, not a
-    /// heading), not of the physics, and it is recorded in REVIEW.md rather than papered
-    /// over here.
+    /// **One thing does not flip: a walker's patrol direction — and it is not a direction the
+    /// file holds.** A walker entity carries a position, not a heading: the initial direction is
+    /// drawn from the episode RNG
+    /// ([`Walker::spawn_spread`](crate::physics::Walker::spawn_spread)), which is the sim's only
+    /// gameplay randomness and the entire reason a walker level is stochastic. A heading field on
+    /// the entity would make every trial of such a level the byte-identical episode, so there is
+    /// nothing here for a mirror to flip — and a mirrored walker level is a reflection of the
+    /// geometry and of the *distribution* of patrols rather than of any one patrol.
+    ///
+    /// **What a previous pass wrote here — that a mirrored walker level is measurably harder,
+    /// 4/3/7/11 against 18/18/17/16 on `l8-long-jump` — does not reproduce, and that is worth
+    /// recording rather than quietly deleting.** The same pair on this build, pop 200, seeds 1-4,
+    /// `--stop-on-win`: **4 / 4 solved at generations 7, 3, 3, 4 against 3, 0, 5, 6** (means 4.2
+    /// and 3.5), and with the walker deleted from both files 2, 2, 3, 6 against 3, 0, 3, 5
+    /// (means 3.2 and 2.8) — the mirror is the *faster* of the two in both pairings. The model
+    /// the old number rested on was wrong about the sim rather than about mirrors: walkers have
+    /// never set off rightward, because the direction draw is in the repository's first commit.
+    /// What was true is that `Walker::new`, which tooling uses for a deterministic pose, builds
+    /// one facing right. See `REVIEW.md` §2.9.
     pub fn mirrored_horizontal(&self) -> Level {
         let mut out = Level::starter(
             format!("{} mirrored", self.name),
@@ -719,6 +782,7 @@ impl Level {
         self.tiles = tiles;
         self.width = width;
         self.height = height;
+        self.routes_cache = std::sync::OnceLock::new();
 
         let mut report = ResizeReport::default();
         let (sx, sy) = self.spawn_tile();
@@ -840,6 +904,29 @@ impl Level {
         (c0..=c1).any(|c| self.is_solid(c, ty + 1))
     }
 
+    /// Whether a spawn placed at tile `(tx, ty)` would stand on something.
+    ///
+    /// The spawn's own version of [`Self::walker_stands_on_ground`], and it refuses one
+    /// thing more than the walker's rule does. A walker placed in a wall is an odd-looking
+    /// level; a *spawn* placed in a wall is an episode that starts with the player embedded
+    /// in the ground, and a spawn placed in mid-air is an episode that starts with the
+    /// player falling — which is a level whose very first frame is already decided. So the
+    /// cell has to be on the map, empty of tiles, and have solid ground under the player's
+    /// own footprint rather than under one point of it.
+    ///
+    /// Ground, not *soil*: sand, brick and timber are solid in exactly the same way, and a
+    /// start on a beach is a start ([`Tile::is_solid`]). The editor asks this before it
+    /// writes a spawn, so the click that would drop the player is refused out loud instead
+    /// of discovered on the first playtest.
+    pub fn spawn_stands_on_ground(&self, tx: i32, ty: i32) -> bool {
+        if tx_out(tx, ty, self.width, self.height) || self.is_solid(tx, ty) {
+            return false;
+        }
+        let x = tx as f32 + (1.0 - PHYSICS.player_w) * 0.5;
+        let (c0, c1) = crate::physics::tile_span(x, PHYSICS.player_w);
+        (c0..=c1).any(|c| self.is_solid(c, ty + 1))
+    }
+
     /// Add a walker at a tile position if it is on the map. Returns whether it landed.
     pub fn add_walker_tile(&mut self, tx: i32, ty: i32) -> bool {
         if tx_out(tx, ty, self.width, self.height) {
@@ -873,6 +960,7 @@ impl Level {
         }
         self.goals.clear();
         self.goals.push(goal_rect(tx, ty));
+        self.routes_cache = std::sync::OnceLock::new();
         true
     }
 
@@ -902,7 +990,12 @@ impl Level {
     pub fn remove_goal_at(&mut self, tx: i32, ty: i32) -> bool {
         let before = self.goals.len();
         self.goals.retain(|g| !goal_marker_covers(g, tx, ty));
-        self.goals.len() != before
+        if self.goals.len() != before {
+            self.routes_cache = std::sync::OnceLock::new();
+            true
+        } else {
+            false
+        }
     }
 
     /// Every placed scenery item, in draw order.
@@ -1160,7 +1253,7 @@ fn goal_rect(tx: i32, ty: i32) -> Rect {
 mod editing_tests {
     use super::*;
 
-    const PACK: [&str; 9] = [
+    const PACK: [&str; 10] = [
         "l1-flat-run",
         "l2-first-gap",
         "l3-gauntlet",
@@ -1170,6 +1263,7 @@ mod editing_tests {
         "l7-ascent",
         "l7-wall-school",
         "l8-long-jump",
+        "l9-wait-and-climb",
     ];
 
     fn shipped(slug: &str) -> Level {
@@ -1485,6 +1579,70 @@ mod editing_tests {
         );
         assert!(level.remove_scenery_at(12, 6), "the second click takes the tree");
         assert_eq!(level.scenery_at(12, 7), None);
+    }
+
+    /// The start point has to stand on ground, in an empty cell, on the map.
+    ///
+    /// The refusal the editor shows as a red ghost rather than as a broken first frame: a
+    /// spawn one row higher than the floor falls, a spawn inside the floor is stuck, and a
+    /// spawn off the grid is a level that kills the player before frame 0.
+    #[test]
+    fn a_spawn_needs_an_empty_cell_with_ground_under_it() {
+        let level = Level::starter("start", 20, 10);
+        // `starter` lays a floor on the bottom row and stands the spawn on it.
+        let (sx, sy) = level.spawn_tile();
+        assert!(
+            level.spawn_stands_on_ground(sx, sy),
+            "the start the constructor laid down must satisfy the rule"
+        );
+        // One row up is mid-air: the player would fall the moment the level opened.
+        assert!(
+            !level.spawn_stands_on_ground(sx, sy - 1),
+            "mid-air is not a start"
+        );
+        assert!(!level.spawn_stands_on_ground(sx, sy - 4));
+        // The floor itself is occupied by a tile, and a player cannot start inside it.
+        assert!(
+            !level.spawn_stands_on_ground(sx, sy + 1),
+            "a solid cell is not a start"
+        );
+        // And off the grid, in all four directions, including below it: falling out is a
+        // death, not a placement.
+        assert!(!level.spawn_stands_on_ground(-1, sy));
+        assert!(!level.spawn_stands_on_ground(level.width, sy));
+        assert!(!level.spawn_stands_on_ground(sx, -1));
+        assert!(!level.spawn_stands_on_ground(sx, level.height));
+
+        // Every material is ground: the rule asks `is_solid`, not `== Tile::Solid`, so a
+        // start on a beach, a cellar floor or a plank deck is a start.
+        let mut level = Level::starter("start-materials", 20, 10);
+        for (tx, material) in [(5, Tile::Sand), (7, Tile::Brick), (9, Tile::Plank)] {
+            for x in 0..level.width {
+                level.set_tile(x, level.height - 1, material);
+            }
+            assert!(
+                level.spawn_stands_on_ground(tx, level.height - 2),
+                "a start on {material:?} is a start"
+            );
+            level.set_tile(tx, level.height - 2, Tile::Empty);
+        }
+
+        // And the span is the player's, not one point: a body over a gap with a tile beside
+        // it has ground under it somewhere. The pair is the rule's own asymmetry, so it is
+        // asked both ways rather than assumed.
+        let mut level = Level::starter("start-span", 20, 10);
+        for x in 0..level.width {
+            level.set_tile(x, level.height - 1, Tile::Empty);
+        }
+        level.set_tile(1, level.height - 1, Tile::Solid);
+        assert!(
+            level.spawn_stands_on_ground(1, level.height - 2),
+            "a cell with ground under part of the footprint is a start"
+        );
+        assert!(
+            !level.spawn_stands_on_ground(5, level.height - 2),
+            "a cell over nothing at all is not"
+        );
     }
 
     #[test]

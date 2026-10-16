@@ -46,7 +46,7 @@
 //! z-order, and [`Scene::from_sim`] places the player at index 0 so a single-agent
 //! view is unchanged from before this module took scenes.
 
-use sim::level::{GLYPH_EMPTY, GLYPH_SAND, GLYPH_SOLID, GLYPH_SPIKE};
+use sim::level::{GLYPH_BRICK, GLYPH_EMPTY, GLYPH_PLANK, GLYPH_SAND, GLYPH_SOLID, GLYPH_SPIKE};
 use sim::{Level, Sim};
 
 /// Player glyph.
@@ -64,9 +64,11 @@ pub const GLYPH_UNKNOWN: char = '?';
 ///
 /// A legend, not a whitelist — see the module docs. Watch mode draws each agent
 /// with its own letter and those letters are not listed here.
-pub const GLYPHS: [(char, &str); 8] = [
+pub const GLYPHS: [(char, &str); 10] = [
     (GLYPH_SOLID, "solid tile"),
     (GLYPH_SAND, "sand tile (solid, a beach)"),
+    (GLYPH_BRICK, "stone brick tile (solid masonry)"),
+    (GLYPH_PLANK, "wood plank tile (solid timber)"),
     (GLYPH_SPIKE, "spike (lethal, not solid)"),
     (GLYPH_EMPTY, "empty space"),
     (GLYPH_GOAL, "goal flag"),

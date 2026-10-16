@@ -18,7 +18,14 @@ use sim::AgentAction;
 /// by the *initial random population*, L2–L8 need evolution. L7 and L8 are the movement
 /// pass's two levels and are *about* their ability — see
 /// [`the_ability_levels_require_their_ability`].
-const SHIPPED: [(&str, i32, i32, usize); 9] = [
+///
+/// **L9 is the content pass's level**: the first one in the pack that is a *chain* rather than
+/// an obstacle — a spike, a pit, a nineteen-tile walker patrol, a hazard patch, a two-tile step, a
+/// three-tile wall climb, a gap in the ledge, another spike and a two-tile climb, with the spawn at
+/// column 2 and the flag at column 56. It is here in the table with the rest because everything the
+/// pack asserts about a level (its size, its one flag, its round trip, its mirror) has to hold for
+/// it too.
+const SHIPPED: [(&str, i32, i32, usize); 10] = [
     ("l1-flat-run", 60, 15, 0),
     ("l2-first-gap", 60, 15, 0),
     ("l3-gauntlet", 60, 15, 1),
@@ -28,6 +35,7 @@ const SHIPPED: [(&str, i32, i32, usize); 9] = [
     ("l7-ascent", 60, 15, 0),
     ("l7-wall-school", 60, 15, 0),
     ("l8-long-jump", 60, 15, 1),
+    ("l9-wait-and-climb", 60, 15, 1),
 ];
 
 #[test]
@@ -246,20 +254,29 @@ fn every_shipped_level_terminates_inside_its_frame_cap() {
     }
 }
 
-/// A walker out of the grid is *invisible to the reachability oracle* but *visible
-/// to every agent*: the enemy sensor reports the nearest live walker at any
-/// distance, clamped to the view radius. Both halves of that asymmetry are worth
-/// pinning, because together they explain why the off-grid walker of the previous
+/// A walker out of the grid is *invisible to the reachability oracle* but *visible to every
+/// agent* — bounded by [`sim::sensors::ENEMY_VIEW_DISTANCE`]. Both halves of that asymmetry
+/// are worth pinning, because together they explain why the off-grid walker of the previous
 /// test was worth a test in the first place.
+///
+/// A walker beyond the view distance is out of sight and reads `(0.0, 0.0)`, while a walker
+/// inside it reports its own normalised offset — the offset, not a threshold, so the test
+/// does not have to be rewritten every time the view distance is measured again.
 #[test]
-fn an_off_grid_walker_is_still_in_the_enemy_sensors() {
+fn an_off_grid_or_distant_walker_is_out_of_sight_until_approached() {
     let width = 24;
     let sky = ".".repeat(width);
     let ground = "#".repeat(width);
     let rows = vec![sky.clone(), sky.clone(), sky.clone(), ground];
 
-    let inside = common::fixture(
-        "walker-in-grid",
+    let close = common::fixture(
+        "walker-close",
+        &rows,
+        (1, 2),
+        &[("walker", 4, 2), ("goal", 22, 2)],
+    );
+    let distant = common::fixture(
+        "walker-distant",
         &rows,
         (1, 2),
         &[("walker", 18, 2), ("goal", 22, 2)],
@@ -278,16 +295,22 @@ fn an_off_grid_walker_is_still_in_the_enemy_sensors() {
         (obs[81], obs[82])
     };
 
-    let near = enemy_slots(&inside);
-    let far = enemy_slots(&outside);
+    // The fixture stands the walker three tiles to the right of the body, so the reading is
+    // that offset over the view distance.
+    let near = enemy_slots(&close);
     assert!(
-        near.0 > 0.99 && far.0 > 0.99,
-        "a walker 17 tiles away and one 400 tiles away both saturate the \
-         normalised enemy dx slot: near {near:?} far {far:?}"
+        (near.0 - 3.0 / sim::sensors::ENEMY_VIEW_DISTANCE).abs() < 0.05 && near.0 > 0.0,
+        "a walker 3 tiles away is inside ENEMY_VIEW_DISTANCE and reads its offset over it: {near:?}"
     );
     assert_eq!(
-        near.1, far.1,
-        "dy should not depend on how far to the right the walker is"
+        enemy_slots(&distant),
+        (0.0, 0.0),
+        "a walker 17 tiles away is beyond ENEMY_VIEW_DISTANCE and reads (0, 0)"
+    );
+    assert_eq!(
+        enemy_slots(&outside),
+        (0.0, 0.0),
+        "an off-grid walker 400 tiles away is out of sight and reads (0, 0)"
     );
 
     // The same level without any walker reads the slots as "no enemy".
@@ -422,8 +445,15 @@ fn every_shipped_levels_mirror_is_reachable_in_principle() {
 ///   it sees soil, so a beach is not a new problem to learn.
 #[test]
 fn sand_is_a_material_and_not_a_mechanic() {
-    // The glyph round trip, including that snad and soil are different glyphs.
-    for tile in [sim::Tile::Empty, sim::Tile::Solid, sim::Tile::Sand, sim::Tile::Spike] {
+    // The glyph round trip, including that sand, brick, plank and soil are different glyphs.
+    for tile in [
+        sim::Tile::Empty,
+        sim::Tile::Solid,
+        sim::Tile::Sand,
+        sim::Tile::Brick,
+        sim::Tile::Plank,
+        sim::Tile::Spike,
+    ] {
         assert_eq!(
             sim::Tile::from_glyph(tile.glyph()),
             Some(tile),
@@ -432,13 +462,19 @@ fn sand_is_a_material_and_not_a_mechanic() {
         );
     }
     assert_ne!(sim::Tile::Sand.glyph(), sim::Tile::Solid.glyph());
+    assert_ne!(sim::Tile::Brick.glyph(), sim::Tile::Solid.glyph());
+    assert_ne!(sim::Tile::Plank.glyph(), sim::Tile::Solid.glyph());
     assert!(sim::Tile::Sand.is_solid(), "sand has to hold a body up");
+    assert!(sim::Tile::Brick.is_solid(), "brick has to hold a body up");
+    assert!(sim::Tile::Plank.is_solid(), "plank has to hold a body up");
 
     let sky = "....".to_string();
-    let rows = vec![sky.clone(), sky.clone(), "#SSS".to_string()];
+    let rows = vec![sky.clone(), sky.clone(), "#SBW".to_string()];
     let level = common::fixture("beach", &rows, (1, 1), &[("goal", 3, 1)]);
     assert_eq!(level.tile(0, 2), Some(sim::Tile::Solid));
-    assert_eq!(level.tile(2, 2), Some(sim::Tile::Sand));
+    assert_eq!(level.tile(1, 2), Some(sim::Tile::Sand));
+    assert_eq!(level.tile(2, 2), Some(sim::Tile::Brick));
+    assert_eq!(level.tile(3, 2), Some(sim::Tile::Plank));
     let round_tripped = sim::Level::from_json_str(
         &level.to_json_pretty().expect("a level serializes"),
     )
@@ -446,29 +482,39 @@ fn sand_is_a_material_and_not_a_mechanic() {
     assert_eq!(
         round_tripped.content_hash(),
         level.content_hash(),
-        "sand did not survive a save and a load"
+        "materials did not survive a save and a load"
     );
 
-    // And the same level, twice, with only the floor's material changed.
+    // And the same level, with only the floor's material changed.
     let soil = common::fixture("soil-floor", &[sky.clone(), sky.clone(), "####".into()], (1, 1), &[("goal", 3, 1)]);
     let sand = common::fixture("sand-floor", &[sky.clone(), sky.clone(), "SSSS".into()], (1, 1), &[("goal", 3, 1)]);
+    let brick = common::fixture("brick-floor", &[sky.clone(), sky.clone(), "BBBB".into()], (1, 1), &[("goal", 3, 1)]);
+    let plank = common::fixture("plank-floor", &[sky.clone(), sky.clone(), "WWWW".into()], (1, 1), &[("goal", 3, 1)]);
     let mut a = sim::Sim::new(&soil, 1);
     let mut b = sim::Sim::new(&sand, 1);
+    let mut c = sim::Sim::new(&brick, 1);
+    let mut d = sim::Sim::new(&plank, 1);
     let actions = common::forward_actions(7, 400);
     for (tick, action) in actions.iter().enumerate() {
         a.step(*action);
         b.step(*action);
+        c.step(*action);
+        d.step(*action);
         assert_eq!(
             a.state_hash(),
             b.state_hash(),
             "the two floors diverge at tick {tick}: sand is not behaving as soil"
         );
+        assert_eq!(a.state_hash(), c.state_hash(), "brick diverges at tick {tick}");
+        assert_eq!(a.state_hash(), d.state_hash(), "plank diverges at tick {tick}");
         assert_eq!(
             a.observation(),
             b.observation(),
             "an agent can tell sand from soil at tick {tick}, which makes it a new problem \
              to learn rather than a different colour of ground"
         );
+        assert_eq!(a.observation(), c.observation());
+        assert_eq!(a.observation(), d.observation());
     }
     assert_eq!(a.outcome(), b.outcome());
     assert!(a.player().grounded, "the body should be standing on the floor");

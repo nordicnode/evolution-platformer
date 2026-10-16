@@ -39,6 +39,7 @@ generations (§9's "the population is itself the difficulty oracle"):
 | L7-ascent | 60 | 12/12 | 12.5 | 1 | 90 | never |
 | L7-wall-school | 60 | 12/12 | 2.5 | 0 | 8 | 1 of 12 seeds |
 | L8-long-jump | 60 | 12/12 | 9.5 | 1 | 16 | never |
+| L9-wait-and-climb | 60 | 12/12 | 67.5 | 30 | 205 | never |
 
 Reproduce a row with:
 
@@ -69,6 +70,29 @@ L7-wall-school is the one row that is not part of the ladder's *length*: it is t
 wall jump on its own, learns in a median of 2.5 generations, and exists because the
 ascent asks for that move twice — see finding 45, which is also where the honest
 limit of "just train it on an easier level" is measured.
+
+**L9 is the row that is a different kind of level, and it is measured in a different
+pass.** Every other row above is an *obstacle*: one thing to find, and the ladder is how
+long the population takes to find it. L9 is a *chain* — a spike, a pit, a nineteen-tile
+walker patrol, a two-tile hazard patch, a two-tile step, a three-tile wall climb, a
+gap in the upper ledge, another spike and a two-tile climb — with the spawn at column 2
+and the flag at column 56, so a genome has to make nine moves in a row rather than one, and the
+ladder's own median (1-20) becomes 67.5. It is the only row here measured at the *current*
+observation — **v8**, where the twelve rows above it are v6 readings, and the reason its numbers
+moved rather than being re-quoted: v8 re-rolls every episode in every arm, so every first-win
+generation in this row is a new draw and no old one carries over. Re-measured at pop 200, 400
+generations, `--stop-on-win`, with the trainer's own defaults (a walker level is judged on three
+patrol phases, `REVIEW.md` §4's trial rule), **all twelve seeds solve inside the cap**: 30, 33, 54,
+54, 58, 67, 68, 70, 81, 82, 90 and 205 generations. What the trial rule is worth on the pack's only
+chain level is separable on the same version — with `--no-auto-trials` (one patrol phase per
+genome, which is what every number in this row was taken with before the rule existed) the same
+twelve seeds give **10 of 12**, 33, 35, 54, 71, 75, 77, 98, 105, 163 and 356, with seeds 8 and 12
+unsolved at 400 — so the rule is worth two seeds and about nine generations of median here, and the
+level is still the slowest row in the table by more than a factor of three (67.5 against L3's 20). It
+remains the point of the level
+rather than a defect in it: the pack's other levels are asked a question a reflex can answer, and
+this one is not. See `REVIEW.md` §4 for the same level run against the population's own memory,
+which is the mechanism item 1 of that review says a level with a wait needs.
 
 Finding 15 still explains why a stall is level information rather than a bug; what
 changed is that the pack stalls less often now. The ability levels are the ones that
@@ -101,6 +125,65 @@ control still spans "over in seconds" to "ten minutes", so a level solving in a
 few generations at 8× can be watched one generation at a time at 1×. Before this
 pack, no speed setting helped, because L1/L2 were solved by the initial population
 and L3 was over in under a minute at every speed.
+
+## The clock: what rewarding a quick finish bought
+
+The game had a frame cap and no clock: an episode that reached the flag in 6 s and one
+that crawled there in 38 s of its 40 s budget scored the same, so the search was told
+nothing about time and a viewer had nothing to race. This pass adds one — fitness **v8**
+pays `SPEED_BONUS = 200` for the fraction of the level's own frame budget a **win** left
+unspent (`SPEED_BONUS × (budget − frames) / budget`), the MAP-Elites archive keys its
+cells on the finish band as well as on behaviour (48 niches → 240 cells), and the
+window prints the run's quickest win, races it in the playtest, and reports the bands the
+archive has filled. All four numbers a reader needs are the same number: `sim::frame_budget`
+for the cap, the episode's own `frames` for the clock, `EpisodeStats::budget_frames` for the
+budget the score is computed against, and `sim::format_time` to write any of them.
+
+The reward is small against the score and large against what actually discriminates a
+population. On the sixty-tile levels every shipped level is, the budget is 2 400 frames and
+a full-window win collects all 200 — 1.8% of the 11 000 a win is worth. But a generation
+of 200 genomes on L1 has ~170 winners, all within a few dozen points of each other on
+progress, jumps and checkpoints, and the clock is worth up to 200 across that crowd. It is
+the only term with enough range to re-rank a generation that has already solved the level,
+which is exactly the state L1–L8 reach within a generation or two.
+
+**Measured: the term is the only change, so `SPEED_BONUS = 0.0` is fitness v7.** Same build,
+same seeds, pop 200, 60 generations, `--release`, on the target i5-9400. `clock` is the
+run's quickest win, `best` the champion's own episode.
+
+| Level | seed | clock (bonus 200) | clock (bonus 0) | champion frames (200) | champion frames (0) |
+|---|---|---|---|---|---|
+| L1-flat-run | 1 | 6.15 s | 6.15 s | 373 | 416 |
+| L1-flat-run | 2 | 6.15 s | 6.15 s | 371 | 504 |
+| L3-gauntlet | 1 | 6.47 s | 7.13 s | 402 | 437 |
+| L3-gauntlet | 2 | 6.40 s | 7.80 s | 385 | 493 |
+| L6-marathon | 1 | 8.93 s | 8.93 s | 624 | 655 |
+| L6-marathon | 2 | 8.67 s | 8.58 s | 530 | 658 |
+
+Read it as: **the champion is quicker or equal in five of six rows, and by up to 22%**
+(L3 seed 2: 493 → 385 frames; L6 seed 2: 658 → 530). The run's *record* is where the
+effect is honest rather than dramatic: on L1 both settings hit 6.15 s, because 369 frames
+is the fastest a body can cross that level at all — the floor is the level's, not the
+reward's — and on L6 seed 2 the record is 10 frames *worse* with the bonus, which is what
+a different ranking of the same population looks like: the first genome to reach the flag
+is a different genome once the ranking changes. So the claim this pass actually
+establishes is the champion's, not the record's: **when a generation has already solved
+the level, the clock decides which of its winners is kept**, and the kept one is quicker.
+
+The archive's time axis is what makes that survive into later generations, and it is a
+*diversity* change rather than a reward change — 240 cells instead of 48 means a niche now
+holds a quick win and a slow win separately, so finding a faster route to the same
+landing zone does not evict the slower one and a route found at one pace is not lost when
+the pace changes. The band count is the run's speed coverage: 4/4 bands on L1 and L8 (wins
+in all four quarters of the budget), 1–2/4 on L3 and L6 after sixty generations, which is
+the reading that says a level is solved *once* rather than solved *well*.
+
+The sizing was checked as early as it could be: 200 is about twelve tiles of progress, so
+a win that skipped a checkpoint to save 100 frames would come out 7.7 points behind one
+that collected it (8.3 points of clock against 16 for the zone), and 200 frames — a tenth
+of the budget — still does not pay for one. That trade is now a test
+(`a_quicker_win_cannot_be_bought_by_skipping_a_checkpoint`), because it is the one way this
+term could buy a worse route instead of a faster one.
 
 # Workspace
 
@@ -154,6 +237,141 @@ the same level must produce the same fitness, or selection is noise.
   pinned by two golden tests: a 10 000-frame run and a fixed observation vector.
   Any change that moves either value must be a deliberate version bump.
 
+## The race: three things the playtest's clock got wrong
+
+Three separate faults, found by reading the playtest against the panel it is supposed to
+agree with rather than by anything failing.
+
+**The ghost was not the agent whose time was quoted.** The dock races the run's *quickest
+win* (`Packet::fastest`, a `FastWin` — four numbers and no network), while the ghost was
+attached from `Packet::best`, the highest-**fitness** genome. Since fitness v8 those are
+different agents the moment a run has two winners, and `best` need not be a winner at all:
+the common case was a ghost that died in the first pit while the line above it announced a
+time it had never run. The fix is not a better guess between the two records, it is to stop
+having two: `Trainer::fastest_agent` now stores the **episode** the time was set on (the
+genome, and the result carrying its seed) beside the time, written in the same branch of
+`Trainer::advance` that sets `fastest`. So `fastest.frames == fastest_agent.result.frames`
+is an invariant of one code path rather than a coincidence of two, and the playtest races
+exactly the record it quotes. Pinned twice: `evo`'s
+`a_run_reports_the_quickest_win_it_has_recorded` replays the stored genome and asserts it
+wins on the recorded tick, and the app's `the_ghost_finishes_on_the_time_the_run_quotes`
+drives the whole path — train until a win, attach, run, check the flag tick.
+
+**A clock that had not started claimed a lead.** The race line was
+`{mine} {where} — the AI's best is {theirs}, {gap}`, and the gap is a subtraction of two
+frame counts. At 0.00 s every gap is a win, so the idle line read
+`0.00s ready — the AI's best is 8.42s, 8.42s faster` — a claim to be eight seconds ahead for
+standing still — and the lamp went gold on the same arithmetic. Both now read the clock's own
+state first: no gap is quoted before the first input, and `beating` is `started && …`, because
+a race that has not begun is not one you are winning.
+
+**A turn is crisp on the ground and stays slow in the air.** "Clunky" here has a number
+behind it: at the bare `run_accel` a reversal is an acceleration with a negative sign, so
+crossing from `run_speed` through zero took **20 ticks (0.33 s)** and from sprint **30 ticks
+(0.5 s)** — two thirds of a jump's airtime spent still travelling the way the player no longer
+wants to go. `Physics::turn_accel_scale` (2.5) makes a **grounded** turn 8 ticks from run speed
+and 12 from sprint.
+
+**Grounded only, and that was measured rather than assumed.** The first attempt scaled the
+turn everywhere and broke `walking_into_a_pit_is_still_fatal` — the test that exists to hold
+"turning around costs more ground than the fall leaves", which is *why* every pit in the shipped
+pack is lethal. With a crisp airborne turn a body that walks off a lip at running speed can
+press back onto the pit wall before the world runs out, which turns each pit into a wall-climb
+exercise and quietly changes the difficulty of the pack. The scale is therefore grounded-only,
+and `a_turn_is_crisper_on_the_ground_than_in_the_air` pins both halves: **5 ticks** grounded
+(the bible's `turn_ticks` ceiling) against **17 airborne** (the unscaled figure, unchanged),
+with the pit test still passing as the constraint that decided it. This is a physics constant,
+so the workspace moved to **0.9.0**.
+
+## The replay: which record the window follows, and which clock it reads
+
+Reported from a watched replay, and both halves were real: **the clock kept counting after the
+agent had reached the goal**, and **the agent being followed was overtaken by ghosts that reached
+the flag first** — so the thing on screen, racing a quoted time, was not the agent that set it.
+
+**The star was the champion.** `Replay::with_limit` took the episode from `Packet::best` — the
+highest-*fitness* genome — while the dock quotes `Packet::fastest` and the playtest's ghost is
+built from `Packet::fastest_agent` (the fix above). Those are different agents as soon as a run
+has two winners, and the ordering is not exotic: `SPEED_BONUS` is 200 — twelve tiles — against
+`CHECKPOINT_BONUS` 16 and `ROUTE_HOP_BONUS` 32, so a winner whose route closes a dozen more hops
+than a quicker one collects 384 points of route against at most a few dozen points of clock and
+takes the champion's place on fitness alone. The replay was therefore the one view still on the
+old record: a slower agent in the middle of a field of agents that had beaten its time, with the
+strip quoting that time beside it.
+
+The two records are both kept, because they answer different questions (`FastWin` vs `BestEver`);
+what changed is which one a *stopwatch* view runs. The star now comes from
+`Packet::fastest_agent` — the episode `fastest` was measured on, written beside it by the trainer —
+with `packet.best` as the fallback for a run that has never won, where there is no clock to race
+and the best-scoring attempt is the most a replay can show (`replay::StarBasis` carries which of
+the two it is, and the strip, the panel and the details board all say it in the same words instead
+of calling both "the best agent"). `--replay`'s help, the replay's `f` row and the playtest's
+ghost button were carrying the same misnomer — the button said "champion" while racing the
+quickest win — and were corrected with it.
+
+**The clock was the field's.** The strip and the panel read `Replay::clock`, which counts the ticks
+the *replay* has been open: it keeps running while the slower ghosts behind the star are still out
+there (that is the point of running them together) and the scenery is animated on it. Nothing that
+quotes an episode's time may use it. The number a viewer reads is now `Replay::star_elapsed` — the
+star's own frame count, the same unit the recorded episode is kept in, which stops counting the
+moment the episode ends — so a win in 5.2 s keeps reading 5.2 s at the flag with the ghosts still
+running. The playtest had this right all along (`play::Session::frames`, wall clock only for
+animation); the replay is the same rule.
+
+**The champion file is deliberately unchanged.** `Save champion`, `train-cli train`'s output and
+the splash screen still record and play the highest-*fitness* genome, because the file answers "which
+genome is the best one this run found" and fitness is that question, clock and all; the champion is
+what `train-cli replay` re-verifies and what the title screen shows off. So "the champion" and "the
+agent a stopwatch view runs" are two different agents on a run with two winners, by design, and the
+UI now says which is which rather than leaving a viewer to infer it.
+
+**Pinned.** `the_star_is_the_runs_quickest_win_rather_than_its_best_score` builds the state a real
+run reaches with two winners — the quickest episode on the record, the slowest agent as the
+champion — and asserts the star is the record's agent, that the champion is one of the *ghosts*,
+and that a packet with no champion at all is still watchable. `no_ghost_reaches_the_flag_before_the_star`
+is the end-to-end version on a real run that really wins (a flag two tiles from the spawn, so a
+generation of eight contains winners): the star takes the flag in **17 frames**, the two winning
+ghosts in **20** and **24**, and the test refuses to pass on a fixture where no ghost won, which
+would compare nothing. `the_clock_stops_where_the_star_stopped` runs ten more seconds of wall clock
+with the field's clock still climbing and asserts the episode time and the strip have not moved.
+
+## What the watcher's core is worth
+
+A run in the window stutters *while it is working*, and the reason is structural rather than a
+hot loop: `evaluate_suite` is a `par_iter`, so a generation is spread over every core by
+rayon — including the core the frame being drawn is running on. The window is not slow, it is
+queued behind its own trainer. The worker now evaluates on its own pool sized
+`available_parallelism() - 1` (`lab::training_threads`), which leaves the frame one core.
+
+**Measured on a 6-core machine**, `l6-marathon` at pop 200, four generations, twice:
+
+| rayon threads | training |
+|---|---|
+| 6 (every core) | 0.052 / 0.054 s/gen |
+| 5 (one reserved) | 0.058 / 0.058 s/gen |
+
+and the same reservation measured from the *other* side — a 5 ms timer's overshoot while the
+trainer saturates the machine, 200 samples, which is what a frame waiting to be drawn
+experiences:
+
+| | median | p95 | worst | over a 10 ms budget |
+|---|---|---|---|---|
+| no trainer | 0.09 ms | 0.93 ms | 4.55 ms | 0 |
+| trainer on 6 cores | 0.33 ms | 1.74 ms | **16.45 ms** | 1/200 |
+| trainer on 5 cores | 0.29 ms | **1.09 ms** | **2.22 ms** | 0 |
+
+The medians barely move and the **tail** is where the difference is: 16.45 ms is one missed
+frame at 60 Hz, and reserving a core takes the worst case to 2.22 ms — inside the frame budget
+with room to spare. So the trade is about 9 % of training throughput for a worst-case wakeup
+that is seven times better, which is the right way round for a view whose whole purpose is to
+be watched while it trains.
+
+The same pass removed a second full-population copy per generation: `Generator::next_packet`
+cloned every genome to build `Packet::agents` out of a `Vec<Genome>` it owned and never read
+again (~1.2 MB at pop 200, the project's own figure for one such copy). It now consumes that
+vector. This one is not separately benchmarked — it is a pure subtraction of work on the
+worker thread, visible in the code as `population.into_iter()`.
+
 ## The version trio
 
 `sensors::VERSION`, `evo::fitness::VERSION` and `sim::SIM_VERSION` are stamped
@@ -203,13 +421,51 @@ thing that changed is what the oracle now says: every shipped level's **mirror**
 in principle, where the mirror of `l8-long-jump` was not before. See REVIEW.md findings 1.8
 and 1.9.
 
+The perception pass moved **sensors to v7** with the sim and the fitness untouched: v5 bounded the
+nearest-enemy vector so a walker across the map stopped feeding a constant phantom threat, v6 widened
+that bound from four tiles to eight after four was measured as *harder to learn* than the unbounded
+lie (twelve seeds on `l3-gauntlet`: mean first win 41 generations at four tiles against 25 unbounded
+and 18 at eight), and v7 appended `enemy_dir`, the nearest sighted walker's direction of travel.
+That last one closes the observation's oldest gap about walkers: a body could see where one was and
+not which way it was going, and the direction is not authored anywhere — it is drawn from the episode
+RNG, which is what makes a walker level stochastic and a trial count meaningful. Nothing about the
+physics, the reward or the frame budget moved with it, so the trio stays split, exactly as the field
+is meant to allow. Every champion trained before v7 is refused at load (it asks for 96 inputs and
+files carry the count they were built with); see REVIEW.md §2.9 for why the level format still has no
+heading field to match the new slot.
+
+The clock pass (REVIEW.md §4, "The clock") moved the trio the other way: fitness to **v8**, with the
+workspace at **0.8.0** and sensors left at **v7**. The *sim* moved as well, which is why this one is a
+pair and not a single bump: a new term needs a denominator, and the honest denominator is the level's
+own frame cap, so `EpisodeStats` gained `budget_frames` — a field of a struct that is part of the state
+`state_hash` pins and part of what a champion is replayed against, exactly as finding 49's checkpoint
+counter was. Champion files from before v8 are refused by the version check, and `--replay` re-measures
+a saved episode against the new arithmetic, which is the whole point of the trio: the alternative is a
+file that replays to a *different score* than it advertises. See
+[The clock: what rewarding a quick finish bought](#the-clock-what-rewarding-a-quick-finish-bought).
+
+The spike's kill zone (REVIEW.md §2.12) moved the workspace to **0.10.0** with sensors and
+fitness untouched: sensors are **v7** and fitness stays **v8**, because the observation and
+the reward are unchanged — what moved is where the hazard *is*. The sprite has always drawn
+its tips three of sixteen cell rows below the tile's top, deliberately, so that a spike
+under a ceiling does not read as part of it; the kill zone tested the whole tile anyway. The
+band that mismatch left above every spike was 0.1875 tiles tall and invisible, and it was
+measured to be the difference between a level being solvable and not: on the hand-drawn
+level that produced the report, one take-off position out of 81 reached the flag alive under
+the tile rule, against fourteen of 81 under the drawn box, and 70% of the swept pairs died
+without the body ever touching a drawn pixel. This is the first bump that moves **no**
+observation and **no** reward, and the first whose evidence is a *level* rather than a
+measurement of the pack — which is what a player-facing rule change should look like, and
+why the trio is a trio.
+
 # Agent interface
 
-**Sensors (v4, 95 inputs).** A 9×9 tile patch around the body (solid `1.0`,
+**Sensors (v7, 96 inputs).** A 9×9 tile patch around the body (solid `1.0`,
 spike `-0.5`, enemy `-1.0`, empty `0.0`), then nearest-enemy `dx`/`dy`, `gap_right`,
 `grounded`, normalised `vx`/`vy`, `can_jump`, the goal vector, a bias input, and
-finally `gap_left`. The plan's sensor table omits spikes, which would leave the most
-common hazard invisible; `-0.5` fills that gap and is documented in `sensors.rs`.
+finally `gap_left` and `enemy_dir`. The plan's sensor table omits spikes, which would
+leave the most common hazard invisible; `-0.5` fills that gap and is documented in
+`sensors.rs`.
 
 v2 appended the three inputs the movement abilities need and changed what `vx`
 *means*: `wall_dir` (the side the body is pressed into), `clinging`, and
@@ -234,6 +490,14 @@ velocity), so the observation's reading depended on the body's last decision —
 first decision of an episode, where a direction has to be chosen, is exactly where that
 hurts. The two slots now describe the ground beside each edge of the feet symmetrically,
 and neither is "forward".
+
+v5, v6 and v7 are the walker pass, in that order: the enemy vector gained a range (bounded
+at four tiles, then widened to eight because four was measured *worse to learn from* than the
+unbounded lie it replaced), and then it gained the one fact about a patrol that no amount of
+training could recover — `enemy_dir`, which way the nearest sighted walker is walking. The
+level format deliberately holds no such field (an authored heading would make every trial of a
+walker level the same episode), so this is an observation change or it is nothing. See
+REVIEW.md §2.9 and §4.
 
 **Actions (11 macro-actions).** `run`, `run_jump`, `sprint`, `sprint_jump`,
 `retreat`, `retreat_jump`, `brake`, `jump_in_place`, `walk`, `retreat_sprint`,
@@ -2081,9 +2345,468 @@ deliberate, documented decision — not drift.
     six budgets, v4 in 18–50 — which is what a term that fills in a missing gradient should
     look like where the gradient was not missing. And the tight floor is still a lottery at
     these budgets either way; the checkpoint term prices the lottery better, it does not make
-    it a cert. Nothing about the shipped ladder weakened: `crates/evo/tests/difficulty.rs`
-    still passes unchanged, and the hazard-free levels have no checkpoint to earn — the
-    arithmetic, not a measurement, is why they cannot be affected.
+    it a cert. Nothing about the shipped ladder    weakened: `crates/evo/tests/difficulty.rs` still passes unchanged, and the hazard-free
+    levels have no checkpoint to earn — the arithmetic, not a measurement, is why they
+    cannot be affected.
+
+50. **A stalled run practises its *next move*: the run's own level from the furthest stand
+    its best genome made, with the flag moved to the stand just past it.** Findings 19–22
+    say what a stalled run does — checkpoint the stuck population, take a detour to an
+    easier level, bring the population back — but the chain needs an easier level, and a
+    level somebody drew by hand is not always there. This derives one from the run's own
+    landscape, and the derivation had to get three things right before it worked. Each is
+    a lesson with a measurement behind it.
+
+    **Where the run is: a stand, not an apex.** The obvious reading of "how far the run
+    has gotten" is `closest_approach`, and it is wrong: it is the running minimum over
+    every *state* the body passed through, including the apex of a leap it then fell back
+    from. On a zig-zag climb one free wall-jump apex outranked the next four platforms of
+    the route, so arriving on any of them scored no progress and selection preferred the
+    body that stayed where it was. `stuck_point` reads the body's distance on the frames
+    it is **grounded** — the furthest it has actually *stood* — and the practice spawn is
+    snapped to ground the body can stand on (a body at a ledge's edge overhangs its
+    support, and a spawn dropped into the gap is refused).
+
+    **Where the flag goes: the next stand, not the level's end.** The first version moved
+    only the spawn and left the flag where it was. Measured on the zig-zag tower
+    (`levels/scratch-spike-tower.json`, 14×40: a zig-zag of two-tile platforms over
+    spikes, flag at the top — the level this work was measured on), it failed:
+
+    | practice level | solved (12 seeds × 420 gen) | checkpoints banked | what the detour did |
+    |---|---|---|---|
+    | none (the chain off) | 0/12 | 4–12 | — |
+    | spawn moved, flag left at the level's end | 0/12 | 4–7 | learned at the spot (best there 83→230) and lost the climb |
+    | spawn moved, **flag at the next stand** | **1/12** — first win at generation 256 | 3–18 | 53 of 57 detours reached their flag; the practice chain walked up the tower |
+
+    The middle row's mechanism is worth stating exactly, because it is invisible in the
+    champion: with the flag at the level's own end a practice episode can only bank the
+    *tail* of the run's score — the stuck population scores ~294 on the tower from the
+    bottom and its practice episodes could reach at most ~230 from the moved spawn. The
+    detour is a two-level suite `[practice, main]` ranked by the **worst** level (the
+    "hold both" rule, and the only ranking that should preserve the climb), but with the
+    tail always the worst, the minimum *was* the tail: every detour bred the climb away.
+    The run's own chart says it — the maximum fell 295→115 the moment the detour started
+    and was still 273 at generation 799, *below* the population the detour took out. It
+    also hides behind `best-ever`: the champion is banked before the detour, so the run
+    looks unchanged while the population under it is worse.
+
+    Moving the flag to the stand just past the stuck one fixes the scale at the root.
+    Winning the practice level is worth the same 10 000 as winning the level, so a genome
+    that makes the move is ranked by its *climb*, and a genome that keeps the climb but
+    loses the move falls under the move's score — the minimum now means "hold both" where
+    both can score. It also makes `flag reached at its generation N` mean the move is
+    *owned*, which is the reading the note needs. With the step re-armed on each new stall
+    spell (the authored `--curriculum` path keeps its one-step-per-run rule), one run
+    works through the tower move by move: the winning seed practised (12,31)→(10,29),
+    (10,29)→(7,27), (4,25)→(1,23) and finally (9,1)→(12,1) — the move right before the
+    top flag — and won the level at generation 256. Reproducible from the seed.
+
+    **What it is claimed to do.** 1 of 12 at 420 generations is a rescue, not a solution:
+    the tower still falls to this budget only occasionally. The claim is the mechanism —
+    the detour learns the move, keeps the climb, and hands back a population that is
+    better on its own level (best-evidence fitness 310–719 against the baseline's
+    282–612, and the two best runs banked 17–18 of the tower's checkpoints against the
+    baseline's 12).    One honest limit: `next_stand` picks the nearest stand genuinely
+    closer to the flag and does *not* check reachability, so a stand the body cannot
+    actually reach makes the practice level unwinnable — visible as "flag not reached
+    there yet", which is what 4 of the 57 detours said. *(Corrected in finding 51: those
+    four misses were the level's hard crossing won ten times over in the same arm, not an
+    unreachable stand — and the proximity guess this paragraph names was the real defect,
+    in two measured forms.)*
+
+    Shipped as `evo::curriculum`: `stuck_point`, `next_stand`, `practice_level`,
+    `practice_step` (the two-level suite step), `save_practice_level`
+    (`<level>.population.json` → `<level>.practice.json`, so the derived landscape is a
+    file somebody can open and play). Wired in `watch`, `train` and the window's evolve
+    worker.
+
+51. **The next stand is the route's next crossing. Proximity was measurably wrong.**
+    Finding 50 placed the practice flag on "the nearest stand that reads closer to the
+    flag" — a straight-line guess where a route question was being asked. The tower arm
+    it was measured on contains both ways that guess fails, in its own detour log:
+
+    - `(4,9) → (6,11)` practised **backwards**. The run stood on the leg's stand at row
+      10 and the flag went to the stand at row 12 — the one it had just climbed from. A
+      zig-zag turns its back on the flag for a whole leg, so the stand *behind* reads
+      closer to the flag than the stand the route visits next, and the detour duly won
+      its flag (backtracking is easy) and spent 40 generations owning a move the run
+      already owned.
+    - `(7,11) → (4,5)` ordered a practice episode **three crossings long**. The stands
+      up the leg (rows 10 and 8) read *farther* from the flag than the stand at row 12,
+      so the "closer to the flag" filter deleted them and the nearest survivor was three
+      jumps away — the whole chain in miniature, exactly what a derived level exists to
+      avoid.
+
+    Finding 50's closing limit was a **misdiagnosis**, correctable from the same log:
+    all four "flag not reached there yet" detours were the crossing (10,29)→(7,27),
+    which the same arm won ten times. The level's hard move is hard; the stand was never
+    unreachable. The reachability hazard was real but latent — proximity could pick a
+    stand no move reaches, and nothing would notice until the practice level went
+    unwinnable.
+
+    **The fix: distance is a graph question.** `sim::reach::goal_routes` builds the
+    move graph and each stand's hop count to the flag: landing zones are the nodes (a
+    spike at standing height splits one platform into two stands the body cannot walk
+    between — `extract_platforms` is too coarse to be a stand), and every edge is one
+    canonical crossing from `edges_from`, so the route can only ever claim a move the
+    game has. `next_stand` takes one crossing off the stuck stand whose hop count to the
+    flag does not grow: strictly fewer is route progress, the same count is a stepping
+    stone (the near ledge of a wide pit — the nearest forward move, not the next-but-five,
+    finding 50's decomposition rule preserved), and *more* is the run being sent back.
+    The straight line survives only as a tie-break within one rung of the graph. A stand
+    with no route to the flag has no next stand at all, and the run says so instead of
+    ordering an impossible jump.
+
+    **The measurement.** 12 seeds × 420 generations on the tower, same protocol as
+    finding 50's arm:
+
+    | practice flag | solved | detours reaching their flag | detour shape |
+    |---|---|---|---|
+    | nearest stand reading closer (finding 50) | 1/12 — win at gen 256 | 53 of 57 | 2 of 57 wrong: 1 backwards, 1 three crossings |
+    | **the route's next crossing** | 1/12 — win at gen 299 | 96 of 104 | every one a single route hop |
+
+    The outcome is the same within noise and the derivation is not. Every practice pair
+    in the new arm is an adjacent leg of the zig-zag — (13,31)→(10,29), (10,29)→(7,27),
+    (7,27)→(4,25), (4,25)→(1,23), (1,23)→(3,21), (6,19)→(9,17), (9,17)→(12,15),
+    (13,15)→(10,13), and (4,9)→(1,7) where the old rule practised backwards — and every
+    seed stepped back about twice as often (104 vs 57 detours: 2→4, 1→2, 5→8 …). The
+    re-arm gate opens only when the run sets a new best after a detour, so the count is
+    the read-out of how often the chain came back and the run moved again; a detour that
+    learns nothing shuts the gate and the run gets no second step back until evolution
+    alone breaks its record. Champion heights are unchanged (3–19 of the tower's
+    checkpoint zones banked against 3–18), seed 11 won both arms (gen 299 against 256,
+    reproducible from the seed), and the eight misses are all the one genuinely hard
+    crossing — (10,29)→(7,27), 28 attempts, 8 unlearned in 40 generations.
+
+    The claim is the mechanism, not the tower's win rate: the practice episode is now
+    always the crossing it claims to be, always one the game has, and never the ground
+    behind the run. What the tower does with that at 420 generations is a separate
+    question — its binding constraint is the crossing at rows 30→28, and no ordering of
+    practice flags makes that jump shorter.
+
+    Shipped as `sim::reach::goal_routes` (`Trajectory` gained `landed_at`, the column a
+    body is supported by, so a landing maps to the stand it reached) and the rewritten
+    `evo::curriculum::next_stand`; the practice-level contract and every front-end are
+    unchanged.
+
+52. **A move cannot start inside a hazard. The oracle's one false positive hid a sealed
+    level — and the stall chain refused to say so.**
+
+    The reachability oracle's hazard check runs *after* movement — the game's own rule:
+    a body dies the tick its box overlaps a spike. But a take-off sweep authors the body
+    standing at an exact x, and where a platform's column is spike-topped, some of those
+    x put the box *inside the spike at tick zero*. Such a body leaves the tile between
+    tick zero and tick one and is never checked at all: the sweep invented jumps out of
+    a spot no body can occupy (to stand there the body would have had to walk into the
+    spike first). `simulate_jump_at` and `simulate_wall_climb` now refuse such a start
+    (`hazard_start`): a death at the take-off, and no edge.
+
+    What it hid: a hand-built 8×30 spike tower (drawn over `levels/l1-flat-run.json`)
+    that four phantom edges reported as beatable. In fact one spike — at (4,12) —
+    seals it. The ledge at (3..4,13) is the only take-off toward the shelf at (6..7,11),
+    and the spike's death window covers every arc across it: the body must have risen
+    1.14+ tiles before its box reaches column 4 (air accel is 0.006/tick², so x stays
+    ≤ 3.1 for the ~5 ticks that takes), and it must then clear x ∈ (3.1, 5.0) while
+    still above the window — the descent re-enters it before the drift can pay for
+    itself. The escape up the right wall is guarded the same way by the spike at (7,16).
+    Evidence: 864 systematic take-off schedules (delayed input, carried speed, held
+    hover) and ~260 000 random 200-tick action sequences from *every* stand on the
+    sealed side — zero ever bridged to the reachable set or touched the flag. Deleting
+    the spike, or moving it one tile right to (5,12), flips the whole level to `OK`
+    (16 of 18 platforms reachable, goal reached). Learning cannot beat geometry; the
+    oracle now says so instead of agreeing with the drawing.
+
+    The second half is the silence. When the practice derivation found no crossing
+    toward the flag — exactly what this level produces at the stuck spot — all three
+    front-ends `continue`d without a word, which is indistinguishable from a dead stall
+    chain. `practice_level_for_stall` now returns `Err(reason)` and `train`, `watch` and
+    the lab say it once per stall spell: *no crossing toward the flag from tile (…);
+    the run stays where it is (…)*. A run stalled on an unbeatable level now says so on
+    its own.
+
+    Pinned by `a_move_cannot_start_inside_a_hazard_and_a_sealed_route_stays_sealed`
+    (a miniature sealed cut: the phantom take-off dies at tick zero, the far stand still
+    reaches the flag in one real jump, and the near stand has no route at all) and by
+    `every_shipped_level_is_reachable_in_principle`, which now reports the redrawn level
+    as unreachable — the honest verdict the oracle owed the pack.
+
+53. **Jump-timing seeds in the practice detour: built as asked, measured flat — the
+    detour was never the crossing's bottleneck.**
+
+    The request was to make the practice detour teach a hard crossing: when the run
+    stalls on a hop, seed the detour population with jump-timing mutations around the
+    stuck genome's attempts. What that means in this representation: the policy is an
+    argmax over eleven action scores, so a jump begins on the tick the jump actions
+    out-score the moving ones — a boundary in output space. `genome::jump_timing_slots`
+    names the genes that draw it (the output layer's row and bias for every action that
+    holds jump), and `genome::mutate_jump_timing` is the fine step over them alone: one
+    to three genes at the run's own sigma, every other gene copied exactly. The practice
+    detour's weakest slots (a quarter of the population ceiling, eight at pop 200 —
+    [`curriculum::PRACTICE_TIMING_SEEDS`]) are replaced by such children of the best-ever
+    genome before the first generation on the practice level, ids fresh, draws from their
+    own stream so the trainer's RNG — every paired reading in this file depends on it —
+    is untouched. [`curriculum_step`] does not seed: an authored easier level is a whole
+    landscape to re-learn, not one move to polish.
+
+    Measured on finding 51's protocol, which makes the comparison paired: 12 seeds × 420
+    generations on `scratch-spike-tower`, the recorded `out/tower-route` arm as control,
+    and the two arms bit-identical up to each detour (verified: their chart rows differ
+    only in the wall-clock column). The new arm is `out/tower-timing`.
+
+    | reading | control | with timing seeds |
+    |---|---|---|
+    | hard hop (10,29)→(7,27): detours reaching the practice flag | 10 of 13 | 12 of 16 |
+    | hard hop: generations to that flag (median of those) | 6.5 | 6 |
+    | all detours reaching their flag | 48 of 51 | 45 of 49 |
+    | wins | 1 of 12 (seed 11, gen 299) | 0 of 12 |
+    | champion height (checkpoints banked, mean of 12) | 7.6 | 7.1 |
+
+    Flat on every reading — and the paired per-seed tallies are noise (heights: five up,
+    four down, three ties). The mechanism is kept because it is the behaviour that was
+    asked for and costs nothing measurable; `PRACTICE_TIMING_SEEDS = 0` is an off arm in
+    one edit.
+
+    What the measurement actually corrects is the premise. The practice detour does not
+    plateau on a crossing: whenever it learns the hop it learns it in a **median of two
+    generations** (six on the hard hop) — the population is dropped at the stuck stand
+    with a flag one move away, and the near-miss genome is one mutation from making it.
+    The misses — three or four detours per arm on the hard hop, ~25% — are detours where
+    the population cannot make the hop at all inside forty generations, and eight timing
+    seeds at four percent of a converged population do not rescue those. The tower's
+    binding constraint is unchanged and is still finding 51's: the hop that is *hard to
+    transfer*, rows 30→28, where even a detour that reached its flag leaves the run
+    failing the same crossing. If the crossing learning is to improve, the place to look
+    is the misses' stall state — what that population cannot do at all — not the timing of
+    a near-miss it already polishes in two generations.
+
+54. **The window looked like a prototype because its controls *were* egui's: a bar of stock
+    buttons is a tool, and the fix is one vocabulary for everything the pointer can press.**
+
+    The report was "it looks and feels more like a prototype than a game", and the diagnosis is
+    not a matter of taste: every control in the window was `ui.button`, `ui.selectable_value` or
+    a hand-painted rectangle, so the furniture was egui's defaults wearing the theme's colours — a
+    rounded grey rectangle with a text label, four times across the top. What a game's tool bar
+    *is*, and what none of that is, is a plate of plastic in a socket: a lit top edge, a shaded
+    bottom one, a face that moves when you push it, and the game's own art on the button.
+
+    The vocabulary now lives in `crates/app/src/ui.rs` and it is deliberately *pure where it can
+    be*, because a look that can only be judged in a screenshot is a look that regresses silently.
+    `bevel(PlateState, Rect) -> Bevel` takes one control's state and rectangle and returns every
+    colour and sub-rectangle it needs, with no `Ui`, painter or input involved: what "tactile"
+    means is then a claim a test can make — a pressed plate's content sits exactly `PRESS_SINK`
+    (2 points) below a resting one's while its *face* stays put, a pressed plate inverts its edges
+    (shadow above, light below — an inset face), a disabled plate ignores the pointer entirely
+    rather than drawing hover feedback for a press it will not answer, and the five states have
+    five different faces with the selected one wearing the accent and dark type on it.
+
+    Three rules came out of it that are worth keeping, because each one was a bug first.
+
+    * **A sign is two lines, and a `Frame` does not know that.** The level's name went on a
+      plaque beside the tools, and the first rendered frame showed the name and the file laid out
+      *side by side* on one line: a `Frame` inside a horizontal bar inherits the bar's layout. The
+      fix is one `with_layout(top_down)` and it is load-bearing — the one-line version was 235
+      points wide against the 140 the sign needs, which is a control's worth of dock spent on a
+      caption.
+    * **A reading that does not fit is not drawn, it is measured.** The run's live line is the
+      only thing on the bar that changes on its own, and the bar has to hold a sign, five tools, a
+      four-cell switch and a *Fit* inside a window that can be dragged to 900 points. `banner`
+      therefore takes the room it has been given, lays its text out, and returns `None` — drawing
+      nothing at all — when the sign would not fit. The alternative is a banner cut in half by a
+      clip rectangle, which reads as a broken window rather than as a smaller one.
+    * **A label that does not fit is a bug, not a wrap.** A switch cell is a fixed box, and its
+      word is not wrapped, so a cell too narrow for its word clips the word. `segment_label_room()`
+      is shared by the widget and by a test that measures the longest word the switch has
+      (*Evolve*) in the font it is drawn in, and the widget itself drops the icon when the word
+      would not fit beside it — the switch must always be able to name its four modes.
+
+    The bar itself is worth stating as a design rather than a list: the level's name chalked on a
+    sign (file and unsaved dot under it), the five document tools, the mode switch as *one object*
+    (a socket holding four exclusive cells, the chosen one standing out — four independent plates
+    would say four things that could all be on at once), *Restart* only while a person is playing,
+    *Fit*, and the run's own numbers at the far end with a lamp that is green on a win, amber on a
+    stall and gold while the search is still improving. Every icon is an atlas sprite, so the tool
+    bar is made of the same sixteen-pixel art as the level behind it. The palette's brush cells and
+    its scenery picker go through the same `bevel`, which also removed four hand-written colour
+    literals from the picker — including the accent's own gold spelled as `250, 214, 102`.
+
+    No animation, on purpose: a plate's state is a fact about where the pointer is, and a
+    spring-damped bounce at forty points reads as a web page rather than as a game.
+
+    Pinned by six tests in `app::ui` (the press sink and the inverted edges, the five distinct
+    faces, the switch's longest word against its cell, a banner declining too little room, the
+    widgets really painting — counted in vertices in a headless context, which is the only thing
+    that separates "drew a chunky plate" from "allocated space and painted nothing" — and a button
+    whose icon is missing still being a button), and by the two rendered frames the defects above
+    were found in: `target/shots/shot-dock-edit.png` and `shot-dock-evolve.png`.
+
+    **Partly superseded by finding 55**, which is the pass that followed: a plate now carries no
+    caption at all, the switch names only the cell that is on (`segment_label_room` is gone, and so is
+    the fixed cell width it was measured against), there are six document tools rather than five, and
+    the control the switch's `Fit` shared a row with moved to an atlas glyph. What finding 54 claims
+    about *how* a plate behaves — the sink, the inverted edges, the five faces, a disabled control
+    ignoring the pointer — is unchanged and still tested.
+
+55. **The window had a look and no composition: the plates were chunky and every one of them
+    carried a caption, the editor had a properties column it did not need, and the theme had been
+    installed into the one of egui's two style slots nothing was drawing with.**
+
+    Finding 54 dressed the furniture. It did not *remove* any of it, and the report that followed
+    was the same report — cluttered, informational, not the graphical feel of a game like Super
+    Mario Maker 2. Reading SMM2's editor rather than guessing at it gives four traits that matter
+    here, and the two research passes agree on them: tools are **pictures** with their meaning on
+    hover; an editing screen carries **almost no text**; the parts live in **one strip**, not in a
+    properties pane beside the canvas; and controls read as **physical objects** — rounded, outlined,
+    chunky. (The sources are solid on structure and *silent* on measurement: no accessible page gives
+    SMM2's panel colours, cell sizes or border thicknesses, and the report says so instead of
+    inventing them. So the palette stayed this game's and only the composition was borrowed.)
+
+    Four changes followed, and they are one idea: **what the window says, it says once, and in a
+    picture.**
+
+    * **One plate, and no captions.** `ui::chunky_button` (icon *above* name) is now `ui::icon_button`
+      (a glyph, period), which is why the second size constant for word-only controls could go: there
+      are none. A control's name is on its hover, where a game puts it; the glyph in the plate is the
+      game's own art, and for the four controls the world has no picture of — the stroke history, the
+      frame-the-level, the details, the restart — it is five new sprites in a new `tools/art/ui.py`
+      family, drawn geometrically so the two turn arrows are reflections of one arc rather than two
+      hand-typed pictures that can drift a pixel apart. They are the first sprites in the atlas the
+      *game* never draws.
+    * **The switch names only the cell that is on.** Four labelled cells spent a word on each of the
+      three things the window was *not* doing. Now the chosen cell is sized *from its own label* —
+      measured in the font it will be drawn in — and its neighbours are bare pictures. That turns a
+      guard into a construction: the old code asked whether the longest word fitted in a fixed cell
+      and dropped the icon when it did not; there is nothing left to clip.
+    * **The editor has no properties column.** The verdict — can the spawn reach the flag — is the one
+      reading that has to be up at all times, and it moved into the strip along the bottom; everything
+      else (the grid's size, the physics a jump may ask for, the materials, the content hash, the zoom)
+      is a **floating window** behind the dock's magnifier. The canvas took the whole width. Half a
+      panel of cream saying nothing is the cheapest way to make a game look like an application, and
+      that panel was doing it. The run views keep their side panel, and the difference is the point:
+      theirs holds the controls a run is *driven* with, so it is busy rather than empty.
+    * **The palette says one thing.** `Parts`, then an instruction, then the selected brush named under
+      the grid — three lines in the one panel a person looks at the level beside. It is one line now
+      (`PARTS · GROUND`), and the instruction is on the cells' hovers, where somebody asking what a
+      cell *is* is already looking.
+
+    The second half of the fix was not composition at all, and it is the reason this finding exists
+    rather than a paragraph in the review. The first frame rendered with the details window open came
+    out **dark**: stock egui window furniture and light type inside a cream window. egui keeps *two*
+    styles — one per theme — and picks between them from the system's preference, while
+    `Context::set_style` writes only into whichever slot is selected *at that moment*. The theme had
+    been installed into the light slot and this machine reports a dark desktop, so everything egui
+    styles itself (a window, a button, a slider, a separator, a drag value) drew in egui's defaults,
+    while everything that *looked* right — the panels, the dock, the canvas — was right only because it
+    paints its own fill through a `Frame`. One `set_theme(ThemePreference::Light)` plus a
+    `set_style_of` into **both** slots fixes it, and the regression test asserts the slot nothing on
+    screen is using, because `ctx.style()` had been passing the whole time. The general lesson is the
+    one finding 54 already states and this pass re-learned the expensive way: **a theme is only
+    verified by rendering the widgets it has to reach**, and until this window existed there was not
+    one in a frame that egui itself drew.
+
+    Two more defects came out of the same "render it and look" rule, both small and both real. The
+    editor's backdrop was a two-tile **transparency checkerboard** over the sky gradient — the picture
+    an image tool paints where there is nothing, said about the one surface in the window that is full
+    of a person's work — and it is a flat work-surface blue now, with the tile grid (already being
+    drawn) as the thing that says where the cells are. And `Atlas::uv` computed a sprite's far edge by
+    multiplying a cell index by `1.0 / rows`, which on the new 15-row grid lands **outside** the
+    texture: `14 * (1/15) + 1/15 == 1.0000001` in f32. Dividing the index by the grid instead puts the
+    last cell's edge at exactly 1.0. The unit-square test from an earlier pass caught it the moment
+    the grid changed shape, which is the whole argument for writing that test.
+
+    Pinned by `app::theme::tests::a_theme_switch_cannot_repaint_the_window`,
+    `app::atlas::tests::every_glyph_the_window_draws_is_in_the_atlas`,
+    `app::ui::tests::the_chosen_cell_has_room_for_the_word_it_shows` (all four modes, measured in the
+    font the switch draws with) and `app::atlas::tests::every_shipped_sprite_maps_inside_the_image_at_one_cell`
+    (which failed first and is listed here because it is the reason the last two lines of the fix
+    exist). The frames are `target/shots/s2-edit.png`, `s2-play.png`, `s3-evolve.png`, `s3-details.png`
+    and `s3-narrow.png` — the last at the window's 900-point minimum with the pack's longest level name,
+    which is how the dock's width budget is checked rather than assumed.
+
+    **Partly superseded by finding 56**, which is the pass that followed: a plate carries a caption
+    again and so does every cell of the switch (the "no captions" rule two bullets up is reversed, and
+    `the_chosen_cell_has_room_for_the_word_it_shows` is now
+    `every_switch_cell_has_room_for_the_widest_name_in_the_set`), there are nine `ui_*` glyphs rather
+    than five, and the two run views' panels are menus whose readings moved into the Details window.
+    What this finding establishes about *composition* — one plate size, one vocabulary of plates shared
+    by the dock, the palette and the panels, no properties column beside the editor's canvas, and the
+    two style slots egui keeps — is unchanged and is what the window is still built on.
+
+56. **Every control in the window was a picture with no name, and the Evolve screen was an
+    instrument board where a menu belonged.**
+
+    The report that opened this pass was two lines long: the Edit, Play and Evolve buttons "do not have
+    text labels until they are clicked", and on the Evolve screen "there is still a LOT of information
+    being thrown at the user". They are one mistake made twice — finding 55 took "few words" and read
+    it as "no words", and left a run's panel saying everything it knew at once — and they have the same
+    fix, which is to decide what the window *has to* say and put the rest one press away.
+
+    **A caption is not something a control earns by being pressed.** Finding 55 kept the word for the
+    switch's *chosen* cell and gave the other three nothing, on the theory that a viewer reads the mode
+    they are in and guesses at the rest. The state a person most needs to read the window in is the one
+    where they have pressed nothing yet: three bare pictures in a row are a puzzle, and a picture of a
+    walker is not a guess at *Evolve*. So every plate in the dock carries its name, all four cells of
+    the switch carry theirs, and the words are the price of the bar being usable at first sight. The
+    SMM2 reading was not wrong about *count* — the window has no sentences on it — it was wrong about
+    zero, and the hover still carries the sentence a word cannot ("step back through the stroke
+    history — Ctrl+Z").
+
+    Three consequences fell out of that, each of which had to be got right rather than hoped at:
+
+    * **The switch is one size for all four cells**, taken from the widest name in the set, so the bar
+      does not twitch sideways when the mode changes. Sizing each cell from its own label — the rule
+      finding 55 introduced — is fine for one labelled cell and a moving target for four; the width is
+      measured in the font it is drawn in, and the caption's room is computed by the same padding the
+      plate is sized with, which is what the rewritten test pins (a rule and its inset that disagree
+      is exactly the sort of drift no assertion about colour sees).
+    * **Four more glyphs**, so a run's rows have pictures like a document's do: `ui_pause`, `ui_play`,
+      `ui_step` and `ui_medal`, which take the atlas from 228 of 240 cells to 232 — still 16x15, so the
+      grid has room, and the *next* family is what widens it.
+    * **`ui::menu_row`**, the second half of the vocabulary: a wide, short plate with the glyph at its
+      left and its name beside it, which is the shape a column of controls wants, against the dock's
+      glyph-over-word. Both are one plate in one socket, drawn by one [`ui::bevel`].
+
+    **The Evolve screen is a menu now.** It was the whole instrument board: on a run with any age on it,
+    thirty-odd lines — the search's sigma beside its stall counter, the diversity the archive had
+    covered, the x the population kept dying at, a genius note, the curriculum note, the death cluster,
+    a best-agent block, a row for every agent in the generation, the recorded champions with their
+    scrubber, two sliders and three checkboxes. Every one of those numbers is real and, read at a
+    glance, the panel said nothing: the question a viewer watching a population learn to jump is asking
+    is *is it getting anywhere*, and the answer was buried under eleven other readings. The panel is now
+    **three readings and one word** — which generation of how many, how many of the population reached
+    the flag, the best fitness (`menu_readings`) and the trend — plus five rows to press
+    (pause/resume, one generation, save champion, restart, details) and two conditions that have to be
+    *told* rather than shown: the level has been edited since the run started, and the run is over. The
+    replay's panel is the same shape, with the transport in the same rows and the toggles drawn as
+    plates that go gold. Both report the same [`panel::Actions`], so a widget's meaning is handled once
+    wherever it was drawn — including the new `details`, which opens the window.
+
+    **Nothing was deleted; it moved one press away.** The **Details window** is mode-aware now: the
+    level's numbers and its verdict in the editor, and a run's board in Evolve and Replay — the step and
+    the stall, the diversity, the max/avg/min of the generation, the death cluster, the champion's own
+    record, a row per agent in the field, the recorded champions and their scrubber, the two ladders,
+    and the key list. That is the piece that makes a quiet panel a design rather than a loss: the
+    numbers a viewer *goes looking* for are all still on screen, behind the magnifier the dock already
+    had. The window scrolls, and the field list is capped and scrolls inside it, because a population of
+    two hundred ghosts is taller than a display.
+
+    Two duplicated readings went the same way. The dock's banner carries no run's numbers at all any
+    more — it was reading out the same generation, flag count and best fitness the panel shows two
+    hundred points away — and the evolve status line is "gen 40 · 8 of 8 running · 8x · seed 7" in place
+    of a sentence that spelled out the field and timed the animation to a tenth. The replay's line lost
+    its ghost roster for the same reason and kept the one fact only it can state: a field that has been
+    *hidden* says so, because an empty canvas with no explanation reads as a broken replay. And because
+    those two lines are the longest in the window, they are **truncated** rather than allowed to push
+    everything after them — the tile under the pointer, the warning — off the edge of the screen.
+
+    Rendered and looked at: `target/shots/v5-evolve.png` (a finished run), `v5-replay.png`,
+    `v5-evolve-details.png`, `v5-replay-details.png`, and the 900-point minimum in
+    `v5-narrow-edit.png` / `v5-narrow-evolve.png` / `v5-narrow-replay.png`, where a labelled switch and
+    a wider dock still fit and the panel is still legible at its narrowest. Pinned by
+    `app::ui::tests::every_switch_cell_has_room_for_the_widest_name_in_the_set`,
+    `app::panel::tests::the_run_panel_says_three_things` — the *count* is the assertion, because a
+    fourth reading added later would pass a test that only checked what the three of them said — and
+    `app::panel::tests::an_idle_frame_of_the_menu_asks_for_nothing`, which draws the panel with no
+    atlas at all (a tileset older than the glyphs must still be a panel rather than a crash).
 
 # The M3 problem
 

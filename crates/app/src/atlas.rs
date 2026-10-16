@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use egui::{ColorImage, Context, Pos2, Rect, TextureHandle, TextureOptions, Vec2};
+use egui::{ColorImage, Context, Pos2, Rect, TextureHandle, TextureOptions};
 
 /// The names the renderer and the editor ask for. A tileset missing any of these
 /// cannot draw a level, and [`Sprites::load`] says so at startup rather than at the
@@ -280,10 +280,83 @@ impl Atlas {
     /// test on every sprite in the shipped atlas is there because that happened.)
     pub fn uv(&self, name: &str) -> Result<Rect, String> {
         let sprite = self.require(name)?;
-        let (cw, ch) = (1.0 / self.cols as f32, 1.0 / self.rows as f32);
-        let min = Pos2::new(sprite.col as f32 * cw, sprite.row as f32 * ch);
-        Ok(Rect::from_min_size(min, Vec2::new(cw, ch)))
+        // Both corners come from *dividing* a cell coordinate by the grid rather than from
+        // multiplying it by a precomputed `1.0 / n`. The two agree to within a rounding error
+        // everywhere except at the far edge, where the reciprocal form lands just outside the
+        // texture — in f32, `14 * (1/15) + 1/15` is `1.0000001` — and the unit-square test refuses it,
+        // which is the test doing its job: a sprite sampled a hair off the edge of the atlas is a
+        // sprite drawing its neighbour's last column. Dividing puts the last cell's far edge at
+        // exactly 1.0, where "the last cell ends where the image ends" is true by construction. It
+        // went unnoticed for as long as the grid was one whose reciprocals happened to cancel.
+        let min = Pos2::new(
+            sprite.col as f32 / self.cols as f32,
+            sprite.row as f32 / self.rows as f32,
+        );
+        let max = Pos2::new(
+            (sprite.col + 1) as f32 / self.cols as f32,
+            (sprite.row + 1) as f32 / self.rows as f32,
+        );
+        Ok(Rect::from_min_max(min, max))
     }
+}
+
+/// The window's own icon, cut out of the game's art.
+///
+/// A program with no icon wears the platform's default, so a row of this game's windows and a
+/// row of every other program's looked the same on a taskbar — and the square beside a window's
+/// name is the first thing most people ever see of it (AUDIT.md F5). The sprite is the
+/// **runner**, the pose the title screen opens on, which is the one picture in the atlas that
+/// says whose window this is.
+///
+/// Scaled by a whole number, nearest-neighbour, for the same reason the canvas camera rounds its
+/// zoom to whole points ([`crate::view::Camera::scale`]): pixel art has exactly one correct
+/// scale and it is an integer, and a smoothly-resampled 16-pixel sprite is a smudge at every
+/// size. `scale` is asked for explicitly rather than picked here, because how big a taskbar's
+/// icon slot is is the window's business.
+///
+/// Read from the PNG instead of taken from the loaded texture because the icon is wanted
+/// *before* the window exists — `with_icon` is a viewport option and the atlas is loaded inside
+/// the window's own creation callback — and one extra decode at startup is cheaper than holding
+/// a second copy of the atlas for the life of the session. Every failure is a `None`: a missing
+/// assets directory is a window without an icon, not a window that will not open, which is the
+/// same bargain the splash's missing champion makes.
+pub fn window_icon(
+    assets_dir: impl AsRef<Path>,
+    sprite: &str,
+    scale: u32,
+) -> Option<egui::IconData> {
+    let dir = assets_dir.as_ref();
+    let src = std::fs::read_to_string(dir.join("tileset.json")).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&src).ok()?;
+    let cell = doc.get("cell")?.as_u64()? as u32;
+    let entry = doc
+        .get("sprites")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(sprite))?;
+    let col = entry.get("col")?.as_u64()? as u32;
+    let row = entry.get("row")?.as_u64()? as u32;
+    let image_name = doc.get("image")?.as_str()?;
+    let bytes = std::fs::read(dir.join(image_name)).ok()?;
+    let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
+
+    let scale = scale.max(1);
+    let size = cell * scale;
+    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            // Checked rather than indexed: a manifest whose sprite sits outside the image it
+            // names is a broken tileset, and a broken tileset must not panic inside the window
+            // builder before a window exists to report it in.
+            let pixel = rgba.get_pixel_checked(col * cell + x / scale, row * cell + y / scale)?;
+            out.extend_from_slice(&pixel.0);
+        }
+    }
+    Some(egui::IconData {
+        rgba: out,
+        width: size,
+        height: size,
+    })
 }
 
 #[cfg(test)]
@@ -292,6 +365,43 @@ mod tests {
 
     fn assets_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets")
+    }
+
+    /// The window's icon is a whole-number crop of the runner, and it is not blank.
+    ///
+    /// The bug this pins is a window with no icon at all: on a taskbar, every window of this game
+    /// looked like every other program's (AUDIT.md F5). A test that only asked for the right *size*
+    /// would pass on a blank square, which is the platform default with extra steps — so this asks
+    /// for the runner's own colours as well, and for the sprite argument to actually choose the
+    /// cell: `empty` is a transparent tile, and cropping it must produce nothing.
+    #[test]
+    fn the_window_icon_is_the_runner_at_a_whole_number_scale() {
+        let icon = window_icon(assets_dir(), "player_idle_a", 4).expect("an icon from the atlas");
+        let cell = 16u32;
+        assert_eq!((icon.width, icon.height), (cell * 4, cell * 4));
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+
+        let opaque = icon.rgba.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(opaque > 0, "a blank icon is not an icon");
+
+        // The runner's own palette, as `art/common.py` names it: the dark ink of the outline and
+        // the vermilion of the body. *Present* is the claim — the crop is of the sprite that was
+        // asked for — and it is the one thing a size assertion cannot see.
+        let has = |rgb: [u8; 3]| icon.rgba.chunks(4).any(|p| p[..3] == rgb && p[3] > 0);
+        assert!(has([44, 24, 36]), "the runner's outline ink is not in the icon");
+        assert!(has([186, 74, 30]), "the runner's body is not in the icon");
+
+        // And the name picks the cell: a transparent tile scales up to a transparent icon.
+        let empty = window_icon(assets_dir(), "empty", 4).expect("an icon from the atlas");
+        assert!(
+            empty.rgba.chunks(4).all(|p| p[3] == 0),
+            "the icon ignored which sprite it was given"
+        );
+
+        // A directory with no tileset in it is *no icon* rather than no window: the window opens
+        // and the atlas load itself reports the real problem.
+        let missing = std::env::temp_dir().join("evo-no-assets-at-all");
+        assert!(window_icon(&missing, "player_idle_a", 4).is_none());
     }
 
     /// Every sprite must map inside the texture, sized to exactly one cell.
@@ -305,7 +415,10 @@ mod tests {
         let ctx = egui::Context::default();
         let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
         let (cols, rows) = atlas.grid();
-        let expected = Vec2::new(1.0 / cols as f32, 1.0 / rows as f32);
+        // One cell, as a width and a height rather than as a vector: the far edge of the last cell
+        // has to land on **exactly** 1.0, and a vector is a place where a rounding error can hide
+        // behind `Debug` formatting that rounds to two places.
+        let (expected_w, expected_h) = (1.0 / cols as f32, 1.0 / rows as f32);
         for name in atlas.names() {
             let uv = atlas.uv(name).expect("every listed sprite resolves");
             assert!(
@@ -313,8 +426,8 @@ mod tests {
                 "{name} maps outside the texture: {uv:?}"
             );
             assert!(
-                (uv.width() - expected.x).abs() < 1e-6 && (uv.height() - expected.y).abs() < 1e-6,
-                "{name} is not one cell ({expected:?}): {uv:?}"
+                (uv.width() - expected_w).abs() < 1e-6 && (uv.height() - expected_h).abs() < 1e-6,
+                "{name} is not one cell ({expected_w} x {expected_h}): {uv:?}"
             );
         }
     }
@@ -344,6 +457,27 @@ mod tests {
                 "the {:?} brush would draw {:?}, which is not in the atlas",
                 brush,
                 brush.sprite()
+            );
+        }
+    }
+
+    /// Every glyph the window's own controls draw is in the shipped atlas.
+    ///
+    /// The same guard as `every_brush_has_an_icon_in_the_atlas`, for the other half of the window:
+    /// `ui::icon_button` falls back to drawing a control's *name* when its sprite is missing, so a
+    /// glyph renamed in the art and not in the app is a tool bar of small words — no error, no blank,
+    /// nothing anyone could call a bug, and exactly the drift that left the ground brush pointing at a
+    /// sprite called `grass` for months. The `ui_*` glyphs are deliberately **not** in [`REQUIRED`]
+    /// (a tileset drawn before them still runs), which is precisely why nothing else would notice.
+    #[test]
+    fn every_glyph_the_window_draws_is_in_the_atlas() {
+        let ctx = egui::Context::default();
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        for name in crate::ui::GLYPHS {
+            assert!(
+                atlas.uv(name).is_ok(),
+                "the window draws {name:?}, which the atlas does not have — so every plate that \
+                 asks for it would quietly draw its own name instead"
             );
         }
     }
@@ -588,9 +722,18 @@ mod tests {
         let pixels = Pixels::load();
         let mut tiles = 0;
         for name in pixels.names() {
-            if !["ground_", "deep_", "sand_", "sandstone_"]
-                .iter()
-                .any(|family| name.starts_with(family))
+            if ![
+                "ground_",
+                "deep_",
+                "sand_",
+                "sandstone_",
+                "brick_",
+                "masonry_",
+                "wood_",
+                "timber_",
+            ]
+            .iter()
+            .any(|family| name.starts_with(family))
             {
                 continue;
             }
@@ -603,8 +746,8 @@ mod tests {
             );
         }
         assert_eq!(
-            tiles, 54,
-            "two materials of 16 masks and 8 buried masks each, and six decorated variants"
+            tiles, 106,
+            "four materials of 16 masks and 8 buried masks each, and ten decorated variants"
         );
     }
 
@@ -1064,6 +1207,12 @@ mod tests {
             "pebble",
             "mushroom",
             "mushroom_pair",
+            "lantern",
+            "crystal",
+            "signpost",
+            "crate",
+            "banner_a",
+            "banner_b",
             "log",
             "stump",
             "reeds_a",
@@ -1297,6 +1446,8 @@ mod tests {
             "stone" => 2,
             "beach" | "packed" => 5,
             "sandstone" => 3,
+            "brick" | "masonry" => 2,
+            "wood" | "timber" => 3,
             other => panic!("unknown look {other:?}"),
         }
     }
@@ -1375,7 +1526,7 @@ mod tests {
             );
             deepest.push((look.to_string(), reach));
         }
-        assert_eq!(checked, 22, "the atlas ships 22 seams");
+        assert_eq!(checked, 38, "the atlas ships 38 seams");
 
         let furthest = |looks: &[&str]| -> i32 {
             deepest
@@ -1414,6 +1565,10 @@ mod tests {
             ("beach", "sand_1"),
             ("packed", "sand_0"),
             ("sandstone", "sandstone_0"),
+            ("brick", "brick_1"),
+            ("masonry", "masonry_0"),
+            ("wood", "wood_1"),
+            ("timber", "timber_0"),
         ];
         for (look, tile) in plain {
             let allowed = pixels.sprite(tile).colours();

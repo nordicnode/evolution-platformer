@@ -315,29 +315,61 @@ a decorated tile can show two props. Harmless, but the editor could suppress the
 hashed prop wherever a placed one exists (a one-line test in the scatter pass), which
 would also make placement feel precise.
 
-### 2.4 The nearest-enemy sensor sees through the whole level — **medium (learning)**
+### 2.4 The nearest-enemy sensor sees through the whole level — **fixed (v5, v6), and extended (v7)**
 
-Finding 17, still true: `sensors::observe` gives slots 81–82 the nearest live
-walker's `dx/dy` clamped at `ENEMY_VIEW_DISTANCE = 4.0` tiles, so a walker 80 tiles
-away reads exactly like one 4 tiles away, and any level with a walker hands every
-agent a constant "enemy that way" input from tick 0. An off-grid walker (now refused
-by the pack test) did the same. The fix is a "no enemy in sight" state, i.e.
-`sensors::VERSION` 3 — a deliberate, vision-improving change that FINDINGS.md already
-argues for.
+Finding 17, as it stood: `sensors::observe` gave slots 81–82 the nearest live walker's
+`dx/dy` clamped at a view distance, so a walker 80 tiles away read exactly like one on top of
+the body, and any level with a walker handed every agent a constant "enemy that way" input
+from tick 0.
 
-### 2.5 `--trials` is off by default, so walker levels are noisy — **medium (learning)**
+Fixed in two steps, both measured: **v5** bounded the vector at four tiles, so a distant walker
+reads `(0.0, 0.0)` and the slots mean "no enemy in sight"; **v6** widened the bound to eight
+after four was measured to be *worse to learn from* than the unbounded lie (twelve seeds on
+`l3-gauntlet`: mean first win 41 generations at four tiles, 25 unbounded, 18 at eight) — a
+threat that is only legible once it is inside the patch is a threat met at contact range. The
+pass after that appended what the vector was still missing, and the thing the level format
+cannot supply: **v7's `enemy_dir`**, the nearest sighted walker's own direction of travel. That
+last slot is what makes a patrol *timeable* rather than merely locatable, and §4 measures it on
+the level built to need it.
+
+### 2.5 `--trials` is off by default, so walker levels are noisy — **fixed this pass**
 
 Finding 14 established that `episode_seed` mixes in the generation, so on the one
 stochastic level an elite re-rolls the walker's patrol phase every generation and can
-lose the run that won. `--trials` averages that noise but defaults to 1. A default of
-2–3 trials *only on levels containing walkers* would stabilise selection where it
-matters without paying for it on the flat levels. Cheap, no version bump.
+lose the run that won. `--trials` averages that noise but defaults to 1.
 
-### 2.6 No automated check runs the determinism suite
+For two passes the fix sat in the tree as advice nothing called: `GaConfig::recommended_trials_for`
+existed, was documented, and **had no caller**, while `train_config` hard-coded its own `3` beside
+the flag name — the same defect this file records for `--reheat-factor` in §4, and the same
+consequence: the window, a resumed run and the API judged a walker level on a **single** patrol
+phase while the command line judged it on three. The rule now lives in the trainer
+([`GaConfig::effective_trials`]), every front-end asks it, and it is **three** phases on a level
+with walkers and one on a level without — three rather than two because two is the thinnest
+sample that can show a genome is unreliable, and because three is what the command line was
+already doing, which makes the tables taken through the CLI comparable with the ones taken through
+the window. `--no-auto-trials` releases the rule and pins the literal count (reproducing the
+one-phase protocol every table in this document written before this pass was taken with). See §4
+for the measurement.
 
-The determinism contract is the spine of the project and there is no `.github/`
-workflow (or equivalent) to run `cargo test --workspace` on a change. The tests are
-excellent; nothing enforces them.
+### 2.6 No automated check runs the determinism suite — **fixed this pass**
+
+The determinism contract is the spine of the project and there was no `.github/`
+workflow (or equivalent) to run `cargo test --workspace` on a change. The tests were
+excellent and nothing enforced them.
+
+There is now a workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on every push
+and pull request: `cargo clippy --workspace --all-targets -- -D warnings` and then
+`cargo test --workspace`, both unfiltered and neither with an escape hatch. The clippy step
+carries `-D warnings` because the tree is clean at that bar today and a lint bar that is not
+enforced is a lint bar that drifts; the test step carries no `--skip`, because a filtered run is
+not the suite. The header comment names what is being protected — the sim's `std`/thread/wall-clock
+rules, the thread-count-independent RNG stream, and the version trio that refuses a stale
+champion — which is the part a reader a year from now will wonder about.
+
+What it does not do, and should not be read as doing: it cannot check that the *numbers* in this
+document are still true (those are measurements, and a machine that re-took all of them on every
+push would be measuring its own runner), and it is light enough that a full cold run fits in the
+job's `timeout-minutes: 30` with the toolchain cache.
 
 ### 2.7 `crates/app/src/view.rs` is ~6.1k lines
 
@@ -370,52 +402,114 @@ done here, because the level it clobbered was restored and no code path in the c
 writes into `levels/` (verified: the file's hash is unchanged across a full `cargo test
 --workspace`).
 
-### 2.9 A walker has a position but no heading, so it always sets off rightward — **low, and the last direction in the level format**
+### 2.9 A walker has a position but no heading — **half wrong, and re-measured this pass**
 
-`Walker::new` builds every walker facing right, and the level file records only where a
-walker stands: a patrol's first direction is a constant. On a rightward level that reads as
-a harmless default. On a leftward one it is the one thing that does not convert — a body
-moving left meets a walker moving *toward* it, where the mirrored geometry had it moving
-away, an ambush rather than a patrol, on the pad between two pits, which is exactly where
-`l8-long-jump` puts one.
+This was written as: `Walker::new` builds every walker facing right, the level file records only
+where a walker stands, so "a patrol's first direction is a constant", and on a mirrored level that
+constant is an ambush — measured as first-win generations 4 / 3 / 7 / 11 against 18 / 18 / 17 / 16
+on `l8-long-jump` and its mirror, with the walker deleted the pair going 1 / 1 / 2 / 1 against
+5 / 0 / 5 / 3.
 
-Measured, which is why this is a finding rather than a hunch: `l8-long-jump` and its mirror
-are learned at first-win generations 4 / 3 / 7 / 11 against 18 / 18 / 17 / 16 (pop 200,
-seeds 1-4); delete the walker from both files and the same pair is 1 / 1 / 2 / 1 against
-5 / 0 / 5 / 3. The three-fold, six-of-six-consistent gap is the walker. The same test on
-`l5-tightrope`, which has no walkers, is symmetric to within noise (7 / 14 / 12 / 6 against
-20 / 1 / 8 / 13).
+**The premise is wrong about the sim, and the measurement does not reproduce.** A walker's initial
+direction is drawn from the episode RNG in
+[`Walker::spawn_spread`](crates/sim/src/physics.rs) — that draw is the sim's only gameplay
+randomness and the reason a walker level is stochastic at all — and it has been there since the
+repository's first commit. `Walker::new` does build a walker facing right, but that constructor is
+the deterministic pose tooling asks for; nothing in an episode goes through it. Re-run this pass,
+pop 200, seeds 1-4, `--stop-on-win`: **4 / 4 solved at 7, 3, 3, 4 against 3, 0, 5, 6** (means 4.2
+and 3.5), and with the walker deleted 2, 2, 3, 6 against 3, 0, 3, 5 (means 3.2 and 2.8). The
+mirror is the *faster* arm in both pairings, at both ends of the walker ablation, and the
+six-of-six gap is gone. The level format's silence about direction is therefore not a defect to
+be repaired by a `heading` field: an authored heading would make every trial of a walker level the
+byte-identical episode and quietly delete what `--trials` exists to average.
 
-A fix means a `heading` (or `facing`) field on the walker entity — a level-format change
-plus an editor control the editor has no walker-direction brush to hang on yet. Worth doing
-when walkers get their own pass; [`Level::mirrored_horizontal`] documents the limitation
-until then, so a symmetry measurement on a walker level is read for what it is.
+**What was genuinely missing is the other side of the same fact: the body could not see which way
+a walker was walking.** That went in as sensors **v7** (`enemy_dir`, index 95 — see §4 and the
+module docs in `crates/sim/src/sensors.rs`), which is an observation change rather than a level
+format one, and it is the version that makes this item survivable: the patrol phase stays
+deliberately unpredictable and timeable rather than authored.
 
-### 2.10 A checkpoint is only credited for a crossing on the level's *left* end — **low (reward)**
+### 2.10 A checkpoint was only credited for a crossing on the level's *left* end — **fixed (fitness v6)**
 
-`Level::landing_zone` + `Level::zone_is_checkpoint` decide whether arriving on a stretch of
+`Level::landing_zone` + `Level::zone_is_checkpoint` decided whether arriving on a stretch of
 ground meant crossing something by looking at the tile to the left of the zone's start. On
 a rightward level that is exactly the right question. On a leftward one the crossing is at
-the zone's *right* end, so a landing that should pay can pay nothing — the one remaining
-rightward assumption in the *reward* (the observation's last one went in 1.9, and the cap
-in 1.8).
+the zone's *right* end, so a landing that should pay could pay nothing — the last rightward
+assumption in the *reward* (the observation's went in 1.9, and the frame cap in 1.8).
 
-Left unfixed deliberately, and small: the term is worth [`CHECKPOINT_BONUS`] = one tile (`16`)
-per zone against a goal worth `10 000`, and on the shipped pack the mirror of each level
-collects the same count as the level (2 and 4 on `l5` and `l8` respectively). The obvious
-symmetric-looking fix — "credit a zone if *either* end is a crossing" — is **wrong** and is
-worth stating so nobody reaches for it: it would pay a body for standing on the near side
-of a pit it has not crossed yet, which is the one thing the term exists not to do (its own
-docstring: a checkpoint is for a crossing, and a leap that ends in the air keeps its
-frontier and nothing else). A correct fix needs the *arrival side*, which the sim does not
-currently hand to `checkpoint_zone` — a signature change plus a test per direction, for at
-most a few dozen points on a level that has that many zones.
+Fixed as the fix's own note predicted it would have to be: the sim now hands the zone the
+**arrival side**. `Level::checkpoint_zone_from(tx, surface_row, from_col)` credits a crossing
+at whichever end the body came from (`from_col < start` looks left of the start, `from_col > end`
+looks right of the end, and a body arriving from *inside* the zone crossed nothing), and the term
+is symmetric by construction rather than by a second rule.
+
+Two things are worth keeping from the unfixed version of this entry, because the cheaper answer is
+still the tempting one. The obvious symmetric-looking rule — "credit a zone if *either* end is a
+crossing" — is **wrong**: it would pay a body for standing on the near side of a pit it has not
+crossed yet, which is the one thing this term exists not to do. And the size is why this was low
+priority and stays low: [`CHECKPOINT_BONUS`] is one tile (`16`) per zone against a goal worth
+`10 000`, so the defect was worth at most a few dozen points on the levels that have that many
+zones. The version bump is what it cost — the term *did* pay on the shipped mirrors, so every score
+in the pack with a hazard on the far side of a landing zone is a different number now, which is
+exactly why [`FITNESS_VERSION`] moved to 6 rather than the change going in quietly. Both halves are
+pinned in
+`sim::tests::physics::a_landing_zone_is_a_checkpoint_only_when_something_had_to_be_crossed`: the
+rightward clauses it always had, and a mirror clause asserting the far side of a *mirrored* spike is
+credited when the body arrives from the right — the case that used to pay nothing.
 
 ### 2.11 The Open menu lists raw filenames and there is no starter pack
 
 The README already says M4 is missing "the curated starter pack and a browsable level
 shelf". A new player sees `l1-flat-run.json … l7-wall-school.json` and a
 `scratch-l1-walkers.json` with no "start here".
+
+### 2.12 A spike killed 0.1875 tiles above its topmost drawn pixel — **fixed (0.10.0)**
+
+The spike sprite leaves the top three of its sixteen pixel rows transparent, deliberately: a
+spike tile drawn to its ceiling reads as part of the wall above it rather than as a hazard
+(`tools/art/terrain.py::spikes`, `apex = 3`). The hazard check tested the **whole tile**
+anyway, so every spike carried an invisible kill band 0.1875 tiles tall above the topmost
+pixel of it — and a body can clear every pixel of a spike and still die. Reported from the
+window as "the hitbox seems to over-extend when the agent is standing beside the spike"; the
+stand-beside case is fine (a body whose box ends at the cell's edge is in the next tile
+over and is not tested), but the band above the tips is real and it was costing levels.
+
+**Measured** on the level that produced the report — a hand-drawn 60×15 whose only route
+onto a four-wide platform crossed a spike crowning that platform's *first* column, with a
+one-tile stepping stone as the take-off: sweeping 81 sub-tile take-off positions across the
+stone against 80 lengths of jump hold (6 480 held-jump-then-run pairs), take-offs that reach
+the flag alive were
+
+* **x = 39.000 only** under the tile rule — one position out of 81, a window 0.005 tiles wide; and
+* **x = 39.000 .. 39.130** under the drawn box — 1 846 live pairs against 67, twenty-seven
+times the positions.
+
+Before the change, 4 563 of those 6 480 pairs died while the body's lowest point inside the
+spike's column was still above the topmost drawn pixel: they never touched a pixel of the
+spike. The same level's champion — the one the report pointed at — stalls at the platform's
+face instead, which is a level-design problem rather than this one and is recorded here so
+the two are not confused: from a take-off flush against that face the body's lowest point
+inside the spike's column is 12.762 while the hazard demands 12.000, and no jump from that
+spot can ever clear it. The fix widens the band you can work in; it does not make a spike in
+the only entry to a platform reachable.
+
+The hazard is now box-versus-box against [`physics::spike_lethal_box`](crates/sim/src/physics.rs)
+— the lower 0.8125 tiles of the cell, the sprite's own extent — and the oracle's
+"a move cannot begin inside a hazard" guard asks the same, weaker question the game asks
+(`reach::hazard_start`), so the sweep cannot invent a false negative out of the band the
+sim just freed. The drawn triangles taper to points, so a body clipping the blank air
+*between* two tips in that top band is still killed: box versus box is the honest
+approximation for one tile type, and it is the one place the rule is stricter than the
+drawing.
+
+Physical, so the trio moves: the workspace is **0.10.0** and every champion trained under
+0.9.0 is refused at load rather than replayed against physics it was not trained on. The
+long-runway golden hash is unchanged (there is no hazard on that runway) even though the
+version pin moved, which is the coverage gap `tests/episodes.rs` already documents.
+Pinned by `sim::tests::physics::a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips`
+(verified to fail under the old tile rule), which holds both halves: the band above the tips
+is air, and a body standing in the spike's own cell is still killed — the assumption
+`Level::is_standable`, the checkpoint zones and the editor's placement rules are built on.
 
 ---
 
@@ -437,6 +531,207 @@ shelf". A new player sees `l1-flat-run.json … l7-wall-school.json` and a
    by restarting the app.
 7. **Save/load presets for scenery** — the picker remembers the last sprite (it does),
    but there is no "scenery set" a user can name and reuse.
+
+### The window's own furniture: a dock, and one vocabulary for the things you press
+
+The other half of the request was the *look*, and the diagnosis was specific: the window was
+opening on **egui's stock buttons lying flat on stock panels**, which is what a tool looks like
+rather than what a game looks like. Nothing about a row of grey rounded rectangles says *this is a
+level editor*, and the level behind them was contradicting them.
+
+What landed is one vocabulary, in one place, used by everything the pointer can press.
+
+* **`theme` grew the depth it was missing**: `DOCK` (the bar itself — a step up from a panel and
+  warmer than it), `BEVEL_LIGHT`/`BEVEL_DARK` (the lit and shaded edges of a raised face),
+  `PLATE` (a sign: the level's name, a banner), `SHADOW`, a second corner radius (`RADIUS_LG` = 8
+  for things you *press*, against the 3 that keeps a chart's frame honest) and `PRESS_SINK` = 2,
+  which is the whole of what "tactile" means at these sizes.
+* **`crates/app/src/ui.rs` is the vocabulary itself** (new module). `bevel(PlateState, Rect) ->
+  Bevel` is a *pure function* — no `Ui`, no painter, no input — resolving one control's state and
+  rectangle into every colour and every sub-rectangle it needs, which is what makes the look
+  *assertable* rather than merely screenshot-able: a pressed plate's content sits exactly
+  `PRESS_SINK` below a resting one's and the **face** does not move (that is what "sinks into its
+  socket" means); a pressed plate **inverts** its edges, so the shadow moves above the light; the
+  five states — disabled, resting, hovered, pressed, selected — have five different faces, and the
+  selected one wears `ACCENT` with `SHELL` type on it; and a disabled plate refuses the pointer
+  rather than drawing feedback for a press it will never answer.
+* **`chunky_button`, `segmented`, `plaque`, `banner`.** A tool is an icon above a name on a plate.
+  The mode switch is *one object*: a socket holding four exclusive cells with the chosen one
+  standing out of the group, and a cell whose word will not fit beside its icon keeps the word and
+  drops the icon (`segment_label_room`, with a test that measures the longest word — *Evolve* — in
+  the font it is drawn in). The plaque is a two-line sign; the banner is a plate, a lamp and one
+  monospaced line, and it *measures itself against the room it is given and declines to draw at
+  all* when that room is too small, which is what keeps a reading from being cut in half by a clip
+  rectangle.
+* **The dock is built out of them.** The title bar is now the level's name chalked on a sign (with
+  the file and its unsaved dot under it), the five document tools — Levels, New, Save (gold while
+  the canvas is ahead of the disk), Undo, Redo — the mode switch carrying the game's own art (a
+  ground tile for Edit, the runner for Play, a walker for Evolve, the flag for Replay), *Restart*
+  beside it only while a person is playing, *Fit* to frame the level, and at the right end the run's
+  own reading (`gen 43/300  best 218.2  wins 2/200`) with a lamp that is green on a win, amber on a
+  stall and gold while it is still improving. The icons are **atlas sprites**, so the tool bar is
+  made of the same sixteen-pixel pictures as the level behind it — the one thing a text label
+  cannot do.
+* **Two rules the dock keeps that a row of buttons does not.** Its right-hand end is *dropped, not
+  clipped*, when the window is narrow, and the file path that used to sit there is gone entirely:
+  the plaque already names the file, and a bar that says the same thing at both ends is spending the
+  middle of itself on a caption. And all five tool responses are collected *before* any of them is
+  acted on, so a save cannot move the levels directory out from under the *Levels…* button
+  mid-row — the kind of flicker that reads as a prototype.
+* **The palette wears the same plates.** Brush cells and the scenery picker used to draw their own
+  rectangles — `CARD` with a hand-rolled ring, four colour literals in the picker including
+  `250, 214, 102` written out by hand — so the thing you paint with and the thing you open a level
+  with answered the pointer differently. They go through `bevel` now: hover lifts, press sinks, the
+  selected brush is the accent with its picture still legible on it, and the picker's literals are
+  theme constants.
+
+**What this does not claim: animation.** There is none, on purpose. A plate's state is a fact about
+where the pointer is, and a spring-damped bounce at forty points reads as a web page rather than as a
+game.
+
+*(Two sentences above are superseded by the pass that follows: the switch no longer carries the word
+of every cell — only the chosen one's — and so the cell-width clearance it was measured against,
+`segment_label_room`, no longer exists. The five tools are six, and none of them carries a caption.)*
+
+### The look, second pass: fewer words, one window, and a theme that was never installed
+
+The report that opened this pass was "still cluttered, still carrying a lot of information, not the
+graphical feel of something like Super Mario Maker 2", and the honest reading of the previous pass is
+that it had dressed the furniture without removing any of it: the *words* were all still there. Two
+researches were run before touching the code — SMM2's Course Maker specifically, and game-HUD design
+guidance generally — and what they agree on is worth stating because it shaped everything below:
+icon-first tools with the meaning on hover, a very small number of words on the editing screen, one
+parts strip rather than a properties pane, and controls that read as physical objects in a chunky,
+rounded, *outlined* style ([Play Nintendo on the parts strip](https://play.nintendo.com/news-tips/tips-tricks/super-mario-maker-2-tips-tricks/),
+[Shacknews on the docked controls](https://www.shacknews.com/article/112648/docked-controls-in-super-mario-maker-2-course-maker),
+[Nintendo Life on the parts menu](https://www.nintendolife.com/guides/whats-new-in-super-mario-maker-2-for-nintendo-switch)).
+The research is thin on *measured* values — no accessible source gives SMM2's panel colours or cell
+sizes, and the report says so plainly rather than inventing them — so the palette stayed the game's own
+and only the *structure* was taken.
+
+**One plate size, and no captions.** Everything the pointer can press in the dock is one 52-point
+square (`ui::TOOL_SIZE`); the second size for label-only controls is gone, because there are no
+label-only controls left. `chunky_button` became `icon_button`: a glyph, and a name that is drawn
+only when the atlas cannot supply the glyph (a tileset from before the glyphs still runs, with words
+on its plates). What a control is *called* is in its tooltip, which is where a game's own bar puts it.
+
+> **Reversed in the third pass.** The plates carry their captions again and so does every cell of the
+> switch — see *a name on every control* below. The reading of the research was right about the
+> *number* of words on the screen and wrong about zero; the state a person most needs to read the
+> window in is the one where they have pressed nothing yet.
+The dock's tool row is therefore six pictures: the signpost for the pack, the spawn pad for a new
+level, the crate a save writes, a turn arrow each way for the stroke history, and a magnifier for the
+level's own numbers.
+
+**Five glyphs were drawn for the four controls the world has no picture of** (four more followed in
+the third pass, for the run's own controls: `ui_pause`, `ui_play`, `ui_step`, `ui_medal`).
+`tools/art/ui.py` is a new art family — `ui_undo`, `ui_redo`, `ui_fit`, `ui_info`, `ui_restart` — drawn geometrically rather
+than as 16-row string art, because an arrow is a *relationship* (the two turn arrows are reflections
+of one arc and one head, so they cannot drift apart by a pixel) and because a glyph is one flat ink in
+this palette, with the plate carrying every bit of state. They are the first sprites in the atlas the
+game itself never draws, they sit before the seams (whose row must stay last, for the reason that
+family's own comment gives), and they took the grid from 16x14 to 16x15 — 223 of 224 cells was a full
+atlas, not a growable one. They are *optional* art: `ui::icon_button` falls back to the control's name,
+which is exactly why `app::atlas::tests::every_glyph_the_window_draws_is_in_the_atlas` exists — a
+renamed glyph is a bar of small words, not an error.
+
+**The switch names only the cell that is on.** `ui::segmented` now allocates the chosen cell from its
+own label, measured in the font it will be drawn in, and draws the other three as bare pictures: four
+independent words became one. That inverts the old failure mode instead of guarding against it — a cell
+sized *by* its word cannot clip it — so the test that used to measure *Evolve* against a clearance
+became a test that the rule gives every one of the four words its own width, and that the widths
+differ (a rule returning one number would have passed the old assertions). The third pass labels all
+four cells and sizes them from the *widest* name in the set, so the group no longer changes shape with
+the choice.
+
+**The editor's properties column is gone.** This is the largest simplification in the pass, and it is
+the one the SMM2 research asks for directly: an editor screen has no side panel of readings. The
+verdict — *can the spawn reach the flag* — moved into the strip along the bottom as a lamp and a word
+(shared by both places that show it, so the two cannot disagree), what was behind it became a floating
+**Details** window that the dock's magnifier toggles, and the canvas took the whole width. The zoom
+reading moved in there too; the status strip's right-hand end keeps only what a person asks *while
+drawing* (the tile under the pointer, anything wrong with the atlas). The run views keep their panel,
+and for a stated reason rather than by accident: that panel holds the controls a run is driven with, so
+it is busy by nature rather than empty by default.
+
+**The palette says one thing.** It used to say three: a bare `Parts` heading, a line of instruction
+about dragging, and the selected brush named under the grid. It is now one line that answers the one
+question a person has of a palette — `PARTS · GROUND` — and the instruction lives on each cell's hover,
+where somebody asking "what is this cell" is already looking.
+
+**The editor's ground stopped being a transparency checkerboard.** The canvas drew alternating pale-blue
+cells over the sky gradient, which is the picture an image tool paints where there is *nothing*; every
+cell of it was saying that about the one surface in the window that is full of a person's work. It is
+a flat work-surface blue now, with the tile grid drawn on it — the grid lines were being drawn all
+along, and they are what an eye actually reads tile boundaries from. The level's own art gets the whole
+of the contrast.
+
+**And the defect the renders found, which was not a look at all.** The first frame with the details
+window open came out **dark** — egui's stock window frame and type inside a cream window. The cause is
+worth writing down because it invalidated the previous pass's verification as much as this one: egui
+keeps *two* styles, one per theme, and chooses between them from the system's preference, while
+`Context::set_style` writes only into whichever is selected at the time. The theme was installed into
+the **light** slot and this machine reports a **dark** desktop, so the installed theme was never used by
+anything egui styles *itself* — a floating window, a button, a slider, a separator — while every surface
+that looked right (the panels, the dock, the canvas) was right only because it paints its own fill.
+`theme::apply` now pins the preference and writes **both** slots, and the new test asserts the slot that
+nothing was using.A pass that had "verified" this half by looking at panels had been looking at
+the exception rather than the rule.
+
+### The look, third pass: a name on every control, and a run's panel as a menu
+
+The report that opened this pass was two lines: the Edit, Play and Evolve buttons "do not have text
+labels until they are clicked", and on the Evolve screen "there is still a LOT of information being
+thrown at the user". They are one mistake made twice — the second pass took "few words" and read it as
+"no words", and left a run's panel saying everything it knew at once — and they have one fix: decide
+what the window *has to* say, and put the rest one press away.
+
+**Every control says its own name.** All four switch cells are labelled, not just the chosen one, and
+every dock plate carries its caption under its picture. Three bare pictures in a row are a puzzle: the
+state a person most needs to read the window in is the one where they have pressed nothing yet, and a
+picture of a walker is not a guess at *Evolve*. The switch's four cells are one width, taken from the
+widest name in the set and measured in the font it is drawn in, so the bar does not twitch sideways
+when the mode changes; the tooltips keep the sentences a word cannot hold. Four new glyphs
+(`ui_pause`, `ui_play`, `ui_step`, `ui_medal`) give the run's own rows pictures to put beside their
+words, and `ui::menu_row` is the second half of the vocabulary — a wide short plate with the glyph at
+its left, which is what a column of controls wants, against the dock's glyph-over-word.
+
+**The Evolve screen is a menu, and the instrument board moved behind the magnifier.** A run with any
+age on it put thirty-odd lines beside the level: the search's sigma and its stall counter, the
+diversity of the archive, the x the population kept dying at, a genius note, a curriculum note, the
+death cluster, a best-agent block, a row for every agent in the generation, the recorded champions and
+their scrubber, two sliders and three checkboxes. All real, and read at a glance the panel said
+nothing — the question a viewer watching a population learn to jump asks is *is it getting anywhere*,
+and the answer was buried under eleven other readings. It is now **three readings and one word**:
+which generation of how many, how many of the population reached the flag, the best fitness, and the
+trend — plus five rows (pause/resume, one generation, save champion, restart, details) and two
+conditions that have to be *told* rather than shown (the level has been edited since the run started;
+the run is over). The replay's panel is the same shape, with its toggles as plates that go gold.
+
+**Nothing was deleted.** The **Details window** is mode-aware: the level's numbers and verdict in the
+editor, and a run's board in Evolve and Replay — the step and the stall, the diversity, the
+generation's max/avg/min, the death cluster, the champion's own record, a row per agent in the field,
+the recorded champions with their scrubber, the two ladders and the key list. A viewer learns one
+control and gets whichever answer belongs to the mode they are in. The window scrolls, and the field
+list is capped and scrolls inside it, because a population of two hundred ghosts is taller than a
+display. Both panels and the window report the same `panel::Actions`, so a pause is a pause wherever
+it was pressed.
+
+**And the duplicated readings went with it.** The dock's banner carries no run's numbers at all now —
+it was reading out the same generation, flag count and best fitness the panel shows two hundred points
+away — and the evolve status line is "gen 40 · 8 of 8 running · 8x · seed 7" instead of a sentence that
+spelled out the field and timed the animation to a tenth of a second. The replay's line lost the ghost
+roster for the same reason and kept the half only it can state (a hidden field says it is hidden).
+Those two lines are the longest in the window, and they are now **truncated** rather than allowed to
+push everything after them — the tile under the pointer, the warning — off the edge.
+
+**Verified by rendering and looking**, which is how every defect in this pass was found rather than a
+check: `target/shots/v5-evolve.png` (a finished run), `v5-replay.png`, `v5-evolve-details.png`,
+`v5-replay-details.png`, and the 900-point minimum in `v5-narrow-edit.png` / `v5-narrow-evolve.png` /
+`v5-narrow-replay.png`, where a labelled switch, a wider dock and a 300-point panel still fit. What is
+*not* verified is any of this with a pointer in hand: there is no display here, so the feel of pressing
+a menu row, and Play mode's own dock (which has no scripting flag and so was never rendered), rest on
+the headless widget tests and on the render.
 
 ---
 
@@ -705,6 +1000,375 @@ why `adaptive_sigma` is a flag rather than the default. What is *kept* is what t
 measurements support: the run is bred at a constant step, and a plateau is answered by the
 two mechanisms that can answer it, a local step and a restart.
 
+### Where the loop is capped now, ranked (this pass's review)
+
+Three passes have fixed the *fitness landscape* and the *observation*, and both are in good
+shape: checkpoints, a priced jump, a distance-to-goal score, an enemy vector that does not lie,
+no phantom inputs, and a decision cadence that was measured rather than guessed. What is left is
+not a bug list. It is the list of things that still stand between this population and behaviour a
+person would call *smart*, ordered by how much each one actually limits that — with the cost and
+the evidence for each, because the next pass should not have to re-derive this.
+
+1. **The tasks are the ceiling, not the search.** The shipped pack is solved almost
+   immediately: `l1-flat-run` and `l2-first-gap` at **generation 1-2** at pop 200, and
+   `l6-marathon` — the longest level in the pack — is won at generation **6 of 300**, by a
+   population that has not learned anything yet. That is a lottery, not a policy: nothing about
+   the level forces a chain of decisions, so nothing about the level forces the *population* to
+   become sophisticated, and a run that solves its problem in six generations is being asked a
+   very easy question. Emergent behaviour comes from long horizons and interacting mechanics,
+   and this pack has one hazard type (spikes), one enemy type (walkers that always set off
+   rightward, finding 2.9), and static terrain. **The cheapest large gain available is authoring
+   harder content**: a level that needs a wait, a climb and a hazard crossing in sequence, with
+   the flag far enough away that no reflex reaches it. Everything below makes such a level
+   *learnable*; none of it substitutes for it.
+   **Done this pass.** `levels/l9-wait-and-climb.json` is that level — a chain of nine moves, with
+   the spawn at column 2 and the flag at column 56 — and it moves the pack's hardest first-win generation
+   from **20** (L3, the old slowest median) to a median of **160**. See "Content" below.
+2. **The policy had no memory.** Fixed in this pass, and measured below — the one change here
+   that adds a *capability* rather than a gradient. Without state a decision is a pure function
+   of the frame, so "hold this jump for three blocks", "wait for the walker to turn" and "this
+   is the second attempt at this ledge" are not merely unlearned, they are unexpressible.
+3. **Selection reads one episode.** `GaConfig::recommended_trials_for(level)` — and the argument
+   in finding 2.5 for using it — has been in the tree since the trials work and **nothing calls
+   it**: on a level with walkers every genome is judged on a single patrol phase, so an elite
+   can be re-rolled out of the run by a phase it never saw (finding 14), and the pack's longest
+   level is "solved" by one lucky agent in six generations. Two or three trials on the levels
+   that are stochastic is the cheapest honest fix in this list, costs no version bump, and makes
+   every other number in this document more trustworthy — including the guesses in it.
+   **Done this pass, and the measurement is a caution rather than a confirmation.** The rule is
+   wired everywhere and the number is three; what it buys on the two levels the pack actually
+   ships is *nothing measurable in solves* at 2.4x the wall clock, because both levels are won by
+   the population in ten generations whether a genome is judged on one phase or three. It does
+   not even remove L6's lottery, because a lottery on a level that easy is the level's fault
+   rather than selection's. See "The trial rule" below for the numbers.
+4. **Diversity is measured but never selected for.** The MAP-Elites archive fills every
+   generation and is reported, and breeding from it was measured as a loss on the plateau, so it
+   is off. Nothing anywhere *rewards* behaving differently: an elitist tournament with crossover
+   walks the whole population into one lineage early, which is why every hard level in this pack
+   is a lottery — twelve seeds of one level produce twelve different answers. The untried version
+   is the reward-level one (a novelty or diversity term, or a diversity-*triggered* breeding rule
+   hung on the stall detector that already exists), which is a different mechanism from
+   parenting out of the archive and is not refuted by the archive's measurement.
+   **The gated version is built and measured this pass, and it is the first archive reading that
+   is not a loss on a plateau**: 9 of 12 seeds at a mean first-win generation of 76, against 10 of
+   12 at 94 with the archive off and 7 of 12 at 121 with the ungated trickle. It costs the hazard
+   floor the one reading the trickle earned (3 of 12 down to 1), so it stays a flag rather than a
+   setting. See "The archive gate" below.
+   **The reward-level half is now built and measured as well** (`--novelty`, a rarity bonus added
+   to the score the population is ranked and bred by and to nothing that is recorded), and the
+   answer is that a small bonus is a real mechanism with a narrow window: it is worth a few seeds
+   on the plateau, worth nothing on the chain level, and worth nothing measurable at any weight
+   tried on the hazard floor. See "The rarity bonus" below for the table and for why `0.0` is
+   still the default.
+5. **One brain, one level.** Every claim in this document is about a specialist: `Trainer::step`
+   takes one level, and a champion is played only where it was trained (the splash documents
+   this as a rule). Nothing generalizes, and nothing is *asked* to — but `PopulationFile` already
+   moves a whole population between levels for the curriculum, so a suite trainer (a generation
+   scored on two or three levels) is a small step from machinery that exists and is the standard
+   route to a policy that looks clever rather than memorised. **Built and measured this pass**, as
+   `train --suite a.json,b.json,...` plus `score` (which asks a saved champion the same question),
+   with one substantive deviation from this list's sketch: the aggregate is the genome's **worst**
+   level rather than a sum, because a flag is worth `10 000` and a whole level of progress about
+   `1 000`, so a sum lets the easiest level own the score and teaches exactly the specialisation a
+   suite exists to remove. The measurement is narrower than the item hoped and the honest headline
+   is the *shape* of the result rather than its size: selection on a suite does not make each level
+   fall faster, it makes one policy hold several at once, which is the thing no arm in this document
+   could do before. See "The suite: one policy, three levels" below.
+6. **The observation has two documented blind spots.** A walker has no heading, so its patrol is
+   unpredictable in the one way that matters (2.9, and the level format has no field for it), and
+   a walker beyond eight tiles is invisible (deliberate, v5/v6). The 9×9 patch is the documented
+   upgrade path, gated on "evolution visibly plateauing on levels that should be solvable" —
+   which, given 1-2-generation solves, it is not yet.
+   **Half done this pass, and the other half is now a decision rather than a gap.** The *body*
+   can see a walker's direction as of sensors **v7** (`enemy_dir`, index 95); the *level file*
+   still cannot say it, and 2.9 is where the reason is written down — an authored heading would
+   make every trial of a walker level the same episode, which is the mechanism this pass spent
+   part of its budget measuring. The patch stays the gated upgrade path, and l9 is the first level
+   written to need the horizon rather than the patch: nine moves in sequence.
+7. **There is no independent baseline.** The GA is compared only against its own earlier
+   versions. An ES or CMA-ES arm on the same episode budget and the same levels would say
+   whether the search or the problem is the binding constraint, and it is the one measurement in
+   this list that can invalidate the others.
+   **Built and measured this pass: `train-cli es`.** On the same episodes it solves 0 of 12 seeds
+   of `scratch-tower` and 2 of 12 of `l3-gauntlet` where the GA solves 10 and 12 — so the search is
+   *not* where the remaining work is either: the GA's breeding is earning its place, and the
+   constraint on this pack is the content, which is item 1. See "The independent baseline"
+   below.
+
+**Order to do them in:** 3 is nearly free and improves the honesty of every later measurement,
+so it comes first (with 6's walker heading, which is one field and one sensor slot); then 1, the
+content, because a harder level is what makes 2, 4 and 5 measurable at all; then 5 and 4 as the
+mechanisms that a harder level will need. 7 is worth doing before any large investment in the
+search, because if a plain ES matches the GA at equal episode budget, the search is not where
+the remaining work is.
+
+**Where that order stands now.** 3 is wired (and its measurement says it was worth less than
+this list assumed), 6's observation half is in as v7, 7 is built and answered, 4's gated half is
+measured, 1 landed as a level that is nine moves long, and 2's memory question is answered below
+(yes in generations, no in solve count). **That leaves 5 and 4's reward half, and this pass did
+both**: a suite trainer with a `score` command that checks the claim on a saved artifact, and a
+rarity bonus in the selection score, off by default and measured on the two levels that would
+show it. Every item on this list now has a mechanism, a measurement and a paragraph saying what
+the measurement does *not* establish — which is the point at which the next pass should be
+re-ranking the list rather than working down it, and the two sections below are written so that
+re-ranking can start from the numbers rather than from the prose.
+
+### Memory: the policy can now have a state of its own
+
+`NetShape` gained `feedback`: that many values of the network's own first hidden layer are
+concatenated onto the next decision's observation, and a fresh scratch means a fresh, empty
+state, so a recurrent policy is exactly as reproducible as a memoryless one (the episode is still
+a function of genome, level and seed). `--feedback <N>` exposes it; 0 is the default and is
+bit-for-bit the net every earlier pass measured. Eight values of sixteen cost 128 genes (1 723 →
+1 851, +7 %) and, on a level where the population is running long episodes, about a third of the
+wall clock.
+
+The measurement is the interesting part, because memory does *not* pay uniformly — it pays exactly
+where a decision has to survive past the frame that prompted it. `--feedback 0` against
+`--feedback 8`, pop 200, 300 generations, `--stop-on-win`, first-win generation:
+
+| level | seeds | memoryless | with memory (8) |
+|---|---|---|---|
+| `l2-first-gap` | 12 | 12/12, mean 2 | 12/12, mean 1 |
+| `l4-rhythm` | 12 | 12/12, mean 11 | 12/12, mean **7** |
+| `l5-tightrope` | 12 | 12/12, mean 16 | 12/12, mean 20 |
+| `l3-gauntlet` (walkers) | 12 | 12/12, mean 18 | 12/12, mean **14** |
+| **`scratch-spike-tight`** (the hazard floor) | **24** | **2/24**, mean 145, solved at 117 and 173 | **11/24**, mean 134, solved at 28, 68, 70, 99, 99, 115, 160, 178, 180, 227, 251 |
+| `scratch-tower` (the plateau) | 24 | 14/24, mean 94 | 13/24, mean 137 |
+
+**Every number in this table is a v6 reading** — 95 inputs, 1 723 genes — because it was taken
+before the sensors' v7 slot existed, and it is recorded rather than re-run: the same protocol on
+the pack's first chain level, at v7, is in "Content" below, and the frozen protocol is what
+makes the two comparable at all.
+
+Read as two facts rather than one. **On the hazard floor it is a different search**: the level the
+owner's report is built on — one-tile spikes with one safe tile between them, the shape that
+produced the park trap — goes from 2 of 24 seeds to 11 of 24, and the solves it finds are often
+four times earlier (28 and 68 against 117 and 173). A policy that can hold a commitment across
+decisions is exactly what that level asks for, and it is the level class this document just said
+the pack does not have enough of. **On the plateau it is a wash that costs time**: 13 against 14 of
+24 is noise, but the solves arrive later (mean 137 against 94) and the same runs spend a third more
+wall clock, because a recurrent episode is longer, the genome is 7 % bigger, and the zig-zag is
+decidable from the frame — every one of its moves is a reflex, so state is genes the search has to
+carry and can do nothing with. The default therefore stays 0, exactly like the archive trickle and
+for the same reason: a mechanism that wins on the levels the pack lacks and loses time on the level
+the pack is measured against is a knob, not a setting. `--feedback 8` is the first thing to reach
+for on a hazard floor, a level with a wait in it, or anything with a jump that must be held.
+
+### The independent baseline: an ES on the same episode budget
+
+Item 7 above was the one item on the list that could invalidate the others, so it was built first of
+this pass's experiments: `train-cli es`, a `(µ, λ)` evolution strategy over the same genome, on the
+same level, with the *same* episode budget. Everything that decides what an episode is — the level,
+the episode seed, the cadence, the memory width and the trial count — is set identically in both
+arms; every search knob is not, because elites, tournaments and crossover describe a population the
+ES arm does not have. `--pop` is λ on that arm and means the same compute: 200 episodes per
+generation against the GA's 200 genomes per generation. Twelve seeds, pop 200, 300 generations,
+`--stop-on-win`:
+
+| level | GA | ES |
+|---|---|---|
+| `scratch-tower` (the plateau) | **10 / 12**, mean 94 | **0 / 12** |
+| `l3-gauntlet` (walkers, 3 trials both arms) | **12 / 12**, mean 17.9 | **2 / 12**, mean 137 |
+
+Paired on the seeds it is as lopsided as it looks: the ES gains nothing the GA misses and loses ten
+seeds on either level (the two it wins on the gauntlet come at generations 32 and 242 against the
+GA's 9-28). **So the search is not the binding constraint — the GA's breeding is doing real work,
+and neither is it the thing standing between this population and intelligence.** Read with item 1
+above, the two baselines agree: an ordinary ES cannot solve the pack at this budget, and the pack's
+levels are solved by the GA in ten to twenty generations, so what is being asked is too easy rather
+than what is answering it too weak.
+
+The honest caveats, because a baseline is worth exactly its tuning. The ES arm runs at **its own
+defaults** (σ = 0.05, lr = 0.01) and was not swept: a larger λ or a learning-rate schedule could do
+better, and the literature's ES results are on problems where λ > n. At λ = 200 in 1 739 dimensions
+the estimate is thin (`es.rs` says so where the arithmetic tests are justified), which is a statement
+about the *batch size*, not about ES. What the measurement establishes is the question it was built
+to answer — with this compute, on these levels, the GA is not replaceable by a gradient-free search
+this simple — and no more than that.
+
+Reproduce with `./target/release/train-cli es --level levels/scratch-tower.json --generations 300
+--pop 200 --seed 1 --stop-on-win --quiet` and the matching `train` line, `--trials 3` on the gauntlet.
+
+### The archive gate: the first archive reading that is not a loss on a plateau
+
+Item 4 above named the untried mechanism: a diversity-*triggered* breeding rule hung on the stall
+detector, as distinct from the every-generation trickle that was measured as a loss. It is built
+(`--archive-on-diversity`, gating archive children on *no new best for `--stagnation` generations*
+**and** no new behavioural niche over the same window) and this is its measurement, twelve seeds per
+arm at pop 200, 300 generations, `--stop-on-win`, first-win generation:
+
+| level | archive off | 2 children, every generation | 2 children, gated |
+|---|---|---|---|
+| `scratch-tower` (plateau) | **10 / 12**, mean 94 | 7 / 12, mean 121 | 9 / 12, mean **76** |
+| `scratch-spike-tight` (hazard floor) | 1 / 12, mean 117 | **3 / 12**, mean 105 | 1 / 12, mean 192 |
+
+Paired on the seeds: against the ungated trickle the gate gains seed 3 and loses 4, 6, 8, 9 and 12;
+against the archive off it gains 3 and loses only 6 and 9. So on the plateau the gate **recovers
+almost all of the trickle's loss and keeps its speed** — nine of twelve against ten, with the solves
+arriving seventeen generations earlier on average — which is the first reading in this document where
+the archive is not simply costing the hardest level in the pack.
+
+**And on the hazard floor it is the wrong tool, which is why it is a flag.** The ungated trickle owns
+the one level where it earns its keep (3 of 12 against 1, gaining seeds 7 and 11, losing none), and
+the gate suppresses exactly that, because a run grinding across a hazard floor is a run that keeps
+finding new bests and new niches — the condition it waits for never arrives. The rule of thumb the
+two rows give is mechanical rather than mystical: **a plateau wants the gate, a grind wants the
+trickle, and the default stays off for both.**
+
+### Content: the pack's first chain level
+
+Item 1 said the cheapest large gain available was content, and that a harder level is what makes the
+memory and diversity mechanisms measurable at all. `levels/l9-wait-and-climb.json` is that level:
+60×15, one walker, one flag, and **nine moves between the spawn and the flag** — spike, pit,
+nineteen-tile patrol run, two-tile hazard patch, two-tile step, three-tile wall climb, a gap in the
+upper ledge, a spike, and a two-tile climb, with the spawn at column 2 and the flag at column 56.
+Every move in it is one
+the pack already teaches somewhere (L2's pit, L3's patrol, L7's climb, L4's timing); what is new is
+that one body has to make all of them inside one episode.
+
+| what | measurement |
+|---|---|
+| Beatable in principle | `train-cli reach` — 6 platforms, all reachable |
+| Not a lottery | **12 / 12 seeds solved**, first wins 30, 33, 54, 54, 58, 67, 68, 70, 81, 82, 90, 205 (medians and means below) |
+| Harder than everything shipped | median first win **67.5** generations against the pack's slowest other median of **20** (L3, a v6 reading) |
+| Not reachable by luck | `evo::tests::difficulty::no_earned_level_is_won_by_a_random_population` — 768 random genomes, no more than one winner, which is the pack's measured noise floor |
+
+400 generations at pop 200 costs 0.03-0.04 s per generation on this machine, so a full run is about
+fifteen seconds: the level is *slow for a population*, not expensive to search.
+
+**Every number in this section is a re-measurement, because the ones it first carried did not
+reproduce.** They were a **v7** reading (95 inputs, 1 723 genes) and the observation has since moved
+to **v8**, which re-rolls every episode in every arm: run the old protocol on this build and seeds
+1-3 come out at 105, 33 and 35 rather than the 39, 46 and 86 the table used to say, which is not a
+regression but a different draw. What is quoted here is what this build does, and the arm that
+matters is separable on it, because the trainer gained a second default in between — the trial rule
+below, which judges a walker level on three patrol phases. `l9` has a walker in it.
+
+| arm (v8, pop 200, 400 generations, `--stop-on-win`, 12 seeds) | solved | median | mean |
+|---|---|---|---|
+| shipped defaults (three patrol phases) | **12 / 12** | 67.5 | 74.3 |
+| `--no-auto-trials` (one patrol phase, the pre-trial-rule protocol) | 10 / 12 | 76 | 106.7 |
+| `--feedback 8` (the recurrent arm, shipped defaults) | **12 / 12** | **41** | **64.3** |
+
+The trial rule is worth two seeds and about nine generations of median on the pack's only chain
+level, which is the cost of judging a stochastic level on one phase — seeds 8 and 12 are *unsolved at
+400* without it.
+
+**And memory pays here, in generations.** Paired on the seeds, `--feedback 8` against memoryless:
+**earlier on eight, later on four, nothing gained and nothing lost** (12 of 12 either way). The
+median goes from 67.5 to 41 and the mean from 74.3 to 64.3, and the pairing is the shape the memory
+section predicted: the two seeds that regress hardest (67 → 211, 30 → 98) are ones where carrying
+sixteen extra genes costs more than the state buys, and the ones that gain most (205 → 42, 90 → 37,
+58 → 31) are the runs where the body has to hold its nerve at the nineteen-tile patrol. On the
+pack's other levels the same arm was neutral (the v6 memory table above), which is the honest form
+of the claim: **memory is not a better policy, it is a longer one, and it pays exactly on the levels
+that need a horizon.** It is still not the default; the first thing to reach for on a level with a
+wait in it, yes.
+
+### The trial rule: what it bought, and where it bought nothing
+
+Item 3 (2.5) was wired this pass: three patrol phases where a level has walkers, one where it does
+not, with `--no-auto-trials` releasing the rule so the one-phase protocol behind every earlier table
+in this document is still reproducible. Twelve seeds, pop 200, 300-400 generations, `--stop-on-win`:
+
+| level | three phases (shipped) | one phase | wall clock |
+|---|---|---|---|
+| `l3-gauntlet` | 12 / 12, mean 17.9 | 12 / 12, mean 17.6 | 6.7 s against 2.8 s |
+| `l6-marathon` | 12 / 12, mean 9.8 | 12 / 12, mean 8.9 | 4.3 s against 1.6 s |
+| `l9-wait-and-climb` | **11 / 12**, mean **136.8** | 9 / 12, mean 214.1 | 40.7 s against 26.2 s |
+
+**On the two walker levels the pack shipped before this pass, the rule buys nothing.** Both levels
+are won by the population in ten to twenty generations on every seed either way, and on `l6-marathon`
+ten of the twelve first-win generations are *identical* between the arms (7, 5, 6, 6, 7, 4, 12, 10, 9,
+12) because the run finds its winner before selection noise matters. The cost is not nothing: judging
+a genome on three phases is 2.4x the wall clock for the same answer at the same population. What the
+rule does not fix is also worth writing down, because it is the argument that was made for it —
+`l6-marathon` still has its lottery (a mean first win near ten generations at pop 200 on the pack's
+longest level is a level that a lucky agent walks), and no trial count repairs that, because the
+problem is the level rather than the reading of it.
+
+**On the level where the patrol phase is load-bearing, the rule earns its cost**: l9's nineteen-tile
+patrol run is crossed in one direction or the other, so a genome judged on a single phase is judged
+on a coin-flip of the level's one timed element. Three phases solve 11 of 12 seeds at a mean of 136.8
+generations; one phase solves 9 of 12 at 214.1, gaining nothing and losing seeds 5, 9 and 11 — and on
+the nine seeds both arms solve, the one-phase arm is later on six of them. 1.55x the wall clock for
+36 % less search and two more solves is a trade worth making, which is the difference between this
+level and the ones that came before it: **the rule matters in proportion to how much of the level is
+a wait.**
+
+### The clock: a time to beat, a reward for being quick, and a pressure towards new routes
+
+The game could already tell you *whether* a level was solved and never *how fast*. Three things were
+asked for, and they turned out to be one mechanism seen from three sides: show the time the AI took,
+reward it for finishing quickly, and make it look for other ways to be quick. Fitness **v8** adds a
+term (`SPEED_BONUS = 200`, paid only on a win, scaled by the level's own unspent frame budget), the
+archive gained a finish-band axis, and every surface that reads a run now says the clock.
+
+**The term is paid only on a win, and that is the whole design.** `Outcome::Stuck` and `Outcome::Died`
+stop the clock too, so a reward for finishing quickly that paid anything for stopped episodes would be
+a race to be killed — the park trap with the sign flipped. Two tests hold the shape of it:
+`a_win_pays_for_the_time_it_did_not_spend` (half the budget unspent is half the bonus, a loss banks
+nothing for dying early, any win still beats any loss by more than the bonus is worth) and
+`a_quicker_win_cannot_be_bought_by_skipping_a_checkpoint` (100 frames saved buys 8.3 points against a
+checkpoint's 16, so pace cannot be paid for by cutting a corner).
+
+**The denominator is the level's own cap**, not a per-level number someone types in: `sim::frame_budget`
+is `max(width, height) × FRAMES_PER_TILE`, which the sim *already* stops episodes at. Using it required
+carrying it in `EpisodeStats` (`budget_frames`), which is why the sim bumped as well as the fitness
+function — a score computed against a cap the episode cannot see is a score that can disagree with the
+cap the episode was run under.
+
+**Measured through the real trainer, against the same build with the bonus switched off** (which is
+exactly fitness v7 — the term is additive and win-only). Pop 200, 60 generations, seed 1 and 2:
+
+| level | seed | quickest win (200) | quickest win (0) | champion frames (200) | champion frames (0) |
+|---|---|---|---|---|---|
+| `l1-flat-run` | 1 | 6.15 s | 6.15 s | 373 | 416 |
+| `l1-flat-run` | 2 | 6.15 s | 6.15 s | 371 | 504 |
+| `l3-gauntlet` | 1 | 6.47 s | 7.13 s | 402 | 437 |
+| `l3-gauntlet` | 2 | 6.40 s | 7.80 s | 385 | 493 |
+| `l6-marathon` | 1 | 8.93 s | 8.93 s | 624 | 655 |
+| `l6-marathon` | 2 | 8.67 s | 8.58 s | 530 | 658 |
+
+The champion — the genome a run keeps and a viewer watches — is quicker or equal in five rows of six,
+by up to 22%. The run's *record* is the honest half of the table: L1 hits the same 6.15 s either way
+because 369 frames is the level's own floor for a body at that speed, and one row (L6 seed 2) has the
+record ten frames worse with the bonus, which is what re-ranking the same population looks like. So the
+claim this pass establishes is narrower than "it learns to be quicker": **among a generation of winners,
+the clock decides which one is kept, and the kept one is quicker.**
+
+**The pressure towards new routes is the archive, not the score.** A finishing band is now part of a
+cell's key, so the grid went from 48 cells to 240 and two wins on the same route at different paces are
+two niches rather than one incumbent fight. That is what lets a run keep a slow route *and* a quick one
+for the same landing zone, so a faster solution to an old problem does not erase the only solution to
+it — and the *speed coverage* a reader sees (`3 / 4 finish bands`) is the count that says a level has
+been solved once rather than solved well. Coverage is reported over the 48 behavioural cells and not the
+240 total; the difference matters because a run spread across a third of the ways of moving would read
+as an eighth explored, and both front-ends were counting the wrong denominator before this pass
+(`evo::ARCHIVE_CELLS` was 48 when that line was written and is 240 now).
+
+**What the viewer got.** The run panel's readings went from three to four with the clock among them — it
+is the one reading a person *acts* on, so it belongs on the panel rather than one press away in the
+Details window. The playtest now runs a stopwatch (`Session::frames`, the sim's own tick count, never
+the wall clock) and prints a race line against the run's record: `7.10s at the flag — the AI's best is
+7.90s, 0.80s faster`, with `the same time, to the frame` for a tie and an explicit "the run has no win to
+race yet" when there is nothing to beat. `--play` opens the window in it, because a scripted frame of
+the playtest was the one view with no way to be rendered. The terminal's champion line, its training
+summary (`clock 6.15s at the flag (gen 0 id 39, 85% of the level's 40.00s unspent, 4 of 4 finish bands
+filled)` — the real L1 line below), the watch sign-off and a `*** QUICKEST WIN ***` note in the live view all read the same number
+through `sim::format_time`, so 8.42 s means 8.42 s in all of them.
+
+The two **look** findings the same pass fixed, both reported by the owner rather than found by the
+suite: the pace control lived only inside the Details window, so the one setting a viewer changes
+*while* watching was a keypress or a scavenger hunt — it is now a `− 8x +` stepper on the panel,
+reporting one rung through the same `Command::Speed` the keys use. And the Details board was a column of
+`ui.small(format!(...))` sentences, in two visually different styles across its four modes; it is now
+label/reading rows (`ui::stat_row`, a fixed label column so a long label truncates instead of
+overprinting its value) under the same section rule every board uses, with the level's own board
+gaining the level's episode cap — the clock a solution is allowed to take, which is what the run's best
+time is read against.
+
 ---
 
 ## 5. Graphics and assets
@@ -714,14 +1378,19 @@ module, and tests that read the shipped PNG — and the last few findings (32–
 the real readability problems (player camouflage, invisible props, floating tree-line).
 What remains is mostly *motion* and *feedback*:
 
-1. **Juice is missing.** There is no audio at all, no screen shake, and no hit-stop.
-   The researched ordering is: make controls responsive (already good — coyote time,
-   jump buffer, corner behaviour are all in the physics bible), then add feedback per
-   action — takeoff anticipation, landing dust (exists), a stronger impact for a stomp
-   or death, a sparkle for the flag, and a short hit-stop on death/stomp only. Screen
-   shake needs a defined intensity ladder and a meaning per event
-   ([GameAnalytics juice](https://www.gameanalytics.com/blog/squeezing-more-juice-out-of-your-game-design),
-   [Feel: screen shakes](https://feel-docs.moremountains.com/screen-shakes.html)).
+1. **Juice is missing.** There is no audio at all, and no hit-stop. The researched
+   ordering is: make controls responsive (already good — coyote time, jump buffer,
+   corner behaviour are all in the physics bible), then add feedback per action —
+   takeoff anticipation, landing dust (exists), a stronger impact for a stomp or
+   death, a sparkle for the flag, and a short hit-stop on death/stomp only
+   ([GameAnalytics juice](https://www.gameanalytics.com/blog/squeezing-more-juice-out-of-your-game-design)).
+   **Camera shake is out of scope, decided against rather than deferred.** One was
+   implemented — a landing, a stomp and a death each left a short impulse on the animator,
+   which displaced the whole frame for up to two-tenths of a second — and it was removed
+   on request because at this zoom a jolt that moves the level under the eye reads as the
+   window being kicked rather than the body hitting the ground. The three events still
+   read: each one spawns its own burst particles and squashes the body, and that is where
+   the impact belongs. The frame the viewer chose is now exactly the frame they see, always.
 2. **Camera legibility.** The follow camera pins the floor and tracks x (good). The
    remaining 2D-platformer polish is a focus zone and a look-ahead in the direction of
    travel, plus a "panic" follow near the frame edge
@@ -735,11 +1404,11 @@ What remains is mostly *motion* and *feedback*:
    material the way finding 32 did for the player, so a future material cannot ship
    camouflage ([Aran Ink](https://aran.ink/posts/celeste-tilesets),
    [SLYNYRD](https://www.slynyrd.com/blog/2020/5/21/pixelblog-28-side-view-tiles)).
-5. **Achievability constraint:** the atlas is 149 of 160 cells. Any *new terrain
-   material* (three families × masks + blends) needs the grid widened first; the
-   generator supports it (`COLS`/`ROWS` + the manifest), and the art tests already
-   refuse an atlas that overflows. That is why this pass added placeable props (which
-   reuse existing cells) rather than a new material — see §6.
+5. **The grid is nearly full again:** 232 of 240 cells, after `art/ui.py` took it from 223 of 224 to
+   16x15 (and grew by four more when the run's own transport joined it). The next *new family* widens it again — the generator refuses an atlas that overflows and the
+   manifest docs say so, so the failure is an error rather than a missing tile — and the same is true
+   of any new terrain material (three families × masks + blends). Worth knowing before the next
+   request for "one more prop": the cheap moves are all reuse now.
 
 ---
 
@@ -786,6 +1455,20 @@ carries the version and the "edit · play · evolve · replay" reminder
 ---
 
 ## 8. Verification
+
+* The clock pass: `cargo test --workspace` — **528 passed, 0 failed**;
+  `cargo clippy --workspace --all-targets -- -D warnings` — **clean**. New tests: the two
+  reward-shape tests in `evo::fitness` (the term's arithmetic and the checkpoint trade), a
+  round-trip test that a written time is a clock (`sim::tests::a_time_in_frames_is_written_short_and_in_order`),
+  the archive's speed-niche test and the run's-record test in `evo::ga`, the four-reading panel
+  test, the pace-stepper ladder test, the playtest's stopwatch/race tests, and the champion-summary
+  clock test. Ablation run through the real trainer (`SPEED_BONUS = 0.0` against `200.0`, five levels,
+  two seeds, recipe in §4) rather than asserted. Frames rendered and inspected: `out/evolve-panel.png`
+  (the clock reading and the `− 8x +` stepper on the panel), `out/play-race.png` (`--play`, the race
+  line in the dock and `0.02s of 40.00s` in the status strip), `out/details-clock.png` and
+  `out/details-level.png` (the two boards). The Details windows, the stepper and the race line were
+  checked by eye on those frames — there is a display in this environment, but nobody at the keyboard
+  to press the stepper, so its *wiring* is held by tests and its *look* by the frames.
 
 * `cargo test --workspace` — **413 passed, 0 failed** (403 before this pass, +10:
   scenery round-trip, splash action, splashed-frame scenery, editor scenery brush;
@@ -871,12 +1554,152 @@ carries the version and the "edit · play · evolve · replay" reminder
   about the trajectories: once a batch fires, the genome values differ even though the number
   of RNG draws does not, and what is observed is that the winning lineage is unaffected.
 
+* **This pass (the look of it, the art across the board, and what the sensors can see).**
+  `cargo test --workspace` — **466 passed, 0 failed** (444 at the end of the last pass: +22,
+  three for the window's own theme, six for the level shelf, five for the editor's shape row
+  and two materials, four for the spawn rule in the sim and the editor, the search's archive
+  and diversity readings, and the sensor re-pin). `cargo clippy --workspace --all-targets` —
+  clean. The front end says what the window says: `--archive-children` in `TRAIN OPTIONS`, a
+  `qd  N children bred from the archive, M of 48 niches filled` line after a run, the panel's
+  own wording (`+N from the archive`, `diversity N/48 niches`) in the live search line, and
+  two new CSV columns.
+* **The art in `assets/` is the art in `tools/`, checked rather than assumed.**
+  `python3 tools/gen_tileset.py` re-run against the shipped atlas reproduces
+  `assets/tileset.png`, `assets/tileset.json` and `assets/tileset_preview.png`
+  **byte-identically** (same md5), so the tileset in the repository is the tileset the
+  generators draw and not a hand-edited copy of one. The atlas grew to ten rows: five
+  materials — soil, sand, stone, brick and timber — each with its crown, body and coping
+  bands, plus one seam band per ordered pair of families.
+* **Every mode rendered and looked at**, through `evo-app --screenshot` on this machine: the
+  title screen with its three doors, the editor with its palette grid, shape row and status
+  bar, the evolve view with the search line, the fitness chart and the agent panel, and the
+  champion replay with the population ghosted and the death marks on. Frames:
+  `target/shots/shot-splash.png`, `shot-edit.png`, `shot-evolve.png`, `shot-replay.png`.
+  The camera no longer takes the simulation's impulses at all: `SHAKE_FULL`, `App::shake`
+  and `AgentAnim::shake` are gone, so the drawn camera *is* the viewer's camera rather than
+  a copy displaced by the loudest lane (§5, item 1). Nothing in the suite could have caught
+  a jolt — a shake is a per-frame displacement with no state a unit test can read — which is
+  why the removal is structural: the only code that could move the frame was deleted rather
+  than switched off.
+* **The AI arm, measured on this machine** (i5-9400, six cores). Every number is
+  `train-cli train` at pop 200, 12 seeds, 300 generations, `--stop-on-win`, with a run counted
+  as solved at its first winning generation. The enemy-view bound is the change the pack
+  actually feels, so it was swept three ways on `l3-gauntlet`, the level that exposed it:
+
+  | enemy view distance | solved | mean first-win generation | wall clock, 12 runs |
+  |---|---|---|---|
+  | v4: unbounded (committed) | 12 / 12 | 25 | 3.8 s |
+  | v5: four tiles | 12 / 12 | **41** | 15.2 s |
+  | v6: eight tiles (shipped here) | 12 / 12 | **18** | 6.9 s |
+
+  v5 fixed a real lie — a walker across the level read as a walker on top of you — and
+  over-corrected: at four tiles the threat was only legible once it was inside the patch, and
+  the population reached the flag later than it had with the dishonest vector. Eight tiles
+  beats both. The levels without walkers cannot see it: between the two bounded arms,
+  `scratch-tower` is 10 of 12 at a mean first-win generation of 94 in both and `l2-first-gap`,
+  `l5-tightrope` and `l7-ascent` are 12 of 12 at generations 2, 16 and 10 in both. (The tower's
+  own movement is the *scoring* change of the same pass — directional checkpoint credit — and
+  it is a gain: 94 against the committed build's 122 at the same 10 of 12.) The sim's own
+  throughput is unchanged: 60 000
+  ticks in ~3 ms in both builds, generation-1 cost on `scratch-tower` within a millisecond.
+  On the levels with walkers the random population lives longer under the honest observation
+  (generation 1 at pop 200: 21 ms at HEAD, 51 ms here), so the *per-generation* wall clock on
+  `l3-gauntlet` and `l6-marathon` is ~2.4x HEAD's while episodes are longer — that is the
+  price of the change, and it is paid against a wall clock to solve that is the same order of
+  magnitude (6.9 s for twelve seeds against 3.8 s) rather than a slower search.
+* **The archive trickle, re-measured at v6 and left off.** `scratch-tower` at 12 seeds: 10 of
+  12 solved at a mean first-win generation of 94 with the trickle off, 7 of 12 at 121 with two
+  archive children, and 6 of 12 at 88 with four — the dose that loses the hardest level in the
+  pack, reproducing the reading that turned the mechanism off. `l3-gauntlet` is where the same
+  arm used to win (15 against 41, measured at v5); at v6 it is 16 against 18, i.e. inside the
+  noise of twelve seeds, because the honest observation already bought what the trickle was
+  papering over. `l6-marathon` solves in single-digit generations either way (9 against 11).
+  So the knob stays a knob, and the panel's diversity reading stays honest with it at 0.
+
+* **This pass (the roadmap's own order: the baseline first, then the trial rule, the archive gate
+  and a level that is a chain).** `cargo test --workspace` — **480 passed, 0 failed** (470 at the
+  end of the last pass: +10 = the ES arm's budget test, its two command-line tests, the rewritten
+  trial-averaging test, the enemy-direction slot and its layout pin, the new level's row in the
+  pack table and in the difficulty ladder). `cargo clippy --workspace --all-targets` — clean. The
+  four measurements are in §4 and each is a first-win-generation table: the **ES baseline**
+  (`train-cli es`, 0 of 12 on the tower against the GA's 10 and 2 of 12 on the gauntlet against
+  12), the **archive gate** (9 of 12 at a mean of 76 on the plateau, but 1 of 12 on the hazard
+  floor where the ungated trickle earns 3), the **trial rule** (nothing on the two walker levels
+  the pack shipped before this pass, 11 of 12 against 9 and a third less search on the level whose
+  patrol run is load-bearing) and **`l9-wait-and-climb`** (a median first win of 160 generations,
+  against the pack's old slowest median of 20, with `--feedback 8` cutting the mean by a third).
+* **Two tests changed because a measurement moved under them, and both changes are measurements
+  rather than loosened assertions.** The window's and the terminal's curriculum tests need a
+  sixty-generation cap because at pop 2 on `l5-tightrope` this build's last new best is generation
+  21 and the 25-generation stall window the panel uses therefore opens at 46 — a forty-generation
+  cap ended the run before the stall the tests exist to exercise (sensors v7 moved the
+  trajectory). And `the_search_bookkeeping_is_as_reproducible_as_the_rest_of_the_run` compares a
+  self-tuning run's sigma path against a fixed one over **forty** generations rather than twelve,
+  because v7's extra input put this fixture's first twelve generations at a success rate the
+  one-fifth rule does not act on — so the comparison was two constant 0.30 paths, failing for
+  exactly the reason the assertion exists. Neither fix weakens a claim: both keep the claim and
+  give the mechanism the room to act.
+* **This pass (the window's furniture: a dock, and one vocabulary for the things you press).**
+  `cargo test --workspace` — **512 passed, 0 failed** (480 at the end of the last pass; six of the
+  additions are `app::ui`'s own and the rest landed with the v8 sensor slot, the trial rule's
+  defaults and the chain level's row in the same uncommitted pass as this one). `cargo clippy
+  --workspace --all-targets -- -D warnings` — **clean**. The six are the press sink and the inverted
+  edges, the five distinct faces, the longest word in the switch measured against the room its cell
+  has for it, the banner declining to draw into too little room, the widgets really painting (counted
+  in *vertices* in a headless context, which is the only thing that separates "drew a chunky plate"
+  from "allocated space and painted nothing"), and a button with a misnamed icon still being a
+  button. §3 has the mechanisms.
+* **The dock was rendered and *looked at*, and the first two renders are why that mattered.**
+  `evo-app --screenshot` again: `target/shots/shot-dock-edit.png` and `shot-dock-evolve.png`.
+  Reading them found two defects no test in this suite could see. The plaque's two lines were laid
+  out **side by side** — a `Frame` inside a horizontal bar inherits the bar's layout, so the sign was
+  235 points wide instead of 140 and cost the bar a control's worth of room. And the Evolve reading
+  was missing entirely: the banner measures itself against the room left after the file path and had
+  quietly declined. Both are fixed (the plaque forces a top-down layout, and the path is gone from
+  the dock because the plaque already names the file), and the frames in `target/shots/` are the
+  evidence rather than the intent — with `--screenshot` and no display in this environment, a frame
+  is the only instrument there is for this half of the work.
+* **Every champion file on disk before this pass is now refused**, for the documented reason: the
+  sensor version moved to v7 and the network's input count with it (95 to 96 inputs, 1 723 to
+  1 739 genes), which is what `champions/README.md` says those files are (a build artifact of a
+  version trio, never committed). Local files were not regenerated here beyond the measurement
+  runs; the next `train` writes fresh ones.
+* **This pass (the look, second pass: fewer words, one window, and a theme that was never
+  installed).** `cargo test --workspace --no-fail-fast` — **514 passed, 0 failed** (512 at the end of
+  the last pass; the two additions are the theme-slot regression test and the guard that every glyph
+  the window draws is in the atlas — the switch's width test *replaced* the clearance one rather than
+  joining it, and the UV test is the same test, failing on a new grid shape). `cargo clippy
+  --workspace --all-targets -- -D warnings` — **clean**. Two of the tests that moved were failures
+  first, and they are the point of the pass:
+  * `app::atlas::tests::every_shipped_sprite_maps_inside_the_image_at_one_cell` failed the moment the
+    atlas grew a fifteenth row — `14 * (1/15) + 1/15` is `1.0000001` in f32, so the bottom row's far
+    edge landed a hair outside the texture. That is a real (if invisible) sampling bug in
+    `Atlas::uv` that the *old* grid happened to hide, and the fix is to divide cell coordinates by
+    the grid rather than multiply them by a reciprocal, which puts the last cell's edge at exactly
+    1.0. Caught by a test written two passes ago for a different reason.
+  * `app::theme::tests::a_theme_switch_cannot_repaint_the_window` is new, and it is the regression test
+    for the details window drawing itself in egui's stock dark colours inside a cream window. It
+    asserts the theme in **both** of egui's style slots, because the broken one is the slot nothing on
+    screen is using yet — `ctx.style()` had been passing all along.
+* **Frames rendered and looked at, again, and again for a reason.** `--screenshot` at 1360x800 for the
+  editor, the replay and the evolve view, and one deliberately at the 900-point minimum width with the
+  pack's longest level name (`target/shots/s2-edit.png`, `s2-play.png`, `s3-evolve.png`,
+  `s3-narrow.png`, and `s3-details.png` with the level-details window open, which the constructor's
+  `details_open` was flipped for on the command line and flipped back). The dark details window is the
+  one defect four of those renders had been hiding in plain sight since the *previous* pass: every
+  panel that looked right was a frame with an explicit fill, so nothing egui styled itself had ever
+  been in a frame anyone read. `/tmp`-style throwaway HTML pages that inline the PNGs as data URIs
+  (`tools/art/shot_viewer.py`) were the only way to see them here — no display, no browser.
+
 **Not verified:** the pointer feel of finding 1.6's ghost, and any interactive
 clicking at all — there is no display in this environment, so every app check goes
 through `--screenshot` and the logic-level tests. The tile the mouse reports is
 `Camera::to_tile`'s, which `the_flag_is_drawn_in_the_cell_the_eraser_addresses` now
 exercises against a real frame, but a human at the window is still the only thing that
-can confirm the drag reads right.
+can confirm the drag reads right. The theme, the shelf, the splash's three doors and the
+editor's shape row are in the same position: they are held by their own tests and by
+rendered frames, and whether the result *looks* right is the one claim a screenshot can
+only support rather than settle.
 
 ## 9. How the additions are held in place
 
@@ -921,3 +1744,58 @@ can confirm the drag reads right.
 | Even the hottest batch is still a pull towards the champion | `evo::ga::tests::even_the_hottest_batch_is_still_a_pull_towards_the_champion` |
 | A flag the user did not give leaves the trainer's default alone | `train_cli::commands::tests::the_command_lines_defaults_are_the_trainers_defaults` |
 | A champion without the search knobs parses, and the reheat factor defaults to 1.0 | `evo::champion::tests::a_champion_file_without_the_search_knobs_still_parses` |
+| The window's palette is installed, and its four surfaces are four depths | `app::theme::tests::apply_installs_a_theme_and_the_surfaces_are_four_distinct_depths` |
+| Installing the theme twice changes nothing | `app::theme::tests::applying_twice_changes_nothing` |
+| Every material has a thumbnail colour, and no two share one | `app::theme::tests::every_material_has_a_thumbnail_colour` |
+| The shelf lists every shipped level and each one opens | `app::shelf::tests::the_shelf_lists_every_shipped_level_and_each_one_loads` |
+| A card names the level's own materials and size | `app::shelf::tests::a_card_reports_the_levels_own_materials_and_size` |
+| A broken level is a card that says why | `app::shelf::tests::a_broken_level_is_a_card_that_says_why` |
+| A thumbnail draws the floor and not the sky | `app::shelf::tests::the_thumbnail_draws_the_floor_and_not_the_sky` |
+| A long level is downsampled into the thumbnail's grid | `app::shelf::tests::a_long_level_is_downsampled_to_the_thumbnails_grid` |
+| Brick and timber are paints of their own | `app::editor::tests::the_brick_and_timber_brushes_paint_their_own_tiles` |
+| A rectangle drag fills the box and is one undo step | `app::editor::tests::a_rect_drag_fills_the_box_and_is_one_undo_step` |
+| A line drag leaves a connected run | `app::editor::tests::a_line_drag_leaves_a_connected_run` |
+| The spawn refuses a cell with nothing under it | `app::editor::tests::the_spawn_refuses_a_cell_with_no_ground_under_it`, `sim::level::editing_tests::a_spawn_needs_an_empty_cell_with_ground_under_it` |
+| A fresh document starts on ground | `app::editor::tests::a_fresh_document_starts_on_ground` |
+| A walker is out of sight beyond the view distance and legible inside it | `sim::tests::levels::an_off_grid_or_distant_walker_is_out_of_sight_until_approached` |
+| A sighted walker's direction is observed, and follows it as it turns | `sim::tests::sensors::the_enemy_direction_slot_follows_the_walker_as_it_turns` |
+| The observation layout is what it says it is, at 96 inputs and version 7 | `sim::tests::sensors::the_vector_has_the_documented_named_layout` |
+| The whole observation vector is pinned again, for v7 | `sim::tests::sensors::golden_observation_hash_at_a_fixed_state` |
+| The network's width follows the sim's table, at 96 inputs and 1 739 genes | `evo::genome::tests::default_shape_matches_the_plan` |
+| Every trial selection runs is really run, on its own seed, and their mean is the score | `evo::ga::tests::every_selection_trial_is_run_on_its_own_seed_and_averaged_into_the_score` |
+| The walker rule is three patrol phases, and `--no-auto-trials` releases it | `evo::ga::tests::a_walker_level_is_judged_on_more_than_one_patrol_phase` |
+| The baseline's episode budget is the GA's, or it is not a baseline | `evo::es::tests::the_baselines_default_budget_matches_the_gas` |
+| The `es` command's defaults come from its trainer, and its budget from the GA's | `train_cli::commands::tests::the_es_command_lines_defaults_are_the_trainers_defaults_and_the_gas_budget` |
+| The `es` subcommand runs a shipped level end to end, and refuses `train`'s flags | `train_cli::commands::tests::the_es_subcommand_runs_on_a_shipped_level` |
+| The archive gate is off by default, and the flag is the only way to it | `evo::ga::tests::the_archive_can_wait_for_a_run_that_has_stopped_having_ideas` |
+| The pack's chain level is in the round trip, the shape table and the difficulty ladder | `sim::level::editing_tests::every_shipped_level_round_trips_through_the_writer_with_the_same_hash`, `sim::tests::levels::all_shipped_levels_load_with_the_documented_shape`, `evo::tests::difficulty::no_earned_level_is_won_by_a_random_population` |
+| The observation layout did not move when the enemy range did, at version 6 | `sim::tests::sensors::the_vector_has_the_documented_named_layout` |
+| The whole observation vector is pinned again, for v6, with a walker in the frame | `sim::tests::sensors::golden_observation_hash_at_a_fixed_state` |
+| The archive breeds only when it is asked to, and fills either way | `evo::ga::tests::the_archive_breeds_only_when_it_is_asked_to` |
+| Every child bred from the archive is counted, and the knob turns them off | `evo::ga::tests::archive_children_are_bred_every_generation_and_the_knob_turns_them_off` |
+| The archive keeps the best genome per niche and breeds from its own incumbents | `evo::ga::tests::map_elites_archive_retains_best_genome_per_behavioural_niche`, `evo::ga::tests::the_archive_breads_from_its_own_incumbents_and_moves_on` |
+| Pressing a plate sinks its content by `PRESS_SINK`, and a dead plate does not sink | `app::ui::tests::a_pressed_plate_sinks_its_content_and_a_resting_one_does_not` |
+| A pressed plate is inset: its lit and shaded edges swap | `app::ui::tests::a_pressed_plate_inverts_its_edges` |
+| Every plate state has its own face, and the chosen one is the accent with dark type | `app::ui::tests::every_state_has_its_own_face` |
+| The switch's chosen cell grows to hold the word it shows, word by word | `app::ui::tests::the_chosen_cell_has_room_for_the_word_it_shows` |
+| A theme switch cannot repaint the window (both of egui's slots are this game's) | `app::theme::tests::a_theme_switch_cannot_repaint_the_window` |
+| Every glyph the window's own controls draw is in the shipped atlas | `app::atlas::tests::every_glyph_the_window_draws_is_in_the_atlas` |
+| The controls paint, and a disabled one answers no pointer | `app::ui::tests::the_controls_paint_and_the_switch_reports_the_cell_under_the_pointer` |
+| A button whose icon is missing is still a button | `app::ui::tests::a_button_without_a_working_icon_still_draws_its_label` |
+| A click on a door enters it, and the press does not leave first | `app::splash::tests::a_click_on_a_door_enters_it_and_the_press_does_not_leave_first` |
+| The doors arrive with the caption and sit under the world | `app::splash::tests::the_doors_arrive_with_the_caption_and_sit_under_the_world` |
+| The editor draws a document on a surface, and the sky's hills stay out of it | `app::view::tests::the_sky_backdrop_draws_clouds_over_the_same_level` |
+| Every shipped sprite maps inside the texture at exactly one cell, edge included | `app::atlas::tests::every_shipped_sprite_maps_inside_the_image_at_one_cell` |
+| A win pays for the budget it did not spend, and only a win does | `evo::fitness::tests::a_win_pays_for_the_time_it_did_not_spend` |
+| The clock a real episode is paid on is the sim's own frame count against the level's own budget | `evo::fitness::tests::the_clock_an_episode_is_scored_on_is_the_sims_own` |
+| A quicker win cannot be bought by skipping a checkpoint | `evo::fitness::tests::a_quicker_win_cannot_be_bought_by_skipping_a_checkpoint` |
+| A time in frames is written one way, in both shapes, and reads back as the frames it was made from | `sim::tests::a_time_in_frames_is_written_short_and_in_order` |
+| The archive keeps a niche per speed and still counts one way of moving | `evo::ga::tests::the_archive_keeps_a_niche_per_speed_and_counts_one_behaviour` |
+| A run reports the quickest win it has recorded, and keeps it across a generation that wins nothing | `evo::ga::tests::a_run_reports_the_quickest_win_it_has_recorded` |
+| The run's panel says four things, including the clock, and an em dash when there is no win to time | `app::panel::tests::the_run_panel_says_four_things` |
+| The panel's pace stepper moves one rung, stops at both ends, and reports rather than applies | `app::panel::tests::the_panel_has_a_pace_stepper_that_walks_the_same_ladder_as_the_keys` |
+| The playtest's stopwatch is the sim's frame count, not the frames drawn | `app::play::tests::the_stopwatch_is_the_sims_frame_count_and_not_the_frames_drawn` |
+| The race line says the time, where it got to, and how it stands against the AI's best | `app::play::tests::the_race_line_says_the_time_and_how_it_stands_against_the_ai` |
+| A session remembers its quickest win and keeps it across a restart | `app::play::tests::a_session_remembers_its_quickest_win_and_keeps_it_across_a_restart` |
+| Being in front of the AI is the clock against the clock, running or finished | `app::play::tests::being_in_front_of_the_record_is_the_clock_against_the_clock` |
+| A champion's summary line says its clock as a time as well as a frame count | `evo::champion::tests::a_champions_summary_says_its_clock_as_a_time_and_a_frame_count` |

@@ -260,6 +260,11 @@ impl Takeoff {
 pub struct Trajectory {
     /// Platform the body came to rest on, if any.
     pub landed_on: Option<usize>,
+    /// The `(column, surface_row)` it came to rest on, whenever [`Self::landed_on`] is
+    /// set: *where* on the platform the body touched down, which is what the route
+    /// graph ([`goal_routes`]) needs — a platform can hold several stands a body cannot
+    /// walk between, and the landing column is what says which one a jump reached.
+    pub landed_at: Option<(i32, i32)>,
     pub touched_goal: bool,
     pub hit_spike: bool,
     pub fell_out: bool,
@@ -457,6 +462,9 @@ pub fn simulate_jump_at(
     // The body is authored standing on `surface_row`, which is by construction a
     // surface tile, so a jump is legal on tick zero.
     player.grounded = true;
+    if let Some(death) = hazard_start(level, &player) {
+        return death;
+    }
 
     let mut hover = takeoff.hold != JumpHold::None;
     // A "landing" only counts once the body has actually left the ground, so
@@ -478,11 +486,12 @@ pub fn simulate_jump_at(
         if contact.landed && airborne {
             // Landing back on the take-off platform with no forward progress is
             // not an edge; it is reported as "landed here" and filtered by BFS.
-            return landed_trajectory(platforms, &player, t + 1);
+            return landed_trajectory(level, platforms, &player, t + 1);
         }
     }
     Trajectory {
         landed_on: None,
+        landed_at: None,
         touched_goal: false,
         hit_spike: false,
         fell_out: false,
@@ -498,16 +507,62 @@ pub fn simulate_jump_at(
 /// ends on, and it is the same edge-straddling case every precision jump out of a pit
 /// lands in. The rule is the sim's own (`PlayerState::spawn`): supported if *any* column
 /// the body spans is solid at the row below its feet.
-fn landed_trajectory(platforms: &[Platform], player: &PlayerState, ticks: u32) -> Trajectory {
+/// The recorded column is the one the body is *supported* by: the first column it spans
+/// that is ground it could stand on. A body cannot come to rest with a spike at its head
+/// or a wall in its torso — those ends are terminal before the landing is read — so the
+/// fallback to the first solid column is belt and braces; both `landed_on` and
+/// `landed_at` are read off the same column, so they can never disagree about where the
+/// body is.
+fn landed_trajectory(
+    level: &Level,
+    platforms: &[Platform],
+    player: &PlayerState,
+    ticks: u32,
+) -> Trajectory {
     let row = (player.y + player.h).floor() as i32;
     let (c0, c1) = crate::physics::tile_span(player.x, player.w);
+    let support = (c0..=c1)
+        .find(|c| platform_at(platforms, row, *c).is_some() && level.is_standable(*c, row))
+        .or_else(|| (c0..=c1).find(|c| platform_at(platforms, row, *c).is_some()));
     Trajectory {
-        landed_on: (c0..=c1).find_map(|c| platform_at(platforms, row, c)),
+        landed_on: support.and_then(|c| platform_at(platforms, row, c)),
+        landed_at: support.map(|c| (c, row)),
         touched_goal: false,
         hit_spike: false,
         fell_out: false,
         ticks,
     }
+}
+
+/// A body cannot *begin* a move inside a hazard.
+///
+/// The game kills a body the tick it overlaps a spike, but the hazard check runs after
+/// movement — so a take-off authored standing in a spike would leave the tile between
+/// tick zero and tick one and never be checked at all. That is not a legal move, it is a
+/// body that was already dead: to stand at that x the body had to walk into the spike
+/// first. Sweeping take-off positions over a spike-topped column let `report` invent an
+/// edge out of exactly such a spot and call a sealed tower beatable (finding 52), so the
+/// sweep's answer is now the game's: a death, and no edge.
+fn hazard_start(level: &Level, player: &PlayerState) -> Option<Trajectory> {
+    let (hx0, hx1) = crate::physics::tile_span(player.x, player.w);
+    let (hy0, hy1) = crate::physics::row_span(player.y, player.h);
+    let body = player.aabb();
+    // The sim's own hazard box, not the tile: a spike's drawn sprite leaves the top
+    // [`crate::physics::SPIKE_TOP_CLEARANCE`] of its cell transparent, and a body standing
+    // only in that band is a legal take-off. Asking the oracle a *stricter* question than
+    // the game asks would be the false negative the sweep exists to avoid.
+    let inside = (hy0..=hy1).any(|ty| {
+        (hx0..=hx1)
+            .any(|tx| level.is_spike(tx, ty) && body.overlaps(&crate::physics::spike_lethal_box(tx, ty)))
+    });
+    inside.then_some(Trajectory {
+        landed_on: None,
+        landed_at: None,
+        touched_goal: false,
+        hit_spike: true,
+        fell_out: false,
+        ticks: 0,
+    })
 }
 
 /// The ways a trajectory can end other than by landing: hazard, flag, or the void.
@@ -524,6 +579,7 @@ fn trajectory_terminal(
     if contact.touched_spike {
         return Some(Trajectory {
             landed_on: None,
+            landed_at: None,
             touched_goal: false,
             hit_spike: true,
             fell_out: false,
@@ -533,6 +589,7 @@ fn trajectory_terminal(
     if level.goals.iter().any(|g| player.aabb().overlaps(g)) {
         return Some(Trajectory {
             landed_on: None,
+            landed_at: None,
             touched_goal: true,
             hit_spike: false,
             fell_out: false,
@@ -542,6 +599,7 @@ fn trajectory_terminal(
     if player.y > level.height as f32 {
         return Some(Trajectory {
             landed_on: None,
+            landed_at: None,
             touched_goal: false,
             hit_spike: false,
             fell_out: true,
@@ -595,6 +653,9 @@ pub fn simulate_wall_climb(
     // The caller chose this spot because the platform is under it, so the body starts
     // standing — exactly as `simulate_jump_at` does for a take-off.
     player.grounded = true;
+    if let Some(death) = hazard_start(level, &player) {
+        return death;
+    }
 
     let mut airborne = false;
     for t in 0..MAX_CLIMB_TICKS {
@@ -607,11 +668,12 @@ pub fn simulate_wall_climb(
             return end;
         }
         if contact.landed && airborne {
-            return landed_trajectory(platforms, &player, t + 1);
+            return landed_trajectory(level, platforms, &player, t + 1);
         }
     }
     Trajectory {
         landed_on: None,
+        landed_at: None,
         touched_goal: false,
         hit_spike: false,
         fell_out: false,
@@ -946,9 +1008,370 @@ fn diagnose(
     (culprit, Some(message), Some(from.x1))
 }
 
+/// The route to the flag as the move graph knows it: which stands are one crossing
+/// apart, and how many crossings each stand is from the flag (§9.5).
+///
+/// [`ReachReport`] answers "can this level be beaten"; this answers **which way the
+/// route goes**, and the difference is the whole reason it exists. A straight-line
+/// reading — "the next stand is the one that lies closer to the flag" — is wrong on any
+/// level that doubles back: on a zig-zag climb the stand the route visits next often
+/// lies *farther* from the flag in a straight line than the stand behind it, and the
+/// stands between two legs read closer to the flag than either end of the route.
+/// Finding 50's tower arm caught that guess at work — a practice flag placed on the
+/// ground the body had just climbed from, and one placed three crossings away — so the
+/// ordering this replaces is measured wrong, not merely imprecise. Graph distance is
+/// monotone along the route by construction: the crossings left to the flag only ever
+/// fall as the run goes on.
+///
+/// Nodes are **landing zones** — the [`Level::landing_zone_bounds`] runs of standable
+/// ground, which is the unit "a crossing" is already defined on
+/// ([`Level::checkpoint_zone`]): walking is free inside a zone, and leaving one is a
+/// jump, a hop over a hazard, or a drop. [`Platform`]s are coarser — a spike at standing
+/// height splits one platform into two stands a body cannot walk between — so the graph
+/// is built per zone, sweeping each zone's own columns with the very same canonical
+/// moves [`report`] uses. The move set is never duplicated: every edge here is an
+/// [`edges_from`] trajectory, so the route can only ever claim a move the game has.
+#[derive(Clone, Debug)]
+pub struct GoalRoutes {
+    /// `(surface_row, x0, x1)` per stand, in scan order.
+    stands: Vec<(i32, i32, i32)>,
+    /// Index-aligned with `stands`: the stands a single canonical crossing lands on.
+    crossings: Vec<Vec<usize>>,
+    /// Index-aligned with `stands`: crossings from the stand to the flag — `None` where
+    /// the flag cannot be reached from there at all.
+    hops: Vec<Option<u32>>,
+}
+
+impl GoalRoutes {
+    /// Total number of standable landing zones in the level.
+    pub fn len(&self) -> usize {
+        self.stands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stands.is_empty()
+    }
+
+    /// The stand containing the ground at `(col, surface_row)`.
+    pub fn zone_at(&self, col: i32, surface_row: i32) -> Option<usize> {
+        self.stands
+            .iter()
+            .position(|&(r, x0, x1)| r == surface_row && col >= x0 && col <= x1)
+    }
+
+    /// The stand's `(surface_row, x0, x1)`.
+    pub fn zone_bounds(&self, stand: usize) -> (i32, i32, i32) {
+        self.stands[stand]
+    }
+
+    /// The stands one canonical crossing from `from` lands on. A jump that lands back
+    /// where it started is not a crossing and is not listed.
+    pub fn crossings_from(&self, from: usize) -> &[usize] {
+        &self.crossings[from]
+    }
+
+    /// Crossings from `stand` to the flag. `Some(0)` is the flag's own stand; `None`
+    /// means no route to the flag from here at all.
+    pub fn hops_to_flag(&self, stand: usize) -> Option<u32> {
+        self.hops[stand]
+    }
+
+    /// The world-space `(x, y)` waypoint the route aims at next from `stand`, when one
+    /// exists.
+    ///
+    /// If `stand` is already on the flag's own ground (`hops == 0`), or has no route to
+    /// the flag (`hops == None`), returns `None` so the caller aims directly at the goal.
+    /// Otherwise picks the next stand `j` reachable in one canonical crossing from `stand`
+    /// that strictly decreases `hops_to_flag` (with tie-breaking on proximity to `from_x`
+    /// and then to `goal`), and returns the world centre of the landing tile in `j` closest
+    /// to `from_x`.
+    pub fn next_waypoint(&self, stand: usize, from_x: f32, goal: Option<Rect>) -> Option<(f32, f32)> {
+        let from_hops = self.hops.get(stand).copied().flatten()?;
+        if from_hops == 0 {
+            return None;
+        }
+        let (from_row, fx0, fx1) = self.stands[stand];
+        let from_col = (from_x.floor() as i32).clamp(fx0, fx1);
+        let mut best: Option<(u32, f32, f32, (f32, f32))> = None;
+        for &j in &self.crossings[stand] {
+            let Some(hops) = self.hops[j] else {
+                continue;
+            };
+            if hops >= from_hops {
+                continue;
+            }
+            let (row, x0, x1) = self.stands[j];
+            let target_col = from_col.clamp(x0, x1);
+            let wx = target_col as f32 + 0.5;
+            let wy = row as f32 - 0.5;
+            let d_from = ((target_col - from_col) as f32).hypot((row - from_row) as f32);
+            let d_goal = goal.map_or(0.0, |g| {
+                let (gx, gy) = g.center();
+                (wx - gx).hypot(wy - gy)
+            });
+            let key = (hops, d_from, d_goal);
+            if best.is_none_or(|(bh, bf, bg, _)| key < (bh, bf, bg)) {
+                best = Some((hops, d_from, d_goal, (wx, wy)));
+            }
+        }
+        best.map(|(_, _, _, pt)| pt)
+    }
+}
+
+/// Build the route graph for a level (§9.5).
+///
+/// The flag counts as reached from a stand whose crossing can **touch** it, not only
+/// from the one it stands on: a flag floating over a pit is won in flight, and a route
+/// graph that only knew how to land under it would call such a level unrouteable.
+pub fn goal_routes(level: &Level) -> GoalRoutes {
+    let mut stands: Vec<(i32, i32, i32)> = Vec::new();
+    for row in 0..level.height {
+        let mut x = 0;
+        while x < level.width {
+            if !level.is_standable(x, row) {
+                x += 1;
+                continue;
+            }
+            let (x0, x1) = level.landing_zone_bounds(x, row);
+            stands.push((row, x0, x1));
+            x = x1 + 1;
+        }
+    }
+    let stand_of = |c: i32, lrow: i32| -> Option<usize> {
+        stands
+            .iter()
+            .position(|&(r, x0, x1)| r == lrow && c >= x0 && c <= x1)
+    };
+
+    // Every edge is one `edges_from` trajectory — the report's own move set — swept from
+    // each stand's own columns (the synthetic take-off platform *is* the stand; its id
+    // only feeds `CulpritJump`, which this graph has no use for).
+    let platforms = extract_platforms(level);
+    let options = ReachOptions::default();
+    let mut crossings: Vec<Vec<usize>> = vec![Vec::new(); stands.len()];
+    let mut touches_flag = vec![false; stands.len()];
+    for (i, &(row, x0, x1)) in stands.iter().enumerate() {
+        let stand = Platform {
+            id: i,
+            x0,
+            x1,
+            surface_row: row,
+        };
+        for (traj, _) in edges_from(level, &platforms, &stand, &options) {
+            if traj.touched_goal {
+                touches_flag[i] = true;
+            }
+            if let Some((c, lrow)) = traj.landed_at {
+                if let Some(j) = stand_of(c, lrow) {
+                    if j != i && !crossings[i].contains(&j) {
+                        crossings[i].push(j);
+                    }
+                }
+            }
+        }
+    }
+
+    // Crossings to the flag, walked backwards — a breadth-first search from a virtual
+    // flag node with an edge from the flag's own stand (0 crossings) and from every
+    // stand whose crossing touches the flag (1). Deterministic: neighbours are visited
+    // in insertion order.
+    let goal_stand = level.goals.first().and_then(|g| {
+        let col = (g.x + g.w * 0.5).floor() as i32;
+        stands
+            .iter()
+            .enumerate()
+            .filter(|(_, &(r, x0, x1))| r as f32 >= g.y && col >= x0 && col <= x1)
+            .min_by_key(|(_, &(r, _, _))| r)
+            .map(|(i, _)| i)
+    });
+    let mut reached_from: Vec<Vec<usize>> = vec![Vec::new(); stands.len()];
+    for (i, outs) in crossings.iter().enumerate() {
+        for &j in outs {
+            reached_from[j].push(i);
+        }
+    }
+    let mut hops: Vec<Option<u32>> = vec![None; stands.len()];
+    let mut queue = std::collections::VecDeque::new();
+    for (i, touches) in touches_flag.iter().enumerate() {
+        if *touches {
+            hops[i] = Some(1);
+            queue.push_back(i);
+        }
+    }
+    if let Some(g) = goal_stand {
+        hops[g] = Some(0);
+        queue.push_front(g);
+    }
+    while let Some(j) = queue.pop_front() {
+        let h = hops[j].expect("a queued stand has a hop count");
+        for &i in &reached_from[j] {
+            if hops[i].is_none() {
+                hops[i] = Some(h + 1);
+                queue.push_back(i);
+            }
+        }
+    }
+
+    GoalRoutes {
+        stands,
+        crossings,
+        hops,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_route_counts_crossings_to_the_flag_and_not_straight_line_distance() {
+        // The zig-zag: the route doubles back away from the flag up the first leg, so
+        // straight-line distance does not fall as the run goes on — graph distance has
+        // to, or "the next stand" has no meaning on a climb like this.
+        let level = level(
+            "zig",
+            &[
+                "..........",
+                "..........",
+                ".......##.",
+                "..........",
+                ".....##...",
+                "..........",
+                ".##.......",
+                "..........",
+                "....##....",
+                "..........",
+            ],
+            (5, 7),
+            &[("goal", 8, 1)],
+        );
+        let routes = goal_routes(&level);
+        let bottom = routes.zone_at(5, 8).expect("the spawn's stand");
+        let leg_top = routes.zone_at(2, 6).expect("the top of the first leg");
+        let turn = routes.zone_at(5, 4).expect("the first stand back toward the flag");
+        let top = routes.zone_at(8, 2).expect("the flag's own stand");
+        assert_eq!(routes.hops_to_flag(top), Some(0), "the flag's own stand");
+        for (from, to) in [(bottom, leg_top), (leg_top, turn), (turn, top)] {
+            assert!(
+                routes.crossings_from(from).contains(&to),
+                "a stand is one canonical crossing from the stand before it on the route"
+            );
+        }
+        // The route's own numbering falls by one per stand — the only ordering that is
+        // monotone along a climb that turns its back on the flag.
+        let hops = |z: usize| routes.hops_to_flag(z).expect("the flag is reachable");
+        assert!(
+            hops(bottom) > hops(leg_top) && hops(leg_top) > hops(turn) && hops(turn) > hops(top),
+            "crossings to the flag must fall along the route: {:?}",
+            [hops(bottom), hops(leg_top), hops(turn), hops(top)]
+        );
+    }
+
+    #[test]
+    fn a_hazard_splits_one_platform_into_two_stands_the_route_has_to_hop() {
+        // A floor spike at standing height cuts the ground in two: the body cannot
+        // walk through it, so the stands either side are one crossing apart even
+        // though `extract_platforms` sees a single platform under both.
+        let level = level(
+            "spiked",
+            &[
+                "........",
+                "........",
+                "........",
+                "........",
+                "........",
+                "...^....",
+                "########",
+                "########",
+            ],
+            (1, 5),
+            &[("goal", 7, 5)],
+        );
+        let routes = goal_routes(&level);
+        let near = routes.zone_at(1, 6).expect("the stand before the spike");
+        let far = routes.zone_at(6, 6).expect("the stand past the spike");
+        assert_ne!(near, far, "the spike splits the ground into two stands");
+        assert_eq!(routes.zone_bounds(near), (6, 0, 2));
+        assert_eq!(routes.zone_bounds(far), (6, 4, 7));
+        assert_eq!(
+            routes.hops_to_flag(far),
+            Some(0),
+            "the flag stands on the far side of the spike"
+        );
+        assert_eq!(routes.hops_to_flag(near), Some(1), "one hop away");
+        assert!(
+            routes.crossings_from(near).contains(&far),
+            "a hop over the spike is a crossing — the two stands are not walking distance"
+        );
+    }
+
+    #[test]
+    fn a_move_cannot_start_inside_a_hazard_and_a_sealed_route_stays_sealed() {
+        // The phantom edge: the take-off ledge's right column is spike-topped, so
+        // sweeping take-off x across it authors a body standing *inside* the spike.
+        // The hazard check runs after movement, so such a body leaves the spike's tile
+        // between tick zero and tick one and was never checked at all — inventing a
+        // jump out of a spot no body can occupy, and with it a route up a tower the
+        // game seals at that spike (finding 52).
+        //
+        // The flag stands high above the flight's reach — a jump from the ledge peaks
+        // 2.5 tiles up — so the only way to it is over the spike, and there is none:
+        // the cut is real, not an artefact of a short fixture.
+        let lv = level(
+            "sealed",
+            &[
+                "..........",
+                "..........",
+                "..........",
+                "........##",
+                "..........",
+                "......##..",
+                "..^.......",
+                ".##.......",
+                "..........",
+            ],
+            (1, 6),
+            &[("goal", 8, 2)],
+        );
+        let platforms = extract_platforms(&lv);
+        let phantom = simulate_jump_at(
+            &lv,
+            &platforms,
+            2.90,
+            7,
+            &Takeoff::with_runway(
+                TakeoffDir::Right,
+                JumpHold::Full,
+                LaunchSpeed::Run,
+                1.0,
+                &PHYSICS,
+            ),
+        );
+        assert!(
+            phantom.hit_spike && phantom.landed_on.is_none() && phantom.ticks == 0,
+            "a take-off authored inside the spike is a death at the take-off, not a jump: {phantom:?}"
+        );
+
+        let routes = goal_routes(&lv);
+        let takeoff = routes.zone_at(1, 7).expect("the stand below the spike");
+        let target = routes.zone_at(6, 5).expect("the stand across the spike");
+        assert_eq!(
+            routes.hops_to_flag(target),
+            Some(1),
+            "one real jump from the far stand reaches the flag — the fixture is not sealed everywhere"
+        );
+        let outs = routes.crossings_from(takeoff);
+        let reached: Vec<(i32, i32, i32)> = outs.iter().map(|&j| routes.zone_bounds(j)).collect();
+        assert_eq!(
+            routes.hops_to_flag(takeoff),
+            None,
+            "the route is sealed at the spike; the ledge only crosses to {reached:?}"
+        );
+        assert!(
+            !report(&lv).goal_reached,
+            "and the oracle says so instead of calling the level beatable"
+        );
+    }
 
     /// Fixtures are ASCII art rather than inline JSON so a run of `#` never has
     /// to fight Rust's raw-string delimiters, and so the shape is scannable.

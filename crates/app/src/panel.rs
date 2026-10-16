@@ -26,24 +26,52 @@ use render::chart::{
     death_cluster, fitness_stall, fitness_trend, format_fitness, HistoryPoint, Stall, Trend,
 };
 
+use crate::atlas::Atlas;
 use crate::lab::{Lane, Packet, MUTATION_RATES, SPEEDS};
-use crate::replay::{Population, Replay};
+use crate::replay::{Population, Replay, StarBasis};
+use crate::theme;
+use crate::ui;
 use crate::view::cohort_swatch;
 use sim::Outcome;
 
-/// Panel background, one shade lighter than the window's own dark grey.
-const PANEL_BG: Color32 = Color32::from_rgb(30, 34, 40);
-/// The chart's plot area, darker than the panel so the lines read as data.
-const PLOT_BG: Color32 = Color32::from_rgb(22, 25, 30);
-const AXIS: Color32 = Color32::from_rgb(70, 78, 90);
-const MAX_LINE: Color32 = Color32::from_rgb(120, 216, 120);
-const AVG_LINE: Color32 = Color32::from_rgb(120, 170, 230);
-const WIN_TICK: Color32 = Color32::from_rgb(250, 214, 102);
-const SCRUB_LINE: Color32 = Color32::from_rgb(240, 150, 90);
-const TEXT: Color32 = Color32::from_rgb(214, 220, 228);
-const TEXT_DIM: Color32 = Color32::from_rgb(160, 168, 180);
-const GOOD: Color32 = Color32::from_rgb(120, 216, 120);
-const WARN: Color32 = Color32::from_rgb(240, 150, 90);
+// The panel's colours are the window's palette, named once in `crate::theme` rather than
+// re-typed here. The old set was this module's own near-misses of the same eleven colours —
+// a `TEXT` four shades off the window's, a `GOOD` that was the same green spelled
+// separately — and a game whose furniture is drawn in three palettes reads as three
+// programs. The names stay local because the drawing code reads better with them
+// (`AXIS` says more at a `line_segment` than `theme::EDGE` does) and because a name that is
+// only ever used two lines from where it is defined is a name that does not need a path.
+
+/// The chart's own background. **The chart is a screen, not a panel.** Everything else in the
+/// window is cream chrome with dark ink; this strip is the run's instrument, and instruments
+/// are dark — it is drawn as a display set into the chrome, framed by it.
+const PANEL_BG: Color32 = theme::SHELL;
+/// The chart's plot area, cut into that display so the lines read as data.
+const PLOT_BG: Color32 = theme::SCREEN_WELL;
+/// The chart's rules.
+const AXIS: Color32 = theme::SCREEN_EDGE;
+/// The best-of-generation line: the growth colour, because the max series *is* the run's
+/// growth and the chart's headline series.
+const MAX_LINE: Color32 = theme::GOOD;
+/// The average line: the cool end of the palette, so the two series can never be confused
+/// for one another even in a monochrome screenshot.
+const AVG_LINE: Color32 = theme::COOL;
+/// A generation that reached the flag: the accent, the window's "look at this" colour.
+const WIN_TICK: Color32 = theme::ACCENT;
+/// The cursor of a scrubbed, i.e. not-live, view: the warning colour, because that is what
+/// looking at the past while a run continues is.
+const SCRUB_LINE: Color32 = theme::WARN;
+/// The panel's own ink, for type on the cream chrome around it.
+const TEXT: Color32 = theme::TEXT;
+const TEXT_DIM: Color32 = theme::TEXT_DIM;
+/// Type *on the chart*, which is a display: the panel's inks are for cream and would be
+/// invisible on it. Two ink scales in one module, because the module draws on both materials.
+const SCREEN_TEXT: Color32 = theme::SCREEN_INK;
+const SCREEN_TEXT_DIM: Color32 = theme::SCREEN_INK_DIM;
+/// A verdict, on chrome: the bright greens and ambers are lamps and chart lines, and type needs
+/// the darker half of each pair.
+const GOOD: Color32 = theme::GOOD_INK;
+const WARN: Color32 = theme::WARN_INK;
 
 /// Room left for the axis labels, inside the chart's rectangle.
 const LABEL_W: f32 = 52.0;
@@ -143,6 +171,22 @@ pub struct RunSummary {
     /// Genomes reheated from the run's best-ever copy and bred in after that stagnation.
     /// Non-zero only after a stall.
     pub immigrants: usize,
+    /// Children bred from the quality-diversity archive, which arrive every generation rather
+    /// than only after a stall.
+    pub archive_children: usize,
+    /// Behavioural niches the archive holds, of `evo::ARCHIVE_CELLS`. The run's diversity
+    /// reading: it falls when the population collapses onto one way of moving.
+    pub archive_bits: usize,
+    /// Finish bands holding a win, of `evo::ARCHIVE_TIME_BINS`. The run's speed coverage, and
+    /// a different reading from the one above: it climbs only when the population learns to
+    /// solve the level *quicker*, never when it finds a new way of moving.
+    pub archive_time_bits: usize,
+    /// The quickest win the run has recorded, and whose it was (see [`evo::FastWin`]).
+    ///
+    /// Carried rather than derived: it is the run's own record rather than a reading of the
+    /// history, and it stands across generations that win nothing, which is what makes it a
+    /// time to beat rather than a number that flickers.
+    pub fastest: Option<evo::FastWin>,
     pub best: Option<BestLine>,
     /// What `render`'s own rule makes of the history.
     pub trend: Trend,
@@ -199,6 +243,10 @@ impl RunSummary {
             mutation_sigma: packet.mutation_sigma,
             stagnation: packet.stagnation,
             immigrants: packet.immigrants,
+            archive_children: packet.archive_children,
+            archive_bits: packet.archive_bits,
+            archive_time_bits: packet.archive_time_bits,
+            fastest: packet.fastest,
             best: None,
             trend: fitness_trend(history),
             stall: fitness_stall(history),
@@ -325,14 +373,19 @@ pub struct Actions {
     /// The follow checkbox was clicked. The window owns the state, as it does for pause:
     /// the widget reports the intent and the state is flipped in one place.
     pub follow: bool,
-    /// Watch the run's best agent: the recorded episode replayed at real time, with the
-    /// generation's other agents ghosted. Offered by the evolution panel, and only once
-    /// there is an agent to watch.
-    pub watch: bool,
-    /// The ghosts checkbox was clicked, in the replay's own panel.
+    /// The ghosts row was pressed, in the replay's own panel.
     pub ghosts: bool,
-    /// -1 / +1 from the scrubber's step buttons.
+    /// -1 / +1 from the record's own step buttons.
     pub scrub_delta: i32,
+    /// One rung of the speed ladder: +1 faster, -1 slower. Reported rather than applied, so a
+    /// button on the panel and the `+`/`-` keys reach the run through one command.
+    pub speed: i32,
+    /// Open or close the Details window.
+    ///
+    /// The one request a panel makes that is not about the run: both panels carry the row, because
+    /// the board behind it is about a run and the window is where a run's numbers are read. What the
+    /// window holds depends on the mode, so the request is a toggle and the window decides.
+    pub details: bool,
 }
 
 /// One step older in the record, stopping at the oldest.
@@ -404,6 +457,50 @@ pub struct Keys {
 /// step, or two rungs of a ladder) and "which wins" should not depend on where a line
 /// happens to sit. The ladders resolve against `view`, so a keypress always carries a
 /// value the other front-end could have reached too.
+/// A section title, then a hairline under it.
+///
+/// The panel used to find its structure in bare `ui.label` lines, which the eye reads as
+/// one more sentence: `Agents in this generation` sat in the same weight and colour as the
+/// readings under it, so three sections looked like one column of prose. A title in the
+/// accent colour, in the monospace the numbers use, with a rule under it, is the whole of
+/// the fix — and it is one function rather than four call sites so the next section gets
+/// the same treatment by existing.
+pub fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(title)
+            .color(theme::ACCENT_INK)
+            .monospace()
+            .strong(),
+    );
+    ui.separator();
+}
+
+/// Small print: a qualifier, a unit, a hint. Dim, so it never competes with a reading.
+fn small_dim(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(
+        egui::RichText::new(text.into())
+            .small()
+            .color(theme::TEXT_DIM),
+    );
+}
+
+/// A reading: the number in the monospace the HUD uses, its unit dimmer beside it.
+fn reading(ui: &mut egui::Ui, value: impl Into<String>, unit: &str) {
+    ui.label(
+        egui::RichText::new(value.into())
+            .monospace()
+            .color(theme::TEXT),
+    );
+    if !unit.is_empty() {
+        ui.label(
+            egui::RichText::new(unit)
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+    }
+}
+
 pub fn commands_for(keys: Keys, view: &ViewState) -> Vec<Command> {
     let mut out = Vec::new();
     if keys.pause {
@@ -451,8 +548,7 @@ pub fn commands_for(keys: Keys, view: &ViewState) -> Vec<Command> {
     out
 }
 
-/// The right-hand panel: what the run is doing, and every control on it.
-/// The panel's one line about the search itself: the step, and — only when it has something
+/// The setup line about the search itself: the step, and — only when it has something
 /// to say — how long the best has stood still and what that bought.
 ///
 /// A pure function of the summary so the three shapes can be checked without a window, the
@@ -460,9 +556,18 @@ pub fn commands_for(keys: Keys, view: &ViewState) -> Vec<Command> {
 /// step are conditional because a run that is still finding new bests has neither a stall to
 /// report nor a restart to explain, and `still for 0   +0 reheated genomes` beside its score
 /// would be noise dressed as information.
-///    /// `sigma` is a constant on a run with a fixed step — the default — and there the line is
-    /// still worth its row: with reheated genomes only ever arriving after a stall, the line is
-    /// where a viewer sees the restarts happen.
+///
+/// `sigma` is a constant on a run with a fixed step — the default — and there the line is
+/// still worth its row: with reheated genomes only ever arriving after a stall, the line is
+/// where a viewer sees the restarts happen.
+///
+/// It is the search's **own** knobs and nothing else. The two grid readings the board used to append
+/// to this line — how many behavioural niches the archive holds and how many children the trickle
+/// bred — are rows of their own above, and that is a promotion rather than a demotion: a clause on a
+/// sentence is read as prose, while the same count in a column of readings is compared. They were
+/// never the same kind of fact as the step and the stall anyway — those are about *how hard* the
+/// search is pushing, and a niche count is about how far the population is *spread* — so one line
+/// carrying both was one line answering two questions.
 pub fn search_line(summary: &RunSummary) -> String {
     match (summary.stagnation, summary.immigrants) {
         (0, 0) => format!("search   sigma {:.3}", summary.mutation_sigma),
@@ -477,178 +582,670 @@ pub fn search_line(summary: &RunSummary) -> String {
     }
 }
 
+/// A reading in a run's panel: the number, what it counts, and the colour it is worth.
+///
+/// Split rather than one pre-formatted string because the two halves are set differently — the
+/// number in the big monospace the window reads numbers in, the unit small and dim beside it — and a
+/// reading the drawing code has to take apart again to lay out was never a string in the first place.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reading {
+    pub value: String,
+    pub unit: String,
+    pub colour: Color32,
+}
+
+/// The type size a reading in a side panel is set in.
+///
+/// Bigger than [`theme::MONO_SIZE`], because a reading is what the panel is *for* and it is read from
+/// a step back, and smaller than [`theme::HEADING_SIZE`], which is the weight the level's own name
+/// carries. Sized here rather than in the theme because nothing else in the window is set in it.
+const HERO_FONT: f32 = 16.0;
+
+/// The plate the two pace buttons are: square enough to read as a stepper's ends, and shorter than a
+/// menu row because it sits *above* the menu rather than in it.
+const SPEED_STEP: Vec2 = Vec2::new(30.0, 26.0);
+
+/// Which rung of [`SPEEDS`] `speed` is on, or the nearest one.
+///
+/// The ladder is the whole of what a viewer can reach — a slider, a button and a key all land on a
+/// rung — so a speed off the ladder can only come from a build that changed the list under a run.
+/// Snapping here rather than trusting the state is what keeps the two pace buttons' enabled-ness
+/// (and the reading beside them) from describing a rung that does not exist.
+/// The pace stepper: `− 8x +`, reporting one rung of the ladder or `0` for a press that has
+/// nowhere to go.
+///
+/// **One control in both panels**, because both of them have a pace: the run's is the rate the
+/// population is animated at and the replay's is the rate the episode is played at, and a viewer who
+/// has learned the stepper beside a run should find the same one beside an episode. Which clock a
+/// rung moves is the window's business (`Command::Speed` decides, and both clocks are one command
+/// with one meaning per subject), so nothing here has to know which of the two it is drawing.
+///
+/// Disabled at the ends rather than stepped past them, so the two plates say the whole of the
+/// ladder's range without a viewer having to press one to find out — and the lit state and the
+/// request come from [`pace_step`], so a plate cannot be lit while asking for nothing, or quiet
+/// while it would move the pace.
+fn pace_row(ui: &mut egui::Ui, atlas: Option<&Atlas>, current: u32, unit: &str) -> i32 {
+    let mut step = 0;
+    let rung = speed_rung(current);
+    ui.horizontal(|ui| {
+        let down = pace_step(rung, false);
+        if ui::icon_button(ui, atlas, None, "\u{2212}", SPEED_STEP, false, down != 0)
+            .on_hover_text("one rung slower — the minus key")
+            .clicked()
+        {
+            step = down;
+        }
+        reading(ui, format!("{}x", SPEEDS[rung]), unit);
+        let up = pace_step(rung, true);
+        if ui::icon_button(ui, atlas, None, "+", SPEED_STEP, false, up != 0)
+            .on_hover_text("one rung faster — the plus key")
+            .clicked()
+        {
+            step = up;
+        }
+    });
+    step
+}
+
+/// What one of the two pace buttons asks for, from the rung the run is on.
+///
+/// `0` at the end of the ladder rather than a step the run's own rule would refuse, which is what
+/// makes the button's enabled state and its request the same fact. Pure, so the ends are a test
+/// rather than something a viewer discovers by pressing a button that does nothing.
+pub fn pace_step(rung: usize, up: bool) -> i32 {
+    if up {
+        if rung + 1 < SPEEDS.len() {
+            1
+        } else {
+            0
+        }
+    } else if rung > 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn speed_rung(speed: u32) -> usize {
+    SPEEDS
+        .iter()
+        .position(|s| *s == speed)
+        .unwrap_or_else(|| {
+            SPEEDS
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.abs_diff(speed))
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        })
+}
+
+/// The four things the run's panel says, and no more.
+///
+/// A pure function of the summary, so what the panel *claims* can be checked without a window — the
+/// same split [`chart_geometry`] and [`search_line`] use. Four, because a panel beside a level is
+/// glanced at rather than read: where the run has got to, whether anything has reached the flag,
+/// **how quickly the flag was reached**, and how good the best agent is. Everything else the window
+/// knows about the search is one press away in the Details window ([`lab_details`]), and every line
+/// kept here is one more thing between the eye and the answer to "is it getting anywhere?".
+///
+/// The clock is here rather than in the board because it is the one reading a viewer *acts* on: it is
+/// what they take to the playtest to race, and a time a person has to open a window to find is a time
+/// nobody races. It is a fourth reading rather than a replacement for any of the three, because the
+/// three answer "is it learning" and this one answers "how fast is it" — a run can be at generation
+/// 4 or generation 400 with the same best time.
+///
+/// The flag reading is the one that changes colour. A run nobody has solved yet is a standing fact
+/// about the level; a run that has been solved is the run's *answer*, and the same sentence in the
+/// growth colour is what says which of the two a viewer is looking at. The clock follows the same
+/// rule for the same reason: no win, no time — and the reading says so in dim ink rather than
+/// inventing a number.
+pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
+    let generation = match summary.target {
+        Some(target) => format!("{} / {}", summary.generation + 1, target),
+        None => (summary.generation + 1).to_string(),
+    };
+    [
+        Reading {
+            value: generation,
+            unit: if summary.target.is_some() {
+                "generations".to_string()
+            } else {
+                "generation".to_string()
+            },
+            colour: TEXT,
+        },
+        Reading {
+            // A count of zero is the reading, spelled as the number rather than as "none": it is the
+            // same shape as the solved case, so the line is comparable from generation to generation
+            // and a run's first win is the same three characters changing colour.
+            value: format!("{} / {}", summary.wins, summary.pop_size),
+            unit: "reached the flag".to_string(),
+            colour: if summary.solved() { GOOD } else { TEXT_DIM },
+        },
+        Reading {
+            // The clock, from the run's own record and through the sim's own formatter, so the
+            // number beside the panel is the number the episode was scored on and the number the
+            // playtest races. An em dash rather than a zero, because no win is not a time of 0.00s.
+            value: match summary.fastest {
+                Some(fast) => sim::format_time(fast.frames),
+                None => "\u{2014}".to_string(),
+            },
+            unit: if summary.fastest.is_some() {
+                "the quickest win".to_string()
+            } else {
+                "nothing has reached the flag yet".to_string()
+            },
+            colour: if summary.fastest.is_some() { GOOD } else { TEXT_DIM },
+        },
+        Reading {
+            value: format_fitness(summary.max_fitness),
+            unit: "best fitness".to_string(),
+            colour: TEXT,
+        },
+    ]
+}
+
+/// One reading, drawn: the number big, its unit small and dim after it.
+fn reading_line(ui: &mut egui::Ui, reading: &Reading) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(reading.value.clone())
+                .font(FontId::new(HERO_FONT, egui::FontFamily::Monospace))
+                .color(reading.colour),
+        );
+        ui.label(
+            egui::RichText::new(reading.unit.clone())
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+    });
+}
+
+/// The run's panel: four readings, the trend in a word, and the four things a viewer does to a run.
+///
+/// It used to be the whole instrument board — the step the search is taking and how long the best has
+/// stood still, the diversity the archive has covered, the x the population keeps dying at, a row for
+/// every agent in the generation, the recorded champions, two ladders and three checkboxes — which
+/// came to thirty-odd lines of type beside a level once a run had any age on it. Every one of those
+/// numbers is real and every one of them was in the way: read at a glance, a panel that says
+/// everything says nothing, and the person it was written for is watching a population learn to jump,
+/// not auditing a search.
+///
+/// So it is a menu. What stays is the four readings ([`menu_readings`]) and the trend word, which
+/// together answer the question a viewer asks of a run in progress, and the controls a person presses
+/// while watching it — pause, one generation, keep the champion, start again — drawn as
+/// [`ui::menu_row`]s with their pictures down the left edge, which is the shape a game pauses into.
+/// Everything else moved one press away into the Details window ([`lab_details`]), where a person
+/// goes *looking* for a number instead of being recited at: nothing was deleted, it was put where it
+/// is asked for.
+///
+/// Two things that are conditions rather than readings are still said here, because a viewer has to
+/// be *told* them rather than shown them: that this run is training on a level that has been edited
+/// since, and that it has stopped. Both cost the panel nothing while they are false.
+///
+/// **Nothing here changes the view.** Leaving the run for the replay is the dock's switch, whose
+/// replay cell is disabled until there is an agent to watch; a panel that offered the same move as
+/// well would be one more control on the one surface that is trying to be quiet.
 pub fn lab_panel(
     ui: &mut egui::Ui,
+    atlas: Option<&Atlas>,
     summary: &RunSummary,
     view: &mut ViewState,
     level_changed: bool,
 ) -> Actions {
     let mut actions = Actions::default();
 
-    ui.heading("Evolution");
-    ui.label(summary.level_name.clone());
-    ui.separator();
-
     // --- where the run is -------------------------------------------------
-    match summary.target {
-        Some(target) => ui.monospace(format!(
-            "generation {} of {}{}",
-            summary.generation + 1,
-            target,
-            if summary.finished { "  (finished)" } else { "" }
-        )),
-        None => ui.monospace(format!("generation {}", summary.generation + 1)),
-    };
-    let wins_line = format!("pop {}   wins {}", summary.pop_size, summary.wins);
-    if summary.solved() {
-        ui.colored_label(GOOD, wins_line);
-    } else {
-        ui.monospace(wins_line);
+    for reading in menu_readings(summary) {
+        reading_line(ui, &reading);
     }
-    ui.monospace(format!(
-        "max {}   avg {}   min {}",
-        format_fitness(summary.max_fitness),
-        format_fitness(summary.avg_fitness),
-        format_fitness(summary.min_fitness)
-    ));
-
-    // The trend and the stall are `render`'s readings of the same history the chart
-    // draws, so they are never phrases invented here.
+    // The trend is `render`'s reading of the same history the chart draws, so it is never a phrase
+    // invented here — and it is the panel's only piece of prose, which is what makes it read as a
+    // verdict rather than as one more number.
     let trend_colour = match summary.trend {
         Trend::Solved => GOOD,
         Trend::Stalled | Trend::Degenerating => WARN,
         _ => TEXT_DIM,
     };
     ui.colored_label(trend_colour, summary.trend.label());
-    if let Some(stall) = &summary.stall {
-        ui.colored_label(WARN, stall.label());
-        match summary.deaths_at {
-            Some(tile) => ui.small(format!(
-                "deaths cluster at x {tile} ({} of them) — the obstacle to fix",
-                summary.deaths_count
-            )),
-            None => ui.small("no death cluster inside the level to point at"),
-        };
-    }
-    if summary.genius {
-        ui.colored_label(WIN_TICK, "genius agent: max jumped by more than half");
-    }
-    // What the search is doing to itself (see [`search_line`]).
-    ui.colored_label(TEXT_DIM, search_line(summary));
-    // The run's own account of the one detour it took, in the words `evo` gave it: the
-    // window has no opinion about how the step went, it only has to say it happened.
-    if let Some(note) = &summary.curriculum {
-        ui.colored_label(TEXT, note);
-    }
-    if summary.finished {
-        ui.colored_label(
-            GOOD,
-            format!(
-                "this run is over ({} generations) — Restart to train again, or V to \
-                 watch the agent it found",
-                summary.generations_run
-            ),
-        );
-    }
-
-    if let Some(best) = &summary.best {
-        ui.add_space(4.0);
-        ui.small(format!(
-            "best: gen {} id {} fitness {}",
-            best.generation,
-            best.genome_id,
-            format_fitness(best.fitness)
-        ));
-        ui.small(format!(
-            "{} after {} frames, best_x {:.1}, {:.1} tiles from the flag",
-            best.outcome, best.frames, best.best_x, best.distance_to_goal
-        ));
-    }
 
     if level_changed {
         ui.add_space(4.0);
         ui.colored_label(
             WARN,
-            "the level has changed since this run started — the population is still \
-             training on the old one. Restart to train on the edit.",
+            "the level has been edited since this run started — Restart trains on what you see",
+        );
+    }
+    if summary.finished {
+        ui.add_space(4.0);
+        ui.colored_label(
+            GOOD,
+            format!(
+                "the run is over after {} generations — Restart trains again",
+                summary.generations_run
+            ),
         );
     }
 
+    // --- the pace the run plays at ------------------------------------------
     ui.add_space(6.0);
-    ui.separator();
-    ui.label("Controls");
-    ui.horizontal(|ui| {
-        // The label says what the *next* press does, and the button only reports the
-        // intent: flipping `view.paused` here as well would double-toggle it.
-        let label = if view.paused { "Resume" } else { "Pause" };
-        if ui.button(label).clicked() {
-            actions.pause = true;
-        }
-        if ui
-            .button("One generation")
-            .on_hover_text("run exactly one generation, then stop")
-            .clicked()
-        {
-            actions.step = true;
-        }
+    // Here, on the panel, and not only in the board: the one setting a viewer changes *while*
+    // watching is how fast the run plays — a population that wins in its first generation is over
+    // before the eye has moved, and a stalled one is unwatchable at 1x. A ladder that lived only in
+    // the Details window was a setting a person had to know was there; the keys reached it, but a
+    // key is not a control, and the number was two hundred points from the menu it belonged to.
+    actions.speed = pace_row(ui, atlas, view.speed, "the pace it plays at");
+
+    // --- what to do about it ----------------------------------------------
+    ui.add_space(8.0);
+    // The rows all take the panel's own width: a menu is a *column*, and a column of plates that each
+    // sized themselves would read as separate buttons that happen to be near each other.
+    let width = ui.available_width();
+    let pause = ui::menu_row(
+        ui,
+        atlas,
+        Some(if view.paused {
+            ui::GLYPH_PLAY
+        } else {
+            ui::GLYPH_PAUSE
+        }),
+        if view.paused { "Resume" } else { "Pause" },
+        width,
+        view.paused,
+        true,
+    )
+    .on_hover_text(if view.paused {
+        "let the run go on — space"
+    } else {
+        "hold the run where it is — space"
     });
-    ui.horizontal(|ui| {
-        if ui
-            .button("Restart run")
-            .on_hover_text("a fresh population on the level as it is now")
-            .clicked()
-        {
-            actions.restart = true;
-        }
-        if ui
-            .button("Save champion")
-            .on_hover_text("write the best-ever genome to the champions directory")
-            .clicked()
-        {
-            actions.save = true;
-        }
-    });
-    // Watching the run's answer is the one thing the run cannot offer from inside itself:
-    // the population advances a generation at a time, and this is one episode at the speed
-    // of the game. Offered as soon as there is an agent to watch, and pointed at again in
-    // the "this run is over" line above once the search has stopped.
-    let watch = ui
-        .add_enabled_ui(summary.best.is_some(), |ui| {
-            ui.button("Watch the best (V)")
-                .on_hover_text(
-                    "replay the run's best agent at real time, with every other agent of \
-                     its generation ghosted",
-                )
-                .on_disabled_hover_text("nothing scored yet: a replay needs an agent to watch")
-        })
-        .inner;
-    if watch.clicked() {
-        actions.watch = true;
+    if pause.clicked() {
+        actions.pause = true;
+    }
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_STEP),
+        "One generation",
+        width,
+        false,
+        true,
+    )
+    .on_hover_text("run exactly one generation, then hold still — N")
+    .clicked()
+    {
+        actions.step = true;
+    }
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_MEDAL),
+        "Save champion",
+        width,
+        false,
+        true,
+    )
+    .on_hover_text("write the best-ever genome to the champions directory — S")
+    .clicked()
+    {
+        actions.save = true;
+    }
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_RESTART),
+        "Restart run",
+        width,
+        false,
+        true,
+    )
+    .on_hover_text("a fresh population on the level as it is now")
+    .clicked()
+    {
+        actions.restart = true;
+    }
+    if ui::menu_row(ui, atlas, Some(ui::GLYPH_INFO), "Details", width, false, true)
+        .on_hover_text("everything else about this run: the search, the field, the record")
+        .clicked()
+    {
+        actions.details = true;
     }
 
-    // Both ladders are sliders over an index rather than a raw value, so every value
-    // the mouse can reach is a rung the terminal's keys can also reach (§10 Tier 2.9).
-    let mut speed_index = SPEEDS
-        .iter()
-        .position(|s| *s == view.speed)
-        .unwrap_or_else(|| {
-            SPEEDS
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, s)| s.abs_diff(view.speed))
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        });
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::Slider::new(&mut speed_index, 0..=SPEEDS.len() - 1)
-                .text("speed")
-                .show_value(false),
-        );
-        ui.monospace(format!("{}x", SPEEDS[speed_index]));
-    });
-    view.speed = SPEEDS[speed_index];
+    actions
+}
 
+/// The run's instrument board: every number about the search that is not one of the three readings
+/// the panel keeps.
+///
+/// This is what the panel used to be, and it lives behind the Details window because a run holds two
+/// kinds of number. The ones a viewer acts on without thinking are on the panel ([`lab_panel`]): how
+/// far it has got, whether anything has won, how good the best is, and the four controls. The ones a
+/// viewer goes *looking* for are here: the step the search is taking and how long the best has stood
+/// still, how much of the behavioural grid the archive has covered, where the population keeps dying,
+/// the champion's own record, a row for every agent in the generation, the recorded champions, and
+/// the two ladders that tune it all. A person asking "why is it stuck" wants the lot; a person
+/// watching wants none of it, and one panel cannot be both.
+///
+/// It reports the same [`Actions`] the panel does, minus the four the panel owns: the widgets say
+/// what was pressed wherever they are drawn, and the window handles one vocabulary rather than one
+/// per surface.
+pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState) -> Actions {
+    let mut actions = Actions::default();
+
+    // --- the search -------------------------------------------------------
+    section(ui, "The search");
+    // Named, because this window floats over whatever is behind it: a board of numbers with nothing
+    // saying whose they are is a board a viewer has to remember the context of.
+    small_dim(ui, summary.level_name.clone());
+    // What the search is doing to itself (see [`search_line`]).
+    ui.colored_label(TEXT_DIM, search_line(summary));
+    // The spread of the generation, and the reason it is here rather than on the panel: the best
+    // fitness on its own cannot say whether the population moved *with* its best agent or whether one
+    // lucky genome is carrying a field that has learned nothing. The average and the worst do, and
+    // reading them side by side is how a viewer tells a run that is getting somewhere from a run that
+    // rolled a six.
+    ui.monospace(format!(
+        "max {}   avg {}   min {}",
+        format_fitness(summary.max_fitness),
+        format_fitness(summary.avg_fitness),
+        format_fitness(summary.min_fitness)
+    ));
+    if let Some(stall) = &summary.stall {
+        ui.colored_label(WARN, stall.label());
+        match summary.deaths_at {
+            Some(tile) => small_dim(
+                ui,
+                format!(
+                    "deaths cluster at x {tile} ({} of them) — the obstacle to fix",
+                    summary.deaths_count
+                ),
+            ),
+            None => small_dim(ui, "no death cluster inside the level to point at"),
+        };
+    }
+    if summary.genius {
+        ui.colored_label(WIN_TICK, "genius agent: max jumped by more than half");
+    }
+    // The two grids, as rows rather than as another clause on the sentence above: they are readings
+    // about how *spread out* the population is, which is a different question from how hard the
+    // search is pushing, and a pair of numbers a viewer compares against each other belongs in a
+    // column that lines up. The diversity denominator is the archive's *behavioural* cells and not
+    // its total: the grid is 48 ways of moving × 5 finish bands, and a count out of the 240 would
+    // report a run across a third of the behaviours as one eighth explored.
+    if summary.archive_bits > 0 {
+        ui::stat_row(
+            ui,
+            "ways of moving",
+            format!(
+                "{} / {} niches",
+                summary.archive_bits,
+                evo::ARCHIVE_BEHAVIOUR_CELLS
+            ),
+        );
+        ui::stat_row(
+            ui,
+            "how quick it has won",
+            format!(
+                "{} / {} finish bands",
+                summary.archive_time_bits,
+                evo::ARCHIVE_TIME_BINS
+            ),
+        );
+    }
+    // And the trickle that keeps the search from closing on one niche, as a row of its own. It was
+    // the last clause of [`search_line`] and it is the one number here that is about the *next*
+    // population rather than about the archive: a fifth of the children bred this generation came
+    // out of a niche rather than out of the ranking, and a run that did not say so would be leaving
+    // that unexplained. Reported *because* it is quiet — it neither stops nor fires on a threshold.
+    if summary.archive_children > 0 {
+        ui::stat_row(
+            ui,
+            "children from the archive",
+            summary.archive_children.to_string(),
+        );
+    }
+    // The run's own account of the one detour it took, in the words `evo` gave it: the window has no
+    // opinion about how the step went, it only has to say it happened.
+    if let Some(note) = &summary.curriculum {
+        ui.colored_label(TEXT, note.clone());
+    }
+
+    // --- the clock ---------------------------------------------------------
+    // Its own section, because the clock is its own question: everything above is about the search
+    // and everything below is about agents, and "how fast has this been solved" is neither — it is
+    // the number a viewer takes to the playtest, and the one number on this board they act on.
+    section(ui, "The clock");
+    match summary.fastest {
+        Some(fast) => {
+            ui::stat_row(
+                ui,
+                "quickest win",
+                format!(
+                    "{} ({} frames)",
+                    sim::format_time(fast.frames),
+                    fast.frames
+                ),
+            );
+            // The budget beside the time, because a time on its own is not a statement about
+            // anything: 8.42 s is quick on a level that allows 40 s and impossible on one that
+            // allows 4. Both numbers come from the same episode and the same level
+            // (`sim::frame_budget`), so they cannot be about different terrains — and each is a row
+            // of its own rather than one bracketed aside, because that aside ran off the end of the
+            // column at every level whose budget is not a round number of seconds.
+            ui::stat_row(ui, "the level allows", sim::format_time(fast.budget_frames));
+            ui::stat_row(
+                ui,
+                "of it unspent",
+                sim::format_time(fast.budget_frames.saturating_sub(fast.frames)),
+            );
+            // The fraction of the speed bonus the win actually collected, printed from the record's
+            // own method rather than recomputed here: a board that did its own division could
+            // disagree with the search about how quick the win it is describing was. The *bonus* is
+            // named as well, because a percentage of an unnamed number is not a reading.
+            ui::stat_row(
+                ui,
+                "pace paid",
+                format!(
+                    "{:.0}% of the {} speed bonus",
+                    fast.spare() * 100.0,
+                    format_fitness(evo::SPEED_BONUS)
+                ),
+            );
+            ui::stat_row(
+                ui,
+                "whose win",
+                format!("gen {} id {}", fast.generation, fast.genome_id),
+            );
+        }
+        None => small_dim(
+            ui,
+            "no win timed yet — the clock starts when an agent reaches the flag",
+        ),
+    }
+
+    // --- the best agent ---------------------------------------------------
+    section(ui, "The best agent so far");
+    match &summary.best {
+        Some(best) => {
+            // A board rather than a sentence, and one that says the clock: the same episode the
+            // section above times is this one, and a reader comparing the two should be able to
+            // see that they are the same run without doing arithmetic on the frame count.
+            ui::stat_row(ui, "generation", best.generation.to_string());
+            ui::stat_row(ui, "genome", best.genome_id.to_string());
+            ui::stat_row(ui, "fitness", format_fitness(best.fitness));
+            ui::stat_row(
+                ui,
+                "episode",
+                format!(
+                    "{} in {} ({} frames)",
+                    best.outcome,
+                    sim::format_time(best.frames),
+                    best.frames
+                ),
+            );
+            ui::stat_row(
+                ui,
+                "reached",
+                format!("x {:.1}, {:.1} tiles from the flag", best.best_x, best.distance_to_goal),
+            );
+        }
+        // A run's first generation is always scored, so this is the moment before the first packet
+        // rather than a state a run can sit in.
+        None => small_dim(ui, "nothing scored yet"),
+    }
+
+    // --- the field --------------------------------------------------------
+    section(ui, "The field");
+    small_dim(
+        ui,
+        "the generation on screen: the champion solid, the rest ghosted, and the swatch is the \
+         agent's own outline colour",
+    );
+    // In a scroller with a ceiling, because this is the one list on the board whose length is a
+    // property of the run's configuration rather than of the window: a population of two hundred
+    // ghosts is a panel taller than the screen, and a window that grew to show it would put its own
+    // close button off the top of the display.
+    egui::ScrollArea::vertical()
+        // Eight rows and no half of one: a list cut through the middle of a line reads as a layout
+        // that ran out of room rather than as a list that scrolls.
+        .max_height(140.0)
+        .show(ui, |ui| {
+            for lane in &summary.lanes {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        CornerRadius::same(2),
+                        Color32::from_rgb(lane.colour[0], lane.colour[1], lane.colour[2]),
+                    );
+                    let colour = if lane.rank == 0 { TEXT } else { TEXT_DIM };
+                    ui.colored_label(
+                        colour,
+                        format!(
+                            "{}  id {}  {}{}",
+                            lane.name,
+                            lane.genome_id,
+                            format_fitness(lane.fitness),
+                            if (lane.mean_fitness - lane.fitness).abs() > 0.005 {
+                                format!("  mean {}", format_fitness(lane.mean_fitness))
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    );
+                });
+            }
+        });
+
+    // --- the record -------------------------------------------------------
+    section(ui, "Recorded champions");
+    if summary.recorded.is_empty() {
+        small_dim(
+            ui,
+            "nothing recorded yet — a route is kept when the best improves",
+        );
+    } else {
+        // Walked by **generation**, never by index into the record: the log drops its oldest entry
+        // when it fills, which shifts every index by one and would silently re-point the cursor at a
+        // route the viewer never chose.
+        let generations: Vec<u32> = summary.recorded.iter().map(|r| r.generation).collect();
+        let current = view
+            .scrub
+            .and_then(|g| generations.iter().position(|x| *x == g));
+
+        // Named rather than drawn as `<` and `>`: the two are the same control the arrow keys are,
+        // and a pair of angle brackets is a notation a viewer has to work out rather than read.
+        let half = ((ui.available_width() - 8.0) * 0.5).max(72.0);
+        ui.horizontal(|ui| {
+            if ui::menu_row(
+                ui,
+                None,
+                Some(ui::GLYPH_UNDO),
+                "Older",
+                half,
+                false,
+                current.is_some(),
+            )
+            .clicked()
+            {
+                actions.scrub_delta = -1;
+            }
+            if ui::menu_row(
+                ui,
+                None,
+                Some(ui::GLYPH_REDO),
+                "Newer",
+                half,
+                false,
+                current.is_some(),
+            )
+            .clicked()
+            {
+                actions.scrub_delta = 1;
+            }
+        });
+        if ui::menu_row(
+            ui,
+            None,
+            Some(ui::GLYPH_PLAY),
+            "Back to live",
+            ui.available_width(),
+            view.scrub.is_none(),
+            view.scrub.is_some(),
+        )
+        .clicked()
+        {
+            actions.resume = true;
+        }
+
+        let mut index = current.unwrap_or(generations.len() - 1);
+        let changed = ui
+            .add(egui::Slider::new(&mut index, 0..=generations.len() - 1).text("route"))
+            .changed();
+        if changed {
+            // Dragging the slider *is* the viewer choosing a generation.
+            view.scrub = Some(generations[index]);
+        }
+
+        match view.scrub.and_then(|g| {
+            summary
+                .recorded
+                .iter()
+                .find(|r| r.generation == g)
+                .map(|r| (g, r))
+        }) {
+            Some((generation, record)) => {
+                ui.colored_label(
+                    SCRUB_LINE,
+                    format!(
+                        "showing recorded generation {} ({}, fitness {}) — not the live run",
+                        generation,
+                        if record.won {
+                            "reached the flag"
+                        } else {
+                            "died"
+                        },
+                        format_fitness(record.fitness)
+                    ),
+                );
+            }
+            None => small_dim(
+                ui,
+                "live: the canvas is drawing this generation's agents",
+            ),
+        }
+    }
+
+    // --- watching and tuning ----------------------------------------------
+    section(ui, "Watching");
+    // The pace is *read* here and *set* on the panel, which is the split this board exists for: a
+    // setting changed while watching the level belongs under the eye, and a fact about the run is
+    // looked up in the window. Reported rather than repeated as a second slider, so the two surfaces
+    // cannot disagree about what the run is playing at.
+    ui::stat_row(ui, "pace", format!("{}x", view.speed));
+    // The ladder is a slider over an index rather than a raw value, so every value the mouse can
+    // reach is a rung the terminal's keys can also reach (§10 Tier 2.9).
     let mut mut_index = MUTATION_RATES
         .iter()
         .position(|r| (*r - view.mutation_rate).abs() < 1e-6)
@@ -659,13 +1256,13 @@ pub fn lab_panel(
                 .text("mutation")
                 .show_value(false),
         );
-        ui.monospace(format!("{:.2}", MUTATION_RATES[mut_index]));
+        reading(ui, format!("{:.2}", MUTATION_RATES[mut_index]), "sigma");
     });
     view.mutation_rate = MUTATION_RATES[mut_index];
 
     ui.checkbox(&mut view.show_deaths, "show death marks");
-    // The button reports the intent and the window flips the state, exactly as the pause
-    // button does: a widget that changed it here as well would double-toggle.
+    // The checkbox reports the intent and the window flips the state, exactly as the panel's rows do:
+    // a widget that changed it here as well would double-toggle.
     let mut follow = view.follow;
     if ui
         .checkbox(&mut follow, "follow the leader")
@@ -675,110 +1272,18 @@ pub fn lab_panel(
         actions.follow = true;
     }
 
-    // --- the lanes --------------------------------------------------------
-    ui.add_space(6.0);
-    ui.separator();
-    ui.label("Agents in this generation");
-    ui.small("champion solid, the rest ghosted; the swatch is the agent's outline");
-    for lane in &summary.lanes {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                CornerRadius::same(2),
-                Color32::from_rgb(lane.colour[0], lane.colour[1], lane.colour[2]),
-            );
-            let colour = if lane.rank == 0 { TEXT } else { TEXT_DIM };
-            ui.colored_label(
-                colour,
-                format!(
-                    "{}  id {}  {}{}",
-                    lane.name,
-                    lane.genome_id,
-                    format_fitness(lane.fitness),
-                    if (lane.mean_fitness - lane.fitness).abs() > 0.005 {
-                        format!("  mean {}", format_fitness(lane.mean_fitness))
-                    } else {
-                        String::new()
-                    }
-                ),
-            );
-        });
-    }
-
-    // --- the scrubber -----------------------------------------------------
-    ui.add_space(6.0);
-    ui.separator();
-    ui.label("Recorded champions");
-
-    if summary.recorded.is_empty() {
-        ui.small("nothing recorded yet — a route is kept when the best improves");
-        return actions;
-    }
-
-    // Walked by **generation**, never by index into the record: the log drops its
-    // oldest entry when it fills, which shifts every index by one and would silently
-    // re-point the cursor at a route the viewer never chose.
-    let generations: Vec<u32> = summary.recorded.iter().map(|r| r.generation).collect();
-    let current = view
-        .scrub
-        .and_then(|g| generations.iter().position(|x| *x == g));
-
-    ui.horizontal(|ui| {
-        ui.add_enabled_ui(current.is_some(), |ui| {
-            if ui.button("<").clicked() {
-                actions.scrub_delta = -1;
-            }
-            if ui.button(">").clicked() {
-                actions.scrub_delta = 1;
-            }
-        });
-        ui.add_enabled_ui(view.scrub.is_some(), |ui| {
-            if ui.button("Back to live").clicked() {
-                actions.resume = true;
-            }
-        });
-    });
-
-    let mut index = current.unwrap_or(generations.len() - 1);
-    let changed = ui
-        .add(egui::Slider::new(&mut index, 0..=generations.len() - 1).text("route"))
-        .changed();
-    if changed {
-        // Dragging the slider *is* the viewer choosing a generation.
-        view.scrub = Some(generations[index]);
-    }
-
-    match view.scrub.and_then(|g| {
-        summary
-            .recorded
-            .iter()
-            .find(|r| r.generation == g)
-            .map(|r| (g, r))
-    }) {
-        Some((generation, record)) => {
-            ui.colored_label(
-                SCRUB_LINE,
-                format!(
-                    "showing recorded generation {} ({}, fitness {}) — not the live run",
-                    generation,
-                    if record.won {
-                        "reached the flag"
-                    } else {
-                        "died"
-                    },
-                    format_fitness(record.fitness)
-                ),
-            );
-        }
-        None => {
-            ui.small("live: the lanes on the canvas are this generation's agents");
-        }
-    }
+    ui.add_space(8.0);
+    // The key list lives on the board rather than on the panel: it is the one thing here that is
+    // *about* the controls instead of being one, and a viewer reading it is already looking for how
+    // to drive the run.
+    small_dim(
+        ui,
+        "space pause   N one generation   S save   +/- speed   M/m mutation   F follow   \
+         ←/→ walk the record   V watch the best",
+    );
 
     actions
 }
-
 /// What to say when the ghost limit left agents out of the field, if it did.
 ///
 /// `population.size` is everything the generation held and `ghosted` is what is drawn, so
@@ -802,39 +1307,233 @@ fn capped_roster_note(population: Population, ghosted: usize) -> Option<String> 
 /// is parked behind this view and none of its numbers describe the episode on screen. The
 /// one thing the two modes share is the camera, which is why `follow` still arrives from
 /// the view state: following is a rule about where to point, not about what is running.
-pub fn replay_panel(ui: &mut egui::Ui, replay: &mut Replay, view: &ViewState) -> Actions {
+/// The three things the replay's panel says: whose episode it is, and how it is going.
+///
+/// The same shape and the same restraint as the run's ([`menu_readings`]): a replay is *watched*, and
+/// what a viewer looking at a running agent needs is which agent it is and what it has scored so far.
+/// Everything else about the replay — the record it came from, the field of ghosts behind it, the
+/// legend for their colours — is on the canvas in front of them, at the size of the window, in the
+/// palette those colours are drawn in.
+pub fn replay_readings(replay: &Replay) -> [Reading; 3] {
+    let star = replay.star();
+    let finished = replay.star_finished();
+    let outcome = replay.star_sim().outcome();
+    [
+        Reading {
+            value: (star.generation + 1).to_string(),
+            unit: "the generation it came from".to_string(),
+            colour: TEXT,
+        },
+        Reading {
+            value: format!("id {}", star.genome_id),
+            // Which of the run's two records this agent is, in the same words the strip and the
+            // details board use ([`StarBasis::label`]): what is on screen is the run's *quickest
+            // win*, which is not the champion — the champion is the top-scoring genome, and on a
+            // run with two winners that is frequently the slower of the two. A viewer who has read
+            // the label can make sense of the field behind it; one who has not would reasonably
+            // ask why the best agent of the run is being overtaken.
+            unit: star.basis.label().to_string(),
+            colour: TEXT,
+        },
+        Reading {
+            // The colour is the episode's own verdict: the growth colour once it is through the
+            // flag, the warning colour once it has stopped short of it, and plain ink while it is
+            // still running — which is the one case where the reading is not an answer yet.
+            value: if finished {
+                outcome.as_str().to_string()
+            } else {
+                "running".to_string()
+            },
+            // The star's own clock, not the field's ([`Replay::star_elapsed`]): a won episode holds
+            // the time it won in while the ghosts behind it are still out there. The field's clock
+            // is the animation's, and reading a time off it made the number beside "won" climb for
+            // as long as the replay was left open.
+            unit: format!(
+                "{:.1}s, score {}",
+                replay.star_elapsed(),
+                format_fitness(replay.star_score())
+            ),
+            colour: if !finished {
+                TEXT
+            } else if outcome == Outcome::Won {
+                GOOD
+            } else {
+                WARN
+            },
+        },
+    ]
+}
+
+/// The replay's panel: the same shape as the run's, and quieter still.
+///
+/// It used to be a page of prose — whose episode this is, what it scored, the generation the ghosts
+/// came from, how many of them were still going and how many were at the flag, a legend for the four
+/// ranks on the canvas, a note about the ghost cap, and the key list. The canvas answers most of that
+/// by being looked at; what belongs beside a replay is the transport, and the rest is one press away
+/// in the Details window ([`replay_details`]).
+///
+/// The ghosts and the camera are rows rather than checkboxes: a row that says what it does whether or
+/// not it is on, and turns gold when it is, is the same control as the dock's tools — and it is what
+/// the other panel in this mode is made of, so the two views of a run share one vocabulary.
+pub fn replay_panel(
+    ui: &mut egui::Ui,
+    atlas: Option<&Atlas>,
+    replay: &mut Replay,
+    view: &ViewState,
+) -> Actions {
     let mut actions = Actions::default();
+
+    for reading in replay_readings(replay) {
+        reading_line(ui, &reading);
+    }
+
+    ui.add_space(8.0);
+    let width = ui.available_width();
+    let pause = ui::menu_row(
+        ui,
+        atlas,
+        Some(if replay.paused {
+            ui::GLYPH_PLAY
+        } else {
+            ui::GLYPH_PAUSE
+        }),
+        if replay.paused { "Play" } else { "Pause" },
+        width,
+        replay.paused,
+        true,
+    )
+    .on_hover_text(if replay.paused {
+        "let the episode run — space"
+    } else {
+        "hold the episode where it is — space"
+    });
+    if pause.clicked() {
+        actions.pause = true;
+    }
+    if ui::menu_row(ui, atlas, Some(ui::GLYPH_RESTART), "Again", width, false, true)
+        .on_hover_text("run these episodes again, from the first tick — R")
+        .clicked()
+    {
+        actions.restart = true;
+    }
+    // The ghost icon is a walker out of the game's own art, which is what a ghost *is*: another agent
+    // of the generation, drawn in its own outline colour.
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some("walker_a"),
+        "Ghosts",
+        width,
+        replay.ghosts,
+        true,
+    )
+    .on_hover_text("show the rest of the generation, each replaying its own episode — G")
+    .clicked()
+    {
+        actions.ghosts = true;
+    }
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some("player_run_1"),
+        "Follow the star",
+        width,
+        view.follow,
+        true,
+    )
+    .on_hover_text("stay on the agent being replayed, or show the whole level — F")
+    .clicked()
+    {
+        actions.follow = true;
+    }
+    if ui::menu_row(ui, atlas, Some(ui::GLYPH_INFO), "Details", width, false, true)
+        .on_hover_text("whose record this is, the field behind it, and how fast it plays")
+        .clicked()
+    {
+        actions.details = true;
+    }
+
+    // The same stepper the run's panel has, on the same ladder: an episode and a run are two things
+    // watched at a pace, and the one control for it belongs where the transport is. The replay's rung
+    // is named as real time when it is, because that is the only rung of the ladder whose *meaning*
+    // is not just its number.
+    ui.add_space(6.0);
+    actions.speed = pace_row(
+        ui,
+        atlas,
+        replay.speed,
+        if replay.speed == crate::replay::REAL_TIME {
+            "the pace it plays at, in real time"
+        } else {
+            "the pace it plays at"
+        },
+    );
+
+    actions
+}
+
+/// The replay's instrument board: the record this episode is, the field behind it, and its clock.
+///
+/// The half of the old replay panel that a viewer *looks up*. Two of these readings are a check
+/// rather than a fact about the run — the episode as it was recorded beside the episode as it is
+/// being replayed, which should be the same number twice — and a check belongs where a person goes on
+/// purpose rather than in the corner of their eye.
+pub fn replay_details(ui: &mut egui::Ui, replay: &mut Replay) -> Actions {
+    // No actions, in fact: everything this board *controls* is a plate on the panel beside it, and
+    // what is left here is read rather than pressed. The return type is the same one the panel uses
+    // anyway, so the window that draws both handles one vocabulary instead of two.
+    let actions = Actions::default();
     let star = replay.star().clone();
 
-    ui.heading("Replay");
-    ui.label(replay.level_name().to_string());
-    ui.separator();
-
     // --- whose episode this is --------------------------------------------
-    ui.label("the run's best agent");
-    ui.monospace(format!(
-        "generation {}   id {}",
-        star.generation + 1,
-        star.genome_id
-    ));
-    ui.small(format!(
-        "recorded: {} in {} frames, fitness {}",
-        star.outcome.as_str(),
-        star.frames,
-        format_fitness(star.fitness)
-    ));
-
+    section(ui, "The episode");
+    // Named, and not the level the editor is showing: an episode is scored on the run's terrain, so
+    // an edit made since the run started puts a different level under the replay's canvas. Which one
+    // a viewer is looking at is exactly the sort of thing a board is read to find out.
+    small_dim(ui, format!("scored on {}", replay.level_name()));
+    // Which record the episode is, in the words the strip and the panel use: the star is the run's
+    // quickest win, which is *not* the champion — quickness is part of the fitness a champion is
+    // picked on and not all of it — so a viewer who came here to ask why the field is overtaking the
+    // agent on screen gets the answer in the first two rows rather than by inference.
+    ui::stat_row(ui, "record", star.basis.label().to_string());
+    if star.basis == StarBasis::BestScore {
+        small_dim(
+            ui,
+            "the run has not won on this level yet, so this is the best-scoring agent it has \
+             rather than a time to beat",
+        );
+    }
+    ui::stat_row(ui, "generation", (star.generation + 1).to_string());
+    ui::stat_row(ui, "genome", star.genome_id.to_string());
+    // The recorded episode as *the file* has it, and then the episode as it is being replayed right
+    // now — the same two rows, one under the other, which is the whole point of the pair: same
+    // episode, same numbers if the replay is faithful, and a mismatch is a bug here rather than news
+    // about the run. That is why they are printed together and why they were never two sections.
+    ui::stat_row(
+        ui,
+        "recorded",
+        format!(
+            "{} in {} ({} frames)",
+            star.outcome.as_str(),
+            sim::format_time(star.frames),
+            star.frames
+        ),
+    );
+    ui::stat_row(ui, "score", format_fitness(star.fitness));
+    // Live rather than recorded, and the *star's* frames rather than the field's clock: the two rows
+    // above are the episode as the packet has it and these two are the episode as it is running, and
+    // a time that kept counting past the flag would make the pair disagree about a replay that is
+    // faithful.
+    let live = replay.star_frames();
+    let outcome = replay.star_sim().outcome();
     if replay.star_finished() {
-        // The score beside the record is the replay's own receipt: same episode, same
-        // number if it is faithful. A mismatch would be a bug here rather than news about
-        // the run, which is exactly why the two are printed together.
-        let outcome = replay.star_sim().outcome();
         ui.colored_label(
             if outcome == Outcome::Won { GOOD } else { WARN },
             format!(
-                "now: {} in {:.1}s, score {}",
+                "replayed: {} in {} ({} frames), score {}",
                 outcome.as_str(),
-                replay.clock(),
+                sim::format_time(live),
+                live,
                 format_fitness(replay.star_score())
             ),
         );
@@ -842,136 +1541,110 @@ pub fn replay_panel(ui: &mut egui::Ui, replay: &mut Replay, view: &ViewState) ->
         ui.colored_label(
             TEXT,
             format!(
-                "now: {:.1}s in, score {}",
-                replay.clock(),
+                "replayed: {} in so far, score {}",
+                sim::format_time(live),
                 format_fitness(replay.star_score())
             ),
         );
     }
 
     // --- the ghosts -------------------------------------------------------
-    ui.add_space(6.0);
-    ui.separator();
-    ui.label("Ghosts");
-    // Named, and named as a *different* generation from the champion's: the field is the
-    // run's newest scored generation and the agent above it is the best-ever record, which
-    // are two numbers the moment the search has moved past its best idea.
-    ui.small(format!(
-        "the population of generation {}, each replaying its own episode",
-        replay.population().generation + 1
-    ));
-    ui.monospace(format!(
-        "{} ghosted: {} still going, {} at the flag",
-        replay.ghost_count(),
-        replay.ghosts_running(),
-        replay.ghosts_won()
-    ));
+    section(ui, "The field");
+    // Named, and named as a *different* generation from the star's: the field is the run's newest
+    // scored generation and the agent above it is a record set back where it was made, which are two
+    // numbers the moment the search has moved past it.
+    small_dim(
+        ui,
+        format!(
+            "the population of generation {}, each replaying its own episode",
+            replay.population().generation + 1
+        ),
+    );
+    ui::stat_row(ui, "ghosted", replay.ghost_count().to_string());
+    ui::stat_row(ui, "still going", replay.ghosts_running().to_string());
+    ui::stat_row(ui, "at the flag", replay.ghosts_won().to_string());
     if let Some(note) = capped_roster_note(replay.population(), replay.ghost_count()) {
-        ui.small(note);
+        small_dim(ui, note);
     }
     // The legend for the colours on the canvas, in the canvas's own palette
-    // (`view::cohort_swatch`): a field drawn in four tints and explained nowhere would be
-    // four tints of noise, and the one thing a viewer cannot guess from the picture is
-    // which end of the rank order a colour is. It is drawn whether or not the ghosts are
-    // showing — the bands are a fact about the field rather than about the toggle, and a
-    // panel that reflowed every time `G` was pressed would move the controls under the
-    // viewer's hand.
+    // (`view::cohort_swatch`): a field drawn in four tints and explained nowhere would be four tints
+    // of noise, and the one thing a viewer cannot guess from the picture is which end of the rank
+    // order a colour is. It is drawn whether or not the ghosts are showing — the bands are a fact
+    // about the field rather than about the toggle.
     ui.add_space(4.0);
-    ui.small("the field by rank, best first — each band fainter than the one above it");
+    small_dim(
+        ui,
+        "the field by rank, best first — each band fainter than the one above it",
+    );
     for (band, ranks) in replay.cohorts() {
         ui.horizontal(|ui| {
             ui.colored_label(cohort_swatch(band), "\u{25a0}");
-            ui.small(format!(
-                "ranks {}–{} ({})",
-                ranks.start + 1,
-                ranks.end,
-                ranks.len()
-            ));
+            reading(
+                ui,
+                format!("ranks {}–{}", ranks.start + 1, ranks.end),
+                &format!("{} agents", ranks.len()),
+            );
         });
     }
     if replay.all_finished() {
-        // Every agent has stopped, so nothing is moving any more: a viewer who wants the
-        // field to run again is told how, rather than watching a still frame wonder.
-        ui.small("the whole field has finished — R runs it again");
-    }
-    let mut ghosts = replay.ghosts;
-    if ui
-        .checkbox(&mut ghosts, "show ghosts (G)")
-        .on_hover_text(
-            "hidden ghosts keep running, so the field is where the champion has it \
-             rather than where it was when you last looked",
-        )
-        .changed()
-    {
-        actions.ghosts = true;
-    }
-
-    // --- controls ---------------------------------------------------------
-    ui.add_space(6.0);
-    ui.separator();
-    ui.label("Controls");
-    ui.horizontal(|ui| {
-        // The label says what the *next* press does, and the button only reports the
-        // intent: flipping `paused` here as well would double-toggle it.
-        let label = if replay.paused { "Play" } else { "Pause" };
-        if ui.button(label).clicked() {
-            actions.pause = true;
-        }
-        if ui
-            .button("Again (R)")
-            .on_hover_text("run the same episodes again, from the first tick")
-            .clicked()
-        {
-            actions.restart = true;
-        }
-    });
-
-    let mut speed_index = SPEEDS.iter().position(|s| *s == replay.speed).unwrap_or(0);
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::Slider::new(&mut speed_index, 0..=SPEEDS.len() - 1)
-                .text("speed")
-                .show_value(false),
+        // Every agent has stopped, so nothing is moving any more: a viewer who wants the field to run
+        // again is told how, rather than watching a still frame wonder.
+        ui.colored_label(
+            theme::ACCENT_INK,
+            "the whole field has finished — R runs it again",
         );
-        // Real time is the rung this view opens on, and the only one worth naming.
-        ui.monospace(if SPEEDS[speed_index] == crate::replay::REAL_TIME {
-            "1x real time".to_string()
+    }
+
+    // --- the clock --------------------------------------------------------
+    section(ui, "Playback");
+    // Read here and *set* on the panel beside this window, the same split the run's board keeps: the
+    // pace is changed while watching the episode, and this is where a viewer looks it up. Real time is
+    // named as well as numbered, because it is the one rung whose meaning is not just its number.
+    ui::stat_row(
+        ui,
+        "pace",
+        if replay.speed == crate::replay::REAL_TIME {
+            format!("{}x (real time)", replay.speed)
         } else {
-            format!("{}x", SPEEDS[speed_index])
-        });
-    });
-    replay.speed = SPEEDS[speed_index];
+            format!("{}x", replay.speed)
+        },
+    );
 
-    let mut follow = view.follow;
-    if ui
-        .checkbox(&mut follow, "follow the champion")
-        .on_hover_text("stay on the agent being replayed, or show the whole level")
-        .changed()
-    {
-        actions.follow = true;
-    }
-
-    if ui
-        .button("Back to the run (Esc)")
-        .on_hover_text("return to the evolution view, which is parked where you left it")
-        .clicked()
-    {
-        actions.resume = true;
-    }
-    ui.small("space pause   R again   G ghosts   +/- speed   F follow   V or Esc back");
+    // Reaching for the ghosts from *here* is reaching for a state the panel already shows as a plate,
+    // so the only thing this needs to offer is the way back to the run — which is the dock's switch
+    // too, and the reason this is a sentence rather than another row.
+    ui.add_space(4.0);
+    small_dim(
+        ui,
+        "space pause   R again   G ghosts   +/- speed   F follow   Esc or the switch: back to the run",
+    );
 
     actions
 }
-
 /// The bottom panel: the fitness chart, with every generation that reached the flag
 /// marked. `scrub` is the recorded generation being shown, when there is one.
 pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scrub: Option<u32>) {
     let width = ui.available_width().max(200.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, CornerRadius::same(4), PANEL_BG);
+    let (frame, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let painter = ui.painter_at(frame);
+    // The strip is chrome — the same cream and gold lip as the panels either side of it — and
+    // the chart is a *display* set into it: a dark screen with a rounded frame, drawn by the
+    // one instrument in the window that is not a control. Everything from here on is inside
+    // `rect`, which is that screen rather than the strip it sits in.
+    painter.rect_filled(frame, CornerRadius::same(theme::RADIUS), theme::PANEL);
+    let rect = frame.shrink(3.0);
+    painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), PANEL_BG);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(theme::RADIUS),
+        egui::Stroke::new(2.0_f32, theme::GOLD_EDGE),
+        egui::StrokeKind::Inside,
+    );
 
-    let font = FontId::proportional(11.0);
+    // Monospace, because every label on this chart is a number: the axis values, the two
+    // generation ticks and the count in the heading, and digits in a proportional face do
+    // not line up in a column.
+    let font = FontId::monospace(11.0);
     let heading = match history.last() {
         Some(last) => format!(
             "fitness — {} generations, latest max {} ({})",
@@ -990,7 +1663,7 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
         Align2::LEFT_TOP,
         heading,
         font.clone(),
-        TEXT_DIM,
+        theme::ACCENT,
     );
 
     // An empty history gets a note, not axes: there is nothing to scale against, and an
@@ -1017,7 +1690,7 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
             Align2::CENTER_CENTER,
             "no generation has been scored yet",
             font,
-            TEXT_DIM,
+            SCREEN_TEXT,
         );
         return;
     }
@@ -1035,7 +1708,7 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
             Align2::RIGHT_CENTER,
             format_fitness(value),
             font.clone(),
-            TEXT_DIM,
+            SCREEN_TEXT_DIM,
         );
     }
 
@@ -1049,7 +1722,7 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
         painter.line_segment(
             [
                 Pos2::new(win.x, plot.top()),
-                Pos2::new(win.x, plot.top() + 6.0),
+                Pos2::new(win.x, plot.top() + 7.0),
             ],
             Stroke::new(2.0_f32, WIN_TICK),
         );
@@ -1081,14 +1754,14 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
         Align2::LEFT_TOP,
         format!("gen {}", geometry.first_generation + 1),
         font.clone(),
-        TEXT_DIM,
+        SCREEN_TEXT_DIM,
     );
     painter.text(
         Pos2::new(plot.right(), plot.bottom() + 3.0),
         Align2::RIGHT_TOP,
         format!("gen {}", geometry.last_generation + 1),
         font,
-        TEXT_DIM,
+        SCREEN_TEXT_DIM,
     );
 }
 
@@ -1270,6 +1943,27 @@ mod tests {
             mutation_sigma: 0.30,
             stagnation: 0,
             immigrants: 0,
+            // A run whose archive has filled a few niches: the fixture is a run that has been
+            // going for a while, and a diversity reading of zero is the collapsed case rather
+            // than the common one.
+            archive_children: 4,
+            archive_bits: 9,
+            // Two of the four finish bands, so the board's speed coverage is a count rather than a
+            // zero: the fixture is a run that has been going for a while.
+            archive_time_bits: 2,
+            // And a timed win, because the clock is the one reading the panel gained: a fixture
+            // without one would leave every assertion about it untested. 505 frames is 8.42 s of the
+            // flat level's own 40 s budget.
+            fastest: Some(evo::FastWin {
+                generation: 4,
+                genome_id: 40,
+                frames: 505,
+                budget_frames: 2400,
+            }),
+            // The episode that time came from. The board does not read it — the playtest does,
+            // to race the ghost — but every `Packet` carries one when the run has won, so the
+            // fixture does too rather than standing for a state no real run can be in.
+            fastest_agent: None,
             lanes: vec![lane(0, 12, 431.2), lane(1, 40, 120.0)],
             // The population the replay ghosts. The chart tests are about the run's shape,
             // so the roster they never draw is empty here.
@@ -1475,8 +2169,9 @@ mod tests {
         stepped.curriculum = Some(note.to_string());
         let summary = RunSummary::new(&stepped, &points);
         assert_eq!(summary.curriculum.as_deref(), Some(note));
-        // And the panel draws it: a rescue the window never mentions would be invisible.
-        draw_panel(&summary, &mut ViewState::default());
+        // And the window says it: a rescue a viewer could never read would be invisible, and the
+        // board behind the panel is where a run's own account of itself is read.
+        draw_details(&summary, &mut ViewState::default());
     }
 
     #[test]
@@ -1514,6 +2209,14 @@ mod tests {
         let mut tuned = summary_with_search(0, 0);
         tuned.mutation_sigma = 0.091;
         assert_eq!(search_line(&tuned), "search   sigma 0.091");
+
+        // And the two grid readings are *not* on it any more, however many niches the archive
+        // holds: they are rows of the board (§[`lab_details`]), and a line that still carried them
+        // would be the wall of prose this split removed. A run with a full archive says exactly the
+        // same sentence as the quiet one.
+        let mut full = summary_with_search(0, 0);
+        full.archive_bits = 48;
+        assert_eq!(search_line(&full), search_line(&quiet));
     }
 
     /// A summary whose only interesting fact is what the search is doing to itself.
@@ -1530,8 +2233,9 @@ mod tests {
         let points = history(&[(0, 10.0, 5.0, 0), (4, 411.0, 60.0, 0)]);
         let summary = RunSummary::new(&packet(points.clone(), Vec::new(), false), &points);
 
-        // Live: the panels offer the way back in only when there is a past to leave.
-        let actions = draw_panel(&summary, &mut ViewState::default());
+        // Live: the board offers the way back in only when there is a past to leave, and with no
+        // pointer anywhere near it a frame of the scrubber asks for nothing.
+        let actions = draw_details(&summary, &mut ViewState::default());
         assert_eq!(actions, Actions::default());
 
         // Looking at a recorded generation: the note says so and Resume is offered.
@@ -1539,7 +2243,7 @@ mod tests {
             scrub: Some(0),
             ..ViewState::default()
         };
-        let actions = draw_panel(&summary, &mut view);
+        let actions = draw_details(&summary, &mut view);
         assert_eq!(actions, Actions::default());
         assert_eq!(view.scrub, Some(0), "the widgets did not move the cursor");
     }
@@ -1657,8 +2361,8 @@ mod tests {
 
     #[test]
     fn the_ladders_the_widgets_offer_are_the_ladders_the_run_understands() {
-        // A value that is not on the rungs (a hand-edited config, a future key) snaps
-        // to the nearest one rather than leaving the slider unrepresentable.
+        // A value that is not on the rungs (a hand-edited config, a future key) is read as the
+        // nearest rung rather than leaving the control unrepresentable.
         let mut view = ViewState {
             speed: 9,
             mutation_rate: 0.2,
@@ -1666,12 +2370,22 @@ mod tests {
         };
         let points = history(&[(0, 10.0, 5.0, 0), (1, 20.0, 9.0, 0)]);
         let summary = RunSummary::new(&packet(points.clone(), Vec::new(), false), &points);
+
+        // The pace stepper *reads* a rung rather than writing one — it reports a step and the window
+        // applies it — so what it owes an off-ladder value is that the rung it names is real and that
+        // stepping from it lands on a rung the run's own rule can reach. Both ends of the stepper
+        // and the number between them come from this one lookup, so neither can describe a rung that
+        // does not exist.
+        assert_eq!(speed_rung(9), SPEEDS.iter().position(|s| *s == 8).unwrap());
+        assert!(SPEEDS.contains(&crate::lab::step_speed(SPEEDS[speed_rung(9)], true)));
+        assert!(SPEEDS.contains(&crate::lab::step_speed(SPEEDS[speed_rung(9)], false)));
+        assert_eq!(pace_step(speed_rung(9), true), 1, "9 is nowhere near an end");
+        assert_eq!(pace_step(speed_rung(9), false), -1);
         draw_panel(&summary, &mut view);
-        assert!(
-            SPEEDS.contains(&view.speed),
-            "speed {} is off the ladder",
-            view.speed
-        );
+
+        // The mutation ladder is still a slider on the board, and that one *does* snap the state it
+        // is handed: a rate off the ladder is not a thing the search can be told.
+        draw_details(&summary, &mut view);
         assert!(
             MUTATION_RATES.contains(&view.mutation_rate),
             "mutation rate {} is off the ladder",
@@ -1783,9 +2497,24 @@ mod tests {
         assert!(note.contains("1001"), "{note}");
     }
 
-    /// Draw the whole panel headlessly, for the tests that care what the widgets do to
+    /// Draw the whole run panel headlessly, for the tests that care what the widgets do to
     /// the view state rather than what they look like.
+    ///
+    /// No atlas: the widgets take one to draw their pictures and every one of them is optional
+    /// (`ui::icon_button`'s rule), so a panel with no textures in it is a panel with captions and no
+    /// glyphs — which is what a tileset drawn before the `ui_*` sprites existed looks like, and a
+    /// state a test can hold without a renderer.
     fn draw_panel(summary: &RunSummary, view: &mut ViewState) -> Actions {
+        draw(summary, view, false)
+    }
+
+    /// Draw the instrument board headlessly — the other half of one run's panel, inside the
+    /// Details window.
+    fn draw_details(summary: &RunSummary, view: &mut ViewState) -> Actions {
+        draw(summary, view, true)
+    }
+
+    fn draw(summary: &RunSummary, view: &mut ViewState, details: bool) -> Actions {
         let ctx = egui::Context::default();
         let mut actions = Actions::default();
         let size = Vec2::new(300.0, 700.0);
@@ -1799,7 +2528,11 @@ mod tests {
                     .frame(egui::Frame::default())
                     .show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            actions = lab_panel(ui, summary, view, false);
+                            actions = if details {
+                                lab_details(ui, summary, view)
+                            } else {
+                                lab_panel(ui, None, summary, view, false)
+                            };
                         });
                     });
             },
@@ -1816,5 +2549,175 @@ mod tests {
             .sum();
         assert!(drawn > 0, "the panel drew nothing");
         actions
+    }
+
+    /// An idle frame of the menu asks for nothing.
+    ///
+    /// The four things the menu can ask for are all destructive in the same way — pause a run,
+    /// restart it, write a champion, run a generation — so a panel that fired one without a pointer
+    /// on it would be a control nobody pressed, acting. Drawn with no atlas, too: a machine with a
+    /// tileset older than the `ui_*` glyphs gets captioned plates and no pictures, and it still has
+    /// to be a panel rather than a crash.
+    #[test]
+    fn an_idle_frame_of_the_menu_asks_for_nothing() {
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
+        let summary = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        assert_eq!(
+            draw_panel(&summary, &mut ViewState::default()),
+            Actions::default()
+        );
+    }
+
+    /// The panel says four things, and they are what a viewer watching a run asks for: where it has
+    /// got to, whether anything has reached the flag, **how long that took**, and how good the best
+    /// agent is.
+    ///
+    /// The *count* is the assertion rather than the wording: the panel's whole problem was being
+    /// longer than the question it answers, and a reading added to it later would pass every test
+    /// that only checked what the others said. The clock is the fourth because it is the one a
+    /// viewer acts on — it is what they take to the playtest to race.
+    #[test]
+    fn the_run_panel_says_four_things() {
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
+        let summary = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        let readings = menu_readings(&summary);
+        assert_eq!(readings.len(), 4, "{readings:?}");
+
+        // The generation, against the run's own target, one-based — the number a viewer reads off
+        // the chart's right-hand edge too.
+        assert_eq!(readings[0].value, "2 / 300");
+        assert_eq!(readings[0].unit, "generations");
+        // The flag: the generation's wins over the population, in the growth colour once the run has
+        // been solved. *That* is the colour's job — a run that has been solved is the run's answer.
+        assert_eq!(readings[1].value, "3 / 200");
+        assert_eq!(readings[1].unit, "reached the flag");
+        assert_eq!(readings[1].colour, GOOD);
+        // The clock, in the sim's own notation rather than the panel's: the number on the panel is
+        // the number the episode was scored on, which is the number the playtest races.
+        assert_eq!(readings[2].value, sim::format_time(505));
+        assert_eq!(readings[2].value, "8.42s");
+        assert_eq!(readings[2].unit, "the quickest win");
+        assert_eq!(readings[2].colour, GOOD);
+        // The best, from the run's own formatter, so the panel and the chart cannot disagree about
+        // what 411.2 looks like.
+        assert_eq!(readings[3].value, format_fitness(411.0));
+        assert_eq!(readings[3].unit, "best fitness");
+
+        // A run nobody has solved says the same thing in a dimmer colour rather than in a word: a
+        // count of zero is the reading.
+        let unsolved = RunSummary::new(
+            &packet(points, Vec::new(), false),
+            &history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 0)]),
+        );
+        assert_eq!(menu_readings(&unsolved)[1].value, "0 / 200");
+        assert_eq!(menu_readings(&unsolved)[1].colour, TEXT_DIM);
+
+        // And a run with no win has no time. An em dash and a sentence rather than `0.00s`, which
+        // would read as "the flag was reached instantly" — the opposite of what has happened.
+        let mut untimed = RunSummary::new(
+            &packet(history(&[(0, 10.0, 5.0, 0)]), Vec::new(), false),
+            &history(&[(0, 10.0, 5.0, 0)]),
+        );
+        untimed.fastest = None;
+        let readings = menu_readings(&untimed);
+        assert_eq!(readings[2].value, "\u{2014}", "{readings:?}");
+        assert_eq!(readings[2].unit, "nothing has reached the flag yet");
+        assert_eq!(readings[2].colour, TEXT_DIM);
+    }
+
+    /// The replay's panel names the record on screen and quotes the star's own clock.
+    ///
+    /// Two claims, and they are the two a viewer reported as wrong: the agent being watched was
+    /// labelled the run's best when it is the run's *quickest win*, and the time beside it kept
+    /// counting after the flag. Both are read here off [`replay_readings`] rather than off a drawn
+    /// frame, because the readings are a pure function of the replay and the panel is the only place
+    /// in this mode that prints a time beside an agent.
+    #[test]
+    fn the_replay_panel_names_the_record_and_quotes_the_stars_own_clock() {
+        let level = sim::Level::starter("panel-replay", 40, 8);
+        let packet = crate::lab::scored_packet(&level, "panel-reading");
+        let mut replay = crate::replay::Replay::new(&packet, &level, &evo::EvalConfig::default())
+            .expect("a scored generation holds an agent to replay");
+
+        let readings = replay_readings(&replay);
+        assert_eq!(readings.len(), 3);
+        // The label is the record's own name (`StarBasis::label`), not a word this module picked: the
+        // fixture has won nothing, so it is the best attempt rather than a time to beat.
+        assert_eq!(readings[1].unit, replay.star().basis.label());
+        assert_eq!(readings[1].unit, "the run's best attempt");
+        assert_eq!(
+            readings[2].unit,
+            format!("0.0s, score {}", format_fitness(replay.star_score())),
+            "an unstarted episode is at 0.0s"
+        );
+
+        // Run the star out, then read the panel again and keep the field going for ten seconds. The
+        // time it prints is the episode's own and it does not move again: the field's clock is still
+        // climbing under it, which is exactly the number that used to be shown here.
+        let mut ticks = 0;
+        while !replay.star_finished() && ticks < 4_000 {
+            replay.advance(1.0 / 60.0);
+            ticks += 1;
+        }
+        assert!(ticks < 4_000, "the star's episode never ended");
+        let finished = replay_readings(&replay);
+        assert_eq!(finished[2].value, replay.star_sim().outcome().as_str());
+        let stopped = finished[2].unit.clone();
+        assert!(
+            stopped.starts_with(&format!("{:.1}s, score ", replay.star_elapsed())),
+            "{stopped}"
+        );
+        for _ in 0..600 {
+            replay.advance(1.0 / 60.0);
+        }
+        assert!(
+            replay.clock() > replay.star_elapsed(),
+            "the field's clock stopped too, so this proves nothing"
+        );
+        assert_eq!(
+            replay_readings(&replay)[2].unit,
+            stopped,
+            "the panel's clock kept counting after the episode ended"
+        );
+    }
+
+    /// The panel's pace stepper moves one rung at a time, stops at both ends of the ladder, and
+    /// reports the step rather than applying it.
+    #[test]
+    fn the_panel_has_a_pace_stepper_that_walks_the_same_ladder_as_the_keys() {
+        // The ends are *requests of zero*, not a step the run would have to refuse: the same number
+        // decides whether the button is drawn enabled, so there is no state where a lit button asks
+        // for nothing.
+        assert_eq!(pace_step(0, false), 0, "the bottom of the ladder has nowhere to go");
+        assert_eq!(pace_step(0, true), 1);
+        assert_eq!(
+            pace_step(SPEEDS.len() - 1, true),
+            0,
+            "nor does the top"
+        );
+        assert_eq!(pace_step(SPEEDS.len() - 1, false), -1);
+        for (rung, here) in SPEEDS.iter().enumerate() {
+            // One rung, never a jump: `lab::step_speed` is what turns the request into a rung, and a
+            // request of two would skip one the viewer could not get back to.
+            assert!(pace_step(rung, true).abs() <= 1 && pace_step(rung, false).abs() <= 1);
+            // And a press that does move the run lands on a rung of the same ladder the keys and the
+            // terminal use — 1x, 2x, 4x ... 50x.
+            let asked = if pace_step(rung, true) == 1 {
+                crate::lab::step_speed(*here, true)
+            } else {
+                crate::lab::step_speed(*here, false)
+            };
+            assert!(SPEEDS.contains(&asked), "{asked}x is not a rung");
+        }
+
+        // Drawn, the panel reports nothing at rest and does not move the pace itself: it reports and
+        // the window applies, which is how one command serves a button, a key and a slider.
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
+        let summary = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        let mut view = ViewState::default();
+        assert!(SPEEDS.contains(&view.speed), "the default pace is a rung");
+        let idle = draw_panel(&summary, &mut view);
+        assert_eq!(idle.speed, 0);
+        assert_eq!(view.speed, SPEEDS[speed_rung(view.speed)]);
     }
 }

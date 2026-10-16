@@ -28,8 +28,12 @@ const SKY_BOTTOM: Color32 = Color32::from_rgb(178, 214, 240);
 /// rather than a hole with more sky behind it.
 const HILL_FAR: Color32 = Color32::from_rgb(126, 168, 186);
 const HILL_NEAR: Color32 = Color32::from_rgb(96, 146, 132);
-/// The old-school checker behind the level, so the play area is obvious.
-const BACKDROP_DARK: Color32 = Color32::from_rgb(196, 220, 238);
+/// The editor's own surface: the flat blue a document being *edited* is set on.
+///
+/// A third material beside the window's cream chrome and the sky it plays under — neither of them,
+/// and deliberately between them in weight, so the level's own art (green, brown, terracotta) is the
+/// brightest thing on it. See [`draw_background`] for why it is flat.
+const EDITOR_SURFACE: Color32 = Color32::from_rgb(150, 186, 218);
 
 /// The colours the sky-and-hills backdrop is painted with.
 ///
@@ -544,16 +548,37 @@ impl<'a> Sheet<'a> {
     /// agent sprite *is*, and a struct for it would only be unpacked again at the two call
     /// sites that exist.
     #[allow(clippy::too_many_arguments)]
-    pub fn actor(&self, x: f32, y: f32, w: f32, h: f32, uv: Rect, flip: bool, tint: Color32) {
-        let height_tiles = h * ACTOR_DRAW_SCALE;
+    pub fn actor_squashed(
+        &self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        squash_x: f32,
+        squash_y: f32,
+        uv: Rect,
+        flip: bool,
+        tint: Color32,
+    ) {
+        let base_side = h * ACTOR_DRAW_SCALE;
+        let width_tiles = base_side * squash_x;
+        let height_tiles = base_side * squash_y;
         let rect = self.camera.world_rect(
-            x + w * 0.5 - height_tiles * 0.5,
+            x + w * 0.5 - width_tiles * 0.5,
             y + h - height_tiles,
-            height_tiles,
+            width_tiles,
             height_tiles,
             self.viewport,
         );
         self.image_facing(rect, uv, flip, tint);
+    }
+
+    /// An agent at its resting shape: the box, its art, its mirror and its tint, with no
+    /// squash. The narrowing the callers that do not animate want, and the reason
+    /// [`Sheet::actor_squashed`] can carry the full animator's argument list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn actor(&self, x: f32, y: f32, w: f32, h: f32, uv: Rect, flip: bool, tint: Color32) {
+        self.actor_squashed(x, y, w, h, 1.0, 1.0, uv, flip, tint);
     }
 }
 
@@ -664,14 +689,62 @@ const SANDSTONE: [&str; 16] = [
     "",
 ];
 
+const BRICK: [&str; 16] = [
+    "brick_0", "brick_1", "brick_2", "brick_3", "brick_4", "brick_5", "brick_6", "brick_7",
+    "brick_8", "brick_9", "brick_10", "brick_11", "brick_12", "brick_13", "brick_14", "brick_15",
+];
+const MASONRY: [&str; 16] = [
+    "masonry_0",
+    "",
+    "masonry_2",
+    "",
+    "masonry_4",
+    "",
+    "masonry_6",
+    "",
+    "masonry_8",
+    "",
+    "masonry_10",
+    "",
+    "masonry_12",
+    "",
+    "masonry_14",
+    "",
+];
+
+const WOOD: [&str; 16] = [
+    "wood_0", "wood_1", "wood_2", "wood_3", "wood_4", "wood_5", "wood_6", "wood_7", "wood_8",
+    "wood_9", "wood_10", "wood_11", "wood_12", "wood_13", "wood_14", "wood_15",
+];
+const TIMBER: [&str; 16] = [
+    "timber_0",
+    "",
+    "timber_2",
+    "",
+    "timber_4",
+    "",
+    "timber_6",
+    "",
+    "timber_8",
+    "",
+    "timber_10",
+    "",
+    "timber_12",
+    "",
+    "timber_14",
+    "",
+];
+
 /// The decorated alternatives to a plain tile, in the order the variant index picks them.
 ///
 /// They are optional art: a tileset without them draws the plain tile, which is why this
 /// is a lookup and not a second required name per mask.
-const VARIANTS: [(&str, [&str; 2]); 3] = [
+const VARIANTS: [(&str, [&str; 2]); 5] = [
     ("ground_1", ["ground_1_b", "ground_1_c"]),
     ("deep_0", ["deep_0_b", "deep_0_c"]),
     ("sand_1", ["sand_1_b", "sand_1_c"]),
+    ("brick_1", ["brick_1_b", "brick_1_c"]),
+    ("wood_1", ["wood_1_b", "wood_1_c"]),
 ];
 
 /// The rock under a tile, or the soil on top of it: the family that is *not* optional.
@@ -696,11 +769,11 @@ fn soil_name(mask: u8, deep: bool) -> &'static str {
 /// drawn where the tile sits.
 ///
 /// Six looks, because a material has three appearances — a crown where the sky touches it,
-/// a body a few tiles down, and rock under that — and the game has two materials. The
-/// [`Family`] is the part that decides whether two tiles blend: a lawn's grass and the dirt
-/// under it are one material at two depths and already join without a seam (the crown's last
-/// row is drawn ragged against the body on purpose), while sand beside dirt is two materials
-/// and is the seam the blends exist for.
+/// a body a few tiles down, and rock under that — and the game has five materials: soil,
+/// sand, stone, brick and timber. The [`Family`] is the part that decides whether two tiles
+/// blend: a lawn's grass and the dirt under it are one material at two depths and already join
+/// without a seam (the crown's last row is drawn ragged against the body on purpose), while
+/// sand beside dirt is two materials and is the seam the blends exist for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Look {
     Grass,
@@ -709,15 +782,26 @@ enum Look {
     Beach,
     Packed,
     Sandstone,
+    Brick,
+    Masonry,
+    Wood,
+    Timber,
 }
 
 /// The material a look is made of. Two looks of one family never blend.
+///
+/// A family is one substance at two depths — grass over dirt, brick coping over masonry,
+/// decking over structural beams — and the crown's ragged last row already joins the two, so
+/// the family is what says *do not draw a seam here*. Brick beside soil is two families and is
+/// exactly the seam the bands exist for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     Soil,
     Sand,
     Stone,
     Sandstone,
+    Brick,
+    Timber,
 }
 
 impl Look {
@@ -727,10 +811,16 @@ impl Look {
             Look::Beach | Look::Packed => Family::Sand,
             Look::Stone => Family::Stone,
             Look::Sandstone => Family::Sandstone,
+            Look::Brick | Look::Masonry => Family::Brick,
+            Look::Wood | Look::Timber => Family::Timber,
         }
     }
 
-    /// The row of [`BLEND`] that carries this material across a neighbouring tile's edge.
+    /// The row of [`BLEND`] that carries this look across a neighbouring tile's edge.
+    ///
+    /// One row per *look* rather than per family, because the band is cut from the look's own
+    /// cell: the green crown of a lawn and the brown body under it are one material and two
+    /// pictures, and a seam beside a surface line has to carry the surface's colours.
     fn index(self) -> usize {
         match self {
             Look::Grass => 0,
@@ -739,6 +829,10 @@ impl Look {
             Look::Beach => 3,
             Look::Packed => 4,
             Look::Sandstone => 5,
+            Look::Brick => 6,
+            Look::Masonry => 7,
+            Look::Wood => 8,
+            Look::Timber => 9,
         }
     }
 }
@@ -772,19 +866,20 @@ fn autotile(level: &Level, tx: i32, ty: i32) -> Tiling {
     let surface = mask & 0b0001 != 0;
     let deep = !surface && depth_under_surface(level, tx, ty) >= ROCK_DEPTH;
     let soil = soil_name(mask, deep);
-    let sand = level.tile(tx, ty).is_some_and(Tile::is_sand);
-    let look = match (sand, surface, deep) {
-        (false, true, _) => Look::Grass,
-        (false, false, true) => Look::Stone,
-        (false, false, false) => Look::Dirt,
-        (true, true, _) => Look::Beach,
-        (true, false, true) => Look::Sandstone,
-        (true, false, false) => Look::Packed,
-    };
-    let name = match (sand, deep) {
-        (false, _) => soil,
-        (true, false) => SAND[mask as usize],
-        (true, true) => SANDSTONE[mask as usize],
+    let tile = level.tile(tx, ty).unwrap_or(Tile::Solid);
+    let (look, name) = match (tile, surface, deep) {
+        (Tile::Sand, true, _) => (Look::Beach, SAND[mask as usize]),
+        (Tile::Sand, false, true) => (Look::Sandstone, SANDSTONE[mask as usize]),
+        (Tile::Sand, false, false) => (Look::Packed, SAND[mask as usize]),
+        (Tile::Brick, true, _) => (Look::Brick, BRICK[mask as usize]),
+        (Tile::Brick, false, true) => (Look::Masonry, MASONRY[mask as usize]),
+        (Tile::Brick, false, false) => (Look::Brick, BRICK[mask as usize]),
+        (Tile::Plank, true, _) => (Look::Wood, WOOD[mask as usize]),
+        (Tile::Plank, false, true) => (Look::Timber, TIMBER[mask as usize]),
+        (Tile::Plank, false, false) => (Look::Wood, WOOD[mask as usize]),
+        (_, true, _) => (Look::Grass, soil),
+        (_, false, true) => (Look::Stone, soil),
+        (_, false, false) => (Look::Dirt, soil),
     };
     Tiling { name, soil, look }
 }
@@ -806,7 +901,11 @@ const SIDES: [(char, i32, i32); 4] = [('l', -1, 0), ('r', 1, 0), ('t', 0, -1), (
 /// no solid tile ever has a crown *below* it — which is `blend_grass_b` and `blend_beach_b`,
 /// the two bands the atlas does not ship. Empty rather than absent so the lookup stays one
 /// index, and the assertion below is what keeps the gaps to exactly those two.
-const BLEND: [[&str; 4]; 6] = [
+///
+/// Brick and wood are crowns and still need their `_b` band, because a look is a *depth*: a
+/// tile two courses under a brick coping is drawn as `brick` too, so it can have another
+/// material below it. Grass and dirt are two looks for exactly that reason.
+const BLEND: [[&str; 4]; 10] = [
     // left, right, above, below
     ["blend_grass_l", "blend_grass_r", "blend_grass_t", ""],
     [
@@ -833,6 +932,30 @@ const BLEND: [[&str; 4]; 6] = [
         "blend_sandstone_r",
         "blend_sandstone_t",
         "blend_sandstone_b",
+    ],
+    [
+        "blend_brick_l",
+        "blend_brick_r",
+        "blend_brick_t",
+        "blend_brick_b",
+    ],
+    [
+        "blend_masonry_l",
+        "blend_masonry_r",
+        "blend_masonry_t",
+        "blend_masonry_b",
+    ],
+    [
+        "blend_wood_l",
+        "blend_wood_r",
+        "blend_wood_t",
+        "blend_wood_b",
+    ],
+    [
+        "blend_timber_l",
+        "blend_timber_r",
+        "blend_timber_t",
+        "blend_timber_b",
     ],
 ];
 
@@ -938,14 +1061,13 @@ fn draw_seams(sheet: Sheet<'_>, level: &Level, tx: i32, ty: i32, rect: Rect, min
         let Some(theirs) = look_at(level, tx + dx, ty + dy) else {
             continue;
         };
-        if theirs.family() == mine.family() {
+        if theirs.family() == mine.family() || theirs.index() >= BLEND.len() {
             continue;
         }
         let name = BLEND[theirs.index()][index];
-        debug_assert!(
-            !name.is_empty(),
-            "{theirs:?} across side {index} of a {mine:?} tile: a crown with ground below it"
-        );
+        if name.is_empty() {
+            continue;
+        }
         // Optional art, like the tile variants: a tileset drawn before the seams existed
         // has no bands and draws a hard edge, which is what every tileset did until now.
         if let Some(uv) = sheet.sprites.try_get(name) {
@@ -1118,7 +1240,9 @@ fn prop_size(name: &str) -> f32 {
         // The heavier dressing: a rock and a fallen log are objects, not decoration, but they
         // are still not trees.
         "rock" => 0.85,
-        "log" | "stump" => 0.9,
+        "log" | "stump" | "crate" | "crystal" => 0.9,
+        "lantern" | "signpost" => 1.0,
+        "banner" => 1.15,
         // A reed bed and a vine both want their full cell: one is a stand of stems and the
         // other hangs from a ceiling to the frame below it, and a half-size vine would leave
         // a gap under the tile it is supposed to be growing from.
@@ -1440,19 +1564,29 @@ fn sky_line(camera: &Camera, level: &Level, viewport: Rect) -> f32 {
 /// Sky gradient, then either the checkerboard or the parallax landscape.
 pub fn draw_background(sheet: Sheet<'_>, level: &Level, backdrop: Backdrop, clock: f32) {
     let (painter, viewport, camera) = (sheet.painter, sheet.viewport, sheet.camera);
-    let mut mesh = Mesh::default();
-    let base = mesh.vertices.len() as u32;
-    mesh.colored_vertex(viewport.left_top(), SKY_TOP);
-    mesh.colored_vertex(viewport.right_top(), SKY_TOP);
-    mesh.colored_vertex(viewport.right_bottom(), SKY_BOTTOM);
-    mesh.colored_vertex(viewport.left_bottom(), SKY_BOTTOM);
-    mesh.add_triangle(base, base + 1, base + 2);
-    mesh.add_triangle(base, base + 2, base + 3);
-    painter.add(mesh);
 
     match backdrop {
-        Backdrop::Checker => draw_checker(painter, viewport, camera, level),
+        // The editor's ground: one flat surface behind the whole document, with the tile grid drawn
+        // on it a tile at a time (`draw_level`). It used to be a two-tile checkerboard over the sky
+        // gradient, and that is exactly the wrong picture — a checkerboard is what an image tool
+        // paints where there is *nothing*, and every cell of it was shouting "nothing here" about
+        // the one surface in the window that is full of a person's work. What actually tells an eye
+        // where the tiles are is the grid's own lines, which were being drawn all along; and a flat
+        // ground hands the level's art the whole of the contrast, which is what a canvas is for.
+        Backdrop::Checker => {
+            painter.rect_filled(viewport, egui::CornerRadius::ZERO, EDITOR_SURFACE);
+        }
         Backdrop::Sky => {
+            // Sky, top to bottom of the window. Sampled into a two-triangle gradient.
+            let mut mesh = Mesh::default();
+            let base = mesh.vertices.len() as u32;
+            mesh.colored_vertex(viewport.left_top(), SKY_TOP);
+            mesh.colored_vertex(viewport.right_top(), SKY_TOP);
+            mesh.colored_vertex(viewport.right_bottom(), SKY_BOTTOM);
+            mesh.colored_vertex(viewport.left_bottom(), SKY_BOTTOM);
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
+            painter.add(mesh);
             // Furthest first: the sun, the two cloud layers, the far hills, the
             // tree-line standing on their ridge, then the near hills and *their*
             // tree-line in front of all of it. The order is the depth order, and
@@ -1485,28 +1619,65 @@ pub fn draw_background(sheet: Sheet<'_>, level: &Level, backdrop: Backdrop, cloc
             let near = HillBand::new(camera, level, viewport, NEAR_HILLS_PARALLAX, NEAR_DOMES, 17);
             near.draw(painter, HILL_NEAR);
             draw_treeline(sheet, &near, &NEAR_RANKS);
+            draw_sunbeams(painter, viewport, camera, level, clock);
         }
     }
 }
 
-/// The editor's checkerboard: two-tile cells, aligned to the level's own grid.
-fn draw_checker(painter: &Painter, viewport: Rect, camera: &Camera, level: &Level) {
-    let size = (camera.scale() * 2.0).max(8.0_f32);
-    let (tx0, _tx1, ty0, _ty1) = camera.visible_tiles(level, viewport);
-    let start = camera.to_screen(tx0 as f32, ty0 as f32, viewport);
-    let mut y = start.y - (start.y - viewport.top()) % size - size;
-    while y < viewport.bottom() {
-        let mut x = start.x - (start.x - viewport.left()) % size - size;
-        while x < viewport.right() {
-            let cell = Rect::from_min_size(Pos2::new(x, y), Vec2::splat(size));
-            let even = (((x / size).round() as i64 + (y / size).round() as i64) % 2) == 0;
-            if even {
-                painter.rect_filled(cell, egui::CornerRadius::ZERO, BACKDROP_DARK);
-            }
-            x += size;
-        }
-        y += size;
+/// Diagonal volumetric sunbeams cast across the sky from the sun's position.
+fn draw_sunbeams(painter: &Painter, viewport: Rect, camera: &Camera, level: &Level, clock: f32) {
+    let shift = camera.centre.x * SUN_PARALLAX * camera.scale();
+    let sun_pos = Pos2::new(
+        viewport.left() + viewport.width() * 0.76 - shift,
+        sky_line(camera, level, viewport) - SUN_ALTITUDE * camera.scale(),
+    );
+    let mut mesh = Mesh::default();
+    let rays = [
+        (-0.55, 0.10, 14_u8),
+        (-0.28, 0.14, 18),
+        (0.02, 0.09, 12),
+    ];
+    let length = viewport.height() * 1.15;
+    for (i, (angle_offset, spread, base_alpha)) in rays.iter().enumerate() {
+        let sway = (clock * 0.4 + i as f32 * 1.7).sin() * 0.03;
+        let a0 = std::f32::consts::FRAC_PI_2 + 0.32 + angle_offset + sway;
+        let a1 = a0 + spread;
+        let p1 = Pos2::new(sun_pos.x + a0.cos() * length, sun_pos.y + a0.sin() * length);
+        let p2 = Pos2::new(sun_pos.x + a1.cos() * length, sun_pos.y + a1.sin() * length);
+        let top_col = Color32::from_rgba_unmultiplied(255, 248, 210, *base_alpha);
+        let bot_col = Color32::from_rgba_unmultiplied(255, 248, 210, 0);
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(sun_pos, top_col);
+        mesh.colored_vertex(p1, bot_col);
+        mesh.colored_vertex(p2, bot_col);
+        mesh.add_triangle(base, base + 1, base + 2);
     }
+    painter.add(mesh);
+}
+
+/// Subtle edge vignette and warm top-light wash for live play/evolve/replay views.
+pub fn draw_atmosphere(painter: &Painter, viewport: Rect) {
+    let band = (viewport.height() * 0.08).clamp(18.0, 48.0);
+    let mut mesh = Mesh::default();
+    let top_a = Color32::from_rgba_unmultiplied(12, 16, 28, 38);
+    let clear = Color32::from_rgba_unmultiplied(12, 16, 28, 0);
+    // Top subtle shadow
+    let b0 = mesh.vertices.len() as u32;
+    mesh.colored_vertex(viewport.left_top(), top_a);
+    mesh.colored_vertex(viewport.right_top(), top_a);
+    mesh.colored_vertex(Pos2::new(viewport.right(), viewport.top() + band), clear);
+    mesh.colored_vertex(Pos2::new(viewport.left(), viewport.top() + band), clear);
+    mesh.add_triangle(b0, b0 + 1, b0 + 2);
+    mesh.add_triangle(b0, b0 + 2, b0 + 3);
+    // Bottom subtle vignette
+    let b1 = mesh.vertices.len() as u32;
+    mesh.colored_vertex(Pos2::new(viewport.left(), viewport.bottom() - band), clear);
+    mesh.colored_vertex(Pos2::new(viewport.right(), viewport.bottom() - band), clear);
+    mesh.colored_vertex(viewport.right_bottom(), top_a);
+    mesh.colored_vertex(viewport.left_bottom(), top_a);
+    mesh.add_triangle(b1, b1 + 1, b1 + 2);
+    mesh.add_triangle(b1, b1 + 2, b1 + 3);
+    painter.add(mesh);
 }
 
 /// The sun: a disc with two dimmer rings around it, high and as far away as anything gets.
@@ -2098,9 +2269,9 @@ pub fn draw_level(
         for tx in tx0..tx1 {
             let rect = sheet.tile(tx, ty);
             match level.tile(tx, ty) {
-                // Sand is drawn by the same call: which material a solid tile is made of is
-                // one lookup inside it, and nothing here has to know.
-                Some(Tile::Solid | Tile::Sand) => {
+                // Sand, brick and wood are drawn by the same call: which material a solid
+                // tile is made of is one lookup inside it, and nothing here has to know.
+                Some(Tile::Solid | Tile::Sand | Tile::Brick | Tile::Plank) => {
                     let tiling = autotile(level, tx, ty);
                     sheet.image(rect, tile_sprite(sheet.sprites, tiling, tx, ty));
                     draw_seams(sheet, level, tx, ty, rect, tiling.look);
@@ -2127,6 +2298,16 @@ pub fn draw_level(
     // the same bush.
     for s in level.scenery() {
         if let Some(prop) = placed_prop(sheet.sprites, s) {
+            if s.sprite == "lantern" || s.sprite == "crystal" {
+                let cell = sheet.tile(prop.cell.0, prop.cell.1);
+                let pulse = 0.85 + 0.15 * (clock * 3.5 + s.x as f32).sin();
+                let glow_colour = if s.sprite == "lantern" {
+                    Color32::from_rgba_unmultiplied(255, 210, 110, (36.0 * pulse) as u8)
+                } else {
+                    Color32::from_rgba_unmultiplied(110, 230, 255, (32.0 * pulse) as u8)
+                };
+                painter.circle_filled(cell.center(), cell.width() * 0.95 * pulse, glow_colour);
+            }
             draw_prop(sheet, &prop);
         }
     }
@@ -2161,16 +2342,35 @@ pub fn draw_level(
 
     // The goal: pole, finial, and the flag that waves off the right of the pole. The pole
     // is two sprites because the flag hangs in the upper tile, and the finial has to stay
-    // put while the cloth moves.
+    // put while the cloth moves. In live views (`opts.ambient`), a warm golden beacon aura
+    // pulses around the finial so the target is unmistakable from across the level.
     let flag = FLAG_FRAMES[((clock * FLAG_HZ) as i64).rem_euclid(4) as usize];
     for goal in &level.goals {
         let (top, bottom) = goal_cells(*goal);
+        let top_rect = sheet.tile(top.0, top.1);
+        if opts.ambient {
+            let pulse = 0.85 + 0.15 * (clock * 2.8).sin();
+            let centre = Pos2::new(
+                top_rect.left() + top_rect.width() * 0.35,
+                top_rect.top() + top_rect.height() * 0.28,
+            );
+            painter.circle_filled(
+                centre,
+                top_rect.width() * 1.15 * pulse,
+                Color32::from_rgba_unmultiplied(255, 224, 120, 22),
+            );
+            painter.circle_filled(
+                centre,
+                top_rect.width() * 0.65 * pulse,
+                Color32::from_rgba_unmultiplied(255, 236, 150, 42),
+            );
+        }
         sheet.image(
             sheet.tile(bottom.0, bottom.1),
             sheet.sprites.get("goal_bottom"),
         );
-        sheet.image(sheet.tile(top.0, top.1), sheet.sprites.get("goal_top"));
-        sheet.image(sheet.tile(top.0, top.1), sheet.sprites.get(flag));
+        sheet.image(top_rect, sheet.sprites.get("goal_top"));
+        sheet.image(top_rect, sheet.sprites.get(flag));
     }
 
     if opts.spawn_marker {
@@ -2299,7 +2499,25 @@ const WALKER_FRAMES: [&str; 4] = ["walker_a", "walker_b", "walker_c", "walker_d"
 /// know that the agent was airborne an instant ago, a puff of dust needs to know how long
 /// ago the last one was, and a run cycle needs to accumulate how far the agent has run
 /// rather than restarting every time the sim happens to be sampled.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
+pub struct TrailDot {
+    pub x: f32,
+    pub y: f32,
+    pub age: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BurstParticle {
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub life: f32,
+    pub max_life: f32,
+    pub colour: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct AgentAnim {
     /// Distance run so far, in seconds-at-full-speed, wrapped to one run cycle.
     stride: f32,
@@ -2318,6 +2536,55 @@ pub struct AgentAnim {
     pub facing_left: bool,
     /// Set for the one frame on which a fall ended.
     pub landed: bool,
+    /// Dynamic squash-and-stretch factor on width (1.0 at rest).
+    pub squash_x: f32,
+    /// Dynamic squash-and-stretch factor on height (1.0 at rest).
+    pub squash_y: f32,
+    /// Recent positions for high-speed sprint/jump motion trail.
+    trail: [TrailDot; 6],
+    trail_len: usize,
+    trail_timer: f32,
+    /// Active particle bursts (jump dust, landing puff, stomp/win sparks).
+    particles: [BurstParticle; 12],
+    particle_len: usize,
+    prev_outcome: Option<Outcome>,
+    prev_stomps: u32,
+}
+
+impl Default for AgentAnim {
+    fn default() -> Self {
+        AgentAnim {
+            stride: 0.0,
+            land: 0.0,
+            dust: None,
+            dust_timer: 0.0,
+            idle: 0.0,
+            airborne: false,
+            facing_left: false,
+            landed: false,
+            squash_x: 1.0,
+            squash_y: 1.0,
+            trail: [TrailDot {
+                x: 0.0,
+                y: 0.0,
+                age: 1.0,
+            }; 6],
+            trail_len: 0,
+            trail_timer: 0.0,
+            particles: [BurstParticle {
+                x: 0.0,
+                y: 0.0,
+                vx: 0.0,
+                vy: 0.0,
+                life: 0.0,
+                max_life: 0.3,
+                colour: [255, 255, 255],
+            }; 12],
+            particle_len: 0,
+            prev_outcome: None,
+            prev_stomps: 0,
+        }
+    }
 }
 
 impl AgentAnim {
@@ -2335,11 +2602,121 @@ impl AgentAnim {
         let grounded = p.grounded;
 
         self.landed = false;
+        let jumped = !self.airborne && !grounded && p.vy < -0.05;
         if self.airborne && grounded {
             self.land = LAND_POSE;
             self.landed = true;
+            self.squash_x = 1.18;
+            self.squash_y = 0.84;
+            self.spawn_burst(
+                p.x + p.w * 0.5,
+                p.y + p.h,
+                [236, 224, 202],
+                4,
+                1.8,
+                -1.2,
+            );
+        } else if jumped {
+            self.squash_x = 0.86;
+            self.squash_y = 1.16;
+            self.spawn_burst(
+                p.x + p.w * 0.5,
+                p.y + p.h,
+                [220, 210, 190],
+                3,
+                1.4,
+                -0.8,
+            );
         }
         self.airborne = !grounded;
+
+        // Smoothly relax squash & stretch back to (1.0, 1.0).
+        let relax = (dt * 14.0).clamp(0.0, 1.0);
+        self.squash_x += (1.0 - self.squash_x) * relax;
+        self.squash_y += (1.0 - self.squash_y) * relax;
+
+        // Stomp or outcome events trigger burst particles.
+        let stomps = sim.stats().stomps;
+        if stomps > self.prev_stomps {
+            self.prev_stomps = stomps;
+            self.squash_x = 1.15;
+            self.squash_y = 0.86;
+            self.spawn_burst(
+                p.x + p.w * 0.5,
+                p.y + p.h,
+                [222, 168, 244],
+                6,
+                2.8,
+                -2.2,
+            );
+        }
+        let outcome = sim.outcome();
+        if self.prev_outcome != Some(outcome) {
+            self.prev_outcome = Some(outcome);
+            match outcome {
+                Outcome::Died => {
+                    self.spawn_burst(
+                        p.x + p.w * 0.5,
+                        p.y + p.h * 0.5,
+                        [244, 128, 52],
+                        8,
+                        3.4,
+                        -2.6,
+                    );
+                }
+                Outcome::Won => {
+                    self.spawn_burst(
+                        p.x + p.w * 0.5,
+                        p.y + p.h * 0.3,
+                        [255, 214, 102],
+                        10,
+                        3.6,
+                        -3.2,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Advance active burst particles.
+        let mut keep_p = 0;
+        for i in 0..self.particle_len {
+            let mut pt = self.particles[i];
+            pt.life -= dt;
+            if pt.life > 0.0 {
+                pt.x += pt.vx * dt;
+                pt.y += pt.vy * dt;
+                pt.vy += 6.5 * dt;
+                self.particles[keep_p] = pt;
+                keep_p += 1;
+            }
+        }
+        self.particle_len = keep_p;
+
+        // Advance and sample motion trail when sprinting or airborne at high speed.
+        let mut keep_t = 0;
+        for i in 0..self.trail_len {
+            let mut dot = self.trail[i];
+            dot.age += dt;
+            if dot.age < 0.18 {
+                self.trail[keep_t] = dot;
+                keep_t += 1;
+            }
+        }
+        self.trail_len = keep_t;
+        self.trail_timer = (self.trail_timer - dt).max(0.0);
+        if (p.vx.abs() > RUN_SPEED * 1.08 || !grounded)
+            && self.trail_timer <= 0.0
+            && self.trail_len < self.trail.len()
+        {
+            self.trail[self.trail_len] = TrailDot {
+                x: p.x + p.w * 0.5,
+                y: p.y + p.h * 0.55,
+                age: 0.0,
+            };
+            self.trail_len += 1;
+            self.trail_timer = 0.028;
+        }
 
         if p.vx.abs() > RUN_SPEED * 0.05 {
             self.facing_left = p.vx < 0.0;
@@ -2373,6 +2750,39 @@ impl AgentAnim {
     /// Whether the idle cycle is on its second frame.
     fn idle_frame(&self) -> bool {
         ((self.idle * 2.2) as i64).rem_euclid(2) == 1
+    }
+
+    fn spawn_burst(
+        &mut self,
+        x: f32,
+        y: f32,
+        colour: [u8; 3],
+        count: usize,
+        spread_vx: f32,
+        up_vy: f32,
+    ) {
+        for k in 0..count {
+            if self.particle_len >= self.particles.len() {
+                break;
+            }
+            let t = if count > 1 {
+                k as f32 / (count - 1) as f32 - 0.5
+            } else {
+                0.0
+            };
+            let vx = t * 2.0 * spread_vx;
+            let vy = up_vy * (1.0 - 0.35 * t.abs());
+            self.particles[self.particle_len] = BurstParticle {
+                x,
+                y,
+                vx,
+                vy,
+                life: 0.26,
+                max_life: 0.26,
+                colour,
+            };
+            self.particle_len += 1;
+        }
     }
 }
 
@@ -2479,6 +2889,34 @@ pub fn draw_agents(
             let feet = sheet.world(p.x + p.w * 0.5 - 0.5, p.y + p.h - 1.0, 1.0, 1.0);
             sheet.image_tinted(feet, sprites.get("puff"), Color32::from_white_alpha(150));
         }
+
+        // High-speed motion trail dots (drawn as non-textured circles so sprite quad counts stay exact).
+        let scale = sheet.camera.scale();
+        for i in 0..anim.trail_len {
+            let dot = anim.trail[i];
+            let frac = (1.0 - dot.age / 0.18).clamp(0.0, 1.0);
+            let alpha = (frac * 95.0) as u8;
+            let pos = sheet.camera.to_screen(dot.x, dot.y, sheet.viewport);
+            sheet.painter.circle_filled(
+                pos,
+                (scale * 0.18 * frac).max(1.5),
+                Color32::from_rgba_unmultiplied(255, 186, 116, alpha),
+            );
+        }
+
+        // Dynamic particle bursts (dust, stomp, death, goal).
+        for i in 0..anim.particle_len {
+            let pt = anim.particles[i];
+            let frac = (pt.life / pt.max_life.max(0.01)).clamp(0.0, 1.0);
+            let alpha = (frac * 215.0) as u8;
+            let pos = sheet.camera.to_screen(pt.x, pt.y, sheet.viewport);
+            let [r, g, b] = pt.colour;
+            sheet.painter.circle_filled(
+                pos,
+                (scale * 0.11 * (0.5 + 0.5 * frac)).max(1.5),
+                Color32::from_rgba_unmultiplied(r, g, b, alpha),
+            );
+        }
     }
 
     let p = sim.player();
@@ -2527,7 +2965,17 @@ pub fn draw_agents(
 pub fn draw_agent_body(sheet: Sheet<'_>, sim: &Sim, tint: Color32, anim: &AgentAnim) {
     let (name, flip) = player_sprite(sim, anim);
     let p = sim.player();
-    sheet.actor(p.x, p.y, p.w, p.h, sheet.sprites.get(name), flip, tint);
+    sheet.actor_squashed(
+        p.x,
+        p.y,
+        p.w,
+        p.h,
+        anim.squash_x,
+        anim.squash_y,
+        sheet.sprites.get(name),
+        flip,
+        tint,
+    );
 }
 
 /// The hue of each rank band of the ghost field, best band first.
@@ -2546,7 +2994,7 @@ const COHORT_HUES: [[u8; 3]; crate::replay::GHOST_COHORTS] = [
 
 /// How solid each band is drawn: the better the band, the more present it is.
 ///
-/// Every band stays translucent — a ghost that hides the champion is worse than no ghost —
+/// Every band stays translucent — a ghost that hides the star is worse than no ghost —
 /// and the fall is monotone, so the field is an order even where a viewer cannot separate
 /// two hues on a moving sprite. It is the property the panel's legend leans on: the bands
 /// are listed best first, and the field fades the same way.
@@ -2569,12 +3017,12 @@ pub fn cohort_swatch(cohort: usize) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-/// Draw a replay: the ghosts as bodies in rank bands, then the champion complete.
+/// Draw a replay: the ghosts as bodies in rank bands, then the star complete.
 ///
 /// The order is the point, twice over. The bands go worst first, so the agents nearest the
-/// champion's quality are drawn on top of the field rather than buried in it — the viewer's
+/// star's quality are drawn on top of the field rather than buried in it — the viewer's
 /// eye should land on the agents that are nearly as good, not on the ones that never left
-/// the first platform. And the champion goes last and with everything on — its walkers, its
+/// the first platform. And the star goes last and with everything on — its walkers, its
 /// dust, its flag — because it is what the replay exists for, and two hundred bodies
 /// landing on the same tile must not be able to hide it.
 pub fn draw_replay(sheet: Sheet<'_>, replay: &crate::replay::Replay) {
@@ -4327,7 +4775,7 @@ mod tests {
         assert_eq!(cohort_tint(crate::replay::GHOST_COHORTS), cohort_tint(last));
 
         // The frame itself: the level's own tints, then the bands worst first, then the
-        // champion — which is drawn last, opaque, whatever the field did.
+        // star — which is drawn last, opaque, whatever the field did.
         let level = Level::starter("replay-cohorts", 40, 8);
         let packet = crate::lab::scored_packet(&level, "view-cohorts");
         let replay = crate::replay::Replay::new(&packet, &level, &evo::EvalConfig::default())
@@ -4352,7 +4800,7 @@ mod tests {
     }
 
     /// The replay draws the field it says it is drawing: one body per ghost, and the
-    /// champion whatever the toggle says.
+    /// star whatever the toggle says.
     ///
     /// The bug this is written against is the one the editor's own walkers had — a
     /// document that is right and a canvas that is wrong — so the assertion is made on the
@@ -4360,7 +4808,7 @@ mod tests {
     /// episode keep the count exact: at tick zero nobody has landed, nobody is dusty and
     /// nothing has won, so every agent quad in the difference is a body.
     #[test]
-    fn the_replay_draws_one_body_per_ghost_and_one_for_the_champion() {
+    fn the_replay_draws_one_body_per_ghost_and_one_for_the_star() {
         let level = Level::starter("replay-draw", 40, 8);
         let packet = crate::lab::scored_packet(&level, "view-draw");
         let mut replay = crate::replay::Replay::new(&packet, &level, &evo::EvalConfig::default())
@@ -4376,11 +4824,11 @@ mod tests {
         assert_eq!(
             shown,
             1 + replay.ghost_count(),
-            "the frame does not hold the champion plus every ghost"
+            "the frame does not hold the star plus every ghost"
         );
 
         // And the toggle is a drawing decision end to end: with the ghosts hidden the
-        // champion is still there, alone.
+        // star is still there, alone.
         replay.ghosts = false;
         let hidden = headless_replay_quads(&replay) - level_only;
         assert_eq!(hidden, 1, "hiding the ghosts hid more than the ghosts");
@@ -4612,8 +5060,8 @@ mod tests {
             );
         }
         assert!(
-            checker.tiles(BACKDROP_DARK).count() > 0,
-            "the editor lost its graph paper"
+            checker.tiles(EDITOR_SURFACE).count() > 0,
+            "the editor lost the surface it draws the document on"
         );
         // Both draw the level itself, so neither frame is a background and nothing else.
         assert!(
@@ -5892,6 +6340,10 @@ mod tests {
             Look::Beach,
             Look::Packed,
             Look::Sandstone,
+            Look::Brick,
+            Look::Masonry,
+            Look::Wood,
+            Look::Timber,
         ] {
             for (index, (_side, _dx, _dy)) in SIDES.iter().enumerate() {
                 if BLEND[look.index()][index] == name {
@@ -5904,15 +6356,22 @@ mod tests {
 
     /// A floor built to contain every seam the level format can make.
     ///
-    /// Six rows deep (8..=13) in seven column ranges, and the ranges exist to put the
+    /// Six rows deep (8..=13) in fourteen column ranges, and the ranges exist to put the
     /// *vertical* seams in it as well as the horizontal ones: a sand surface lying on soil, soil
     /// lying on sand, and rock over rock of the other material — which is the only arrangement
     /// the rock looks' `_t` bands can be reached from at all, since a rock tile three rows down
     /// has rock under it unless the material changes. Rows 0..8 stay empty so the surface looks
     /// are crowns.
+    ///
+    /// Brick and plank arrive with their own materials, so the floor carries their stacks too:
+    /// a brick wall beside a bank of soil reaches the brick and masonry bands, and a deck of
+    /// planks beside it reaches the wood and timber ones. The four columns that mix a crown into
+    /// a stack are the only way to reach a *crown* material's `_t` band — a brick tile at the
+    /// surface with soil under it — and a buried tile of the other material the only way to reach
+    /// the deep looks' `_b` bands.
     fn seam_probe() -> Level {
-        let mut level = Level::starter("seam-probe", 40, 14);
-        let ranges: [(i32, i32, [Tile; 6]); 7] = [
+        let mut level = Level::starter("seam-probe", 70, 14);
+        let ranges: [(i32, i32, [Tile; 6]); 14] = [
             // Rows 8..=13, top to bottom.
             (0, 4, [Tile::Solid; 6]),
             (5, 9, [Tile::Sand; 6]),
@@ -5976,6 +6435,43 @@ mod tests {
                     Tile::Sand,
                 ],
             ),
+            // A brick stack on its own, then a bank of soil beside it: brick/masonry `_l` and
+            // `_r` on both sides of the two seams, at the crown and at depth.
+            (35, 39, [Tile::Brick; 6]),
+            (40, 44, [Tile::Solid; 6]),
+            // A brick crown over soil: the soil tile below it carries `blend_brick_t`, and the
+            // buried soil tile below *that* carries `blend_masonry_t` and `blend_masonry_b`.
+            (
+                45,
+                49,
+                [
+                    Tile::Brick,
+                    Tile::Solid,
+                    Tile::Brick,
+                    Tile::Brick,
+                    Tile::Solid,
+                    Tile::Brick,
+                ],
+            ),
+            // The same three arrangements in planks: a plank deck beside soil for the wood and
+            // timber verticals, and the mixed stack for the crown's `_t` and the deep `_b`.
+            (50, 54, [Tile::Plank; 6]),
+            (55, 59, [Tile::Sand; 6]),
+            (
+                60,
+                64,
+                [
+                    Tile::Plank,
+                    Tile::Solid,
+                    Tile::Plank,
+                    Tile::Plank,
+                    Tile::Solid,
+                    Tile::Plank,
+                ],
+            ),
+            // And the two materials beside each other, so a brick wall abutting a deck has a seam
+            // between two built materials rather than only against soil.
+            (65, 69, [Tile::Brick; 6]),
         ];
         for (first, last, rows) in ranges {
             for tx in first..=last {
@@ -6140,7 +6636,7 @@ mod tests {
             .filter(|name| name.starts_with("blend_"))
             .map(|name| name.to_string())
             .collect();
-        assert_eq!(shipped.len(), 22, "the atlas ships 22 seams");
+        assert_eq!(shipped.len(), 38, "the atlas ships 38 seams");
         let missed: Vec<&String> = shipped.iter().filter(|n| !drawn.contains(*n)).collect();
         assert!(
             missed.is_empty(),
@@ -6156,6 +6652,10 @@ mod tests {
             Look::Beach,
             Look::Packed,
             Look::Sandstone,
+            Look::Brick,
+            Look::Masonry,
+            Look::Wood,
+            Look::Timber,
         ];
         for look in looks {
             for (index, (_side, _dx, _dy)) in SIDES.iter().enumerate() {

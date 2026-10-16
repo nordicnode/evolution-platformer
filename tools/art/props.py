@@ -41,7 +41,20 @@ from .common import (
     CLOUD,
     CLOUD_DARK,
     CLOUD_LIGHT,
+    CRYSTAL,
+    CRYSTAL_DARK,
+    CRYSTAL_LIGHT,
     DIRT,
+    FLAG,
+    FLAG_DARK,
+    FLAG_LIGHT,
+    GOLD,
+    GOLD_DARK,
+    IRON_BOLT,
+    IRON_FRAME,
+    IRON_LIGHT,
+    LANTERN_GLOW,
+    LANTERN_WARM,
     PINE,
     PINE_DARK,
     PINE_FAR,
@@ -78,6 +91,11 @@ from .common import (
     TUFT_DARK,
     TUFT_DRY,
     TUFT_DRY_DARK,
+    WOOD,
+    WOOD_DARK,
+    WOOD_DEEP,
+    WOOD_LIGHT,
+    WOOD_MID,
     cell,
     h,
 )
@@ -358,6 +376,122 @@ def mushroom_pair() -> Image.Image:
     _put(px, 12, 8, MUSHROOM_LIGHT)
     _put(px, 10, 10, MUSHROOM_LIGHT)
     _box(px, 8, 10, 13, 10, PETAL_DARK)
+    return img
+
+
+def lantern() -> Image.Image:
+    """A wrought-iron standing lantern with a warm glowing glass chamber."""
+    img = cell()
+    px = img.load()
+    # Base and post
+    _box(px, 5, 14, 10, 15, IRON_FRAME)
+    _box(px, 7, 9, 8, 14, IRON_FRAME)
+    _put(px, 7, 10, IRON_BOLT)
+    _put(px, 7, 12, IRON_BOLT)
+    # Lantern cage
+    _box(px, 5, 4, 10, 9, IRON_FRAME)
+    _box(px, 6, 5, 9, 8, LANTERN_WARM)
+    _box(px, 7, 5, 8, 7, LANTERN_GLOW)
+    _put(px, 7, 6, SPARK)
+    # Cap and finial
+    _box(px, 4, 3, 11, 4, IRON_FRAME)
+    _box(px, 6, 2, 9, 2, IRON_BOLT)
+    _box(px, 7, 1, 8, 1, IRON_LIGHT)
+    return img
+
+
+def crystal() -> Image.Image:
+    """A cluster of three faceted cyan crystals jutting from a stone base."""
+    img = cell()
+    px = img.load()
+    # Stone base
+    _box(px, 3, 14, 12, 15, ROCK_DARK)
+    _box(px, 4, 13, 11, 14, ROCK)
+    # Center tall spire
+    for y in range(4, 14):
+        half = 1 if y < 7 else 2
+        _box(px, 8 - half, y, 7 + half, y, CRYSTAL)
+        _put(px, 8 - half, y, CRYSTAL_LIGHT)
+        _put(px, 7 + half, y, CRYSTAL_DARK)
+    _put(px, 7, 3, CRYSTAL_LIGHT)
+    # Left angled shard
+    for step, y in enumerate(range(8, 14)):
+        x = 4 + step // 2
+        _box(px, x, y, x + 1, y, CRYSTAL)
+        _put(px, x, y, CRYSTAL_LIGHT)
+    # Right angled shard
+    for step, y in enumerate(range(9, 14)):
+        x = 11 - step // 2
+        _box(px, x, y, x + 1, y, CRYSTAL_DARK)
+        _put(px, x, y, CRYSTAL)
+    return img
+
+
+def signpost() -> Image.Image:
+    """A wooden trail signpost pointing right toward the goal."""
+    img = cell()
+    px = img.load()
+    # Base dirt/grass and wooden post
+    _box(px, 5, 14, 9, 15, WOOD_DEEP)
+    _box(px, 6, 3, 8, 15, WOOD_MID)
+    _box(px, 6, 3, 6, 15, WOOD_LIGHT)
+    _box(px, 8, 3, 8, 15, WOOD_DARK)
+    # Arrow board pointing right
+    _box(px, 3, 5, 12, 8, WOOD)
+    _box(px, 3, 5, 12, 5, WOOD_LIGHT)
+    _box(px, 3, 8, 12, 8, WOOD_DARK)
+    _box(px, 13, 6, 13, 7, WOOD)
+    _put(px, 14, 6, WOOD_LIGHT)
+    _put(px, 13, 5, WOOD_LIGHT)
+    _put(px, 13, 8, WOOD_DARK)
+    # Nail and scribed lines
+    _put(px, 7, 6, IRON_BOLT)
+    _box(px, 4, 6, 5, 6, WOOD_DARK)
+    _box(px, 9, 6, 11, 6, WOOD_DARK)
+    return img
+
+
+def crate() -> Image.Image:
+    """A reinforced timber supply crate with diagonal bracing."""
+    img = cell()
+    px = img.load()
+    _box(px, 3, 6, 12, 15, WOOD_DARK)
+    _box(px, 4, 7, 11, 14, WOOD)
+    # Outer frame
+    _box(px, 3, 6, 12, 7, WOOD_LIGHT)
+    _box(px, 3, 14, 12, 15, WOOD_DEEP)
+    _box(px, 3, 6, 4, 15, WOOD_MID)
+    _box(px, 11, 6, 12, 15, WOOD_DEEP)
+    # Diagonal brace
+    for i in range(6):
+        _put(px, 5 + i, 8 + i, WOOD_LIGHT)
+        _put(px, 5 + i, 9 + i, WOOD_MID)
+    # Corner iron studs
+    for x, y in ((4, 7), (11, 7), (4, 14), (11, 14)):
+        _put(px, x, y, IRON_BOLT)
+    return img
+
+
+def banner(sway: int) -> Image.Image:
+    """A crimson and gold heraldic banner on a spear pole, with two frames of sway."""
+    img = cell()
+    px = img.load()
+    # Base and spear pole
+    _box(px, 3, 14, 6, 15, IRON_FRAME)
+    _box(px, 4, 2, 5, 15, WOOD_MID)
+    _box(px, 4, 2, 4, 15, WOOD_LIGHT)
+    _box(px, 4, 1, 5, 2, GOLD)
+    # Hanging pennant cloth
+    shift = 1 if sway else 0
+    _box(px, 6, 3, 11, 11, FLAG)
+    _box(px, 6, 3, 11, 3, GOLD)
+    _box(px, 6, 4, 6, 11, FLAG_LIGHT)
+    _box(px, 11, 4, 11, 11, FLAG_DARK)
+    # Gold emblem in the middle
+    _box(px, 8, 6, 9, 8, GOLD)
+    # Forked swallowtail bottom
+    _box(px, 6 + shift, 12, 7 + shift, 13, FLAG_DARK)
+    _box(px, 10 + shift, 12, 11 + shift, 13, FLAG_DARK)
     return img
 
 
@@ -738,6 +872,12 @@ def sprites() -> list[tuple[str, Image.Image]]:
         ("vine_a", vine(0)),
         ("vine_b", vine(1)),
         ("mushroom_pair", mushroom_pair()),
+        ("lantern", lantern()),
+        ("crystal", crystal()),
+        ("signpost", signpost()),
+        ("crate", crate()),
+        ("banner_a", banner(0)),
+        ("banner_b", banner(1)),
         # The foreground wood: two trees, each drawn whole and cut into the two cells a
         # level gives it. Named `base` and `top` because that is what they are — the cell
         # the trunk stands in, and the cell above it — and the view refuses to plant one

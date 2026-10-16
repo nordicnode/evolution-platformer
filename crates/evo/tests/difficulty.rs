@@ -46,7 +46,14 @@ use sim::Level;
 /// Solved at generation 0 by a randomly initialised population.
 const TRIVIAL: [&str; 1] = ["l1-flat-run"];
 /// Only ever solved by evolution.
-const EARNED: [&str; 8] = [
+///
+/// `l9-wait-and-climb` is the pack's first *chain* (a spike, a pit, a nineteen-tile patrol, a
+/// hazard patch, a step, a wall climb, a ledge gap, a spike and a two-tile climb to a flag 53
+/// tiles from the spawn), and the reason it is in this list rather than in `TRIVIAL` is the same
+/// as every other row's: a random population does not reach it. It is also the only row here
+/// that needs more than one decision, which is what its median first win of 160 generations is
+/// measuring (`FINDINGS.md`, the difficulty table).
+const EARNED: [&str; 9] = [
     "l2-first-gap",
     "l3-gauntlet",
     "l4-rhythm",
@@ -55,6 +62,7 @@ const EARNED: [&str; 8] = [
     "l7-ascent",
     "l7-wall-school",
     "l8-long-jump",
+    "l9-wait-and-climb",
 ];
 
 /// Small on purpose: the suite should stay fast, and a claim about the pack is

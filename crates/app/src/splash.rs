@@ -45,6 +45,7 @@ use sim::{AgentAction, Level, Sim, Tile};
 
 use crate::atlas::Atlas;
 use crate::play::{self, Keys};
+use crate::theme;
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 
 /// The words. The title is the window's own title, so the taskbar and the splash agree.
@@ -114,13 +115,57 @@ const GROUND_LINE: f32 = 0.78;
 /// The seed of the splash's episode, so the splash is the same splash every launch.
 const SEED: u64 = 4;
 
-/// The game's own palette, so the words cannot be a different game's colours.
-const TITLE_INK: Color32 = Color32::from_rgb(255, 240, 190); // the sun's face
-const TITLE_SHADE: Color32 = Color32::from_rgb(20, 24, 32); // the panel background, darker
-const SUBTITLE_INK: Color32 = Color32::from_rgb(214, 220, 228); // panel TEXT
-const HINT_INK: Color32 = Color32::from_rgb(250, 214, 102); // panel WIN_TICK
-const RULE_INK: Color32 = Color32::from_rgb(120, 216, 120); // panel MAX_LINE
-const FOOT_INK: Color32 = Color32::from_rgb(160, 168, 180); // panel TEXT_DIM
+/// The game's own palette, and it is the *window's* palette rather than this screen's.
+///
+/// These six were local colours that happened to sit close to the panels' — close enough to
+/// look deliberate, far enough that an edit to one side never reached the other. The window
+/// is one palette applied once ([`crate::theme::apply`]), so the splash reads it the way
+/// every other surface does: the title takes the accent, its shadow the frame's own darkest
+/// surface, and the small print the dim text. Two of the six are *replaced* rather than
+/// renamed — the title stopped being a cream of its own and became the accent, because a
+/// screen with one thing on it wants one ink for the thing it is about.
+const TITLE_INK: Color32 = theme::ACCENT;
+const TITLE_SHADE: Color32 = theme::SHELL;
+const SUBTITLE_INK: Color32 = theme::TEXT;
+const HINT_INK: Color32 = theme::ACCENT;
+const RULE_INK: Color32 = theme::GOOD;
+const FOOT_INK: Color32 = theme::TEXT_DIM;
+
+/// When the three doors are up: a beat after the invitation starts breathing.
+///
+/// They arrive with the caption rather than at the first frame, because a doorway offered
+/// before the screen has said what it is a doorway *to* is a button nobody reads. A beat
+/// and not a crossfade: a button is a hit target as well as a pixel, and a target that is
+/// half transparent on the frame it becomes clickable is a target somebody clicks twice.
+const DOORS_LAG: f32 = 0.25;
+/// The size each door is drawn at. One number for the row, so the placement arithmetic in
+/// [`buttons`] is the same number the buttons are made of.
+const DOOR_SIZE: Vec2 = Vec2::new(112.0, 26.0);
+
+/// The three doors, left to right, with what each one does and the key that also does it.
+///
+/// Edit first because it is what most launches want — a splash is usually opened on the way
+/// to drawing something — and then the two activities the invitation names, in the order the
+/// plan lists them: play it yourself, then teach the population. The tooltips carry the same
+/// keys [`show`] reads, so a person who would rather use the keyboard can read the key off
+/// the button instead of guessing at it.
+const DOORS: [(&str, Action, &str); 3] = [
+    (
+        "Edit",
+        Action::Edit,
+        "build a level: paint tiles, place the spawn and the flag\nany other key",
+    ),
+    (
+        "Play",
+        Action::Play,
+        "take the keyboard and play the level yourself  (P)",
+    ),
+    (
+        "Evolve",
+        Action::Evolve,
+        "train a population to beat this level  (E)",
+    ),
+];
 
 /// The splash, and everything it is doing while it is up.
 pub struct Splash {
@@ -278,6 +323,13 @@ impl Splash {
             self.hold -= dt;
             if self.hold <= 0.0 {
                 self.session.restart(&self.level);
+                // A champion's network may carry state between decisions (`NetShape::feedback`),
+                // so the restart has to forget it: the second loop of the title screen must be
+                // the episode it was the first time, not one that begins holding the tail of
+                // the previous run's thoughts. Inert for the script, and for a memoryless net.
+                if let Policy::Champion(run) = &mut self.policy {
+                    run.scratch.reset_context();
+                }
             }
             self.session.advance_actions(dt, |_| AgentAction::Walk);
             return;
@@ -321,6 +373,12 @@ impl Splash {
     /// else opens the editor. Nothing else about the app runs while this is up — the caller
     /// returns early — so the key that dismisses the splash cannot also press a button in the
     /// editor underneath it.
+    ///
+    /// The one press that is not that rule is a press on the three doors drawn in the band
+    /// under the world ([`buttons`]): those are widgets, they answer on the release, and a
+    /// press that took the screen down on its way to them would put the editor under a click
+    /// aimed at Play. So the band's own presses are passed through to the button and every
+    /// other press — the sky, the title, the level — is still "just start".
     pub fn show(&self, ctx: &Context, atlas: &Atlas, sprites: &Sprites) -> Option<Action> {
         let rect = ctx.screen_rect();
         let painter = ctx.layer_painter(egui::LayerId::background());
@@ -355,10 +413,17 @@ impl Splash {
         invitation(&painter, rect, self.clock, world_bottom);
         footer(&painter, rect, self.credit());
 
+        // The doors, over the caption they answer: the invitation asks the question —
+        // "press any key" — and these are the three answers, spelled out. Drawn before the
+        // input is read, because the widget has to exist on the frame the pointer lands on
+        // it for egui to know the press was aimed at it.
+        let band = button_band(rect, world_bottom);
+        let from_doors = buttons(ctx, band, self.clock);
+
         if self.clock < ARMED {
             return None;
         }
-        ctx.input(|i| {
+        let from_keys = ctx.input(|i| {
             for event in &i.events {
                 match event {
                     // A press, not a release: letting go of a key is not a decision.
@@ -373,8 +438,18 @@ impl Splash {
                             _ => Action::Edit,
                         });
                     }
-                    // A pointer that has left the window has not made one either; a click
-                    // on the title is "just start", which is the editor.
+                    // A press *on the doors* is not a decision either, and this is the one
+                    // press the rule below has to step aside for: a button answers on the
+                    // release, so taking the press here would start the editor out from
+                    // under the pointer and the click would arrive somewhere it was not
+                    // aimed. Every other press is "just start": a click on the title, on
+                    // the sky or on the world is the editor.
+                    egui::Event::PointerButton {
+                        pressed: true,
+                        pos, ..
+                    } if doors_are_up(self.clock) && band.expand(8.0).contains(*pos) => {
+                        continue;
+                    }
                     egui::Event::PointerButton { pressed: true, .. } => {
                         return Some(Action::Edit);
                     }
@@ -382,7 +457,12 @@ impl Splash {
                 }
             }
             None
-        })
+        });
+        // A key beats a button in the same frame, which cannot happen for a person and has
+        // to be decided anyway: the keyboard is the faster way out of this screen, and the
+        // button is the pointer's, so the two can only disagree on a frame that delivered
+        // both. `or` rather than precedence by hand: either is a decision to leave.
+        from_keys.or(from_doors)
     }
 
     /// Where the world is drawn from: close on the runner, easing out to where the run goes.
@@ -673,6 +753,88 @@ fn title(painter: &Painter, ctx: &Context, rect: Rect, clock: f32) {
     }
 }
 
+/// Whether the doors are on screen at `clock`.
+///
+/// One function rather than the comparison written twice, because `show` has to answer it
+/// for a reason of its own: a press inside the doors' band belongs to the *button* under the
+/// pointer, and the rule that any press starts the editor has to step aside for it. Two
+/// copies of "when are they up" is how the band ends up swallowing a click on a frame the
+/// buttons are not drawn on.
+fn doors_are_up(clock: f32) -> bool {
+    clock >= HINT_AT + DOORS_LAG
+}
+
+/// Where the three doors sit: the strip under the world, just above the invitation.
+///
+/// The invitation's own rule ([`invitation_line`]), one row higher: under the level rather
+/// than on it, so the doors read over haze instead of over whatever the level's fit happened
+/// to leave down there, and inside the window when the world is tall enough to reach the
+/// bottom of it. A world that *does* reach the bottom — a champion on a long, deep level —
+/// pushes the row down onto the invitation's clamped line, where the buttons still read: a
+/// button is an opaque card with a border, not a line of type, so unlike the caption it does
+/// not need clean haze behind it. The width is capped for the same reason the caption's band
+/// is — three buttons across a very wide window would be a toolbar, and the row has to stay a
+/// cluster.
+///
+/// A strip and not three rectangles, because the caller needs one rectangle to ask "was that
+/// press aimed at the doors?" — and a press that lands *between* two buttons is aimed at the
+/// doors. Anything narrower is a rule that a mouse has to be pixel-precise to satisfy.
+pub fn button_band(rect: Rect, world_bottom: f32) -> Rect {
+    let line = invitation_line(rect, world_bottom);
+    let height = 34.0;
+    Rect::from_center_size(
+        Pos2::new(rect.center().x, line - height * 1.35),
+        Vec2::new(rect.width().min(560.0), height),
+    )
+}
+
+/// Draw the three doors and report the one that was clicked, if any.
+///
+/// Real widgets in a real `egui` area rather than three hand-hit-tested rectangles: the
+/// window's own theme styles them ([`crate::theme::apply`] gives every button its resting
+/// fill, its hover ring and its pressed state), so a button on the front door is the same
+/// button as one in a panel — which is the whole point of having a theme. Only the *ink*
+/// differs per door, and it is the palette's own meaning: the editor is plain text, play is
+/// the accent, and evolve is the growth colour, because learning is what it is.
+fn buttons(ctx: &Context, band: Rect, clock: f32) -> Option<Action> {
+    if !doors_are_up(clock) {
+        return None;
+    }
+    let mut action = None;
+    // The row is *placed* rather than centred by the layout, and the arithmetic is the
+    // reason: `vertical_centered` centres a child whose width it knows, and a horizontal
+    // row's width is only known once it has been laid out — so the row was drawn from the
+    // band's left edge and the band's own centre landed on the third door. Placing the row
+    // by its measured width is exact, and it is what makes "the band's centre is the middle
+    // button's centre" true rather than approximate: the width is the buttons' own size plus
+    // the theme's own spacing, so a change to either moves the row with it.
+    let spacing = ctx.style().spacing.item_spacing.x;
+    let row = DOOR_SIZE.x * DOORS.len() as f32 + spacing * (DOORS.len() - 1) as f32;
+    egui::Area::new(egui::Id::new("splash-doors"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(band.center().x - row * 0.5, band.top()))
+        .interactable(true)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = spacing;
+                for (label, target, about) in DOORS {
+                    let ink = match target {
+                        Action::Edit => theme::TEXT,
+                        Action::Play => theme::ACCENT,
+                        Action::Evolve => theme::GOOD,
+                    };
+                    let button =
+                        egui::Button::new(egui::RichText::new(label).monospace().color(ink))
+                            .min_size(DOOR_SIZE);
+                    if ui.add(button).on_hover_text(about).clicked() {
+                        action = Some(target);
+                    }
+                }
+            });
+        });
+    action
+}
+
 /// The line under the title: what the window is *for*, in one sentence.
 fn subtitle(painter: &Painter, rect: Rect, clock: f32) {
     let arrived = ((clock - TITLE_AT - 0.6) / 0.6).clamp(0.0, 1.0);
@@ -790,6 +952,169 @@ mod tests {
 
     fn assets_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets")
+    }
+
+    /// Drive one frame of the screen with the given events, and report what it decided.
+    ///
+    /// The screen's own `show`, at a fixed window size, so the tests below are about what the
+    /// widgets do rather than about a reimplementation of them: egui reads the events into
+    /// input state before the frame runs, which is why a press and the release that follows it
+    /// are two calls rather than one.
+    fn frame(
+        ctx: &Context,
+        splash: &Splash,
+        atlas: &Atlas,
+        sprites: &Sprites,
+        rect: Rect,
+        events: Vec<egui::Event>,
+    ) -> Option<Action> {
+        let mut action = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                action = splash.show(ctx, atlas, sprites);
+            },
+        );
+        action
+    }
+
+    /// A pointer press or release at `pos`, as egui delivers one.
+    fn at(pos: Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// The screen, its atlas, and the rectangle of the window the tests drive it at.
+    fn screen() -> (Context, Atlas, Sprites, Rect) {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
+        (ctx, atlas, sprites, rect)
+    }
+
+    /// A splash driven far enough that the doors and the invitation are both up.
+    fn armed() -> Splash {
+        let mut splash = Splash::scripted();
+        while splash.clock() < HINT_AT + 0.6 {
+            splash.advance(sim::DT);
+        }
+        splash
+    }
+
+    /// The band the doors occupy, for a splash at its armed clock.
+    fn band_of(splash: &Splash, rect: Rect) -> Rect {
+        let world_bottom = splash
+            .camera(rect)
+            .to_screen(0.0, splash.level.height as f32, rect)
+            .y;
+        button_band(rect, world_bottom)
+    }
+
+    /// A click on a door enters the activity it names, and the press that starts the click
+    /// does *not* leave for the editor on its way.
+    ///
+    /// The whole reason the band exists. The screen's oldest rule is "any press starts the
+    /// editor", and a button is a widget that answers on the release — so without the
+    /// carve-out, aiming at Play would take the window to the editor on the way down and
+    /// Play would never be reached. The two frames are exactly the two a mouse sends:
+    /// press, then release.
+    #[test]
+    fn a_click_on_a_door_enters_it_and_the_press_does_not_leave_first() {
+        let (ctx, atlas, sprites, rect) = screen();
+        let splash = armed();
+        let band = band_of(&splash, rect);
+        // The middle door is Play, and the row is centred in the band, so the band's own
+        // centre is the middle button's centre: three doors of one width, the middle one
+        // exactly in the middle.
+        let pos = band.center();
+
+        // Two frames with no events first, and the count is not padding. An `egui::Area`
+        // registers itself in the layer order on the frame it is first laid out and is only
+        // hit-testable from the *next* one: a new area's own frame can draw itself and still
+        // answer "no" to a pointer over it, because the layer stack the hit test consults is
+        // the previous frame's. One warm-up frame therefore leaves the press on the floor of
+        // the window and the *window* takes it — this test failed exactly that way, with the
+        // button's rectangle printed around the pointer and `hovered()` false. Two frames is
+        // a window that has drawn the screen twice, which is every frame a person can click
+        // on: the doors are up for a quarter second before the invitation is drawn, and the
+        // first of those is the only one an area cannot be clicked on.
+        assert_eq!(frame(&ctx, &splash, &atlas, &sprites, rect, Vec::new()), None);
+        assert_eq!(frame(&ctx, &splash, &atlas, &sprites, rect, Vec::new()), None);
+        assert_eq!(
+            frame(&ctx, &splash, &atlas, &sprites, rect, at(pos, true)),
+            None,
+            "the press on a door left for the editor instead of reaching the button"
+        );
+        assert_eq!(
+            frame(&ctx, &splash, &atlas, &sprites, rect, at(pos, false)),
+            Some(Action::Play),
+            "the release on the Play door did not enter the playtest"
+        );
+    }
+
+    /// Every other click is still "just start": the editor.
+    ///
+    /// The other half of the carve-out, and the one a narrow rule gets wrong: the band is a
+    /// strip under the world, and a press at the top of the window is nowhere near it.
+    #[test]
+    fn a_press_away_from_the_doors_still_opens_the_editor() {
+        let (ctx, atlas, sprites, rect) = screen();
+        let splash = armed();
+        let far = Pos2::new(rect.center().x, rect.top() + 40.0);
+        assert!(far.y < band_of(&splash, rect).top());
+        assert_eq!(
+            frame(&ctx, &splash, &atlas, &sprites, rect, at(far, true)),
+            Some(Action::Edit),
+            "a click on the sky stopped being a way out of the screen"
+        );
+    }
+
+    /// The doors are up only once the invitation has been, and they sit under the world.
+    ///
+    /// Both halves are geometry, and both are the kind a screenshot catches late: a row of
+    /// buttons over the level's lawn, or a row that appears before the caption that explains
+    /// it. The band is placed off the world's own bottom edge, so a level that reaches further
+    /// down pushes the doors up with it.
+    #[test]
+    fn the_doors_arrive_with_the_caption_and_sit_under_the_world() {
+        assert!(!doors_are_up(0.0));
+        assert!(!doors_are_up(HINT_AT));
+        assert!(doors_are_up(HINT_AT + DOORS_LAG + 0.01));
+
+        let (_, _, _, rect) = screen();
+        let splash = armed();
+        let world_bottom = splash
+            .camera(rect)
+            .to_screen(0.0, splash.level.height as f32, rect)
+            .y;
+        let band = button_band(rect, world_bottom);
+        assert!(
+            band.top() > world_bottom,
+            "the doors are drawn over the level: band {band:?} against world bottom {world_bottom}"
+        );
+        assert!(
+            band.bottom() < invitation_line(rect, world_bottom),
+            "the doors are standing on the caption under them"
+        );
+        assert!(band.bottom() <= rect.bottom(), "the doors fall off the window");
+
+        // A world that reaches the bottom of the window still leaves the doors inside it,
+        // because the invitation's line is clamped there and the band hangs off it.
+        let tall = button_band(rect, rect.bottom() + 200.0);
+        assert!(tall.bottom() <= rect.bottom() && tall.top() >= rect.top());
     }
 
     /// The path of a shipped level, as the window would be given it.
@@ -1385,6 +1710,13 @@ mod tests {
                 }
                 for quad in mesh.vertices.chunks(4) {
                     if quad.len() < 4 {
+                        continue;
+                    }
+                    // A *word* is a quad that samples a glyph. A quad that samples the font
+                    // atlas's white pixel is a filled shape — the sunbeams and the vignette
+                    // the sky is drawn with are meshes too, and they land on the title's own
+                    // line, so counting them would count scenery as type.
+                    if quad[0].uv == egui::epaint::WHITE_UV {
                         continue;
                     }
                     let centre = quad.iter().fold(Pos2::ZERO, |a, v| a + v.pos.to_vec2()) / 4.0;

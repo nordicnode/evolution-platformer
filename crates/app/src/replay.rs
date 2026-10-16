@@ -1,27 +1,39 @@
-//! Watching the run's best agent play the level, at real time, with the population
+//! Watching the run's quickest win play the level, at real time, with the population
 //! ghosted beside it.
 //!
 //! The evolution view is the *search*: a generation at a time, at whatever speed makes a
 //! generation readable. This is its answer. One episode, run once, at the speed the game
 //! actually runs at — 60 ticks a second, the first rung of the speed ladder — with the
-//! champion solid and the population ghosted on the same clock, the same level and the
+//! star solid and the population ghosted on the same clock, the same level and the
 //! same physics.
 //!
 //! The two halves of that come from different places, and it is worth being exact about
-//! them because a viewer will watch them diverge. The champion is the run's **best-ever**
-//! agent: the record, which is older than the newest generation as soon as the search
-//! moves past its best idea ([`Star`] carries the generation it came from). The field
-//! beside it is the **last generation the run scored** — the population as the run left
-//! it, which is what the window was handed and what [`Population::generation`] names. So
-//! a stopped run shows its best idea racing the population that has since moved on, which
-//! is a comparison worth watching rather than an accident.
+//! them because a viewer will watch them diverge. The star is the run's **quickest win**:
+//! the episode the clock in [`Packet::fastest`] was measured on, which is older than the
+//! newest generation as soon as the search moves past that idea ([`Star`] carries the
+//! generation it came from). A run that has never won has no clock to race, and then the
+//! star is the best-scoring attempt it does have ([`StarBasis`]) — the most a replay can
+//! show of a run that is still learning. The field beside it is the **last generation the
+//! run scored** — the population as the run left it, which is what the window was handed
+//! and what [`Population::generation`] names. So a stopped run shows the idea that got
+//! there quickest racing the population that has since moved on, which is a comparison
+//! worth watching rather than an accident.
+//!
+//! **Not the champion.** The two records are real and they are different agents, which is
+//! the whole reason this distinction is spelled out here: the champion is the highest-*
+//! fitness* genome, and since fitness v8 the clock is only part of that score (progress,
+//! jumps, checkpoints and route hops are the rest), so a run with two winners can have a
+//! champion that is slower than its quickest win. Everywhere a viewer races a *time* — this
+//! replay, the playtest's ghost, the dock that quotes the number — the record that carries
+//! the time is the one that runs. The champion is still the champion; it is just not what a
+//! stopwatch is about.
 //!
 //! Two things make the episodes themselves cheap, and both are already in the packet. The
-//! run's best-ever genome arrives with the `EpisodeResult` it earned the record on, whose
-//! `seed` is half of the episode — a replay with any other seed would be a different run
-//! of the same network, which is exactly what a replay must not be. And [`Packet::agents`]
-//! holds every agent of that last generation, each paired with the episode it ran, so the
-//! ghosts are the population's own runs rather than fresh samples of it.
+//! starring genome arrives with the `EpisodeResult` it earned the record on, whose `seed` is
+//! half of the episode — a replay with any other seed would be a different run of the same
+//! network, which is exactly what a replay must not be. And [`Packet::agents`] holds every
+//! agent of that last generation, each paired with the episode it ran, so the ghosts are the
+//! population's own runs rather than fresh samples of it.
 //!
 //! Nothing here trains, and nothing here is a lookalike: the runners are the same
 //! [`EpisodeRunner`] the trainer and the champion's own replay check use, so what the
@@ -29,7 +41,7 @@
 //! fitness that episode was recorded with.
 //!
 //! ```text
-//!   the champion                          the ghosts
+//!   the star                              the ghosts
 //!   (drawn last and complete: its         (bodies only, faint enough not to hide the
 //!    walkers, its dust, its flag)          one that matters — and no walkers of their
 //!                                          own, or a hundred marches would curtain it)
@@ -92,18 +104,18 @@ pub fn cohort_of(position: usize, roster: usize, cohorts: usize) -> usize {
     (position * cohorts / roster).min(cohorts - 1)
 }
 
-/// The agents one replay ghosts: the population's agents other than the champion, best
+/// The agents one replay ghosts: the population's agents other than the star, best
 /// first.
 ///
 /// A free function rather than a step inside [`Replay::with_limit`] because this is the
-/// rule — *which* agents a viewer is shown beside the champion, and in what order — and a
+/// rule — *which* agents a viewer is shown beside the star, and in what order — and a
 /// rule buried in a constructor is one only an end-to-end test can reach. `agents` is
 /// [`Packet::agents`] — the last generation the run scored — in population order; the
 /// result is a prefix of it by `mean_fitness`, the metric selection itself ranks on, so
 /// "the best 256 of them" is a statement about the run rather than about the order the
 /// population happens to sit in.
 ///
-/// The champion's own genome is left out: it is not *another* agent, and a second copy of
+/// The star's own genome is left out: it is not *another* agent, and a second copy of
 /// the same network running a different seed would be a ghost that means nothing.
 pub(crate) fn ghost_roster(agents: &[Agent], star_id: u32, limit: usize) -> Vec<&Agent> {
     let mut pool: Vec<&Agent> = agents
@@ -115,8 +127,39 @@ pub(crate) fn ghost_roster(agents: &[Agent], star_id: u32, limit: usize) -> Vec<
     pool
 }
 
-/// The episode being replayed: the run's best-ever genome, and the episode that earned
-/// the record.
+/// Which of the run's two records a replay is showing.
+///
+/// Two records, and they are two *agents* the moment a run has won more than once. Written
+/// down rather than inferred from the star's outcome, because the inference is exactly the
+/// one a viewer gets wrong: a run that has not won yet still has a best-scoring agent, and a
+/// window that showed it without saying so would be quoting a time nobody has run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StarBasis {
+    /// The run's quickest winning episode: the clock in [`Packet::fastest`], and the agent
+    /// that ran it. What a replay is of whenever the run has won at all, and the record the
+    /// playtest's ghost and the dock's time-to-beat come from too.
+    QuickestWin,
+    /// The highest-fitness agent of a run that has **never** won on this level: there is no
+    /// time to race, so the replay shows the best attempt there is — and says so, because
+    /// "the agent it is proudest of" and "the fastest agent" are different claims.
+    BestScore,
+}
+
+impl StarBasis {
+    /// What the strip, the panel and the details board call the agent on screen.
+    ///
+    /// One phrase rather than three, so the three places a viewer reads it cannot disagree
+    /// about whose episode they are looking at.
+    pub fn label(self) -> &'static str {
+        match self {
+            StarBasis::QuickestWin => "the run's quickest win",
+            StarBasis::BestScore => "the run's best attempt",
+        }
+    }
+}
+
+/// The episode being replayed: the run's quickest win, and the episode that earned it — or, on a
+/// run that has never won, the best-scoring attempt it has ([`StarBasis`]).
 ///
 /// Kept as the record itself rather than as a pointer into the packet, because it is what
 /// the replay is *checked against*: the score at the end of the run has to land on
@@ -125,9 +168,11 @@ pub(crate) fn ghost_roster(agents: &[Agent], star_id: u32, limit: usize) -> Vec<
 #[derive(Clone, Debug, PartialEq)]
 pub struct Star {
     pub genome_id: u32,
+    /// Which record this is ([`StarBasis`]).
+    pub basis: StarBasis,
     /// The generation that produced this genome. The run's record, not the newest
     /// generation the window holds: the two part company as soon as the search moves past
-    /// its best idea, which is why this is printed beside the field's own generation
+    /// that idea, which is why this is printed beside the field's own generation
     /// rather than assumed to be it ([`Population`]).
     pub generation: u32,
     /// The seed the evaluator scored this episode under. The other half of the episode.
@@ -140,10 +185,10 @@ pub struct Star {
 
 /// The generation the ghosts come from.
 ///
-/// Kept as its own fact rather than read off the champion, because the two are usually
+/// Kept as its own fact rather than read off the star, because the two are usually
 /// different numbers and a label that conflated them would be wrong in the common case:
-/// the population is the run's newest scored generation, and the champion is its
-/// best-ever. The viewer is told both.
+/// the population is the run's newest scored generation, and the star is a record set
+/// somewhere behind it. The viewer is told both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Population {
     pub generation: u32,
@@ -154,7 +199,7 @@ pub struct Population {
 
 /// A pool of episodes animated together, on one clock.
 ///
-/// `runners[0]` is the champion and the rest are the ghosts, so "the one being watched" is
+/// `runners[0]` is the star and the rest are the ghosts, so "the one being watched" is
 /// not a flag kept somewhere that could disagree with what is drawn: it is the head of the
 /// roster.
 pub struct Replay {
@@ -173,7 +218,7 @@ pub struct Replay {
     /// Draw the ghosts.
     ///
     /// The toggle changes what is *drawn* and nothing else: every ghost is stepped whether
-    /// or not it is visible, so turning them back on shows the same field the champion has
+    /// or not it is visible, so turning them back on shows the same field the star has
     /// been running through, not one that fell behind while nobody was looking.
     pub ghosts: bool,
     /// Hold the clock.
@@ -183,10 +228,11 @@ pub struct Replay {
 }
 
 impl Replay {
-    /// A replay of the run's best agent, with the last scored generation as ghosts.
+    /// A replay of the run's quickest win, with the last scored generation as ghosts.
     ///
-    /// `None` when the run has not scored a generation yet: there is no best anything to
-    /// watch, and an empty replay would be a mode with nothing in it.
+    /// `None` only when the packet holds no episode at all — no record and no evaluated
+    /// genome — which is a run that has scored nothing: there is nothing to watch, and an
+    /// empty replay would be a mode with nothing in it.
     pub fn new(packet: &Packet, level: &Level, eval: &EvalConfig) -> Option<Replay> {
         Replay::with_limit(packet, level, eval, GHOST_LIMIT)
     }
@@ -201,21 +247,39 @@ impl Replay {
         eval: &EvalConfig,
         limit: usize,
     ) -> Option<Replay> {
-        let best = packet.best.as_ref()?;
+        // The star is the run's **quickest win** when it has one, and its best-scoring attempt
+        // when it has not.
+        //
+        // It used to be `packet.best` — the highest-*fitness* genome — which is a different agent
+        // from the record-holder as soon as a run has two winners, because the clock is only part
+        // of the score (see [`evo::FastWin`]). The window was then racing one record and following
+        // another: the dock quoted the quickest time, the field behind it was the population's own
+        // runs, and the solid agent in the middle was frequently *slower* than ghosts a viewer
+        // could watch reach the flag ahead of it — which is the one thing a race must not do.
+        // `Packet::fastest_agent` is the episode `fastest` was measured on, written beside it by
+        // the trainer, so the star now reaches the flag on exactly the tick the dock quotes, and no
+        // winning ghost on screen can be quicker than the agent being watched. The playtest's ghost
+        // was moved to this same record first and for the same reason (`App::attach_champion_ghost`);
+        // this is the replay catching up with it.
+        let (record, basis) = match packet.fastest_agent.as_ref() {
+            Some(win) => (win, StarBasis::QuickestWin),
+            None => (packet.best.as_ref()?, StarBasis::BestScore),
+        };
         let star = Star {
-            genome_id: best.genome.id,
-            generation: best.generation,
-            seed: best.result.seed,
-            fitness: best.result.fitness,
-            outcome: best.result.outcome,
-            frames: best.result.frames,
+            genome_id: record.genome.id,
+            basis,
+            generation: record.generation,
+            seed: record.result.seed,
+            fitness: record.result.fitness,
+            outcome: record.result.outcome,
+            frames: record.result.frames,
         };
 
         let roster = ghost_roster(&packet.agents, star.genome_id, limit);
         let mut runners: Vec<EpisodeRunner> = Vec::with_capacity(roster.len() + 1);
         runners.push(EpisodeRunner::new(
             level,
-            best.genome.clone(),
+            record.genome.clone(),
             eval,
             star.seed,
         ));
@@ -328,7 +392,7 @@ impl Replay {
         &self.level_name
     }
 
-    /// The champion's live episode.
+    /// The star's live episode.
     pub fn star_sim(&self) -> &Sim {
         self.runners[0].sim()
     }
@@ -376,7 +440,7 @@ impl Replay {
         self.runners.len() - 1
     }
 
-    /// One ghost's live episode. Index `0` is the first ghost, never the champion.
+    /// One ghost's live episode. Index `0` is the first ghost, never the star.
     pub fn ghost_sim(&self, i: usize) -> &Sim {
         self.runners[i + 1].sim()
     }
@@ -385,13 +449,41 @@ impl Replay {
         &self.anims[i + 1]
     }
 
-    /// Seconds of the episode that have been simulated — not seconds on the wall clock:
-    /// at 4x the difference is the whole point.
+    /// Seconds of the **field** simulated — not seconds on the wall clock: at 4x the difference
+    /// is the whole point.
+    ///
+    /// The field's clock, not the star's: it is what the level's scenery and the walkers are
+    /// animated on, so the world keeps moving while the slower agents behind the star are still
+    /// out there. Nothing a viewer reads a *time* from uses it — [`Replay::star_elapsed`] is the
+    /// number on the strip.
     pub fn clock(&self) -> f32 {
         self.ticks as f32 * sim::DT
     }
 
-    /// The champion's score so far, by the same function the evaluator used.
+    /// The star's own episode length, in frames: the unit every time in this project is kept in
+    /// ([`evo::FastWin::frames`], [`crate::play::Session::frames`]).
+    ///
+    /// Off the star's own simulation, which stops counting the moment its episode ends — so this
+    /// holds at the frame the agent reached the flag (or died) and never climbs after it.
+    pub fn star_frames(&self) -> u32 {
+        self.star_sim().stats().frames
+    }
+
+    /// The star's own episode time in seconds: the number to read a time from, and the one the
+    /// strip and the panel quote.
+    ///
+    /// A finished episode holds its last frame, so this stops where the star stopped — a win in
+    /// 5.2 s keeps reading 5.2 s while the ghosts behind it are still running and the scenery is
+    /// still waving. The field's clock ([`Replay::clock`]) is the one that keeps going, and it is
+    /// for animating the world rather than for timing an episode. Both the strip and the panel
+    /// used the field's clock here, which is what made a won race read like a stopwatch nobody had
+    /// stopped: the agent stood at the flag while the seconds it had already spent kept ticking up
+    /// beside it.
+    pub fn star_elapsed(&self) -> f32 {
+        self.star_frames() as f32 * sim::DT
+    }
+
+    /// The star's score so far, by the same function the evaluator used.
     ///
     /// Live rather than predicted: while it runs it answers "how is it going", and when it
     /// stops it is the number to hold against [`Star::fitness`] — which is why the status
@@ -401,7 +493,7 @@ impl Replay {
         score(sim.stats(), sim.outcome())
     }
 
-    /// The champion's episode has ended: the flag, a grave, or the sim's own caps.
+    /// The star's episode has ended: the flag, a grave, or the sim's own caps.
     pub fn star_finished(&self) -> bool {
         self.star_sim().outcome().is_finished()
     }
@@ -425,53 +517,54 @@ impl Replay {
         (0..self.len()).all(|i| self.runners[i].is_finished())
     }
 
-    /// The status line: whose episode this is, how it is going, and what the ghosts are.
+    /// The status line: whose episode this is, how it is going, and whether the field is on screen.
     ///
     /// One string built here rather than in the window for the reason `play::Session` has
     /// one: a number assembled where it is drawn cannot be tested, and this one carries the
     /// fact the replay exists for — the recorded fitness beside the score actually being
     /// produced.
+    ///
+    /// **A ledger, not a report.** It used to carry the field in full as well — how many
+    /// ghosts came from which generation, how many were still going and how many were at the
+    /// flag — which is a paragraph about a picture the canvas is drawing in colour and the
+    /// Details window states in numbers ([`crate::panel::replay_details`]). On a strip along
+    /// the bottom of the window those three clauses pushed the line past the edge of the
+    /// window, and what a strip is for is the number that changes.
     pub fn summary(&self) -> String {
+        // The clock on the strip is the **star's own** ([`Replay::star_elapsed`]), not the field's.
+        // The field's keeps running while the slower agents behind it are still out there, so a
+        // finished episode read as one that was still costing time after it had won — the number
+        // beside "won" climbed for as long as the viewer left the replay open. Both halves of this
+        // line are now the star's: the time it took, and the score it made.
         let outcome = self.star_sim().outcome();
         let headline = if outcome.is_finished() {
             format!(
-                "{} in {:.1}s — score {} (recorded: {})",
+                "{} in {:.1}s — score {} (recorded {})",
                 outcome.as_str(),
-                self.clock(),
+                self.star_elapsed(),
                 format_fitness(self.star_score()),
                 format_fitness(self.star.fitness)
             )
         } else {
             format!(
                 "running — {:.1}s in, score {}",
-                self.clock(),
+                self.star_elapsed(),
                 format_fitness(self.star_score())
             )
         };
-        // The field's generation is printed, not assumed: the champion is the run's
-        // best-ever and the ghosts are its newest generation, so "the generation this
-        // came from" would be wrong on every run that has moved past its best idea.
+        // Only a *hidden* field is worth a word here. Ghosts that are showing explain
+        // themselves, and a generation switched off has to say so, or an empty canvas with no
+        // explanation reads as a replay that is broken rather than one that is quiet.
         let ghosts = if self.ghosts {
-            format!(
-                "{} ghosts from generation {}: {} still going, {} at the flag",
-                self.ghost_count(),
-                self.population.generation + 1,
-                self.ghosts_running(),
-                self.ghosts_won()
-            )
+            String::new()
         } else {
-            format!(
-                "{} ghosts hidden (generation {})",
-                self.ghost_count(),
-                self.population.generation + 1
-            )
+            format!(" — {} ghosts hidden", self.ghost_count())
         };
         format!(
-            "replaying the best of generation {} (id {}) — {} — {} — {}x{}",
+            "replaying {} of generation {} (id {}) — {headline}{ghosts} — {}x{}",
+            self.star.basis.label(),
             self.star.generation + 1,
             self.star.genome_id,
-            headline,
-            ghosts,
             self.speed,
             if self.paused { " — paused" } else { "" }
         )
@@ -498,6 +591,61 @@ mod tests {
         Replay::new(&packet, level, &eval()).expect("a scored generation has a best agent")
     }
 
+    /// A packet whose run recorded a **quickest win** by one agent while its best *score* belongs
+    /// to another — the state a real run reaches the moment it has two winners, and the one the
+    /// choice of star is about.
+    ///
+    /// `scored_packet` gives one generation of a run that has won nothing, so the two records are
+    /// raised here by hand out of that generation's own agents. Only the two records are synthetic:
+    /// each still carries the genome, seed and result of an episode that really was evaluated, so
+    /// the fidelity claims the replay makes about the star still mean something on this packet.
+    fn packet_with_two_records(level: &Level, tag: &str) -> Packet {
+        let mut packet = crate::lab::scored_packet(level, tag);
+        let quickest = packet
+            .agents
+            .iter()
+            .min_by_key(|agent| agent.result.frames)
+            .cloned()
+            .expect("a generation");
+        // The *slowest* agent of the generation is the champion, so the two records are as far
+        // apart as one generation allows and nothing here can pass by accident.
+        let champion = packet
+            .agents
+            .iter()
+            .filter(|agent| agent.genome.id != quickest.genome.id)
+            .max_by_key(|agent| agent.result.frames)
+            .cloned()
+            .expect("a second agent");
+        assert_ne!(quickest.genome.id, champion.genome.id);
+
+        packet.fastest = Some(evo::FastWin {
+            generation: packet.generation,
+            genome_id: quickest.genome.id,
+            frames: quickest.result.frames,
+            budget_frames: sim::frame_budget(level),
+        });
+        packet.fastest_agent = Some(evo::BestEver {
+            generation: packet.generation,
+            result: quickest.result.clone(),
+            genome: quickest.genome.clone(),
+        });
+        packet.best = Some(evo::BestEver {
+            generation: packet.generation,
+            result: champion.result.clone(),
+            genome: champion.genome.clone(),
+        });
+        packet
+    }
+
+    /// A level whose flag stands two tiles from the spawn, so a genome that walks right wins in a
+    /// handful of frames and a generation of eight contains winners. The runway cannot promise
+    /// that, and a test about the *quickest win* needs a run that has one.
+    fn dash() -> Level {
+        let mut level = Level::starter("replay-dash", 40, 8);
+        level.set_goal_tile(3, 6);
+        level
+    }
+
     /// The seed the evaluator used for one agent's representative episode.
     fn scored_seed(generation: u32, genome_id: u32) -> u64 {
         sim::episode_seed(GaConfig::default().master_seed, generation, genome_id, 0)
@@ -514,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn the_champion_replays_the_episode_the_record_was_made_on() {
+    fn the_star_replays_the_episode_the_record_was_made_on() {
         let level = runway();
         let mut replay = replay_on(&level, "fidelity");
         run_to_end(&mut replay, 4_000);
@@ -541,18 +689,192 @@ mod tests {
     }
 
     #[test]
-    fn the_champion_runs_the_seed_it_was_scored_under() {
+    fn the_star_runs_the_seed_it_was_scored_under() {
         let level = runway();
-        let packet = crate::lab::scored_packet(&level, "star-seed");
-        let best = packet.best.as_ref().expect("a best agent");
+        // The record path rather than the fallback: this is the episode a viewer races, so its seed
+        // is the one the evaluator used for that genome's trial 0 and not a fresh sample of the same
+        // network.
+        let packet = packet_with_two_records(&level, "star-seed");
+        let replay = Replay::new(&packet, &level, &eval()).expect("a record");
+
+        let star = replay.star();
         assert_eq!(
-            best.result.seed,
-            scored_seed(best.generation, best.genome.id)
+            star.seed,
+            scored_seed(star.generation, star.genome_id),
+            "the star is not running the seed it was scored under"
+        );
+        assert_eq!(
+            star.seed,
+            packet.fastest_agent.as_ref().expect("a record").result.seed
+        );
+    }
+
+    #[test]
+    fn the_star_is_the_runs_quickest_win_rather_than_its_best_score() {
+        let level = runway();
+        let packet = packet_with_two_records(&level, "two-records");
+        let win = packet.fastest_agent.as_ref().expect("a record");
+        let champion = packet.best.as_ref().expect("a champion");
+        let time = packet.fastest.expect("the time beside it");
+        assert_ne!(
+            win.genome.id, champion.genome.id,
+            "the fixture needs two agents"
         );
 
+        let mut replay = Replay::new(&packet, &level, &eval()).expect("a record");
+        // The agent the clock was measured on, and that agent's own episode. The champion is a
+        // *different* agent here — that is the whole point of the fixture — and it is not the one
+        // on screen.
+        assert_eq!(replay.star().basis, StarBasis::QuickestWin);
+        assert_eq!(replay.star().genome_id, win.genome.id);
+        assert_eq!(replay.star().generation, win.generation);
+        assert_eq!(replay.star().seed, win.result.seed);
+        assert_eq!(replay.star().frames, time.frames);
+        assert_eq!(replay.star().fitness, win.result.fitness);
+        assert_ne!(replay.star().genome_id, champion.genome.id);
+
+        // And the champion did not vanish: it is in the field behind the star, which is what the
+        // viewer was watching — the run's best-scoring agent running *behind* the one being raced.
+        let roster = ghost_roster(&packet.agents, win.genome.id, GHOST_LIMIT);
+        assert_eq!(replay.ghost_count(), roster.len());
+        assert_eq!(
+            roster.len(),
+            packet.agents.len() - 1,
+            "the star's own slot is the only one the roster drops"
+        );
+        assert!(
+            roster.iter().any(|a| a.genome.id == champion.genome.id),
+            "the champion is not ghosted beside the star"
+        );
+
+        // The record alone is enough to build one: a packet with no champion in it still has an
+        // episode a viewer can be shown, which is the precedence the choice makes explicit rather
+        // than leaving to whichever field happened to be `Some`.
+        let mut record_only = packet.clone();
+        record_only.best = None;
+        let without_champion = Replay::new(&record_only, &level, &eval()).expect("a record");
+        assert_eq!(without_champion.star().basis, StarBasis::QuickestWin);
+        assert_eq!(without_champion.star().genome_id, win.genome.id);
+
+        // The star's episode is the record's episode, replayed: it ends the same way, in the same
+        // number of frames, which is the claim the strip's time rests on.
+        run_to_end(&mut replay, 4_000);
+        assert_eq!(replay.star_sim().outcome(), win.result.outcome);
+        assert_eq!(replay.star_frames(), time.frames);
+    }
+
+    #[test]
+    fn a_run_that_has_never_won_replays_its_best_attempt_and_says_so() {
+        let level = runway();
+        let mut packet = crate::lab::scored_packet(&level, "no-win");
+        packet.fastest = None;
+        packet.fastest_agent = None;
+        let best = packet.best.clone().expect("a best agent");
+
         let replay = Replay::new(&packet, &level, &eval()).expect("a best agent");
-        assert_eq!(replay.star().seed, best.result.seed);
+        assert_eq!(replay.star().basis, StarBasis::BestScore);
         assert_eq!(replay.star().genome_id, best.genome.id);
+        assert_eq!(replay.star().seed, best.result.seed);
+
+        // No time to race is not the same claim as the run's own record, and the strip says which
+        // one it is making rather than quoting a clock nobody has run.
+        let line = replay.summary();
+        assert!(
+            line.contains(StarBasis::BestScore.label()),
+            "the strip does not say what this agent is: {line}"
+        );
+        assert!(
+            !line.contains(StarBasis::QuickestWin.label()),
+            "an unwon run's replay advertises a win: {line}"
+        );
+    }
+
+    #[test]
+    fn the_clock_stops_where_the_star_stopped() {
+        let level = runway();
+        let mut replay = replay_on(&level, "stopwatch");
+        run_to_end(&mut replay, 4_000);
+
+        // The time is the star's own episode, in the unit the episode was scored in.
+        assert_eq!(replay.star_frames(), replay.star().frames);
+        let stopped = replay.star_elapsed();
+        assert!(
+            (stopped - replay.star_frames() as f32 * sim::DT).abs() < 1e-6,
+            "the episode time is not the episode's length: {stopped}"
+        );
+        let line = replay.summary();
+
+        // Ten more seconds of wall clock, with the field's own clock running on. The number a viewer
+        // reads a time from does not move again: it is the time the agent *arrived* in, not how long
+        // the replay has been open, and the strip that quoted a climbing clock beside "won" was the
+        // bug this pins.
+        for _ in 0..600 {
+            replay.advance(1.0 / 60.0);
+        }
+        assert!(
+            replay.clock() > stopped,
+            "the field's clock stopped too: {} vs {stopped}",
+            replay.clock()
+        );
+        assert_eq!(
+            replay.star_elapsed(),
+            stopped,
+            "the episode time kept counting after the episode ended"
+        );
+        assert_eq!(
+            replay.summary(),
+            line,
+            "the strip's time moved after the finish"
+        );
+    }
+
+    #[test]
+    fn no_ghost_reaches_the_flag_before_the_star() {
+        // A real run that really won, rather than the fabricated records above: the claim is about
+        // the field a viewer watches, and the field is the population's own episodes.
+        let level = dash();
+        let packet = crate::lab::scored_packet(&level, "quickest");
+        let win = packet
+            .fastest_agent
+            .as_ref()
+            .expect("a generation of dash-runners holds a winner");
+        let time = packet.fastest.as_ref().expect("the time beside it");
+        assert!(win.result.won(), "the record's episode is not a win");
+        assert_eq!(
+            win.result.frames, time.frames,
+            "the run's time and the episode it came from have parted"
+        );
+
+        let mut replay = Replay::new(&packet, &level, &eval()).expect("a record");
+        assert_eq!(replay.star().basis, StarBasis::QuickestWin);
+        assert_eq!(replay.star().frames, time.frames);
+        assert_eq!(replay.star().genome_id, time.genome_id);
+
+        let mut ticks = 0;
+        while !replay.all_finished() && ticks < 4_000 {
+            replay.advance(1.0 / 60.0);
+            ticks += 1;
+        }
+        assert!(ticks < 4_000, "the field never finished");
+        assert!(
+            replay.ghosts_won() > 0,
+            "no ghost won, so the field proved nothing about the race"
+        );
+
+        // The rule the whole change is for: on the replays a viewer races, nobody reaches the flag
+        // ahead of the agent being followed. A quick win by the star and a quick win by a ghost were
+        // what the old star produced — the champion on screen while the field overtook it.
+        let star = replay.star_frames();
+        for i in 0..replay.ghost_count() {
+            let ghost = replay.ghost_sim(i);
+            if ghost.outcome() == Outcome::Won {
+                assert!(
+                    ghost.stats().frames >= star,
+                    "ghost {i} reached the flag in {} frames, ahead of the star's {star}",
+                    ghost.stats().frames
+                );
+            }
+        }
     }
 
     #[test]
@@ -560,21 +882,21 @@ mod tests {
         let level = runway();
         let packet = crate::lab::scored_packet(&level, "roster");
         let replay = Replay::new(&packet, &level, &eval()).expect("a best agent");
-        let best = packet.best.as_ref().expect("a best agent");
+        let star = replay.star().genome_id;
 
         assert_eq!(packet.agents.len(), packet.pop_size);
-        // The generation still holds the champion — elites are copied unchanged and keep
+        // The generation still holds the star — elites are copied unchanged and keep
         // their ids — and it is not ghosted: it is the agent on screen, solid.
         assert!(
-            packet.agents.iter().any(|a| a.genome.id == best.genome.id),
-            "the champion is not in its own generation"
+            packet.agents.iter().any(|a| a.genome.id == star),
+            "the star is not in its own generation"
         );
-        let roster = ghost_roster(&packet.agents, best.genome.id, GHOST_LIMIT);
+        let roster = ghost_roster(&packet.agents, star, GHOST_LIMIT);
         assert_eq!(roster.len(), packet.agents.len() - 1);
         assert_eq!(replay.ghost_count(), roster.len());
         assert!(
-            roster.iter().all(|a| a.genome.id != best.genome.id),
-            "the champion is ghosted beside itself"
+            roster.iter().all(|a| a.genome.id != star),
+            "the star is ghosted beside itself"
         );
 
         // Rank order, by the metric selection itself uses.
@@ -591,7 +913,7 @@ mod tests {
                 agent.result.seed,
                 scored_seed(packet.generation, agent.genome.id)
             );
-            assert_ne!(agent.result.seed, best.result.seed);
+            assert_ne!(agent.result.seed, replay.star().seed);
         }
     }
 
@@ -668,10 +990,11 @@ mod tests {
             }
         }
         // The band order is the roster's own: the roster is sorted best-first, so a lower
-        // position is a better `mean_fitness`.
+        // position is a better `mean_fitness`. It is built around the same agent the replay
+        // starred — this fixture wins nothing, so that is the run's best-scoring agent.
         let packet = crate::lab::scored_packet(&level, "cohorts");
-        let best = packet.best.as_ref().expect("a best agent");
-        let ranked = ghost_roster(&packet.agents, best.genome.id, GHOST_LIMIT);
+        let star = packet.best.as_ref().expect("a best agent").genome.id;
+        let ranked = ghost_roster(&packet.agents, star, GHOST_LIMIT);
         for pair in ranked.windows(2) {
             assert!(pair[0].result.mean_fitness >= pair[1].result.mean_fitness);
         }
@@ -681,8 +1004,8 @@ mod tests {
     fn every_ghost_replays_the_episode_it_was_scored_on() {
         let level = runway();
         let packet = crate::lab::scored_packet(&level, "ghost-fidelity");
-        let best = packet.best.as_ref().expect("a best agent");
-        let roster = ghost_roster(&packet.agents, best.genome.id, GHOST_LIMIT)
+        let star = packet.best.as_ref().expect("a best agent").genome.id;
+        let roster = ghost_roster(&packet.agents, star, GHOST_LIMIT)
             .into_iter()
             .map(|agent| agent.result.clone())
             .collect::<Vec<_>>();
@@ -854,12 +1177,12 @@ mod tests {
     fn a_population_bigger_than_the_limit_is_ghosted_best_first() {
         let level = runway();
         let packet = crate::lab::scored_packet(&level, "limit");
-        let best = packet.best.as_ref().expect("a best agent");
+        let star = packet.best.as_ref().expect("a best agent").genome.id;
 
         let mut ranked: Vec<(f32, u32)> = packet
             .agents
             .iter()
-            .filter(|a| a.genome.id != best.genome.id)
+            .filter(|a| a.genome.id != star)
             .map(|a| (a.result.mean_fitness, a.genome.id))
             .collect();
         // Stable, as the roster's own sort is, so a tie breaks the same way in both.
@@ -872,7 +1195,7 @@ mod tests {
         // The three that made it are the three selection would have kept, in that order:
         // the roster is a prefix of the population by `mean_fitness`, not the first three
         // slots of it.
-        let roster = ghost_roster(&packet.agents, best.genome.id, 3);
+        let roster = ghost_roster(&packet.agents, star, 3);
         let got: Vec<u32> = roster.iter().map(|a| a.genome.id).collect();
         assert_eq!(
             got,
@@ -885,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_names_the_episode_and_the_field() {
+    fn the_status_line_names_the_episode_and_keeps_the_field_off_it() {
         let level = runway();
         let mut replay = replay_on(&level, "summary");
 
@@ -898,35 +1221,46 @@ mod tests {
             line.contains(&format!("id {}", replay.star().genome_id)),
             "{line}"
         );
-        assert!(
-            line.contains(&format!("{} ghosts", replay.ghost_count())),
-            "{line}"
-        );
         assert!(line.contains("1x"), "the clock is not named: {line}");
+        // Whose episode this is, in the words the panel and the details board use: the star of a run
+        // that has won is its quickest win, and the strip says so rather than leaving a viewer to
+        // read it off the id.
         assert!(
-            line.contains(&format!(
-                "ghosts from generation {}",
-                replay.population().generation + 1
-            )),
-            "the field's generation is not on the line: {line}"
+            line.contains(replay.star().basis.label()),
+            "the strip does not say what is being replayed: {line}"
+        );
+        // The field is not on the strip while it is on the canvas: its roster is three readings
+        // the Details window states in full, and a strip that tried to say them as well ran off
+        // the end of the window (see `summary`).
+        assert!(
+            !line.contains("ghosts"),
+            "a field nobody has hidden is described on the strip: {line}"
         );
 
-        // Hidden ghosts say so, rather than leaving a count that reads as a field nobody
-        // can see.
+        // A hidden field says so — and how big it is, because nothing else on screen says what
+        // the viewer has switched off.
         replay.ghosts = false;
-        assert!(replay.summary().contains("ghosts hidden"));
+        let hidden = replay.summary();
+        assert!(hidden.contains("ghosts hidden"), "{hidden}");
+        assert!(
+            hidden.contains(&format!("{} ghosts", replay.ghost_count())),
+            "{hidden}"
+        );
 
         // And once the champion's episode is over the line carries both numbers — the
         // score it just produced and the record it has to match — because those two being
         // equal is the whole claim a replay makes.
         run_to_end(&mut replay, 4_000);
         let done = replay.summary();
-        assert!(done.contains("recorded:"), "{done}");
+        assert!(
+            done.contains(&format!("recorded {}", format_fitness(replay.star().fitness))),
+            "the record the replay has to match is not on the line: {done}"
+        );
         assert!(done.contains(replay.star().outcome.as_str()), "{done}");
     }
 
     #[test]
-    fn the_field_is_the_last_generation_scored_not_the_champions_own() {
+    fn the_field_is_the_last_generation_scored_not_the_stars_own() {
         let level = runway();
         let mut packet = crate::lab::scored_packet(&level, "population");
         assert_eq!(
@@ -934,10 +1268,10 @@ mod tests {
             packet.generation,
             "a one-generation fixture cannot part the two numbers"
         );
-        // The run moves past its best idea: it scores further generations while the
+        // The run moves past its record: it scores further generations while the
         // record stays where it was made, so the newest population no longer holds the
         // genome the record belongs to. That is the ordinary state of a stopped run, and
-        // the field's generation has to be its own fact rather than the champion's.
+        // the field's generation has to be its own fact rather than the star's.
         let star_id = packet.best.as_ref().expect("a best agent").genome.id;
         packet.generation += 7;
         packet.agents.retain(|agent| agent.genome.id != star_id);
@@ -946,13 +1280,15 @@ mod tests {
         assert_eq!(replay.population().generation, packet.generation);
         assert_ne!(replay.population().generation, replay.star().generation);
         assert_eq!(replay.population().size, packet.agents.len());
-        // And the field is ghosted in full: the champion is not *in* this generation, so
-        // the roster has nothing to filter out of it.
+        // And the field is ghosted in full: the star is not *in* this generation, so
+        // the roster has nothing to filter out of it. The generation the ghosts belong to is
+        // reported where a viewer looks for it — the details board — rather than on the strip, so
+        // what the *line* owes is that it does not claim the star's own generation instead.
         assert_eq!(replay.ghost_count(), packet.agents.len());
         let line = replay.summary();
         assert!(
-            line.contains(&format!("ghosts from generation {}", packet.generation + 1)),
-            "{line}"
+            !line.contains(&format!("generation {}", replay.population().generation + 1)),
+            "the strip names the field's own generation: {line}"
         );
     }
 
@@ -960,7 +1296,11 @@ mod tests {
     fn a_run_with_nothing_scored_yet_has_no_replay() {
         let level = runway();
         let mut packet = crate::lab::scored_packet(&level, "unscored");
+        // Both records, because either one alone is enough to replay: the run's quickest win comes
+        // first and the best score is what is left when there is no win.
         packet.best = None;
+        packet.fastest = None;
+        packet.fastest_agent = None;
         assert!(Replay::new(&packet, &level, &eval()).is_none());
     }
 }

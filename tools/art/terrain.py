@@ -52,6 +52,12 @@ from enum import Enum
 from PIL import Image
 
 from .common import (
+    BRICK,
+    BRICK_DARK,
+    BRICK_DEEP,
+    BRICK_LIGHT,
+    BRICK_MID,
+    BRICK_TOP,
     DIRT,
     DIRT_DARK,
     DIRT_DEEP,
@@ -62,6 +68,15 @@ from .common import (
     GRASS_EDGE,
     GRASS_LIGHT,
     GRASS_MID,
+    IRON_BOLT,
+    IRON_LIGHT,
+    MASONRY,
+    MASONRY_DARK,
+    MASONRY_DEEP,
+    MASONRY_LIGHT,
+    MASONRY_MID,
+    MORTAR,
+    MORTAR_DARK,
     SAND,
     SAND_DARK,
     SAND_DEEP,
@@ -79,6 +94,12 @@ from .common import (
     STONE_DEEP,
     STONE_LIGHT,
     STONE_MID,
+    WOOD,
+    WOOD_DARK,
+    WOOD_DEEP,
+    WOOD_LIGHT,
+    WOOD_MID,
+    WOOD_TOP,
     cell,
     h,
 )
@@ -108,6 +129,8 @@ class Detail(Enum):
     NONE = "none"
     CRACKS = "cracks"
     STRATA = "strata"
+    BRICKS = "bricks"
+    PLANKS = "planks"
 
 
 @dataclass(frozen=True)
@@ -264,6 +287,98 @@ SANDSTONE_ROCK = Material(
     detail=Detail.STRATA,
 )
 
+#: Brick: terracotta coping stones over mortared courses, over dressed stone masonry.
+BRICK_CROWN = Crown(BRICK_TOP, BRICK_LIGHT, BRICK, seed=101, ragged_seed=107)
+BRICK_BODY = Body(
+    BRICK_LIGHT,
+    BRICK,
+    BRICK_MID,
+    BRICK_DARK,
+    BRICK_DEEP,
+    seed=109,
+    thresholds=(0.15, 0.32, 0.90),
+)
+MASONRY_BODY = Body(
+    MASONRY_LIGHT,
+    MASONRY,
+    MASONRY_MID,
+    MASONRY_DARK,
+    MASONRY_DEEP,
+    seed=113,
+    thresholds=(0.14, 0.34, 0.90),
+)
+
+BRICK_GROUND = Material(
+    name="brick",
+    crown=BRICK_CROWN,
+    body=BRICK_BODY,
+    crown_edge=BRICK_DARK,
+    body_edge=BRICK_DEEP,
+    corner=BRICK_DEEP,
+    under_deep=BRICK_DEEP,
+    under_a=BRICK_DARK,
+    under_b=BRICK_MID,
+    detail=Detail.BRICKS,
+)
+MASONRY_ROCK = Material(
+    name="masonry",
+    crown=None,
+    body=MASONRY_BODY,
+    crown_edge=MASONRY_DARK,
+    body_edge=MASONRY_DARK,
+    corner=MASONRY_DARK,
+    under_deep=MASONRY_DEEP,
+    under_a=MASONRY_DARK,
+    under_b=MASONRY_DARK,
+    detail=Detail.BRICKS,
+)
+
+#: Wood: milled timber decking over horizontal planks and timber beams.
+WOOD_CROWN = Crown(WOOD_TOP, WOOD_LIGHT, WOOD, seed=127, ragged_seed=131)
+WOOD_BODY = Body(
+    WOOD_LIGHT,
+    WOOD,
+    WOOD_MID,
+    WOOD_DARK,
+    WOOD_DEEP,
+    seed=137,
+    thresholds=(0.16, 0.34, 0.92),
+)
+TIMBER_BODY = Body(
+    WOOD,
+    WOOD_MID,
+    WOOD_DARK,
+    WOOD_DEEP,
+    WOOD_DEEP,
+    seed=139,
+    thresholds=(0.14, 0.32, 0.90),
+)
+
+WOOD_GROUND = Material(
+    name="wood",
+    crown=WOOD_CROWN,
+    body=WOOD_BODY,
+    crown_edge=WOOD_DARK,
+    body_edge=WOOD_DEEP,
+    corner=WOOD_DEEP,
+    under_deep=WOOD_DEEP,
+    under_a=WOOD_DARK,
+    under_b=WOOD_MID,
+    detail=Detail.PLANKS,
+)
+TIMBER_ROCK = Material(
+    name="timber",
+    crown=None,
+    body=TIMBER_BODY,
+    crown_edge=WOOD_DEEP,
+    body_edge=WOOD_DEEP,
+    corner=WOOD_DEEP,
+    under_deep=WOOD_DEEP,
+    under_a=WOOD_DARK,
+    under_b=WOOD_DARK,
+    detail=Detail.PLANKS,
+)
+
 
 # --- the autotiler ----------------------------------------------------------
 
@@ -334,7 +449,54 @@ def solid(mask: int, material: Material) -> Image.Image:
             px[x, 15] = material.under_deep
             px[x, 14] = material.under_a if h(x, 14, 53) < 0.6 else material.under_b
 
+    if material.detail is Detail.BRICKS:
+        _bricks(px, material, open_up, mask)
+    elif material.detail is Detail.PLANKS:
+        _planks(px, material, open_up, mask)
+
     return img
+
+
+def _bricks(px, material: Material, open_up: bool, mask: int) -> None:
+    """Coursed brickwork or stone ashlar: horizontal mortar joints and staggered vertical joints."""
+    body = material.body
+    start_y = CROWN_ROWS if open_up else 1
+    end_y = 14 if (mask & 0b1000) else 15
+    x0 = 1 if (mask & 0b0010) else 0
+    x1 = 15 if (mask & 0b0100) else 16
+    for y in range(start_y, end_y):
+        if y in (5, 9, 13):
+            for x in range(x0, x1):
+                if h(x, y, 163) < 0.85:
+                    px[x, y] = body.dark
+        else:
+            course = (y - 1) // 4
+            offset = 4 if (course % 2 == 1) else 0
+            for x in range(x0, x1):
+                if (x + offset) % 8 == 0 and x0 < x < x1 - 1:
+                    px[x, y] = body.deep
+                elif y in (6, 10) and (x + offset) % 8 in (1, 2):
+                    px[x, y] = body.light
+
+
+def _planks(px, material: Material, open_up: bool, mask: int) -> None:
+    """Horizontal wood grain, plank seams, and recessed iron bolts."""
+    body = material.body
+    start_y = CROWN_ROWS if open_up else 1
+    end_y = 14 if (mask & 0b1000) else 15
+    x0 = 1 if (mask & 0b0010) else 0
+    x1 = 15 if (mask & 0b0100) else 16
+    for y in range(start_y, end_y):
+        if y in (7, 11):
+            for x in range(x0, x1):
+                px[x, y] = body.deep
+        elif y in (8, 12):
+            for x in range(x0, x1):
+                if h(x, y, 173) < 0.7:
+                    px[x, y] = body.light
+    for bx, by in ((3, 6), (12, 6), (3, 10), (12, 10)):
+        if start_y <= by < end_y and x0 <= bx < x1:
+            px[bx, by] = body.deep
 
 
 def _cracks(px, material: Material) -> None:
@@ -394,6 +556,26 @@ def sand(mask: int) -> Image.Image:
 def sandstone(mask: int) -> Image.Image:
     """One sandstone tile: the rock under a beach."""
     return rock(mask, SANDSTONE_ROCK)
+
+
+def brick(mask: int) -> Image.Image:
+    """One brick tile: terracotta coping over mortared brick courses."""
+    return solid(mask, BRICK_GROUND)
+
+
+def masonry(mask: int) -> Image.Image:
+    """One masonry tile: dressed stone under a brick structure."""
+    return rock(mask, MASONRY_ROCK)
+
+
+def wood(mask: int) -> Image.Image:
+    """One wood plank tile: milled timber decking over planked beams."""
+    return solid(mask, WOOD_GROUND)
+
+
+def timber(mask: int) -> Image.Image:
+    """One deep timber tile: heavy structural beams under wood decking."""
+    return rock(mask, TIMBER_ROCK)
 
 
 def _with_detail(base: Image.Image, paint) -> Image.Image:
@@ -481,6 +663,43 @@ def _shells(px) -> None:
         px[x, y] = SAND_DARK
 
 
+def _brick_moss(px) -> None:
+    """Lichen and weathered chips on the brick coping."""
+    for x in (3, 4, 11, 12):
+        px[x, 1] = GRASS_MID
+    px[4, 2] = GRASS_DARK
+    px[11, 2] = GRASS_DARK
+    px[7, 2] = BRICK_DARK
+    px[8, 3] = BRICK_DARK
+
+
+def _brick_cracked(px) -> None:
+    """A weathered notch and mortar fleck on the brick coping."""
+    px[5, 1] = BRICK_DARK
+    px[5, 2] = BRICK_DEEP
+    px[6, 2] = BRICK_DARK
+    px[10, 1] = MORTAR
+    px[11, 1] = MORTAR_DARK
+    px[10, 3] = BRICK_DARK
+
+
+def _wood_knots(px) -> None:
+    """Wood grain knots and iron nail heads on the timber deck."""
+    px[4, 1] = WOOD_DARK
+    px[5, 1] = WOOD_DEEP
+    px[5, 2] = WOOD_DARK
+    px[11, 2] = IRON_BOLT
+    px[12, 2] = IRON_LIGHT
+
+
+def _wood_rivets(px) -> None:
+    """Countersunk iron rivets along the top decking plank."""
+    for x in (2, 7, 13):
+        px[x, 1] = IRON_LIGHT
+        px[x, 2] = IRON_BOLT
+    px[9, 3] = WOOD_DARK
+
+
 # --- blending: the seam where two materials meet ----------------------------
 #
 # This is the module's second contract with the renderer, and it is a contract about
@@ -495,21 +714,24 @@ def _shells(px) -> None:
 # slightly-wrong yellow — and the way a material looks at a seam cannot drift away from
 # the way it looks everywhere else.
 #
-# **A material, not a pair of materials.** Twenty-two bands cover every seam the four
-# materials can make, in both directions, because the band belongs to the material that
+# **A material, not a pair of materials.** Thirty-eight bands cover every seam the ten
+# looks can make, in both directions, because the band belongs to the material that
 # is crossing rather than to the pair it is crossing into. A pair table would need four
-# more bands for every material already shipped, to say the same thing twice; a fifth
-# material costs its own four bands and no new code and no change to the renderer.
+# more bands for every material already shipped, to say the same thing twice; a sixth
+# material costs its own four bands and no new code and no change to the renderer. That
+# is exactly how brick and timber arrived: a masonry texture, a plank texture, and the
+# eight bands below, with nothing in the Rust view changed but a lookup row.
 
-#: The six things a solid tile can look like, and the material each is made of.
+#: The ten things a solid tile can look like, and the material each is made of.
 #:
 #: A material has three appearances — a crown where the sky touches it, a body a few
-#: tiles down, and rock under that — and two of the six are one material's crown and
+#: tiles down, and rock under that — and two of the ten are one material's crown and
 #: body. Those two *already* join seamlessly, because the crown's last row is drawn
 #: ragged against the body on purpose ([`CROWN_ROWS`]), so a blend is only ever drawn
 #: where two different materials meet: grass over dirt is a surface, sand beside dirt is
-#: a seam.
-LOOKS = ("grass", "dirt", "stone", "beach", "packed", "sandstone")
+#: a seam. Bricks and planks arrived as their own materials, so they carry their own
+#: seams: a brick wall meeting a bank of soil used to be a hard line.
+LOOKS = ("grass", "dirt", "stone", "beach", "packed", "sandstone", "brick", "masonry", "wood", "timber")
 MATERIAL_OF = {
     "grass": "soil",
     "dirt": "soil",
@@ -517,6 +739,10 @@ MATERIAL_OF = {
     "beach": "sand",
     "packed": "sand",
     "sandstone": "sandstone",
+    "brick": "masonry",
+    "masonry": "masonry",
+    "wood": "timber",
+    "timber": "timber",
 }
 
 #: How far each material creeps into the tile beside it, in pixels.
@@ -524,13 +750,21 @@ MATERIAL_OF = {
 #: Looseness rather than decoration: sand is a pile of grains and spills five pixels,
 #: soil crumbles three, sandstone two, and stone — which is stone — barely moves at all.
 #: Five is a third of a tile, which is as far as a band can reach before two of them
-#: meeting in the middle turns a seam into a smear.
-SPILL = {"soil": 3, "sand": 5, "stone": 2, "sandstone": 3}
+#: meeting in the middle turns a seam into a smear. Masonry is dressed stone and holds its
+#: edge like stone does; timber is milled and splinters at its cut ends, so it travels with
+#: more than stone and less than raw earth.
+SPILL = {"soil": 3, "sand": 5, "stone": 2, "sandstone": 3, "masonry": 2, "timber": 3}
 
 #: The four sides a band can lie along, and the two looks that are never asked for on
 #: one of them. A surface tile has sky above it, so no solid tile ever has a crown
 #: *below* it: `blend_grass_b` and `blend_beach_b` are the two bands that describe a
 #: situation the level format cannot build, and they are the two the atlas does not ship.
+#:
+#: Grass and beach only, even though brick and wood are crowns too: a look is a *depth*,
+#: not a tile, and `brick` and `wood` are the shallow-body looks as well — the tile two
+#: courses under a brick coping is drawn as `brick`, so it can perfectly well have a
+#: different material below it and needs its `_b` band to say so. Grass and dirt are two
+#: looks for exactly this reason, and the sand family learned to be two at the same time.
 SIDES = ("l", "r", "t", "b")
 BLIND_SIDES = {"grass": ("b",), "beach": ("b",)}
 
@@ -550,6 +784,10 @@ def _plain(look: str) -> Image.Image:
         "beach": lambda: solid(0b0001, SAND_GROUND),
         "packed": lambda: solid(0, SAND_GROUND),
         "sandstone": lambda: rock(0, SANDSTONE_ROCK),
+        "brick": lambda: solid(0b0001, BRICK_GROUND),
+        "masonry": lambda: rock(0, MASONRY_ROCK),
+        "wood": lambda: solid(0b0001, WOOD_GROUND),
+        "timber": lambda: rock(0, TIMBER_ROCK),
     }
     if look not in plain:
         raise ValueError(f"unknown look {look!r}")
@@ -665,6 +903,16 @@ def sprites() -> list[tuple[str, Image.Image]]:
     for mask in DEEP_MASKS:
         out.append((f"sandstone_{mask}", sandstone(mask)))
 
+    # The third and fourth materials: brick over masonry, and wood over timber.
+    for mask in range(16):
+        out.append((f"brick_{mask}", brick(mask)))
+    for mask in DEEP_MASKS:
+        out.append((f"masonry_{mask}", masonry(mask)))
+    for mask in range(16):
+        out.append((f"wood_{mask}", wood(mask)))
+    for mask in DEEP_MASKS:
+        out.append((f"timber_{mask}", timber(mask)))
+
     # Variants: the tiles a level repeats most. The Rust view picks one by hashing
     # the tile coordinates, so a long floor is not one picture stamped sixty times.
     out.append(("ground_1_b", _with_detail(ground(1), _flowers)))
@@ -673,6 +921,10 @@ def sprites() -> list[tuple[str, Image.Image]]:
     out.append(("deep_0_c", _with_detail(deep(0), _crack)))
     out.append(("sand_1_b", _with_detail(sand(1), _ripples)))
     out.append(("sand_1_c", _with_detail(sand(1), _shells)))
+    out.append(("brick_1_b", _with_detail(brick(1), _brick_moss)))
+    out.append(("brick_1_c", _with_detail(brick(1), _brick_cracked)))
+    out.append(("wood_1_b", _with_detail(wood(1), _wood_knots)))
+    out.append(("wood_1_c", _with_detail(wood(1), _wood_rivets)))
 
     out.append(("spike", spikes()))
     return out

@@ -7,7 +7,7 @@
 mod common;
 
 use common::fixture;
-use sim::physics::PHYSICS;
+use sim::physics::{PlayerState, PHYSICS, SPIKE_TOP_CLEARANCE};
 use sim::AgentAction;
 
 /// Ground rows 4..5, open sky above. 12 columns wide.
@@ -465,6 +465,25 @@ fn a_landing_zone_is_a_checkpoint_only_when_something_had_to_be_crossed() {
             "column {col} is a ledge with a two-tile drop beside it, which is a crossing"
         );
     }
+
+    // And the directional variant (`checkpoint_zone_from`) is symmetric across left-to-right
+    // and right-to-left crossings: arriving from the right checks the zone's right edge.
+    let mirror_spike = spike.mirrored_horizontal();
+    let mirror_col = mirror_spike.width - 1 - SPIKE_COLUMN;
+    for col in (mirror_col + 1)..mirror_spike.width {
+        assert_eq!(
+            mirror_spike.checkpoint_zone_from(col, 4, mirror_spike.width - 2),
+            None,
+            "the spawn ledge on the right side of the mirrored spike is not a checkpoint"
+        );
+    }
+    for col in 0..mirror_col {
+        assert_eq!(
+            mirror_spike.checkpoint_zone_from(col, 4, mirror_col + 1),
+            Some(0),
+            "column {col} on the far (left) side of the mirrored spike is a checkpoint when approached from the right"
+        );
+    }
 }
 
 /// **A checkpoint is credited on arrival, not on the way past.**
@@ -631,6 +650,85 @@ fn spike_contact_ends_the_episode_and_records_where_it_happened() {
     assert!(
         (3.0..=4.0).contains(&dy),
         "death at y = {dy} should be at ground level"
+    );
+}
+
+/// **A spike kills where it is drawn, and not in the air above its tips.**
+///
+/// The sprite leaves the top three of its sixteen pixel rows transparent, deliberately: a
+/// spike tile drawn all the way to its ceiling stops reading as a hazard and starts reading
+/// as part of the wall above it (`tools/art/terrain.py::spikes`). The hazard check tested
+/// the whole tile anyway, so every spike carried an invisible kill band 0.1875 tiles tall
+/// above its topmost drawn pixel. On a hand-drawn level whose only route onto a platform
+/// crossed such a spike, 70% of a swept 6,480 take-off/hold pairs died without the body
+/// ever touching a drawn pixel, and the whole route reduced to one take-off position with
+/// 0.025 tiles of clearance — the report behind `REVIEW.md` §2.12, and the reason the box
+/// now follows the drawing.
+///
+/// Both halves are pinned here: the band above the tips is air, and below it the spike is
+/// as lethal as it has always been — including for a body *standing* in its cell, which is
+/// what makes a spike-topped column unstandable for the checkpoint and oracle rules.
+#[test]
+fn a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips() {
+    let ph = &PHYSICS;
+    let level = fixture("spike", SPIKE, (2, 3), &[("goal", 11, 3)]);
+    let drawn_top = 3.0 + SPIKE_TOP_CLEARANCE;
+    assert!(
+        (drawn_top - 3.1875).abs() < 1e-6,
+        "the spike sprite's opaque pixels start three of sixteen cell rows below the top \
+         (assets/tileset.png, cell 11,6: bbox rows 3..16), so the topmost drawn pixel is at \
+         3.1875; the constant says {drawn_top}"
+    );
+
+    // A resting body placed by its bottom edge, as `PlayerState::spawn` would put it.
+    fn placed(
+        level: &sim::Level,
+        ph: &sim::physics::Physics,
+        x: f32,
+        bottom: f32,
+    ) -> PlayerState {
+        let mut p = PlayerState::spawn(level, ph);
+        p.x = x;
+        p.y = bottom - ph.player_h;
+        p.grounded = true;
+        p
+    }
+
+    // Standing flush against the spike's left face, the body is in the next tile over and
+    // nothing of it is in the hazard. This is the case the report was written about.
+    let mut flush = placed(&level, ph, SPIKE_COLUMN as f32 - ph.player_w, 4.0);
+    assert!(
+        !flush.tick(&level, ph, AgentAction::Walk).touched_spike,
+        "a body standing beside the spike, with its box ending at the cell's edge, does not \
+         touch it"
+    );
+
+    // Inside the cell, in the blank band above the tips: clear. The body is placed one
+    // tick's fall above the tips (gravity is 0.0125 tiles/tick and the hazard check runs
+    // at the end of the tick), so it is still above every drawn pixel when it is tested.
+    let mut in_the_band = placed(&level, ph, SPIKE_COLUMN as f32 + 0.2, drawn_top - 0.02);
+    assert!(
+        !in_the_band.tick(&level, ph, AgentAction::Walk).touched_spike,
+        "a body that never reaches down to the topmost drawn pixel has cleared the spike"
+    );
+
+    // A hundredth of a tile lower, the drawing is in the way.
+    let mut into_the_drawing = placed(&level, ph, SPIKE_COLUMN as f32 + 0.2, drawn_top + 0.02);
+    assert!(
+        into_the_drawing
+            .tick(&level, ph, AgentAction::Walk)
+            .touched_spike,
+        "a body whose box reaches into the drawn part of the spike is killed"
+    );
+
+    // And a body standing *in* the spike's cell — the tile the body walks through — is
+    // still killed, which is what `Level::is_standable` and the checkpoint zones assume.
+    let mut standing_in_it = placed(&level, ph, SPIKE_COLUMN as f32 + 0.2, 4.0);
+    assert!(
+        standing_in_it
+            .tick(&level, ph, AgentAction::Walk)
+            .touched_spike,
+        "a body standing in a spike's own cell is inside the obstacle"
     );
 }
 
@@ -1099,6 +1197,79 @@ fn walking_into_a_pit_is_still_fatal() {
         "and it must not have touched the pit wall on the way: the turn costs more ground \
          than {} ticks of fall allow",
         sim.stats().frames
+    );
+}
+
+/// Ticks for a body already at the run cap to be brought to a standstill by pressing against it,
+/// on the ground or in the air. Airborne, the body leaves the ground on a `RunJump` so it carries
+/// the run's momentum with it and the only thing under test is the turn.
+fn ticks_to_reverse(level: &sim::Level, airborne: bool) -> u32 {
+    let mut sim = sim::Sim::new(level, 3);
+    common::settle(&mut sim);
+    common::step_n(&mut sim, AgentAction::Run, 12);
+    assert!(
+        (sim.player().vx - PHYSICS.run_speed).abs() < 1e-5,
+        "the fixture should be at the run cap, not {}",
+        sim.player().vx
+    );
+    if airborne {
+        sim.step(AgentAction::RunJump);
+        assert!(!sim.player().grounded, "the body should have left the ground");
+    } else {
+        assert!(sim.player().grounded, "this half is the one on the ground");
+    }
+    let mut ticks = 0;
+    while sim.player().vx > 0.0 {
+        sim.step(AgentAction::Retreat);
+        ticks += 1;
+        assert!(ticks <= 64, "the body never crossed zero");
+    }
+    ticks
+}
+
+/// A **grounded** turn is crisp, and the same press **in the air** is not: that difference *is*
+/// `Physics::turn_accel_scale`, and both halves are claims the bible derives rather than numbers
+/// this test invented.
+///
+/// The airborne half is not a leftover, it is the load-bearing one. A body that walks off a pit
+/// lip at running speed must not be able to press back onto the pit wall before the world runs
+/// out, because that is what makes every pit in the shipped pack lethal
+/// ([`walking_into_a_pit_is_still_fatal`] measures it: zero cling ticks). A turn as crisp in the
+/// air as on the ground makes that lip rescue reachable and quietly turns each pit into a wall
+/// climb — which is a difficulty change, not a comfort setting — so the scale is grounded-only
+/// and this test is what keeps it that way.
+#[test]
+fn a_turn_is_crisper_on_the_ground_than_in_the_air() {
+    let level = fixture("turn", FLAT, (2, 3), &[("goal", 11, 3)]);
+    let cap = PHYSICS.run_speed;
+    let grounded = ticks_to_reverse(&level, false);
+    let airborne = ticks_to_reverse(&level, true);
+
+    // The grounded turn is the bible's own figure. `turn_ticks` is the continuous division and
+    // the sim lands on its ceiling — a tick is the atom of the clock, so a turn that needs four
+    // and a bit ticks takes five of them — which is why the expectation is rounded up here
+    // rather than written down as a literal.
+    let derived = (PHYSICS.turn_ticks(cap)).ceil() as u32;
+    assert_eq!(
+        grounded,
+        derived,
+        "a grounded turn from the cap is {derived} ticks by the bible (turn_ticks = {}), \
+         but took {grounded}",
+        PHYSICS.turn_ticks(cap)
+    );
+
+    // The airborne turn is the *unscaled* acceleration, which is what it was before the scale
+    // existed: `run_accel × air_accel_scale`, with no turn term at all.
+    let air_derived = (cap / (PHYSICS.run_accel * PHYSICS.air_accel_scale)).ceil() as u32;
+    assert!(
+        airborne >= air_derived - 1 && airborne <= air_derived + 1,
+        "an airborne turn must keep the old acceleration: {air_derived} ticks by the bible, \
+         took {airborne}"
+    );
+    assert!(
+        airborne >= grounded * 3,
+        "the air has to stay the slow place to change your mind, or the pits stop being fatal: \
+         {grounded} grounded against {airborne} airborne ticks"
     );
 }
 

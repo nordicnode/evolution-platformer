@@ -57,6 +57,47 @@ pub const NO_PROGRESS_FRAMES: u32 = 600;
 /// Episode cap = `level.width * FRAMES_PER_TILE` (§7.4.6).
 pub const FRAMES_PER_TILE: u32 = 40;
 
+/// The episode cap for `level`: `max(width, height) × FRAMES_PER_TILE` (§7.4.6).
+///
+/// The *longer* side, not the width. A budget proportional to width alone quietly assumed
+/// every level is a side-scroller: a 10x22 tower got 400 frames to climb 18 rows, which is
+/// less than the 600-frame anti-camper timer and about seven jumps' worth of airtime. Every
+/// shipped level is wider than it is tall, so this leaves all of them exactly as they were.
+///
+/// One function rather than the expression written twice, because two consumers now need the
+/// same number: the sim stops an episode at it, and the scoring measures how much of it a
+/// winning episode left unspent ([`EpisodeStats::budget_frames`]). A cap the two disagreed
+/// about would grade a fast win as a slow one, and the disagreement would be invisible in
+/// both.
+pub fn frame_budget(level: &Level) -> u32 {
+    level.width.max(level.height).max(1) as u32 * FRAMES_PER_TILE
+}
+
+/// A count of frames written as a **time**, the one way this project writes one.
+///
+/// The unit is the frame, because that is the unit everything else counts in: [`DT`] of a
+/// second each, so `frames` is the whole of what a clock is and no caller has to know about a
+/// wall-clock. Both front-ends and the champion metadata go through here rather than through
+/// their own arithmetic, for the reason [`frame_budget`] is one function: a window that said
+/// `8.4s` beside a terminal that said `504 frames` for the same episode would be two answers to
+/// one question, and the number a viewer races has to be the number the AI was scored on.
+///
+/// Two shapes, deliberately. Under a minute it is hundredths of a second — `0.98s`, `8.42s` —
+/// which is the resolution a race needs, since one frame is 0.017 s and two times that differ by
+/// a frame have to be tellable apart. At a minute and up it is `m:ss.hh`, because `97.35s` is a
+/// number a reader has to convert; no shipped level is anywhere near it (a full-width level's
+/// budget is 40 s), so the second shape exists for the level someone draws tomorrow rather than
+/// for one of ours.
+pub fn format_time(frames: u32) -> String {
+    let seconds = frames as f64 * DT as f64;
+    if seconds < 60.0 {
+        format!("{seconds:.2}s")
+    } else {
+        let minutes = (seconds / 60.0).floor();
+        format!("{}:{:05.2}", minutes as u64, seconds - minutes * 60.0)
+    }
+}
+
 /// How an episode finished. `Running` means "not finished yet".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -93,6 +134,15 @@ impl Outcome {
 pub struct EpisodeStats {
     /// Frames in which the episode was actually simulated.
     pub frames: u32,
+    /// The frame cap this episode ran under ([`frame_budget`] for the level it was played on).
+    ///
+    /// Constant for the episode, and carried here rather than re-derived by whoever reads the
+    /// stats because it is the *denominator* of the one reading that needs it: how much of the
+    /// budget the body left unspent, which is what finishing quickly means in a game whose
+    /// clock is its tick counter (`evo::fitness::SPEED_BONUS`). A consumer that recomputed the
+    /// cap itself could disagree with the sim about when an episode ends, and a fast win would
+    /// score as a slow one.
+    pub budget_frames: u32,
     /// How much closer to the flag the body has ever been than it started, in pixels
     /// (§7.4.1).
     ///
@@ -139,6 +189,16 @@ pub struct EpisodeStats {
     /// sailing over a hazard and dying beyond it, and a single zone pays once however many
     /// times the body walks back onto it.
     pub checkpoints: u32,
+    /// Route crossings closed from the spawn stand toward the flag, measured only when
+    /// grounded on a route stand (`spawn_hops - best_hops_reached`, in `0..=spawn_hops`).
+    ///
+    /// **Monotone along zig-zag routes where straight-line Euclidean distance reverses.**
+    /// Every canonical crossing onto a stand fewer hops from the flag increments this
+    /// count, giving evolution a true geodesic gradient up winding towers.
+    pub route_hops_closed: u32,
+    /// Best (deepest along the route) stand index the body has **stood on** during the
+    /// episode, or `None` if it has not yet stood on a route stand.
+    pub best_stand: Option<usize>,
     /// Where the agent died, if it did.
     pub death_pos: Option<(f32, f32)>,
 }
@@ -146,8 +206,10 @@ pub struct EpisodeStats {
 impl EpisodeStats {
     fn new(player: &PlayerState, level: &Level) -> Self {
         let approach = goal_approach(player, level);
+        let spawn_stand = spawn_route_stand(level);
         EpisodeStats {
             frames: 0,
+            budget_frames: frame_budget(level),
             progress_pixels: 0.0,
             closest_approach: approach,
             goal_distance_pixels: approach * PIXELS_PER_TILE,
@@ -156,9 +218,22 @@ impl EpisodeStats {
             stomps: 0,
             jumps: 0,
             checkpoints: 0,
+            route_hops_closed: 0,
+            best_stand: spawn_stand,
             death_pos: None,
         }
     }
+}
+
+/// The route stand index of the level's spawn point, when the spawn rests on a standable zone.
+fn spawn_route_stand(level: &Level) -> Option<usize> {
+    let surface = Level::tile_y(level.spawn.y + level.spawn.h + 0.05);
+    let col = Level::tile_x(level.spawn.x + level.spawn.w * 0.5);
+    level
+        .routes()
+        .zone_at(col, surface)
+        .or_else(|| level.routes().zone_at(col - 1, surface))
+        .or_else(|| level.routes().zone_at(col + 1, surface))
 }
 
 /// Distance from a body to the level's goal, in tiles: zero when they overlap.
@@ -201,6 +276,13 @@ pub struct Sim {
     /// common case by far, and this is what keeps it from re-deriving its landing zone
     /// (a scan back to the start of the run) on every one of those frames.
     last_stand: (i32, i32),
+    /// The route stand index the body is currently standing on (or last stood on), used by
+    /// the waypoint sensor (`sensors::observe_from_stand`) and geodesic progress tracking.
+    current_route_stand: Option<usize>,
+    /// Route hops from the spawn stand to the flag, if the spawn is on a route to the flag.
+    spawn_hops: Option<u32>,
+    /// Minimum `hops_to_flag` reached on a grounded stand so far in this episode.
+    min_hops_reached: Option<u32>,
 }
 
 impl Sim {
@@ -219,6 +301,8 @@ impl Sim {
             .map(|(i, r)| Walker::spawn_spread(i as u32, *r, level, &PHYSICS, &mut rng))
             .collect();
         let spawn_player = level.spawn_player();
+        let current_route_stand = spawn_route_stand(level);
+        let spawn_hops = current_route_stand.and_then(|s| level.routes().hops_to_flag(s));
         Sim {
             player: spawn_player,
             walkers,
@@ -230,6 +314,9 @@ impl Sim {
             // No tile is ever at a negative row, so this cannot match a real standing tile
             // and the first grounded frame always takes the slow path once.
             last_stand: (i32::MIN, i32::MIN),
+            current_route_stand,
+            spawn_hops,
+            min_hops_reached: spawn_hops,
         }
     }
 
@@ -318,21 +405,52 @@ impl Sim {
             return;
         }
 
-        // ---- checkpoints --------------------------------------------------
+        // ---- checkpoints & geodesic route progress -----------------------
         // Credit the safe landing zones the body has walked onto. Grounded-only on
         // purpose: the term exists to pay for *arriving* somewhere, so a body that sails
         // over a hazard and dies in the air beyond it keeps the frontier it covered and
-        // earns nothing here. See `Level::checkpoint_zone`.
+        // earns nothing here. See `Level::checkpoint_zone_from`.
+        let mut route_advanced = false;
         if self.player.grounded {
             let surface = Level::tile_y(self.player.y + self.player.h + 0.05);
             let col = Level::tile_x(self.player.x + self.player.w * 0.5);
             if (surface, col) != self.last_stand {
+                let from_col = if self.last_stand.0 == i32::MIN {
+                    Level::tile_x(self.level.spawn.x + self.level.spawn.w * 0.5)
+                } else {
+                    self.last_stand.1
+                };
                 self.last_stand = (surface, col);
-                if let Some(zone) = self.level.checkpoint_zone(col, surface) {
+                if let Some(zone) = self.level.checkpoint_zone_from(col, surface, from_col) {
                     let id = (surface, zone);
                     if !self.credited.contains(&id) {
                         self.credited.push(id);
                         self.stats.checkpoints = self.credited.len() as u32;
+                    }
+                }
+                let routes = self.level.routes();
+                let stand = routes
+                    .zone_at(col, surface)
+                    .or_else(|| routes.zone_at(col - 1, surface))
+                    .or_else(|| routes.zone_at(col + 1, surface));
+                if let Some(s) = stand {
+                    self.current_route_stand = Some(s);
+                    if let Some(hops) = routes.hops_to_flag(s) {
+                        if self.min_hops_reached.is_none_or(|m| hops < m) {
+                            self.min_hops_reached = Some(hops);
+                            self.stats.best_stand = Some(s);
+                            if let Some(sh) = self.spawn_hops {
+                                let closed = sh.saturating_sub(hops);
+                                if closed > self.stats.route_hops_closed {
+                                    self.stats.route_hops_closed = closed;
+                                    route_advanced = true;
+                                }
+                            }
+                        } else if self.stats.best_stand.is_none() {
+                            self.stats.best_stand = Some(s);
+                        }
+                    } else if self.stats.best_stand.is_none() {
+                        self.stats.best_stand = Some(s);
                     }
                 }
             }
@@ -352,6 +470,8 @@ impl Sim {
             self.stats.progress_pixels =
                 self.stats.goal_distance_pixels - approach * PIXELS_PER_TILE;
             self.stats.no_progress_frames = 0;
+        } else if route_advanced {
+            self.stats.no_progress_frames = 0;
         } else {
             self.stats.no_progress_frames += 1;
         }
@@ -368,15 +488,9 @@ impl Sim {
         }
     }
 
-    /// Frame cap for this level (§7.4.6).
-    ///
-    /// The *longer* side, not the width. A budget proportional to width alone quietly
-    /// assumed every level is a side-scroller: a 10x22 tower got 400 frames to climb 18
-    /// rows, which is less than the 600-frame anti-camper timer and about seven jumps' worth
-    /// of airtime. Every shipped level is wider than it is tall, so this leaves all of them
-    /// exactly as they were.
+    /// Frame cap for this level (§7.4.6), i.e. [`frame_budget`] of its terrain.
     pub fn max_frames(&self) -> u32 {
-        self.level.width.max(self.level.height).max(1) as u32 * FRAMES_PER_TILE
+        frame_budget(&self.level)
     }
 
     fn die(&mut self) {
@@ -389,9 +503,26 @@ impl Sim {
         debug_assert!(self.outcome.is_finished());
     }
 
+    /// How close the body is to the flag *right now*, in tiles ([`goal_approach`]).
+    ///
+    /// The current reading, as opposed to [`EpisodeStats::closest_approach`] — the running
+    /// minimum over the whole episode, which includes positions the body only passed through
+    /// and never kept (the apex of a leap it then fell back from). Ask this one when the
+    /// question is "where has the body actually *stood*": `evo::curriculum::stuck_point`
+    /// tracks it over grounded frames to find the spot a stalled run should practice from.
+    pub fn goal_approach(&self) -> f32 {
+        goal_approach(&self.player, &self.level)
+    }
+
     /// Observation vector for the agent policy (§7.2). See [`sensors`].
     pub fn observation(&self) -> [f32; sensors::N_INPUTS] {
-        sensors::observe(&self.level, &self.player, &self.walkers, &PHYSICS)
+        sensors::observe_from_stand(
+            &self.level,
+            &self.player,
+            &self.walkers,
+            &PHYSICS,
+            self.current_route_stand,
+        )
     }
 
     /// Canonical hash of the complete simulated state (§5.2, §5.3).
@@ -410,6 +541,14 @@ impl Sim {
         h.u32(self.stats.stomps);
         h.u32(self.stats.jumps);
         h.u32(self.stats.checkpoints);
+        h.u32(self.stats.route_hops_closed);
+        match self.stats.best_stand {
+            Some(s) => {
+                h.u8(1);
+                h.u32(s as u32);
+            }
+            None => h.u8(0),
+        }
         // And the zone ids themselves, so a change to *which* zones qualify moves this hash
         // even when an episode happens to credit the same number of them.
         h.u32(self.credited.len() as u32);
@@ -449,5 +588,51 @@ impl Sim {
         use rand_xoshiro::rand_core::Rng as _;
         let mut probe = self.rng.clone();
         probe.next_u64()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A time is written one way, and the two shapes meet exactly where they say they do.
+    #[test]
+    fn a_time_in_frames_is_written_short_and_in_order() {
+        assert_eq!(format_time(0), "0.00s");
+        assert_eq!(format_time(1), "0.02s", "one frame is 1/60 s");
+        assert_eq!(format_time(505), "8.42s");
+        assert_eq!(format_time(2400), "40.00s", "a full-width level's budget");
+        // The seam: 3599 frames is 59.98 s and stays in hundredths, 3600 is a minute and changes
+        // shape. A reader never sees both shapes for one time, and a time is never written two
+        // ways, which is the whole point of there being one function.
+        assert_eq!(format_time(3599), "59.98s");
+        assert_eq!(format_time(3600), "1:00.00");
+        assert_eq!(format_time(3600 + 150), "1:02.50");
+
+        // And it is a *clock*: reading a time back gives the frame count it was made from, so a
+        // column of them is ordered by frames whatever shape each one is in. Sixty frames to the
+        // hundredth is exactly why hundredths are the right resolution — a frame is 0.0167 s, so
+        // two episodes a frame apart still read as two times.
+        for frames in [0u32, 1, 2, 59, 60, 505, 3598, 3599, 3600, 3725, 20_000, 727_000] {
+            assert_eq!(
+                frames_of(&format_time(frames)),
+                frames as i64,
+                "{} did not survive the round trip",
+                format_time(frames)
+            );
+        }
+    }
+
+    /// Frames a written time stands for, to the nearest frame. The inverse of [`format_time`] for
+    /// both of its shapes, used only by the test above — which is what makes "a slower episode
+    /// never reads as a faster one" a fact rather than an impression.
+    fn frames_of(written: &str) -> i64 {
+        let (minutes, rest) = match written.split_once(':') {
+            Some((m, rest)) => (m.parse::<f64>().expect("minutes"), rest),
+            None => (0.0, written),
+        };
+        let seconds = rest.trim_end_matches('s').parse::<f64>().expect("seconds");
+        let total = minutes * 60.0 + seconds;
+        (total / DT as f64).round() as i64
     }
 }

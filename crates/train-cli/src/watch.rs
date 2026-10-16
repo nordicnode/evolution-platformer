@@ -41,8 +41,9 @@ use crossterm::terminal::{
     LeaveAlternateScreen,
 };
 use evo::{
-    curriculum_step, ChampionFile, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind,
-    MUTATION_RATES, PopulationFile, ShowcaseLane, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
+    curriculum_step, practice_level_for_stall, practice_step, save_practice_level, ChampionFile,
+    EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, MUTATION_RATES, PopulationFile,
+    ShowcaseLane, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
 use render::chart::{
@@ -76,7 +77,9 @@ const WATCH_OPTS: &[&str] = &[
     "reheat-factor",
     "adaptive-sigma",
     "action-repeat",
+    "feedback",
     "trials",
+    "no-auto-trials",
     "out",
     "speed",
     "best",
@@ -204,14 +207,28 @@ pub fn watch(a: &Args) -> Result<(), String> {
         ))?),
         mutation_sigma: usage(a.f32_opt("mut-sigma", 0.30))?,
         fine_children: usage(a.usize_opt("fine-children", 8))?,
-        adaptive_sigma: a.has_flag("adaptive-sigma"),
+        adaptive_sigma: if a.has_flag("adaptive-sigma") {
+            true
+        } else {
+            GaConfig::default().adaptive_sigma
+        },
         stagnation_generations: usage(a.usize_opt("stagnation", 20))? as u32,
         immigrants: usage(a.usize_opt("immigrants", 8))?,
         // As in `train`: the default lives in the config, not in a second copy here.
         reheat_factor: usage(a.f32_opt("reheat-factor", GaConfig::default().reheat_factor))?,
         crossover_rate: usage(a.f32_opt("crossover", 0.75))?,
         action_repeat: usage(a.usize_opt("action-repeat", 4))? as u32,
-        trials: usage(a.usize_opt("trials", 1))? as u32,
+        // As in `train`: the width of the recurrent state, defaulted from the trainer's own
+        // shape rather than from a second copy here, and clamped by the trainer.
+        shape: evo::NetShape {
+            feedback: usage(a.usize_opt("feedback", GaConfig::default().shape.feedback))?,
+            ..GaConfig::default().shape
+        },
+        // As in `train`: the walker rule lives in the trainer (`GaConfig::effective_trials`), so
+        // watching a run judges it the way training it does — which the window, this mode and the
+        // API all get from the same place.
+        trials: usage(a.usize_opt("trials", GaConfig::default().trials as usize))? as u32,
+        auto_trials: !a.has_flag("no-auto-trials"),
         master_seed: usage(a.u64_opt("seed", 1))?,
         ..GaConfig::default()
     };
@@ -260,10 +277,19 @@ pub fn watch(a: &Args) -> Result<(), String> {
     let pop_size = trainer.config.pop_size;
     let mut history: Vec<HistoryPoint> = Vec::new();
     let mut curriculum_taken: Option<String> = None;
+    // The run's standing best when the last derived practice step fired: the gate that
+    // lets a practice run take a step per *stall spell* rather than one per run, and
+    // never two in the same spell.
+    let mut detour_best = f32::NEG_INFINITY;
     let mut deaths: Vec<(f32, f32, u32)> = Vec::new();
     let mut traces = TraceLog::new();
     let mut note: Option<String> = None;
     let mut generations_run = 0usize;
+    // The quickest win the run had recorded at the last generation, so a *new* one can be said out
+    // loud. It moves silently otherwise: a generation that shaves a tenth of a second off the best
+    // time moves no chart line by more than a pixel, and since fitness v8 the clock is what the
+    // search is partly paid for — so the moment the record falls is a moment worth a line.
+    let mut fastest_seen: Option<evo::FastWin> = None;
 
     for _ in 0..generations {
         if live.quit {
@@ -318,12 +344,15 @@ pub fn watch(a: &Args) -> Result<(), String> {
             note: note.as_deref(),
             traces: &traces,
             // Read off the report the search just produced: the size these children were
-            // bred with, the run's own staleness counter, and how many immigrants that
-            // counter bought.
+            // bred with, the run's own staleness counter, how many immigrants that counter
+            // bought, and how much of the behavioural archive the run is spread across.
             search: SearchState {
                 sigma: report.mutation_sigma,
                 stagnation: trainer.stagnation(),
                 immigrants: report.immigrants,
+                archive_children: report.archive_children,
+                archive_bits: report.archive_bits,
+                archive_time_bits: report.archive_time_bits,
             },
         };
         animate_lanes(&mut screen, &level, &mut runners, &info, &ctx, &mut live)
@@ -340,6 +369,25 @@ pub fn watch(a: &Args) -> Result<(), String> {
         deaths.retain(|(_, _, g)| report.generation.saturating_sub(*g) <= death_window);
         note = None;
 
+        // A quicker win than this run has ever had, said out loud. The note line is the view's own
+        // instrument for a fact no column of scores can show, which is what a record falling is: the
+        // stopwatch, not the fitness.
+        let fastest_now = trainer.fastest();
+        if fastest_now != fastest_seen {
+            if let Some(fast) = fastest_now {
+                note = Some(format!(
+                    "*** QUICKEST WIN: {} ({} frames) at the flag (gen {} id {}, {:.0}% of the level's {} unspent) ***",
+                    sim::format_time(fast.frames),
+                    fast.frames,
+                    fast.generation,
+                    fast.genome_id,
+                    fast.spare() * 100.0,
+                    sim::format_time(fast.budget_frames)
+                ));
+            }
+            fastest_seen = fastest_now;
+        }
+
         // `s` saves the best-ever champion; handled between generations so the file
         // is written once per keypress and the note outlives the key.
         if live.save_requested {
@@ -347,27 +395,84 @@ pub fn watch(a: &Args) -> Result<(), String> {
             note = Some(save_champion(&trainer, &level, &stem, &out_dir)?);
         }
 
-        // The stall the view has just reported is the trigger for the run's one
-        // curriculum step (§12 M5: stall detector -> death-spot highlight ->
-        // curriculum resume). It uses the *same* stall rule the status line shows,
-        // so the run cannot act on a stall the viewer is not being told about.
-        if curriculum_taken.is_none() {
-            if let (Some(stall), Some(easier)) = (fitness_stall(&history), &curriculum_level) {
+        // The stall the view has just reported is the trigger for a curriculum step
+        // (§12 M5: stall detector -> death-spot highlight -> curriculum resume). It
+        // uses the *same* stall rule the status line shows, so the run cannot act on
+        // a stall the viewer is not being told about.
+        //
+        // The authored easier level steps back once per run (the plan's rule). The
+        // derived practice re-arms on every *new* stall spell — a practice run has to
+        // work through a spot, keep the gain, and meet the next spot — and never
+        // twice within one, so a detour that learns nothing cannot loop (finding 50).
+        let armed = match &curriculum_level {
+            Some(_) => curriculum_taken.is_none(),
+            None => report.max_fitness > detour_best,
+        };
+        if armed {
+            if let Some(stall) = fitness_stall(&history) {
+                // The authored easier level is the run's first choice. Without one,
+                // the run practises *where it is stuck* instead (finding 50): its own
+                // level from the furthest stand its best genome has made, so every
+                // episode of the detour is the next move instead of the whole chain.
+                let practice;
+                let easier: &Level = match &curriculum_level {
+                    Some(easier) => easier,
+                    None => {
+                        let derived = match practice_level_for_stall(&trainer, &level) {
+                            Ok(derived) => derived,
+                            Err(reason) => {
+                                // Nowhere to practise from is said out loud too: the
+                                // stall line says the search stopped, this says why it
+                                // is not stepping back. Once per stall spell — the arm
+                                // closes until the run finds something better.
+                                detour_best = report.max_fitness;
+                                note = Some(format!(
+                                    "curriculum: {reason}; the run stays where it is ({})",
+                                    stall.label()
+                                ));
+                                continue;
+                            }
+                        };
+                        practice = derived;
+                        &practice
+                    }
+                };
                 // The step itself is `evo`'s, because the window runs the same one:
                 // a checkpoint and an excursion are the run's, not a front-end's.
                 let path = Path::new(&out_dir).join(format!("{stem}.population.json"));
-                let step = curriculum_step(
-                    &mut trainer,
-                    &level,
-                    easier,
-                    curriculum_generations,
-                    &path,
-                    live.mut_rate,
-                    &stall.label(),
-                )?;
+                let step = if curriculum_level.is_none() {
+                    // The practice detour keeps the main level in its judgement, so
+                    // what it learns comes back able to reach the spot it left.
+                    save_practice_level(easier, &path)?;
+                    practice_step(
+                        &mut trainer,
+                        &level,
+                        easier,
+                        curriculum_generations,
+                        &path,
+                        live.mut_rate,
+                        &stall.label(),
+                    )?
+                } else {
+                    curriculum_step(
+                        &mut trainer,
+                        &level,
+                        easier,
+                        curriculum_generations,
+                        &path,
+                        live.mut_rate,
+                        &stall.label(),
+                    )?
+                };
+                detour_best = report.max_fitness;
                 let summary = step.note(&level.name);
                 note = Some(summary.clone());
-                curriculum_taken = Some(summary);
+                // Every step keeps its line: a run that practised its way past three
+                // spots says so three times, not once.
+                curriculum_taken = Some(match curriculum_taken {
+                    Some(prev) => format!("{prev}\n{summary}"),
+                    None => summary,
+                });
             }
         }
     }
@@ -888,7 +993,8 @@ struct Frame<'a> {
     traces: &'a TraceLog,
     /// The recorded generation being shown, or `None` while the view is live.
     scrub: Option<u32>,
-    /// What the search is doing to itself (mutation size, stagnation, immigrants).
+    /// What the search is doing to itself (mutation size, stagnation, immigrants, and how
+    /// much of the behavioural archive it is spread across).
     search: SearchState,
     progress: Progress,
 }
@@ -970,6 +1076,28 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
     let mut search = format!("search  sigma {:.3}", f.search.sigma);
     if f.search.stagnation > 0 {
         search.push_str(&format!("   no new best in {}", f.search.stagnation));
+    }
+    // The quality-diversity half of the same story, in the desktop window's own words (see
+    // `app::panel::search_line`): a viewer who reads "diversity 9/48 niches" here and in the
+    // window is reading the same number off the same run, which is the rule that keeps the two
+    // front-ends one game. The denominator is the archive's *behavioural* cells and not the grid's
+    // whole 240: the grid is 48 ways of moving × 5 finish bands, and counting a run across a third
+    // of the behaviours out of the total would report it as an eighth explored — the window would
+    // say 16/48 beside this line's 16/240, which is the disagreement this parity rule exists to
+    // stop. Both clauses are skipped when they are zero rather than printed as zeros — before the
+    // first generation there is no archive to report, and `diversity 0/48` beside a live run would
+    // read as a population that had collapsed rather than one that has not started.
+    if f.search.archive_children > 0 {
+        search.push_str(&format!("   +{} from the archive", f.search.archive_children));
+    }
+    if f.search.archive_bits > 0 {
+        search.push_str(&format!(
+            "   diversity {}/{} niches   speed {}/{} bands",
+            f.search.archive_bits,
+            evo::ARCHIVE_BEHAVIOUR_CELLS,
+            f.search.archive_time_bits,
+            evo::ARCHIVE_TIME_BINS
+        ));
     }
     lines.push(clip(&search, cols));
 
@@ -1113,15 +1241,16 @@ struct GenCtx<'a> {
     note: Option<&'a str>,
     traces: &'a TraceLog,
     /// What the search is doing to *itself* this generation: the self-tuning mutation
-    /// size, how long the best has stood still, and how many reheated genomes that bought.
-    /// Beside the fitness row rather than in it, because these are the trainer's
-    /// readings of its own search and not the population's score.
+    /// size, how long the best has stood still, how many reheated genomes that bought, and how
+    /// many behavioural niches the archive holds. Beside the fitness row rather than in it,
+    /// because these are the trainer's readings of its own search and not the population's
+    /// score.
     search: SearchState,
 }
 
 /// The trainer's own reading of its search, carried into the frame.
 ///
-/// All three are read off the generation that was just scored, so a viewer watching the
+/// All five are read off the generation that was just scored, so a viewer watching the
 /// size fall is watching the run stop exploring and start polishing — the one thing a
 /// fitness chart cannot show, because a chart of a converged run and a chart of a run
 /// that is quietly searching a small neighbourhood look identical on it.
@@ -1135,6 +1264,19 @@ struct SearchState {
     /// run's best-ever genome. Non-zero only after a stagnation, so it is also the signal that
     /// the run has stopped moving and done something about it.
     immigrants: usize,
+    /// Children of the quality-diversity archive bred into the generation that follows the
+    /// scored one ([`evo::GenRow::archive_children`]). Unlike the immigrants these arrive every
+    /// generation, so the number is a fact about the search's shape rather than about a stall.
+    archive_children: usize,
+    /// Behavioural niches the archive held at the end of the scored generation, of
+    /// [`evo::ARCHIVE_BEHAVIOUR_CELLS`]. The run's diversity reading: it falls when the population
+    /// collapses onto one way of moving, which no column of scores can show.
+    archive_bits: usize,
+    /// Finish bands holding a win, of [`evo::ARCHIVE_TIME_BINS`]. The run's *speed* coverage, and a
+    /// different reading from the one above: it climbs only when the population learns to solve the
+    /// level quicker, never when it finds a new way of moving. Zero before anything has finished,
+    /// which is why the frame prints it only beside a non-empty archive.
+    archive_time_bits: usize,
 }
 
 /// Frames a generation is allowed to draw at this speed: enough to watch the whole
@@ -1533,6 +1675,21 @@ fn finish_training(
     screen.close();
     println!();
     println!("watched {} ({} generations)", level.name, trainer.history().len());
+    // The clock, before the best agent rather than after it: what a viewer carries away from a
+    // watching session is *how quickly* the level was solved, and `best` below is a different
+    // record — the highest-scoring genome, which is not always the quickest win.
+    match trainer.fastest() {
+        Some(fast) => println!(
+            "clock   {} ({} frames) at the flag (gen {} id {}, {:.0}% of the level's {} unspent)",
+            sim::format_time(fast.frames),
+            fast.frames,
+            fast.generation,
+            fast.genome_id,
+            fast.spare() * 100.0,
+            sim::format_time(fast.budget_frames),
+        ),
+        None => println!("clock   no win to time: nothing reached the flag"),
+    }
     if let Some(best) = trainer.best_ever() {
         println!(
             "best    gen {} id {} fitness {:.2} ({} after {} frames, best_x {:.1}, jumps {}, checkpoints {})",
@@ -2494,6 +2651,12 @@ mod tests {
         // L5 at pop 2 does not improve for the 25 generations the stall rule asks
         // for, which is exactly the trigger. L1 is the easier level: a random
         // population wins it at generation 0, so the detour is cheap to run.
+        //
+        // Sixty rather than forty, and the extra twenty are a measurement: at pop 2 this run's
+        // last new best is generation 21, so the 25-flat window opens at 46 and a forty-
+        // generation cap ended the run before the stall the test exists to exercise could fire.
+        // (The trajectory moved when sensors v7 appended its input.) The window is what the panel
+        // uses (`render::chart::STALL_GENERATIONS`), not a flag, so the run has to be given room.
         let stalled_args = a(&[
             "watch",
             "--level",
@@ -2501,7 +2664,7 @@ mod tests {
             "--pop",
             "2",
             "--generations",
-            "40",
+            "60",
             "--curriculum",
             &easier,
             "--curriculum-generations",

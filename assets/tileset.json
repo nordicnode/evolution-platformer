@@ -4,7 +4,7 @@
   "image": "tileset.png",
   "cell": 16,
   "cols": 16,
-  "rows": 10,
+  "rows": 15,
   "generator": "tools/gen_tileset.py",
   "sprites": [
     {
@@ -253,504 +253,924 @@
       "row": 3
     },
     {
-      "name": "ground_1_b",
+      "name": "brick_0",
       "col": 1,
       "row": 3
+    },
+    {
+      "name": "brick_1",
+      "col": 2,
+      "row": 3
+    },
+    {
+      "name": "brick_2",
+      "col": 3,
+      "row": 3
+    },
+    {
+      "name": "brick_3",
+      "col": 4,
+      "row": 3
+    },
+    {
+      "name": "brick_4",
+      "col": 5,
+      "row": 3
+    },
+    {
+      "name": "brick_5",
+      "col": 6,
+      "row": 3
+    },
+    {
+      "name": "brick_6",
+      "col": 7,
+      "row": 3
+    },
+    {
+      "name": "brick_7",
+      "col": 8,
+      "row": 3
+    },
+    {
+      "name": "brick_8",
+      "col": 9,
+      "row": 3
+    },
+    {
+      "name": "brick_9",
+      "col": 10,
+      "row": 3
+    },
+    {
+      "name": "brick_10",
+      "col": 11,
+      "row": 3
+    },
+    {
+      "name": "brick_11",
+      "col": 12,
+      "row": 3
+    },
+    {
+      "name": "brick_12",
+      "col": 13,
+      "row": 3
+    },
+    {
+      "name": "brick_13",
+      "col": 14,
+      "row": 3
+    },
+    {
+      "name": "brick_14",
+      "col": 15,
+      "row": 3
+    },
+    {
+      "name": "brick_15",
+      "col": 0,
+      "row": 4
+    },
+    {
+      "name": "masonry_0",
+      "col": 1,
+      "row": 4
+    },
+    {
+      "name": "masonry_2",
+      "col": 2,
+      "row": 4
+    },
+    {
+      "name": "masonry_4",
+      "col": 3,
+      "row": 4
+    },
+    {
+      "name": "masonry_6",
+      "col": 4,
+      "row": 4
+    },
+    {
+      "name": "masonry_8",
+      "col": 5,
+      "row": 4
+    },
+    {
+      "name": "masonry_10",
+      "col": 6,
+      "row": 4
+    },
+    {
+      "name": "masonry_12",
+      "col": 7,
+      "row": 4
+    },
+    {
+      "name": "masonry_14",
+      "col": 8,
+      "row": 4
+    },
+    {
+      "name": "wood_0",
+      "col": 9,
+      "row": 4
+    },
+    {
+      "name": "wood_1",
+      "col": 10,
+      "row": 4
+    },
+    {
+      "name": "wood_2",
+      "col": 11,
+      "row": 4
+    },
+    {
+      "name": "wood_3",
+      "col": 12,
+      "row": 4
+    },
+    {
+      "name": "wood_4",
+      "col": 13,
+      "row": 4
+    },
+    {
+      "name": "wood_5",
+      "col": 14,
+      "row": 4
+    },
+    {
+      "name": "wood_6",
+      "col": 15,
+      "row": 4
+    },
+    {
+      "name": "wood_7",
+      "col": 0,
+      "row": 5
+    },
+    {
+      "name": "wood_8",
+      "col": 1,
+      "row": 5
+    },
+    {
+      "name": "wood_9",
+      "col": 2,
+      "row": 5
+    },
+    {
+      "name": "wood_10",
+      "col": 3,
+      "row": 5
+    },
+    {
+      "name": "wood_11",
+      "col": 4,
+      "row": 5
+    },
+    {
+      "name": "wood_12",
+      "col": 5,
+      "row": 5
+    },
+    {
+      "name": "wood_13",
+      "col": 6,
+      "row": 5
+    },
+    {
+      "name": "wood_14",
+      "col": 7,
+      "row": 5
+    },
+    {
+      "name": "wood_15",
+      "col": 8,
+      "row": 5
+    },
+    {
+      "name": "timber_0",
+      "col": 9,
+      "row": 5
+    },
+    {
+      "name": "timber_2",
+      "col": 10,
+      "row": 5
+    },
+    {
+      "name": "timber_4",
+      "col": 11,
+      "row": 5
+    },
+    {
+      "name": "timber_6",
+      "col": 12,
+      "row": 5
+    },
+    {
+      "name": "timber_8",
+      "col": 13,
+      "row": 5
+    },
+    {
+      "name": "timber_10",
+      "col": 14,
+      "row": 5
+    },
+    {
+      "name": "timber_12",
+      "col": 15,
+      "row": 5
+    },
+    {
+      "name": "timber_14",
+      "col": 0,
+      "row": 6
+    },
+    {
+      "name": "ground_1_b",
+      "col": 1,
+      "row": 6
     },
     {
       "name": "ground_1_c",
       "col": 2,
-      "row": 3
+      "row": 6
     },
     {
       "name": "deep_0_b",
       "col": 3,
-      "row": 3
+      "row": 6
     },
     {
       "name": "deep_0_c",
       "col": 4,
-      "row": 3
+      "row": 6
     },
     {
       "name": "sand_1_b",
       "col": 5,
-      "row": 3
+      "row": 6
     },
     {
       "name": "sand_1_c",
       "col": 6,
-      "row": 3
+      "row": 6
+    },
+    {
+      "name": "brick_1_b",
+      "col": 7,
+      "row": 6
+    },
+    {
+      "name": "brick_1_c",
+      "col": 8,
+      "row": 6
+    },
+    {
+      "name": "wood_1_b",
+      "col": 9,
+      "row": 6
+    },
+    {
+      "name": "wood_1_c",
+      "col": 10,
+      "row": 6
     },
     {
       "name": "spike",
-      "col": 7,
-      "row": 3
+      "col": 11,
+      "row": 6
     },
     {
       "name": "player_idle_a",
-      "col": 8,
-      "row": 3
+      "col": 12,
+      "row": 6
     },
     {
       "name": "player_idle_b",
-      "col": 9,
-      "row": 3
+      "col": 13,
+      "row": 6
     },
     {
       "name": "player_run_1",
-      "col": 10,
-      "row": 3
+      "col": 14,
+      "row": 6
     },
     {
       "name": "player_run_2",
-      "col": 11,
-      "row": 3
+      "col": 15,
+      "row": 6
     },
     {
       "name": "player_run_3",
-      "col": 12,
-      "row": 3
+      "col": 0,
+      "row": 7
     },
     {
       "name": "player_run_4",
-      "col": 13,
-      "row": 3
+      "col": 1,
+      "row": 7
     },
     {
       "name": "player_run_5",
-      "col": 14,
-      "row": 3
+      "col": 2,
+      "row": 7
     },
     {
       "name": "player_run_6",
-      "col": 15,
-      "row": 3
+      "col": 3,
+      "row": 7
     },
     {
       "name": "player_jump",
-      "col": 0,
-      "row": 4
+      "col": 4,
+      "row": 7
     },
     {
       "name": "player_fall",
-      "col": 1,
-      "row": 4
+      "col": 5,
+      "row": 7
     },
     {
       "name": "player_land",
-      "col": 2,
-      "row": 4
+      "col": 6,
+      "row": 7
     },
     {
       "name": "player_hurt",
-      "col": 3,
-      "row": 4
+      "col": 7,
+      "row": 7
     },
     {
       "name": "walker_a",
-      "col": 4,
-      "row": 4
+      "col": 8,
+      "row": 7
     },
     {
       "name": "walker_b",
-      "col": 5,
-      "row": 4
+      "col": 9,
+      "row": 7
     },
     {
       "name": "walker_c",
-      "col": 6,
-      "row": 4
+      "col": 10,
+      "row": 7
     },
     {
       "name": "walker_d",
-      "col": 7,
-      "row": 4
+      "col": 11,
+      "row": 7
     },
     {
       "name": "walker_dead",
-      "col": 8,
-      "row": 4
+      "col": 12,
+      "row": 7
     },
     {
       "name": "goal_top",
-      "col": 9,
-      "row": 4
+      "col": 13,
+      "row": 7
     },
     {
       "name": "goal_bottom",
-      "col": 10,
-      "row": 4
+      "col": 14,
+      "row": 7
     },
     {
       "name": "goal_flag_1",
-      "col": 11,
-      "row": 4
+      "col": 15,
+      "row": 7
     },
     {
       "name": "goal_flag_2",
-      "col": 12,
-      "row": 4
+      "col": 0,
+      "row": 8
     },
     {
       "name": "goal_flag_3",
-      "col": 13,
-      "row": 4
+      "col": 1,
+      "row": 8
     },
     {
       "name": "goal_flag_4",
-      "col": 14,
-      "row": 4
+      "col": 2,
+      "row": 8
     },
     {
       "name": "spawn_marker",
-      "col": 15,
-      "row": 4
+      "col": 3,
+      "row": 8
     },
     {
       "name": "bush_a",
-      "col": 0,
-      "row": 5
+      "col": 4,
+      "row": 8
     },
     {
       "name": "bush_b",
-      "col": 1,
-      "row": 5
+      "col": 5,
+      "row": 8
     },
     {
       "name": "bush_c",
-      "col": 2,
-      "row": 5
+      "col": 6,
+      "row": 8
     },
     {
       "name": "bush_d",
-      "col": 3,
-      "row": 5
+      "col": 7,
+      "row": 8
     },
     {
       "name": "bush_e",
-      "col": 4,
-      "row": 5
+      "col": 8,
+      "row": 8
     },
     {
       "name": "bush_f",
-      "col": 5,
-      "row": 5
+      "col": 9,
+      "row": 8
     },
     {
       "name": "tuft_a",
-      "col": 6,
-      "row": 5
+      "col": 10,
+      "row": 8
     },
     {
       "name": "tuft_b",
-      "col": 7,
-      "row": 5
+      "col": 11,
+      "row": 8
     },
     {
       "name": "tuft_c",
-      "col": 8,
-      "row": 5
+      "col": 12,
+      "row": 8
     },
     {
       "name": "tuft_d",
-      "col": 9,
-      "row": 5
+      "col": 13,
+      "row": 8
     },
     {
       "name": "tuft_e",
-      "col": 10,
-      "row": 5
+      "col": 14,
+      "row": 8
     },
     {
       "name": "tuft_f",
-      "col": 11,
-      "row": 5
+      "col": 15,
+      "row": 8
     },
     {
       "name": "flowers",
-      "col": 12,
-      "row": 5
+      "col": 0,
+      "row": 9
     },
     {
       "name": "flowers_pink",
-      "col": 13,
-      "row": 5
+      "col": 1,
+      "row": 9
     },
     {
       "name": "rock",
-      "col": 14,
-      "row": 5
+      "col": 2,
+      "row": 9
     },
     {
       "name": "pebble",
-      "col": 15,
-      "row": 5
+      "col": 3,
+      "row": 9
     },
     {
       "name": "mushroom",
-      "col": 0,
-      "row": 6
+      "col": 4,
+      "row": 9
     },
     {
       "name": "flowers_white",
-      "col": 1,
-      "row": 6
+      "col": 5,
+      "row": 9
     },
     {
       "name": "log",
-      "col": 2,
-      "row": 6
+      "col": 6,
+      "row": 9
     },
     {
       "name": "stump",
-      "col": 3,
-      "row": 6
+      "col": 7,
+      "row": 9
     },
     {
       "name": "reeds_a",
-      "col": 4,
-      "row": 6
+      "col": 8,
+      "row": 9
     },
     {
       "name": "reeds_b",
-      "col": 5,
-      "row": 6
+      "col": 9,
+      "row": 9
     },
     {
       "name": "vine_a",
-      "col": 6,
-      "row": 6
+      "col": 10,
+      "row": 9
     },
     {
       "name": "vine_b",
-      "col": 7,
-      "row": 6
+      "col": 11,
+      "row": 9
     },
     {
       "name": "mushroom_pair",
-      "col": 8,
-      "row": 6
+      "col": 12,
+      "row": 9
+    },
+    {
+      "name": "lantern",
+      "col": 13,
+      "row": 9
+    },
+    {
+      "name": "crystal",
+      "col": 14,
+      "row": 9
+    },
+    {
+      "name": "signpost",
+      "col": 15,
+      "row": 9
+    },
+    {
+      "name": "crate",
+      "col": 0,
+      "row": 10
+    },
+    {
+      "name": "banner_a",
+      "col": 1,
+      "row": 10
+    },
+    {
+      "name": "banner_b",
+      "col": 2,
+      "row": 10
     },
     {
       "name": "tree_a_base",
-      "col": 9,
-      "row": 6
+      "col": 3,
+      "row": 10
     },
     {
       "name": "tree_a_top",
-      "col": 10,
-      "row": 6
+      "col": 4,
+      "row": 10
     },
     {
       "name": "tree_b_base",
-      "col": 11,
-      "row": 6
+      "col": 5,
+      "row": 10
     },
     {
       "name": "tree_b_top",
-      "col": 12,
-      "row": 6
+      "col": 6,
+      "row": 10
     },
     {
       "name": "butterfly_a_1",
-      "col": 13,
-      "row": 6
+      "col": 7,
+      "row": 10
     },
     {
       "name": "butterfly_a_2",
-      "col": 14,
-      "row": 6
+      "col": 8,
+      "row": 10
     },
     {
       "name": "butterfly_b_1",
-      "col": 15,
-      "row": 6
+      "col": 9,
+      "row": 10
     },
     {
       "name": "butterfly_b_2",
-      "col": 0,
-      "row": 7
+      "col": 10,
+      "row": 10
     },
     {
       "name": "pine_a",
-      "col": 1,
-      "row": 7
+      "col": 11,
+      "row": 10
     },
     {
       "name": "pine_b",
-      "col": 2,
-      "row": 7
+      "col": 12,
+      "row": 10
     },
     {
       "name": "pine_c",
-      "col": 3,
-      "row": 7
+      "col": 13,
+      "row": 10
     },
     {
       "name": "pine_d",
-      "col": 4,
-      "row": 7
+      "col": 14,
+      "row": 10
     },
     {
       "name": "pine_near_a",
-      "col": 5,
-      "row": 7
+      "col": 15,
+      "row": 10
     },
     {
       "name": "pine_near_b",
-      "col": 6,
-      "row": 7
+      "col": 0,
+      "row": 11
     },
     {
       "name": "cloud_a",
-      "col": 7,
-      "row": 7
+      "col": 1,
+      "row": 11
     },
     {
       "name": "cloud_b",
-      "col": 8,
-      "row": 7
+      "col": 2,
+      "row": 11
     },
     {
       "name": "cloud_c",
-      "col": 9,
-      "row": 7
+      "col": 3,
+      "row": 11
     },
     {
       "name": "dust_a",
-      "col": 10,
-      "row": 7
+      "col": 4,
+      "row": 11
     },
     {
       "name": "dust_b",
-      "col": 11,
-      "row": 7
+      "col": 5,
+      "row": 11
     },
     {
       "name": "puff",
-      "col": 12,
-      "row": 7
+      "col": 6,
+      "row": 11
     },
     {
       "name": "spark_a",
-      "col": 13,
-      "row": 7
+      "col": 7,
+      "row": 11
     },
     {
       "name": "spark_b",
+      "col": 8,
+      "row": 11
+    },
+    {
+      "name": "ui_mirror",
+      "col": 9,
+      "row": 11
+    },
+    {
+      "name": "ui_undo",
+      "col": 10,
+      "row": 11
+    },
+    {
+      "name": "ui_redo",
+      "col": 11,
+      "row": 11
+    },
+    {
+      "name": "ui_fit",
+      "col": 12,
+      "row": 11
+    },
+    {
+      "name": "ui_info",
+      "col": 13,
+      "row": 11
+    },
+    {
+      "name": "ui_restart",
       "col": 14,
-      "row": 7
+      "row": 11
+    },
+    {
+      "name": "ui_pause",
+      "col": 15,
+      "row": 11
+    },
+    {
+      "name": "ui_play",
+      "col": 0,
+      "row": 12
+    },
+    {
+      "name": "ui_step",
+      "col": 1,
+      "row": 12
+    },
+    {
+      "name": "ui_medal",
+      "col": 2,
+      "row": 12
     },
     {
       "name": "blend_grass_l",
-      "col": 15,
-      "row": 7
+      "col": 3,
+      "row": 12
     },
     {
       "name": "blend_grass_r",
-      "col": 0,
-      "row": 8
+      "col": 4,
+      "row": 12
     },
     {
       "name": "blend_grass_t",
-      "col": 1,
-      "row": 8
+      "col": 5,
+      "row": 12
     },
     {
       "name": "blend_dirt_l",
-      "col": 2,
-      "row": 8
+      "col": 6,
+      "row": 12
     },
     {
       "name": "blend_dirt_r",
-      "col": 3,
-      "row": 8
+      "col": 7,
+      "row": 12
     },
     {
       "name": "blend_dirt_t",
-      "col": 4,
-      "row": 8
+      "col": 8,
+      "row": 12
     },
     {
       "name": "blend_dirt_b",
-      "col": 5,
-      "row": 8
+      "col": 9,
+      "row": 12
     },
     {
       "name": "blend_stone_l",
-      "col": 6,
-      "row": 8
+      "col": 10,
+      "row": 12
     },
     {
       "name": "blend_stone_r",
-      "col": 7,
-      "row": 8
+      "col": 11,
+      "row": 12
     },
     {
       "name": "blend_stone_t",
-      "col": 8,
-      "row": 8
+      "col": 12,
+      "row": 12
     },
     {
       "name": "blend_stone_b",
-      "col": 9,
-      "row": 8
+      "col": 13,
+      "row": 12
     },
     {
       "name": "blend_beach_l",
-      "col": 10,
-      "row": 8
+      "col": 14,
+      "row": 12
     },
     {
       "name": "blend_beach_r",
-      "col": 11,
-      "row": 8
+      "col": 15,
+      "row": 12
     },
     {
       "name": "blend_beach_t",
-      "col": 12,
-      "row": 8
+      "col": 0,
+      "row": 13
     },
     {
       "name": "blend_packed_l",
-      "col": 13,
-      "row": 8
+      "col": 1,
+      "row": 13
     },
     {
       "name": "blend_packed_r",
-      "col": 14,
-      "row": 8
+      "col": 2,
+      "row": 13
     },
     {
       "name": "blend_packed_t",
-      "col": 15,
-      "row": 8
+      "col": 3,
+      "row": 13
     },
     {
       "name": "blend_packed_b",
-      "col": 0,
-      "row": 9
+      "col": 4,
+      "row": 13
     },
     {
       "name": "blend_sandstone_l",
-      "col": 1,
-      "row": 9
+      "col": 5,
+      "row": 13
     },
     {
       "name": "blend_sandstone_r",
-      "col": 2,
-      "row": 9
+      "col": 6,
+      "row": 13
     },
     {
       "name": "blend_sandstone_t",
-      "col": 3,
-      "row": 9
+      "col": 7,
+      "row": 13
     },
     {
       "name": "blend_sandstone_b",
+      "col": 8,
+      "row": 13
+    },
+    {
+      "name": "blend_brick_l",
+      "col": 9,
+      "row": 13
+    },
+    {
+      "name": "blend_brick_r",
+      "col": 10,
+      "row": 13
+    },
+    {
+      "name": "blend_brick_t",
+      "col": 11,
+      "row": 13
+    },
+    {
+      "name": "blend_brick_b",
+      "col": 12,
+      "row": 13
+    },
+    {
+      "name": "blend_masonry_l",
+      "col": 13,
+      "row": 13
+    },
+    {
+      "name": "blend_masonry_r",
+      "col": 14,
+      "row": 13
+    },
+    {
+      "name": "blend_masonry_t",
+      "col": 15,
+      "row": 13
+    },
+    {
+      "name": "blend_masonry_b",
+      "col": 0,
+      "row": 14
+    },
+    {
+      "name": "blend_wood_l",
+      "col": 1,
+      "row": 14
+    },
+    {
+      "name": "blend_wood_r",
+      "col": 2,
+      "row": 14
+    },
+    {
+      "name": "blend_wood_t",
+      "col": 3,
+      "row": 14
+    },
+    {
+      "name": "blend_wood_b",
       "col": 4,
-      "row": 9
+      "row": 14
+    },
+    {
+      "name": "blend_timber_l",
+      "col": 5,
+      "row": 14
+    },
+    {
+      "name": "blend_timber_r",
+      "col": 6,
+      "row": 14
+    },
+    {
+      "name": "blend_timber_t",
+      "col": 7,
+      "row": 14
+    },
+    {
+      "name": "blend_timber_b",
+      "col": 8,
+      "row": 14
     }
   ]
 }

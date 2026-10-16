@@ -10,8 +10,9 @@
 //!   its own thread while the generation it just finished is animated over the terrain,
 //!   with the fitness chart, the run's readings and the recorded champion routes.
 //! * **Replay** — the run's answer, once the viewer has stopped pushing the search: its
-//!   best-ever agent playing the level at real time, with the population of the last
-//!   generation it scored ghosted on the same clock.
+//!   quickest winning agent playing the level at real time, with the population of the last
+//!   generation it scored ghosted on the same clock. (A run that has not won yet shows its
+//!   best-scoring attempt instead, and says so.)
 //!
 //! Everything is drawn from the deterministic core: this binary owns no physics, and the
 //! trainer it hosts is the same `evo` the headless driver uses.
@@ -23,8 +24,8 @@
 //! by the other.
 //!
 //! ```text
-//! evo-app [--level levels/l6-marathon.json] [--assets assets] [--splash] [--evolve]
-//!         [--replay] [--pop 200] [--seed 1] [--generations 300]
+//! evo-app [--level levels/l6-marathon.json] [--assets assets] [--splash] [--play]
+//!         [--evolve] [--replay] [--pop 200] [--seed 1] [--generations 300]
 //!         [--champions champions] [--resume champions/l5-tightrope.population.json]
 //!         [--curriculum levels/l3-gauntlet.json] [--curriculum-generations 40]
 //!         [--screenshot out.png]
@@ -33,11 +34,15 @@
 mod app;
 mod atlas;
 mod editor;
+mod help;
 mod lab;
 mod panel;
 mod play;
 mod replay;
+mod shelf;
 mod splash;
+mod theme;
+mod ui;
 mod view;
 
 use std::path::PathBuf;
@@ -61,12 +66,14 @@ OPTIONS:
                           plays the run's saved champion for the level being opened
                           when --champions holds one that won, and a demo run otherwise.
     --no-splash           Skip the title screen and open the editor on the first frame.
+    --play                Open in the playtest, with the clock running from the spawn.
     --evolve              Open in the evolution view and start training at once.
-    --replay              Open in the replay of the run's best agent: it starts a run
+    --replay              Open in the replay of the run's quickest win: it starts a run
                           like --evolve, takes it to its cap when one was given, and then
-                          plays back the best episode it found at real time, with the
-                          population of the last generation it scored ghosted.
-    --no-ghosts           Open that replay with the population hidden, showing the best
+                          plays back the episode that reached the flag fastest at real
+                          time, with the population of the last generation it scored
+                          ghosted. A run that has not won shows its best-scoring attempt.
+    --no-ghosts           Open that replay with the population hidden, showing that one
                           agent alone (the `g` key and the panel's checkbox do the same
                           thing while the window is up).
     --pop <N>             Population size for that run.        [default 200]
@@ -128,6 +135,7 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
             // A population of one has no selection pressure, and a zero-generation run
             // would never score anything: both are refused rather than clamped, because a
             // scripted `--generations 0` is a mistake in the script, not a preference.
+            "--play" => lab.play = true,
             "--evolve" => lab.evolve = true,
             // `--replay` is `--evolve` plus one thing done afterwards, so it is not an
             // error to ask for both: whichever lands, the run is started and the replay is

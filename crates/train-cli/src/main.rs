@@ -5,6 +5,7 @@
 //! | command | what it does |
 //! |---|---|
 //! | `train` | evolve a population on a level, print the fitness chart, save a champion |
+//! | `es` | the same level on the same episode budget, searched by an evolution strategy |
 //! | `watch` | the same training, animated: best-4 + random-4 per generation (M3) |
 //! | `reach` | run the jump-reachability oracle on one level or a whole directory |
 //! | `replay` | re-simulate a saved champion and verify it reproduces |
@@ -74,9 +75,11 @@ fn run(raw: &[String]) -> Result<(), Failure> {
 
     let result = match args.command.as_str() {
         "train" => commands::train(&args),
+        "es" => commands::es(&args),
         "watch" => watch::watch(&args),
         "reach" => commands::reach(&args),
         "replay" => commands::replay(&args),
+        "score" => commands::score(&args),
         "play" => commands::play(&args),
         "render" => commands::render(&args),
         "sensors" => commands::sensors(&args),
@@ -107,11 +110,17 @@ USAGE:
     train-cli <COMMAND> [OPTIONS]
 
 COMMANDS:
-    train     Evolve a population on a level, print the fitness chart, save a champion.
+    train     Evolve a population on a level (or a whole suite of them, see --suite),
+              print the fitness chart, save a champion.
+    es        Search the same level with an evolution strategy instead of the GA, on the
+              same episode budget. The independent baseline: it is here to say whether
+              the search or the problem is the binding constraint. See ES OPTIONS.
     watch     Train with the evolution on screen: chart, best-4 + random-4 agents per
               generation, speed control, pause, death markers, genius splash (M3).
     reach     Check that a level is beatable in principle (jump-reachability oracle).
     replay    Re-simulate a saved champion and confirm it reproduces its trajectory.
+    score     Score a saved champion on one level or a suite of them: what one policy
+              actually does on each, which is the read a suite's claim has to survive.
     play      Play a level yourself with the keyboard, in the terminal.
     render    Print ASCII frames of a level, for eyeballing physics and entities.
     sensors   Print the observation layout, the action table and the physics bible.
@@ -120,7 +129,31 @@ COMMANDS:
     --version, -V   Show version and the sim/sensor/fitness version trio.
 
 TRAIN OPTIONS:
-    --level <PATH>        Level JSON to train on.                        [required]
+    --level <PATH>        Level JSON to train on. [required unless --suite is given]
+    --suite <A,B,...>     Train ONE population on several levels at once, every generation
+                          ranked by the level it is **worst** at: the standard route to a
+                          policy that generalises rather than memorises, and the item the
+                          review ranks largest (REVIEW.md §4 item 5). Level 0 is where a
+                          champion is recorded (written as `<level0>-suite.json` so a
+                          single-level champion of the same level is never overwritten) and
+                          where the quality-diversity archive reads its behaviour. The
+                          aggregate is a **minimum and not the sum**: one flag is worth
+                          10 000 while a whole level of progress is worth about 1 000, so a
+                          sum would let the easiest level own the score and would teach the
+                          population to specialise — the one thing a suite is for.
+                          `--stop-on-win` means **every** level won, and each level keeps
+                          its own episode budget (three patrol phases where it has walkers).
+                          Duplicates and an empty entry are refused rather than guessed at.
+    --novelty <F>         Fitness units paid to a genome for behaving **rarely**, added to the
+                          score the population is ranked and bred by — and never to a number
+                          that is recorded: the chart, the champion's fitness and `replay`
+                          still read the real episode, so a novelty run is comparable with
+                          every other run in the notes. The bonus is `F x (1 - share of the
+                          population in the genome's behavioural cell)`, so `--novelty 16`
+                          pays a genome alone in its niche one tile of ground. Off by
+                          default (0.0); measured on the plateau and on the chain level in
+                          REVIEW.md §4, and offered rather than shipped for the reason that
+                          section records.                             [default 0.0]
     --generations <N>     Generations to run.                                [default 30]
     --pop <N>             Population size.                          [default 200 native]
     --seed <N>            Master seed; the whole run is reproducible.        [default 1]
@@ -143,6 +176,29 @@ TRAIN OPTIONS:
                           the run's best-ever genome** — every gene moved — so the batch
                           explores a long way from the best point found instead of
                           restarting from noise.                        [default 8]
+    --archive-children <N>
+                          Offspring per generation bred from the quality-diversity archive
+                          instead of the ranking: perturbations of the best genome found in
+                          one of the archive's niches, which is the kind of genome a
+                          plateau's next obstacle needs and the ranking usually throws
+                          away. Fires every generation, not only on a stall. **Off by
+                          default**, because it is measured as a loss on the hardest
+                          level in the pack: 10 of 12 seeds solved with it off, 7 at 2 and
+                          6 at 4, against wins that come earlier on easier levels. It is
+                          a knob to try on a level that is stuck, not a setting to ship.
+                                                                            [default 0]
+    --archive-on-diversity
+                          Breed those archive children only when the run is out of ideas in
+                          both senses: no new best for --stagnation generations *and* no new
+                          behavioural niche over the same window. Measured on `scratch-tower`
+                          at 12 seeds: the ungated trickle 7 of 12 at a mean first-win
+                          generation of 121, gated 9 of 12 at 76, gate off 10 of 12 at 94 — so
+                          the gate is the first archive reading that is not a loss on a
+                          plateau. **Off by default anyway**, because on a hazard floor the
+                          gate is what costs: `scratch-spike-tight` solves 3 of 12 with the
+                          ungated trickle against 1 with the gate, since a run grinding across
+                          a hazard floor is always finding something new and the condition
+                          never arrives. Use it on a plateau.
     --reheat-factor <X>   How hot that batch is, as a multiple of the run's own mutation
                           size, held inside the 0.05-1.00 sigma band. 1.0 throws it as far as
                           an ordinary mutation step but at every gene rather than five percent
@@ -155,14 +211,54 @@ TRAIN OPTIONS:
     --tournament <N>      Tournament selection size (3-5).                    [default 4]
     --crossover <R>       Crossover probability.                          [default 0.75]
     --action-repeat <N>   Physics ticks between network queries (3-6).        [default 4]
+    --feedback <N>        Width of the network's memory: that many values of its own first
+                          hidden layer are fed back into the next decision, so the policy
+                          has a state of its own rather than being a pure function of the
+                          frame in front of it — which is what lets it count, wait for a
+                          walker, and commit to a manoeuvre across several decisions. 0,
+                          the default, is a memoryless net: the recipe every measurement
+                          in `REVIEW.md` was taken with. Costs `N x 16` extra genes, and
+                          is clamped to 64.
+                                                                            [default 0]
     --trials <N>          Episodes per genome, averaged. Only distinguishes anything
-                          on levels with walkers, v1's one stochastic element.
+                          on levels with walkers, v1's one stochastic element. Left at its
+                          default, a level **with walkers in it** is judged on three patrol
+                          phases rather than one, through the trainer's own rule
+                          (`GaConfig::recommended_trials_for`), because a single phase is a
+                          re-roll of the RNG rather than a measurement of a genome.
                                                                             [default 1]
+    --no-auto-trials      Release that rule and judge every level on the literal `--trials`
+                          count, which is how a number measured before the rule existed is
+                          reproduced (and how the one-phase runs in the notes were taken).
+    --curriculum <PATH>   Easier level to fall back to when the run stalls.
+    --curriculum-generations <N>
+                          Generations spent there before returning. 0 takes the detour
+                          out of the run altogether — the protocol measurements before
+                          finding 50 were taken under.                       [default 40]
     --out <DIR>           Champion output directory.                  [default champions]
     --csv <PATH>          Also write the (generation, max, avg) history as CSV.
     --max-seconds <S>     Stop early after S wall-clock seconds.
     --stop-on-win         Stop as soon as any agent touches the flag.
     --quiet               Print only the final summary and the champion path.
+
+ES OPTIONS:
+    --level <PATH>        Level to search.                                 [required]
+    --generations <N>     Generations to run.                                [default 30]
+    --pop <N>             Perturbations per generation: λ, rounded down to an even number
+                          because a mirror without its pair is half an estimate.
+                                                                            [default 200]
+    --seed <N>            Master seed; the whole run is reproducible.        [default 1]
+    --sigma <S>           Size of the probe, in gene units. Smaller than a mutation
+                          sigma on purpose: a step wants a steady direction, not a
+                          saturation on the biggest mutant.                [default 0.05]
+    --learning-rate <L>   How far along the rank-weighted direction the mean moves each
+                          generation.                                         [default 0.01]
+    --action-repeat <N>   Physics ticks between network queries. Matched to the GA's.
+    --feedback <N>        Memory width, exactly as for `train`.
+    --trials <N>          Episodes per genome, averaged — matched to the GA's.
+    --max-seconds <S>     Stop early after S wall-clock seconds.
+    --stop-on-win         Stop as soon as any member of the batch touches the flag.
+    --quiet               Print only the final summary.
 
 WATCH OPTIONS:
     --level <PATH>        Level to evolve on. Required unless --champion is given.
@@ -178,19 +274,30 @@ WATCH OPTIONS:
     --headless            Plain text frames, no keyboard. Implied without a TTY.
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
     --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --stagnation,
-    --immigrants, --reheat-factor, --elite, --tournament, --crossover, --action-repeat,
-    --trials              As for `train`.
+    --immigrants, --archive-children, --reheat-factor, --elite, --tournament, --crossover,
+    --action-repeat, --feedback, --trials
+                          As for `train`.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
     --curriculum-generations <N>
                           Generations spent there before returning.        [default 40]
     --resume <PATH>       Start from a population checkpoint instead of a fresh one.
 
-STALLING (watch):
-    With --curriculum, the first stall writes the stuck population to
-    <out>/<level>.population.json and trains it on the easier level for
+STALLING (train and watch):
+    On a stall the run writes the stuck population to
+    <out>/<level>.population.json and trains it on an easier level for
     --curriculum-generations, then resumes the original level with that population.
-    One step per run. The chart, the stall line and the saved champion stay
-    measurements of the original level.
+    The chart, the stall line and the saved champion stay measurements of the
+    original level.
+
+    With --curriculum the easier level is the one you named, and one step per run.
+    Without it, the run practises where it is stuck (findings 50–51): the same level
+    with the spawn moved to the furthest spot its best genome has stood on and the
+    flag moved to the stand the route to the flag reaches next — one crossing the
+    jump oracle can make, not the nearest stand a straight line prefers. Written to
+    <out>/<level>.practice.json so it can be opened and played. Every episode of the
+    detour is then the next move rather than the whole chain, the detour is judged on
+    the move and the climb together (a two-level suite, ranked by the worst), and the
+    step re-arms whenever the run stalls at a new spot.
 
 KEYS (watch):
     space pause/resume   -/+ speed   m/M mutation rate   n next generation
@@ -208,6 +315,22 @@ REPLAY OPTIONS:
     --level <PATH>        Level it was trained on; omitted = infer from name.
     --frames <N>          Render up to N ASCII frames of the replay.
 
+SCORE OPTIONS:
+    --champion <PATH>     Champion JSON to score.                       [required]
+    --suite <A,B,...>     Levels to score it on. Omitted, a single level is resolved from the
+                          champion's own content hash in --levels-dir, which is the one
+                          answer that cannot be wrong.
+    --level <PATH>        One level to score it on instead.
+    --levels-dir <DIR>    Directory the hash is looked up in.            [default levels]
+    --seed <N>            Master seed the fresh episodes are drawn from. [default the
+                          champion's own training seed]
+                          The episodes are the ones this genome would have faced in
+                          generation 0 of its own run — reproducible, and *not* the single
+                          episode the file records, which is what `replay` verifies. Each
+                          level is judged on the trainer's own trial count (three patrol
+                          phases where it has walkers), and a level counts as solved only
+                          when every one of its trials won.
+
 PLAY OPTIONS:
     --level <PATH>        Level to play.                                [required]
     --seed <N>            Episode seed.                                      [default 1]
@@ -223,6 +346,7 @@ RENDER OPTIONS:
 EXAMPLES:
     train-cli train --level levels/l1-flat-run.json --generations 40
     train-cli train --level levels/l2-first-gap.json --pop 200 --csv out/l2.csv
+    train-cli es --level levels/scratch-tower.json --generations 300 --stop-on-win
     train-cli reach --all
     train-cli watch --level levels/l2-first-gap.json
     train-cli watch --champion champions/l1-flat-run.json --speed 16
@@ -269,7 +393,7 @@ mod tests {
     fn help_text_mentions_every_subcommand_the_dispatcher_accepts() {
         let text = help();
         for cmd in [
-            "train", "watch", "reach", "replay", "play", "render", "sensors",
+            "train", "es", "watch", "reach", "replay", "play", "render", "sensors",
         ] {
             assert!(text.contains(cmd), "help text omits {cmd}");
         }

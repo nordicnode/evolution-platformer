@@ -6,7 +6,12 @@ use std::time::Instant;
 
 use evo::champion::replay as replay_champion;
 use evo::ga::MUTATION_SIGMA_RANGE;
-use evo::{ChampionFile, GaConfig, Trainer, FITNESS_VERSION};
+use evo::{
+    curriculum_step, practice_level_for_stall, practice_step, save_practice_level, ChampionFile,
+    EsConfig, EsTrainer, EvalConfig, GaConfig, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
+    FITNESS_VERSION,
+};
+use render::chart::{fitness_stall, HistoryPoint};
 use sim::physics::{AgentAction, PHYSICS};
 use sim::reach;
 use sim::{Level, Outcome, SIM_VERSION};
@@ -15,6 +20,7 @@ use crate::args::{Args, ParseError};
 
 const TRAIN_OPTS: &[&str] = &[
     "level",
+    "suite",
     "generations",
     "pop",
     "seed",
@@ -27,17 +33,42 @@ const TRAIN_OPTS: &[&str] = &[
     "fine-children",
     "stagnation",
     "immigrants",
+    "archive-children",
+    "archive-on-diversity",
+    "novelty",
     "reheat-factor",
     "adaptive-sigma",
+    "feedback",
     "trials",
+    "no-auto-trials",
+    "curriculum",
+    "curriculum-generations",
     "out",
     "csv",
     "max-seconds",
     "stop-on-win",
     "quiet",
 ];
+/// `es`: the baseline arm. Its flags are the ones that change what it measures — the batch, the
+/// probe, the step — plus the cadence and the memory width, which have to match the GA's for the
+/// comparison to be about the search rather than about the arithmetic.
+const ES_OPTS: &[&str] = &[
+    "level",
+    "generations",
+    "pop",
+    "seed",
+    "sigma",
+    "learning-rate",
+    "action-repeat",
+    "feedback",
+    "trials",
+    "max-seconds",
+    "stop-on-win",
+    "quiet",
+];
 const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose"];
 const REPLAY_OPTS: &[&str] = &["champion", "level", "levels-dir"];
+const SCORE_OPTS: &[&str] = &["champion", "level", "suite", "levels-dir", "seed"];
 const PLAY_OPTS: &[&str] = &["level", "seed"];
 const RENDER_OPTS: &[&str] = &["level", "steps", "stride", "action", "seed"];
 const SENSORS_OPTS: &[&str] = &[];
@@ -68,13 +99,56 @@ fn parse_action(name: &str) -> Result<AgentAction, String> {
 
 pub fn train(a: &Args) -> Result<(), String> {
     usage(a.reject_unknown(TRAIN_OPTS))?;
-    let level_path = usage(a.required_path("level"))?;
-    let level = load_level(&level_path)?;
+    // `--suite` and `--level` are alternatives rather than two spellings of one thing: a suite
+    // *is* its list, so a run that names both has two answers to "what is being scored" and the
+    // honest response is to refuse rather than to pick one of them silently.
+    if a.opt("suite").is_some() && a.opt("level").is_some() {
+        return Err(
+            "usage: --suite and --level are alternatives (--suite names every level it scores on)\n         \
+             try `train-cli --help`"
+                .into(),
+        );
+    }
+    let level_paths = match a.opt("suite") {
+        Some(list) => parse_level_list(list)?,
+        None => vec![usage(a.required_path("level"))?],
+    };
+    let mut levels: Vec<Level> = Vec::with_capacity(level_paths.len());
+    for path in &level_paths {
+        levels.push(load_level(path)?);
+    }
+    // A suite is more than one level; one level is an ordinary run however it was named. That is
+    // what keeps `--suite levels/l1-flat-run.json` a legal no-op rather than a second code path.
+    let suite = levels.len() > 1;
+    // The level a champion is recorded on: the first of the suite. See the note printed with it.
+    let level_path = level_paths[0].clone();
+    let level = levels[0].clone();
 
     let generations = usage(a.usize_opt("generations", 30))?;
     let out_dir = a.string("out", "champions");
     let quiet = a.has_flag("quiet");
     let stop_on_win = a.has_flag("stop-on-win");
+    // The stall chain (§12 M5), the terminal's copy of the window's: fall back to an
+    // easier level when the run stops moving. With no `--curriculum` the fallback is
+    // derived instead (finding 50) — the level itself, starting from the furthest stand
+    // the run's best genome has made — and `--curriculum-generations 0` takes the whole
+    // detour out of the run, which is the protocol every measurement before finding 50
+    // was taken under.
+    let curriculum_level = match a.opt("curriculum") {
+        Some(path) => Some(load_level(path)?),
+        None => None,
+    };
+    let curriculum_generations =
+        usage(a.usize_opt("curriculum-generations", DEFAULT_CURRICULUM_GENERATIONS as usize))?
+            as u32;
+    if curriculum_level.is_some() && curriculum_generations == 0 {
+        return Err("usage: --curriculum-generations must be at least 1 (with --curriculum)".into());
+    }
+    if suite && curriculum_level.is_some() {
+        return Err(
+            "usage: --curriculum falls back on one level; a suite is its own landscape".into(),
+        );
+    }
     let max_seconds: Option<f64> = match a.opt("max-seconds") {
         Some(_) => Some(usage(a.f64_opt("max-seconds", 0.0))?),
         None => None,
@@ -83,23 +157,43 @@ pub fn train(a: &Args) -> Result<(), String> {
     let cfg = train_config(a)?;
 
     if !quiet {
-        println!("level   {} ({}x{})", level.name, level.width, level.height);
-        println!("hash    {}", level.content_hash_string());
-        println!(
-            "oracle  {}",
-            reachability_line(&level)
-        );
+        // A suite prints one line per level, because "which levels" *is* the experiment: the
+        // question a suite run asks is whether one policy can hold all of them at once, and a
+        // header that named only the first would hide half of the answer. A single level prints
+        // the same three lines it always did.
+        if suite {
+            println!(
+                "suite   {} levels, ranked by the worst of them (REVIEW.md §4 item 5)",
+                levels.len()
+            );
+        }
+        for l in &levels {
+            println!("level   {} ({}x{})", l.name, l.width, l.height);
+            println!("hash    {}", l.content_hash_string());
+            println!("oracle  {}", reachability_line(l));
+        }
         println!(
             "ga      pop {}  elite {}  tournament {}  sigma {:.2}  rate {:.3}  crossover {:.2}  action_repeat {}  trials {}",
             cfg.pop_size, cfg.elite, cfg.tournament, cfg.mutation_sigma,
             cfg.mutation_rate, cfg.crossover_rate, cfg.action_repeat, cfg.trials
         );
+        // The episode budget is per level and comes from the trainer's own rule (three patrol
+        // phases where a level has walkers, one where it does not), so a suite prints what each
+        // level actually costs rather than the flag's single number.
+        if suite {
+            let per: Vec<String> = levels
+                .iter()
+                .map(|l| format!("{} {}", cfg.effective_trials(l), l.name))
+                .collect();
+            println!("trials  {} episodes per genome per generation", per.join(" | "));
+        }
         // The search's own shape, printed because it is what the run will *do* rather than
         // what it starts from: fine children are the second, local mutation scale, the
-        // immigrants are reheated from the run's best-ever genome, and with adaptive sigma the
-        // printed 0.30 is a starting value the run moves on its own.
+        // immigrants are reheated from the run's best-ever genome, the archive children are
+        // bred from the quality-diversity record, and with adaptive sigma the printed 0.30 is
+        // a starting value the run moves on its own.
         println!(
-            "search  fine {}  sigma {}  immigrants {} reheated at {:.2}x ({:.2}) after {} still generations",
+            "search  fine {}  sigma {}  immigrants {} reheated at {:.2}x ({:.2}) after {} still generations  qd {} from the archive",
             cfg.fine_children,
             if cfg.adaptive_sigma {
                 format!("self-tuning {:.2}-{:.2} from {:.2}", MUTATION_SIGMA_RANGE[0], MUTATION_SIGMA_RANGE[1], cfg.mutation_sigma)
@@ -109,7 +203,8 @@ pub fn train(a: &Args) -> Result<(), String> {
             cfg.immigrants,
             cfg.reheat_factor,
             cfg.reheat_sigma(),
-            cfg.stagnation_generations
+            cfg.stagnation_generations,
+            cfg.archive_children
         );
         if cfg.trials > 1 && level.walkers.is_empty() {
             println!(
@@ -130,35 +225,98 @@ pub fn train(a: &Args) -> Result<(), String> {
         );
     }
 
+    // Hoisted out of the sign-off: the stall chain names its artifacts (the population
+    // checkpoint, the derived practice level) after the run's stem, and a name computed
+    // twice is a name two code paths can disagree about.
+    let stem = Path::new(&level_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| level.name.clone());
+    // A suite champion never takes the name a single-level champion of the same level would:
+    // `<level>.json` in the champions directory belongs to the run that trained on that level
+    // alone, and overwriting it with a policy that was *selected* on three levels would be the
+    // silent-replacement failure `REVIEW.md` §2.8 records, in the one directory this tool writes
+    // to without being asked.
+    let stem = if suite { format!("{stem}-suite") } else { stem };
+
     let mut trainer = Trainer::new(cfg);
     let effective = trainer.config.clone();
     let started = Instant::now();
     let mut solved_at: Option<u32> = None;
     let mut generation_secs: Vec<f64> = Vec::with_capacity(generations);
+    let mut history: Vec<HistoryPoint> = Vec::with_capacity(generations);
+    let mut curriculum_taken: Option<String> = None;
+    // The run's standing best when the last derived practice step fired: the gate that
+    // lets a practice run take a step per *stall spell* rather than one per run, and
+    // never two in the same spell.
+    let mut detour_best = f32::NEG_INFINITY;
+
+    if suite && !quiet {
+        println!(
+            "\n{:>4}  {:>10}  {:>10}  {:>10}  {:>9}  {:>5}  {:>7}  {:>5}",
+            "gen", "max", "avg", "min", "wins", "sigma", "secs", "suite"
+        );
+    }
 
     for _ in 0..generations {
         let t0 = Instant::now();
-        let report = trainer.step(&level);
+        let report = if suite {
+            trainer.step_suite(&levels)
+        } else {
+            trainer.step(&level)
+        };
         let secs = t0.elapsed().as_secs_f64();
         generation_secs.push(secs);
+        history.push(HistoryPoint {
+            generation: report.generation,
+            max_fitness: report.max_fitness,
+            avg_fitness: report.avg_fitness,
+            wins: report.wins,
+        });
 
-        if solved_at.is_none() && report.wins > 0 {
+        // What "solved" means depends on the run. On one level it is the first genome on the
+        // flag. On a suite it is a genome that won **every** level, because the claim a suite run
+        // makes is a generalisation claim: stopping on the first level won would end the run on
+        // exactly the specialist the reward was built to discourage.
+        let solved_now = if suite {
+            report.suite_solved > 0
+        } else {
+            report.wins > 0
+        };
+        if solved_at.is_none() && solved_now {
             solved_at = Some(report.generation);
         }
 
         if !quiet {
-            println!(
-                "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}{}",
-                report.generation,
-                report.max_fitness,
-                report.avg_fitness,
-                report.min_fitness,
-                report.wins,
-                effective.pop_size,
-                report.mutation_sigma,
-                secs,
-                if report.genius { "  <-- GENIUS AGENT" } else { "" }
-            );
+            if suite {
+                println!(
+                    "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}  {:>3}/{:<2}{}",
+                    report.generation,
+                    report.max_fitness,
+                    report.avg_fitness,
+                    report.min_fitness,
+                    report.wins,
+                    effective.pop_size,
+                    report.mutation_sigma,
+                    secs,
+                    report.suite_solved,
+                    effective.pop_size,
+                    if report.genius { "  <-- GENIUS AGENT" } else { "" }
+                );
+            } else {
+                println!(
+                    "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}{}",
+                    report.generation,
+                    report.max_fitness,
+                    report.avg_fitness,
+                    report.min_fitness,
+                    report.wins,
+                    effective.pop_size,
+                    report.mutation_sigma,
+                    secs,
+                    if report.genius { "  <-- GENIUS AGENT" } else { "" }
+                );
+            }
         }
 
         if stop_on_win && solved_at.is_some() {
@@ -170,6 +328,88 @@ pub fn train(a: &Args) -> Result<(), String> {
                     println!("--max-seconds {limit:.0} reached; stopping early");
                 }
                 break;
+            }
+        }
+
+        // The stall chain, on the same stall rule the chart reads (§12 M5). The
+        // authored easier level is the run's first choice and steps back once per run
+        // (the plan's rule); without one the run practises where it is stuck
+        // (finding 50) — one step per *stall spell*, so a run can work through a spot,
+        // keep the gain, and meet the next. The detour's landscape is written beside
+        // the checkpoint so it can be opened and played.
+        let armed = match &curriculum_level {
+            Some(_) => curriculum_taken.is_none(),
+            None => report.max_fitness > detour_best,
+        };
+        if armed && curriculum_generations > 0 && !suite {
+            if let Some(stall) = fitness_stall(&history) {
+                let practice;
+                let easier: &Level = match &curriculum_level {
+                    Some(easier) => easier,
+                    None => {
+                        let derived = match practice_level_for_stall(&trainer, &level) {
+                            Ok(derived) => derived,
+                            Err(reason) => {
+                                // Nowhere to practise from is part of the run's story,
+                                // not a missing line: a silent skip is indistinguishable
+                                // from a dead stall chain. Said once per stall spell —
+                                // the arm closes until the run finds something better —
+                                // and kept in the checkpoint note like any step.
+                                detour_best = report.max_fitness;
+                                let summary = format!(
+                                    "curriculum: {reason}; the run stays where it is ({})",
+                                    stall.label()
+                                );
+                                if !quiet {
+                                    println!("{summary}");
+                                }
+                                curriculum_taken = Some(match curriculum_taken {
+                                    Some(prev) => format!("{prev}\n{summary}"),
+                                    None => summary,
+                                });
+                                continue;
+                            }
+                        };
+                        practice = derived;
+                        &practice
+                    }
+                };
+                let path = Path::new(&out_dir).join(format!("{stem}.population.json"));
+                let step = if curriculum_level.is_none() {
+                    // The practice detour keeps the main level in its judgement, so
+                    // what it learns comes back able to reach the spot it left.
+                    save_practice_level(easier, &path)?;
+                    practice_step(
+                        &mut trainer,
+                        &level,
+                        easier,
+                        curriculum_generations,
+                        &path,
+                        effective.mutation_rate,
+                        &stall.label(),
+                    )?
+                } else {
+                    curriculum_step(
+                        &mut trainer,
+                        &level,
+                        easier,
+                        curriculum_generations,
+                        &path,
+                        effective.mutation_rate,
+                        &stall.label(),
+                    )?
+                };
+                detour_best = report.max_fitness;
+                let summary = step.note(&level.name);
+                if !quiet {
+                    println!("{summary}");
+                }
+                // Every step keeps its line: a run that practised its way past three
+                // spots says so three times, not once.
+                curriculum_taken = Some(match curriculum_taken {
+                    Some(prev) => format!("{prev}\n{summary}"),
+                    None => summary,
+                });
             }
         }
     }
@@ -186,10 +426,6 @@ pub fn train(a: &Args) -> Result<(), String> {
         &effective,
     );
 
-    let stem = Path::new(&level_path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| level.name.clone());
     let champion_path = Path::new(&out_dir).join(format!("{stem}.json"));
     champion.save(&champion_path)?;
 
@@ -218,6 +454,7 @@ pub fn train(a: &Args) -> Result<(), String> {
 
     println!();
     match solved_at {
+        Some(g) if suite => println!("solved at generation {g} (every level won)"),
         Some(g) => println!("solved at generation {g} (first win)"),
         None => println!(
             "not solved in {} generations; best-evidence: max fitness {:.2}",
@@ -243,6 +480,60 @@ pub fn train(a: &Args) -> Result<(), String> {
         bursts,
         if bursts == 1 { "" } else { "s" }
     );
+    // And the quality-diversity half of the search, on its own line because it is a different
+    // kind of fact: the immigrants above are a *reaction* to a plateau, while the archive
+    // children arrive every generation and the niche count says how spread out the population
+    // is. A converged run that is still finding bests is exactly the case the two numbers
+    // disagree about, and it is the case a summary exists to show.
+    let archive_children: usize = trainer.history().iter().map(|r| r.archive_children).sum();
+    println!(
+        "qd      {} children bred from the archive, {} of {} niches filled",
+        archive_children,
+        trainer.archive().occupied(),
+        evo::ARCHIVE_BEHAVIOUR_CELLS
+    );
+    // The clock, and on its own line because it is the one reading here that is *not* about the
+    // search: since fitness v8 a win is paid for the time it did not spend, so the number the
+    // population was rewarded for is a number the terminal owes a reader. It is the run's own record
+    // rather than the champion's episode, and those can be different agents: the best-scoring genome
+    // is not necessarily the quickest win, and this is the time a person would race.
+    match trainer.fastest() {
+        Some(fast) => println!(
+            "clock   {} ({} frames) at the flag (gen {} id {}, {:.0}% of the level's {} unspent, {} of {} finish bands filled)",
+            sim::format_time(fast.frames),
+            fast.frames,
+            fast.generation,
+            fast.genome_id,
+            fast.spare() * 100.0,
+            sim::format_time(fast.budget_frames),
+            trainer.archive().time_bands(),
+            evo::ARCHIVE_TIME_BINS
+        ),
+        None => println!("clock   no win to time: nothing reached the flag"),
+    }
+    if suite {
+        // The claim a suite run makes, level by level, evaluated on the champion with the same
+        // seeds its own generation used — so these are the numbers the run was selected on rather
+        // than a fresh sample of them.
+        let (_, per_level) =
+            evo::ga::suite_score(&levels, &best.genome, &effective, best.generation);
+        let listed: Vec<String> = levels
+            .iter()
+            .zip(&per_level)
+            .map(|(l, f)| format!("{} {:.1}", l.name, f))
+            .collect();
+        println!(
+            "suite   {} | worst {:.1} | {} of {} levels won",
+            listed.join(" | "),
+            per_level.iter().copied().fold(f32::INFINITY, f32::min),
+            best.result.suite_wins,
+            levels.len()
+        );
+        println!(
+            "note    the champion is recorded on {} — fitness and frames below are that level's\n         episode, because a champion file is a claim about one level that `replay` checks",
+            levels[0].name
+        );
+    }
     println!(
         "best    gen {} id {} fitness {:.2} ({} after {} frames, best_x {:.1}, jumps {}, checkpoints {})",
         champion.metadata.generation,
@@ -268,6 +559,11 @@ pub fn train(a: &Args) -> Result<(), String> {
     );
     println!("champion {}", champion_path.display());
     println!("         {}", champion.summary());
+    // Printed after the summary, and always: a run whose shape changed mid-flight
+    // should say so where the numbers are.
+    if let Some(summary) = &curriculum_taken {
+        println!("{summary}");
+    }
 
     Ok(())
 }
@@ -279,8 +575,27 @@ pub fn train(a: &Args) -> Result<(), String> {
 /// `1.0` beside the flag name, the trainer's default later moved to `3.0`, and the command line
 /// quietly went on asking for the old temperature for every run that did not name one — a whole
 /// sweep's result that never reached a user, found only by reading the header of a real run.
+///
+/// It takes no level. It did, for one pass, because it used to choose the trial count from the
+/// level's walkers; that rule now lives in the trainer and the caller asks
+/// [`GaConfig::effective_trials`] for the answer, so the only thing the second parameter could do
+/// here was sit unused.
 fn train_config(a: &Args) -> Result<GaConfig, String> {
     let default = GaConfig::default();
+    // Trials used to be chosen *here* — a hard-coded `3` beside the flag name for a level with
+    // walkers — which is the same defect the doc comment above records for the reheat factor, and
+    // it left `GaConfig::recommended_trials_for` as dead code while every other front-end (the
+    // window, a resumed run, the API) judged walker levels on a single patrol phase. The rule now
+    // lives in the trainer and this line is a pass-through: the flag is the operator's answer, and
+    // `--no-auto-trials` releases the trainer's. The warning below stays in the caller because it
+    // is about the pair — an explicit trial count on a level that cannot be stochastic.
+    let trials = usage(a.usize_opt("trials", default.trials as usize))? as u32;
+    let auto_trials = !a.has_flag("no-auto-trials");
+    let adaptive_sigma = if a.has_flag("adaptive-sigma") {
+        true
+    } else {
+        default.adaptive_sigma
+    };
     Ok(GaConfig {
         pop_size: usage(a.usize_opt("pop", default.pop_size))?,
         elite: usage(a.usize_opt("elite", default.elite))?,
@@ -289,33 +604,246 @@ fn train_config(a: &Args) -> Result<GaConfig, String> {
         mutation_sigma: usage(a.f32_opt("mut-sigma", default.mutation_sigma))?,
         crossover_rate: usage(a.f32_opt("crossover", default.crossover_rate))?,
         fine_children: usage(a.usize_opt("fine-children", default.fine_children))?,
-        adaptive_sigma: a.has_flag("adaptive-sigma"),
+        adaptive_sigma,
         stagnation_generations: usage(
             a.usize_opt("stagnation", default.stagnation_generations as usize),
         )? as u32,
         immigrants: usage(a.usize_opt("immigrants", default.immigrants))?,
+        archive_children: usage(a.usize_opt("archive-children", default.archive_children))?,
+        archive_on_diversity: a.has_flag("archive-on-diversity"),
+        // The reward-level half of the quality-diversity question: fitness units paid to a genome
+        // for behaving rarely, added to the **selection** score and never to a recorded one. Default
+        // 0.0 comes from the trainer, like every other default here.
+        novelty_weight: usage(a.f32_opt("novelty", default.novelty_weight))?,
         reheat_factor: usage(a.f32_opt("reheat-factor", default.reheat_factor))?,
         action_repeat: usage(a.usize_opt("action-repeat", default.action_repeat as usize))? as u32,
+        // Memory: how much of the network's own first hidden layer is fed back into the next
+        // decision, which is what lets a policy count, wait and commit rather than react. The
+        // default comes from the trainer's shape (0 — a memoryless net, which is what every
+        // measurement in `REVIEW.md` was taken with), and the trainer clamps the width to
+        // `genome::MAX_FEEDBACK`, so a typo is a slower run rather than a failed allocation.
+        shape: evo::NetShape {
+            feedback: usage(a.usize_opt("feedback", default.shape.feedback))?,
+            ..default.shape
+        },
         // Trials are only distinguishable on levels that are actually stochastic
         // (those with walkers): elsewhere every trial is the same episode.
-        trials: usage(a.usize_opt("trials", default.trials as usize))? as u32,
+        trials,
+        auto_trials,
         master_seed: usage(a.u64_opt("seed", default.master_seed))?,
-        ..GaConfig::default()
     })
 }
 
+// ---------------------------------------------------------------------------
+// es
+// ---------------------------------------------------------------------------
+
+/// The baseline arm: a `(µ, λ)` evolution strategy over the same genome, on the same level,
+/// paying for the same number of episodes.
+///
+/// **Why this exists, and what it can settle.** Every number in `REVIEW.md` compares this
+/// project's search with an earlier version of itself, and that comparison cannot tell "the GA
+/// is the binding constraint" from "the problem is". An ES on an equal episode budget can: it
+/// makes exactly one move per generation — a rank-weighted step along the sampled mirror
+/// directions — with no elites, no tournament, no crossover and no archive, so if a plain ES
+/// matches the GA on a level, the remaining work is in the content and the fitness landscape
+/// rather than in the breeding rules, and if it loses the search is earning its place.
+///
+/// What is deliberately *shared* with `train` is everything that decides what an episode *is*:
+/// the level, the episode seed, the decision cadence, the trial count and the memory width. What
+/// is deliberately not shared is every search knob, because elites and tournaments describe a
+/// population this arm does not have. `--pop` is the batch here, and it means the same compute:
+/// `λ` episodes per generation against the GA's 200 genomes per generation.
+///
+/// The arm ships no champion file: [`ChampionFile`] records the GA's own search knobs, and a
+/// mean is a distribution rather than a policy anyone can replay. What it prints is what a
+/// comparison needs — the generation the level fell at, and the fitness of the best point it
+/// ever evaluated.
+pub fn es(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(ES_OPTS))?;
+    let level_path = usage(a.required_path("level"))?;
+    let level = load_level(&level_path)?;
+
+    let generations = usage(a.usize_opt("generations", 30))?;
+    let quiet = a.has_flag("quiet");
+    let stop_on_win = a.has_flag("stop-on-win");
+    let max_seconds: Option<f64> = match a.opt("max-seconds") {
+        Some(_) => Some(usage(a.f64_opt("max-seconds", 0.0))?),
+        None => None,
+    };
+
+    let cfg = es_config(a)?;
+
+    if !quiet {
+        println!("level   {} ({}x{})", level.name, level.width, level.height);
+        println!("hash    {}", level.content_hash_string());
+        println!("oracle  {}", reachability_line(&level));
+        println!(
+            "es      pop {} ({} perturbations in {} mirrored pairs)  sigma {:.3}  lr {:.4}  action_repeat {}  trials {}",
+            cfg.pop_size,
+            cfg.batch(),
+            cfg.batch() / 2,
+            cfg.sigma,
+            cfg.learning_rate,
+            cfg.action_repeat,
+            cfg.trials
+        );
+        println!(
+            "seed    {}   (sim {} / sensors v{} / fitness v{})",
+            cfg.master_seed,
+            SIM_VERSION,
+            sim::sensors::VERSION,
+            FITNESS_VERSION
+        );
+        println!(
+            "\n{:>4}  {:>10}  {:>10}  {:>7}",
+            "gen", "max", "mean", "secs"
+        );
+    }
+
+    let mut trainer = EsTrainer::new(cfg);
+    let effective = trainer.config().clone();
+    let started = Instant::now();
+    let mut solved_at: Option<u32> = None;
+    let mut generation_secs: Vec<f64> = Vec::with_capacity(generations);
+
+    for _ in 0..generations {
+        let t0 = Instant::now();
+        let row = trainer.step(&level);
+        let secs = t0.elapsed().as_secs_f64();
+        generation_secs.push(secs);
+
+        if solved_at.is_none() && row.solved {
+            solved_at = Some(row.generation);
+        }
+        if !quiet {
+            println!(
+                "{:>4}  {:>10.2}  {:>10.2}  {:>7.2}{}",
+                row.generation,
+                row.max_fitness,
+                row.mean_fitness,
+                secs,
+                if row.solved { "  <-- SOLVED" } else { "" }
+            );
+        }
+
+        if stop_on_win && solved_at.is_some() {
+            break;
+        }
+        if let Some(limit) = max_seconds {
+            if started.elapsed().as_secs_f64() >= limit {
+                if !quiet {
+                    println!("--max-seconds {limit:.0} reached; stopping early");
+                }
+                break;
+            }
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let episodes = trainer.history().len() * effective.batch();
+    let mean = if generation_secs.is_empty() {
+        0.0
+    } else {
+        generation_secs.iter().sum::<f64>() / generation_secs.len() as f64
+    };
+
+    println!();
+    match solved_at {
+        Some(g) => println!("solved at generation {g} (first win)"),
+        None => println!("not solved in {} generations", generation_secs.len()),
+    }
+    match trainer.best_ever() {
+        Some((generation, _, fitness)) => println!(
+            "best    gen {} fitness {:.2} (best evaluated point, not the mean)",
+            generation, fitness
+        ),
+        None => println!("best    no generation ran, so nothing was evaluated"),
+    }
+    println!(
+        "timing  {:>7.3} s/gen mean | {} generations in {:.1} s | {} episodes ({} per genome at trials {})",
+        mean,
+        generation_secs.len(),
+        elapsed.as_secs_f64(),
+        episodes,
+        effective.batch(),
+        effective.trials
+    );
+
+    Ok(())
+}
+
+/// The [`EsConfig`] an `es` invocation asks for.
+///
+/// As with [`train_config`], every default comes from the trainer's own `Default` rather than
+/// from a second copy beside the flag name — the defect this project already paid for once, when
+/// `train` kept asking for a reheat temperature the trainer had moved away from.
+fn es_config(a: &Args) -> Result<EsConfig, String> {
+    let default = EsConfig::default();
+    Ok(EsConfig {
+        pop_size: usage(a.usize_opt("pop", default.pop_size))?,
+        sigma: usage(a.f32_opt("sigma", default.sigma))?,
+        learning_rate: usage(a.f32_opt("learning-rate", default.learning_rate))?,
+        master_seed: usage(a.u64_opt("seed", default.master_seed))?,
+        // The same one-flag-plus-a-copy-of-the-default shape the GA path uses, so the memory
+        // width is comparable across the two arms.
+        shape: evo::NetShape {
+            feedback: usage(a.usize_opt("feedback", default.shape.feedback))?,
+            ..default.shape
+        },
+        action_repeat: usage(a.usize_opt("action-repeat", default.action_repeat as usize))? as u32,
+        trials: usage(a.usize_opt("trials", default.trials as usize))? as u32,
+    })
+}
+
+/// The levels `--suite` names, as paths.
+///
+/// One comma-separated list rather than a flag that accumulates, because the *order* is part of the
+/// answer: level 0 is the level a champion is recorded on and the level the archive reads its
+/// behaviour from, so `a,b` and `b,a` are different runs. Duplicates are refused rather than
+/// deduplicated — a level named twice would double its weight in a sum and change nothing in a
+/// minimum, which is exactly the sort of silent difference a suite exists to make visible.
+fn parse_level_list(list: &str) -> Result<Vec<String>, String> {
+    let mut paths: Vec<String> = Vec::new();
+    for raw in list.split(',') {
+        let path = raw.trim();
+        if path.is_empty() {
+            return Err(format!(
+                "usage: --suite has an empty entry in {list:?}; expected --suite a.json,b.json"
+            ));
+        }
+        if paths.iter().any(|p| p == path) {
+            return Err(format!(
+                "usage: --suite names {path:?} twice; each level is scored once per generation"
+            ));
+        }
+        paths.push(path.to_string());
+    }
+    if paths.is_empty() {
+        return Err(
+            "usage: --suite needs at least one level, e.g. --suite levels/l2-first-gap.json".into(),
+        );
+    }
+    Ok(paths)
+}
+
 fn write_csv(path: &str, history: &[evo::GenRow]) -> Result<(), String> {
-    // The last two columns are the search's own reading rather than the run's score, and
+    // The last four columns are the search's own reading rather than the run's score, and
     // they are in the CSV for the same reason they are on the chart: `mutation_sigma` is the
     // self-tuning size as it stood when that generation's children were bred, and
     // `immigrants` is how many random genomes were injected after it — the two facts that
-    // separate "the run plateaued" from "the run plateaued and did something about it".
+    // separate "the run plateaued" from "the run plateaued and did something about it". The
+    // last two are the quality-diversity half of the same story: `archive_children` is how
+    // many of that generation's children came from the behavioural archive rather than the
+    // ranking, and `archive_bits` is how many niches the archive held, which is the run's
+    // diversity — the reading that falls when a population collapses onto one way of moving,
+    // and which no column of scores can show.
     let mut out = String::from(
-        "generation,max_fitness,avg_fitness,min_fitness,wins,best_id,genius,mutation_sigma,immigrants\n",
+        "generation,max_fitness,avg_fitness,min_fitness,wins,best_id,genius,mutation_sigma,immigrants,archive_children,archive_bits\n",
     );
     for row in history {
         out.push_str(&format!(
-            "{},{:.4},{:.4},{:.4},{},{},{},{:.4},{}\n",
+            "{},{:.4},{:.4},{:.4},{},{},{},{:.4},{},{},{}\n",
             row.generation,
             row.max_fitness,
             row.avg_fitness,
@@ -324,7 +852,9 @@ fn write_csv(path: &str, history: &[evo::GenRow]) -> Result<(), String> {
             row.best_id,
             row.genius as u8,
             row.mutation_sigma,
-            row.immigrants
+            row.immigrants,
+            row.archive_children,
+            row.archive_bits
         ));
     }
     if let Some(dir) = Path::new(path).parent() {
@@ -362,7 +892,7 @@ pub fn reach(a: &Args) -> Result<(), String> {
 
     let paths: Vec<PathBuf> = if a.has_flag("all") {
         let dir = a.string("levels-dir", "levels");
-        let mut found = list_levels(&dir)?;
+        let mut found = pack_levels(&dir)?;
         if found.is_empty() {
             return Err(format!("no *.json levels found in {dir:?}"));
         }
@@ -436,6 +966,38 @@ pub(crate) fn list_levels(dir: &str) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
+/// The levels a `levels` directory **ships**: everything in it except the drawings a person
+/// made there.
+///
+/// The pack is the repo's own set — the `l*` courses and the `scratch-*` fixtures the
+/// measurements are taken on — and every one of them is expected to be beatable, which is a
+/// claim `reach --all` and `cargo test` both check. A *drawing* is a different thing: the
+/// editor writes one as `custom-<stem>.json` beside the pack when a person saves a level
+/// (`crate::app`'s `protect_shipped_path`, which exists so that saving never clobbers a
+/// shipped course), and a half-drawn level is allowed to be unbeatable — the editor's canvas
+/// is a place to work, and refusing to save an unfinished level would be the worse rule.
+///
+/// So the two are separated here rather than by a weaker assertion: the pack keeps its
+/// "every level is beatable" guarantee in full, and a drawing is diagnosed on request with
+/// `reach --level <drawing>`, which is exactly the command a designer wants on the level
+/// they are building. [`list_levels`] stays unfiltered for [`find_level_by_hash`], because a
+/// champion trained on a person's own level has to be findable by the level it came from.
+pub(crate) fn pack_levels(dir: &str) -> Result<Vec<PathBuf>, String> {
+    Ok(list_levels(dir)?
+        .into_iter()
+        .filter(|p| !is_user_drawing(p))
+        .collect())
+}
+
+/// Whether a path is a level a person drew and saved rather than one of the pack's own.
+///
+/// By name, and the name is a convention the editor already writes: `custom-<stem>.json`.
+fn is_user_drawing(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem.starts_with("custom-"))
+}
+
 // ---------------------------------------------------------------------------
 // replay
 // ---------------------------------------------------------------------------
@@ -466,7 +1028,12 @@ pub fn replay(a: &Args) -> Result<(), String> {
     println!("champion {}", champion_path);
     println!("level    {} ({})", level.name, level.content_hash_string());
     println!("trained  {}", champion.summary());
-    println!("frames   {}", champion.metadata.frames);
+    println!(
+        "clock    {} ({} frames of the level's {})",
+        sim::format_time(champion.metadata.frames),
+        champion.metadata.frames,
+        sim::format_time(sim::frame_budget(&level))
+    );
 
     let (genome, result) = replay_champion(&level, &champion)?;
     let expected = champion.metadata.trajectory_hash.clone();
@@ -515,6 +1082,161 @@ pub(crate) fn find_level_by_hash(dir: &str, hash: &str) -> Result<Option<Level>,
         }
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// score
+// ---------------------------------------------------------------------------
+
+/// Score a saved champion on one level or a whole suite of them.
+///
+/// **Why this exists.** Every claim this project has made about a policy has been a claim about a
+/// *specialist*: `train` fits one level and a champion is played only where it was trained. The
+/// suite trainer (REVIEW.md §4 item 5) is the first mechanism that asks a population to hold more
+/// than one level at once, and a claim like that has to be checkable on an artifact — so this is
+/// the read that makes it checkable: point it at any champion file, name the levels, and it says
+/// what that one policy actually does on each of them. It is the generalisation half of what
+/// `replay` is for the recorded-episode half.
+///
+/// **The episodes are fresh ones, and that is deliberate.** They are the episodes this genome
+/// would have been judged on in generation 0 of its own run — `episode_seed(master_seed, 0,
+/// genome_id, trial)`, with the master seed the champion recorded — rather than the single episode
+/// the file carries. `replay` verifies the recorded one; this asks the wider question, and asking
+/// it with the same seeds every time is what makes two champions comparable.
+///
+/// Trials come from the **trainer's own rule** rather than from what the champion was trained
+/// with, so a level with walkers in it is judged on three patrol phases: a policy that solves a
+/// patrol on one phase and dies on the next has not solved the level, and this is the command
+/// where that would otherwise be the easiest thing to hide.
+pub fn score(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(SCORE_OPTS))?;
+    let champion_path = usage(a.required_path("champion"))?;
+    let raw = fs::read_to_string(&champion_path)
+        .map_err(|e| format!("cannot read {champion_path}: {e}"))?;
+    let champion = ChampionFile::from_json_str(&raw).map_err(|e| format!("{champion_path}: {e}"))?;
+    let genome = champion.to_genome()?;
+
+    let levels: Vec<Level> = match a.opt("suite") {
+        Some(list) => {
+            let mut out = Vec::new();
+            for path in parse_level_list(list)? {
+                out.push(load_level(&path)?);
+            }
+            out
+        }
+        None if a.opt("level").is_some() => vec![load_level(&usage(a.required_path("level"))?)?],
+        // With neither, the level is resolved by the champion's own content hash, which is the one
+        // answer that cannot be wrong: a level that has been renamed or edited is simply not the
+        // level the policy was fitted to.
+        None => vec![find_level_by_hash(
+            &a.string("levels-dir", "levels"),
+            &champion.metadata.level_hash,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "no level in {} matches this champion's hash; name one with --level or --suite",
+                a.string("levels-dir", "levels")
+            )
+        })?],
+    };
+
+    let eval = EvalConfig {
+        action_repeat: champion.metadata.action_repeat,
+    };
+    let master = usage(a.u64_opt("seed", champion.metadata.training_config.master_seed))?;
+
+    println!(
+        "champion  {} (gen {}, id {})",
+        champion_path, champion.metadata.generation, champion.metadata.genome_id
+    );
+    println!(
+        "          trained on {} at pop {} / seed {}",
+        champion.metadata.level_name,
+        champion.metadata.training_config.pop_size,
+        champion.metadata.training_config.master_seed
+    );
+
+    // A provenance note rather than a refusal, and the reason the two commands differ.
+    // `replay` is asked to verify the episode the file *recorded*, so a version-trio mismatch
+    // is refused outright (`evo::champion::check_reproducibility`). This command asks the
+    // opposite question — what the policy does on today's physics — so it runs, but the two
+    // layers have to be told apart in what it prints: the summary line below is the file's
+    // own numbers under its own build, while the trial result is today's. Silently mixing
+    // them is exactly the kind of claim the version trio exists to stop.
+    let stale = champion.metadata.sim_version != SIM_VERSION
+        || champion.metadata.sensor_version != sim::sensors::VERSION
+        || champion.metadata.fitness_version != evo::fitness::FITNESS_VERSION;
+    if stale {
+        println!(
+            "          note: recorded under sim {} / sensors v{} / fitness v{}; this build is \
+             sim {} / sensors v{} / fitness v{} — the trial result below is re-simulated on \
+             today's physics, and only the recorded summary is the file's own",
+            champion.metadata.sim_version,
+            champion.metadata.sensor_version,
+            champion.metadata.fitness_version,
+            SIM_VERSION,
+            sim::sensors::VERSION,
+            evo::fitness::FITNESS_VERSION
+        );
+    }
+
+    let mut solved = 0usize;
+    let mut means: Vec<f32> = Vec::with_capacity(levels.len());
+    for level in &levels {
+        let trials = GaConfig::recommended_trials_for(level);
+        let mut sum = 0.0f32;
+        let mut wins = 0usize;
+        let mut first: Option<evo::EpisodeResult> = None;
+        for trial in 0..trials {
+            let seed = sim::rng::episode_seed(master, 0, champion.metadata.genome_id, trial);
+            let r = evo::run_episode(level, &genome, &eval, seed);
+            sum += r.fitness;
+            if r.won() {
+                wins += 1;
+            }
+            if trial == 0 {
+                first = Some(r);
+            }
+        }
+        let mean = sum / trials as f32;
+        means.push(mean);
+        let first = first.expect("trials >= 1");
+        // A level is solved only when *every* trial won, which is the same conservative reading the
+        // suite trainer takes: on a walker level one phase is a coin flip.
+        let won_all = wins == trials as usize;
+        if won_all {
+            solved += 1;
+        }
+        println!(
+            "level     {} ({}x{}){}{}",
+            level.name,
+            level.width,
+            level.height,
+            if trials > 1 { format!("  {trials} trials") } else { String::new() },
+            if won_all { "  WON" } else { "" }
+        );
+        println!(
+            "          {:<9} fitness {:>9.2}  frames {:<5} best_x {:>5.1}  jumps {:>3}  checkpoints {:>2}  {} of {} trials won",
+            first.outcome.as_str(),
+            mean,
+            first.frames,
+            first.best_x,
+            first.jumps,
+            first.checkpoints,
+            wins,
+            trials
+        );
+    }
+
+    if levels.len() > 1 {
+        println!(
+            "suite     {} of {} levels won  |  as a suite this policy scores {:.2} (its worst level)",
+            solved,
+            levels.len(),
+            means.iter().copied().fold(f32::INFINITY, f32::min)
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -740,11 +1462,34 @@ mod tests {
         assert!(parse_action("teleport").is_err());
     }
 
+    /// Every level the pack ships is beatable as built, and its spawn is on solid ground.
+    ///
+    /// Scoped to [`pack_levels`] rather than to everything in the directory: a drawing a person
+    /// saved there (`custom-*`) is their work in progress and may legitimately be unbeatable,
+    /// and `reach --level <drawing>` is the command that tells them where it stops. The pack
+    /// itself — every `l*` course and every `scratch-*` fixture a measurement is taken on — is
+    /// still checked in full, which is the assertion this test exists for.
     #[test]
     fn reach_checks_all_shipped_levels_and_they_are_beatable() {
-        let mut paths = list_levels(&wpath("levels")).expect("levels dir exists");
+        let mut paths = pack_levels(&wpath("levels")).expect("levels dir exists");
         paths.sort();
         assert!(paths.len() >= 3, "expected the L1-L3 pack, found {paths:?}");
+        // The pack is most of the directory, so a filter that quietly swallowed it would make
+        // this test vacuous: every `l*` course has to be in the swept set.
+        let shipped = list_levels(&wpath("levels"))
+            .expect("levels dir exists")
+            .into_iter()
+            .filter(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|stem| stem.starts_with('l'))
+            })
+            .count();
+        assert!(
+            shipped > 0 && paths.len() >= shipped,
+            "the pack sweep covers {} of the directory's {shipped} shipped courses",
+            paths.len()
+        );
         for path in paths {
             let level = Level::from_json_file(&path).expect("level parses");
             let report = reach::report(&level);
@@ -759,6 +1504,69 @@ mod tests {
                 "{} has no spawn platform",
                 path.display()
             );
+        }
+    }
+
+    /// A drawing a person saved beside the pack is still *loadable* and still *diagnosable*,
+    /// which is what makes the pack sweep's scope a scoping rather than a blind spot.
+    ///
+    /// The assertion is about the two readings **agreeing**, not about the drawing's verdict:
+    /// a level the oracle calls unbeatable must come back as a reported failure from the
+    /// command, and a level it calls beatable must come back clean. Pinning the current verdict
+    /// would turn this into a statement about one file, and the file belongs to a person who is
+    /// allowed to change it.
+    #[test]
+    fn a_users_own_drawing_is_reported_on_request_whatever_the_verdict() {
+        let drawn: Vec<PathBuf> = list_levels(&wpath("levels"))
+            .expect("levels dir exists")
+            .into_iter()
+            .filter(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|stem| stem.starts_with("custom-"))
+            })
+            .collect();
+        // The repo ships one: the tower a person drew over `l1-flat-run`'s canvas. If it ever
+        // goes away this test stops proving anything, and it says so rather than passing quietly.
+        assert!(
+            !drawn.is_empty(),
+            "no `custom-*` drawing is checked in, so the exclusion in `pack_levels` is untested"
+        );
+        for path in drawn {
+            let level = Level::from_json_file(&path).expect("a drawing still parses");
+            let report = reach::report(&level);
+            assert!(
+                report.start.is_some(),
+                "{} has no spawn platform",
+                path.display()
+            );
+            let command = reach(&a(&["reach", "--level", &path.to_string_lossy()]));
+            match (&report.diagnosis, command) {
+                // Beatable: nothing to diagnose and nothing to report.
+                (None, Ok(())) => assert!(
+                    report.goal_reached,
+                    "{} had no diagnosis but is not reported as beaten",
+                    path.display()
+                ),
+                // Unbeatable: the command fails, and it fails *because of this*.
+                (Some(msg), Err(err)) => {
+                    assert!(!msg.is_empty(), "{}", path.display());
+                    assert!(
+                        err.contains("not beatable"),
+                        "{} is reported for the wrong reason: {err}",
+                        path.display()
+                    );
+                }
+                (None, Err(err)) => panic!(
+                    "{}: the oracle found nothing wrong and the command failed anyway: {err}",
+                    path.display()
+                ),
+                (Some(msg), Ok(())) => panic!(
+                    "{}: the oracle says {:?} and the command passed",
+                    path.display(),
+                    msg
+                ),
+            }
         }
     }
 
@@ -840,14 +1648,86 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A suite run scores every level it names and writes a champion that belongs to none of the
+    /// single-level names — the naming is a guard, not cosmetics: `champions/` is the one directory
+    /// this tool writes to without being asked, and a suite selected on three levels must not land
+    /// on top of the champion trained on one of them (REVIEW.md §2.8's failure mode).
+    #[test]
+    fn a_suite_run_writes_its_own_champion_and_records_it_on_its_first_level() {
+        let dir = tmpdir("train-cli-suite");
+        let out = dir.to_string_lossy().to_string();
+        let first = wpath("levels/l2-first-gap.json");
+        let second = wpath("levels/l1-flat-run.json");
+        train(&a(&[
+            "train",
+            "--suite",
+            &format!("{first},{second}"),
+            "--generations",
+            "2",
+            "--pop",
+            "16",
+            "--seed",
+            "4",
+            "--out",
+            &out,
+            "--quiet",
+        ]))
+        .expect("the suite runs");
+
+        let suite_champion = dir.join("l2-first-gap-suite.json");
+        assert!(suite_champion.exists(), "the suite writes its own champion");
+        assert!(
+            !dir.join("l2-first-gap.json").exists(),
+            "and never the single-level name it would otherwise share"
+        );
+
+        let levels: Vec<Level> = vec![load_level(&first).expect("l2"), load_level(&second).expect("l1")];
+        let champ = ChampionFile::load_for_level(&suite_champion, &levels[0])
+            .expect("a suite champion is recorded on the suite's first level");
+        assert_eq!(champ.metadata.level_hash, levels[0].content_hash_string());
+        assert!(
+            ChampionFile::load_for_level(&suite_champion, &levels[1]).is_err(),
+            "and it is not a champion of the other level, which is what the hash is for"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--suite` is a list with an order, and the two ways a list can be nonsense are refused
+    /// where they are typed rather than discovered as a slower run.
+    #[test]
+    fn a_suite_list_refuses_an_empty_entry_and_a_duplicate() {
+        assert_eq!(
+            parse_level_list("a.json,b.json").expect("a list parses"),
+            vec!["a.json".to_string(), "b.json".to_string()]
+        );
+        assert_eq!(
+            parse_level_list(" a.json , b.json ").expect("whitespace is trimmed"),
+            vec!["a.json".to_string(), "b.json".to_string()]
+        );
+        assert!(
+            parse_level_list("a.json,").is_err(),
+            "a trailing comma is an empty entry, not a level"
+        );
+        assert!(parse_level_list("").is_err(), "an empty list names nothing");
+        let dup = parse_level_list("a.json,a.json").expect_err("a duplicate is refused");
+        assert!(dup.contains("twice"), "{dup}");
+
+        // And naming both `--level` and `--suite` is a usage error rather than a priority rule.
+        let both = a(&["train", "--level", "a.json", "--suite", "a.json,b.json"]);
+        let err = train(&both).expect_err("two answers to what is being scored");
+        assert!(err.contains("--suite and --level are alternatives"), "{err}");
+    }
+
     /// The guard for the whole class of bug, not only the instance that was found: a flag the
     /// user did not give must leave the trainer's own default in place. The defect this catches
     /// was real — `--reheat-factor` carried a second copy of its default, the trainer's moved to
     /// 3.0, and the command line went on asking for 1.0 for every run that did not name one.
     #[test]
     fn the_command_lines_defaults_are_the_trainers_defaults() {
-        let level = wpath("levels/l1-flat-run.json");
-        let args = a(&["train", "--level", &level]);
+        let level_path = wpath("levels/l1-flat-run.json");
+        let level = load_level(&level_path).expect("level loads");
+        let args = a(&["train", "--level", &level_path]);
         let cli = train_config(&args).expect("a bare train invocation parses");
         let default = GaConfig::default();
         assert_eq!(cli.pop_size, default.pop_size);
@@ -860,10 +1740,132 @@ mod tests {
         assert_eq!(cli.adaptive_sigma, default.adaptive_sigma);
         assert_eq!(cli.stagnation_generations, default.stagnation_generations);
         assert_eq!(cli.immigrants, default.immigrants);
+        assert_eq!(cli.archive_children, default.archive_children);
+        assert_eq!(cli.novelty_weight, default.novelty_weight);
         assert_eq!(cli.reheat_factor, default.reheat_factor);
         assert_eq!(cli.action_repeat, default.action_repeat);
+        assert_eq!(cli.shape.feedback, default.shape.feedback);
         assert_eq!(cli.trials, default.trials);
         assert_eq!(cli.master_seed, default.master_seed);
+
+        // And the flag reaches the trainer's shape when it *is* given, without disturbing the
+        // rest of the recipe.
+        let asked = a(&["train", "--level", &level_path, "--feedback", "8"]);
+        let asked = train_config(&asked).expect("parses");
+        assert_eq!(asked.shape.feedback, 8);
+        // The rarity bonus is a fitness-units number rather than a ratio, so the flag sets it
+        // directly and the trainer bounds it (see `NOVELTY_WEIGHT_MAX`).
+        let rarity = a(&["train", "--level", &level_path, "--novelty", "16"]);
+        let rarity = train_config(&rarity).expect("parses");
+        assert_eq!(rarity.novelty_weight, 16.0);
+        assert_eq!(
+            rarity.sanitized(None).novelty_weight,
+            16.0,
+            "a measured weight must survive the trainer's own clamping"
+        );
+        assert_eq!(asked.shape.inputs, default.shape.inputs);
+        assert_eq!(asked.shape.hidden, default.shape.hidden);
+
+        // A walker level doubles (triples) the episodes selection reads, and it does so through
+        // the *trainer's* rule rather than through a number written down here — which is what the
+        // old hard-coded `3` in this function was, and why `recommended_trials_for` sat unused.
+        let walker_level = load_level(&wpath("levels/l3-gauntlet.json")).expect("l3 loads");
+        let walker_cli = train_config(&args).expect("parses");
+        assert_eq!(walker_cli.trials, default.trials, "the flag is a pass-through now");
+        assert_eq!(
+            walker_cli.effective_trials(&walker_level),
+            3,
+            "walker levels are judged on three patrol phases by default"
+        );
+        assert_eq!(walker_cli.effective_trials(&level), 1, "and a flat level on one");
+        let opted_out = a(&["train", "--level", &level_path, "--no-auto-trials"]);
+        let opted_out = train_config(&opted_out).expect("parses");
+        assert_eq!(
+            opted_out.effective_trials(&walker_level),
+            1,
+            "--no-auto-trials is how the numbers taken before the rule existed are reproduced"
+        );
+    }
+
+    /// The baseline arm's flags default from the trainer too, for the same reason, and — the part
+    /// that actually matters — the *episode budget* it reads is the GA's. An `es` invocation that
+    /// quietly cost a different number of episodes per generation would make the comparison in
+    /// `REVIEW.md` §4 a comparison of wall-clock settings rather than of searches.
+    #[test]
+    fn the_es_command_lines_defaults_are_the_trainers_defaults_and_the_gas_budget() {
+        let level_path = wpath("levels/l1-flat-run.json");
+        let args = a(&["es", "--level", &level_path]);
+        let cli = es_config(&args).expect("a bare es invocation parses");
+        let default = EsConfig::default();
+        assert_eq!(cli.pop_size, default.pop_size);
+        assert_eq!(cli.sigma, default.sigma);
+        assert_eq!(cli.learning_rate, default.learning_rate);
+        assert_eq!(cli.master_seed, default.master_seed);
+        assert_eq!(cli.action_repeat, default.action_repeat);
+        assert_eq!(cli.trials, default.trials);
+        assert_eq!(cli.shape.feedback, default.shape.feedback);
+
+        let ga = GaConfig::default();
+        assert_eq!(cli.pop_size, ga.pop_size, "one batch is one GA generation");
+        assert_eq!(cli.action_repeat, ga.action_repeat);
+        assert_eq!(cli.shape.inputs, ga.shape.inputs);
+
+        // And the flags do reach it, without disturbing the rest of the arm.
+        let asked = a(&[
+            "es",
+            "--level",
+            &level_path,
+            "--sigma",
+            "0.10",
+            "--learning-rate",
+            "0.02",
+            "--feedback",
+            "8",
+            "--pop",
+            "64",
+        ]);
+        let asked = es_config(&asked).expect("parses");
+        assert_eq!(asked.sigma, 0.10);
+        assert_eq!(asked.learning_rate, 0.02);
+        assert_eq!(asked.shape.feedback, 8);
+        assert_eq!(asked.batch(), 64);
+        assert_eq!(asked.shape.inputs, default.shape.inputs);
+
+        // A typo is a usage error rather than a second run of the GA with different flags.
+        let bad = a(&["es", "--level", &level_path, "--mut-sigma", "0.4"]);
+        assert!(bad.reject_unknown(ES_OPTS).is_err());
+    }
+
+    /// The arm end to end through the real command on a real level, which is the thing a unit
+    /// test of the arithmetic cannot show: that the subcommand walks the level, updates the mean
+    /// and survives its own summary — including the `--stop-on-win` and `--max-seconds` exits,
+    /// each of which ends the loop somewhere other than the top.
+    #[test]
+    fn the_es_subcommand_runs_on_a_shipped_level() {
+        let level_path = wpath("levels/l1-flat-run.json");
+        for extra in [
+            Vec::new(),
+            vec!["--stop-on-win"],
+            vec!["--max-seconds", "0.0001"],
+        ] {
+            let mut argv = vec![
+                "es",
+                "--level",
+                level_path.as_str(),
+                "--generations",
+                "3",
+                "--pop",
+                "8",
+                "--quiet",
+            ];
+            argv.extend(extra.iter().copied());
+            es(&a(&argv)).unwrap_or_else(|e| panic!("es {extra:?} failed: {e}"));
+        }
+
+        // And the invocation is checked like every other subcommand: a missing level and a flag
+        // that belongs to `train` are both usage errors rather than a quietly different run.
+        assert!(es(&a(&["es"])).is_err());
+        assert!(es(&a(&["es", "--level", &level_path, "--mut-sigma", "0.4"])).is_err());
     }
 
     fn csv_has_rows(path: &str, rows: usize) -> bool {

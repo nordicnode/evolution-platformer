@@ -48,6 +48,19 @@ const SHAFT: &[&str] = &[
     "#####",
 ];
 
+/// A pen: ground rows 4..5 with two wall columns (5 and 9) standing on it, so a walker
+/// placed between them patrols a fixed run and turns around at both ends, while the body
+/// that is watching stands outside the run and cannot be reached. This is what the
+/// direction slot is measured on — a walker that never turns would not show a flip.
+const PEN: &[&str] = &[
+    "............",
+    "............",
+    ".....#...#..",
+    ".....#...#..",
+    "############",
+    "############",
+];
+
 /// Ground rows 4..5 with a wall column at 9 rising to the top of the grid: a body
 /// running right presses into its face, which is what the wall slots are measured on.
 const WALL_FACE: &[&str] = &[
@@ -91,11 +104,19 @@ fn patch_index(dx: i32, dy: i32) -> usize {
 
 #[test]
 fn the_vector_has_the_documented_named_layout() {
-    // 95 = the plan's 90 plus the three ability inputs appended by v2, v3's second goal
-    // axis, and v4's second gap probe. Every earlier index keeps its slot, which is what
-    // makes the diff between the layouts reviewable.
-    assert_eq!(sensors::N_INPUTS, 95, "§7.2's 90 plus v2's three plus v3's and v4's one each");
-    assert_eq!(sensors::VERSION, 4);
+    // 98 = the plan's 90 plus the three ability inputs appended by v2, v3's second goal
+    // axis, v4's second gap probe, v7's enemy heading, and v8's two waypoint axes. Every
+    // earlier index keeps its slot, which is what makes the diff between the layouts
+    // reviewable.
+    assert_eq!(
+        sensors::N_INPUTS,
+        98,
+        "§7.2's 90 plus v2's three, v3's and v4's one each, v7's enemy_dir and v8's waypoint"
+    );
+    // v5 bounded the enemy slots and v6 widened that bound; both moved the reading without
+    // moving a slot. v7 and v8 are appends, which is why this number moved: the whole
+    // reason the layout is asserted by name rather than by one opaque blob.
+    assert_eq!(sensors::VERSION, 8);
 
     let names = sensors::input_names();
     assert_eq!(names.len(), sensors::N_INPUTS);
@@ -124,7 +145,75 @@ fn the_vector_has_the_documented_named_layout() {
     assert_eq!(names[92], "clinging");
     assert_eq!(names[93], "sprint_charge");
     assert_eq!(names[94], "gap_left", "v4 appends the leftward probe");
-    assert_eq!(names.len(), 90 + 2 + sensors::N_ABILITY_INPUTS);
+    assert_eq!(names[95], "enemy_dir", "v7 appends the walker's heading");
+    assert_eq!(names[96], "waypoint_dx", "v8 appends the route's next waypoint");
+    assert_eq!(names[97], "waypoint_dy");
+    assert_eq!(names.len(), 90 + 3 + sensors::N_ABILITY_INPUTS + 2);
+}
+
+/// **The slot no amount of training could recover.** `enemy_dx`/`enemy_dy` say where a walker
+/// is; nothing said which way it was walking, and that is not a fact a level file holds — a
+/// patrol's initial direction is drawn from the episode RNG, which is the only gameplay
+/// randomness in the sim. So this test is about a *new observation* rather than a new input:
+/// the reading has to follow the walker as it turns, not just exist.
+#[test]
+fn the_enemy_direction_slot_follows_the_walker_as_it_turns() {
+    let level = common::fixture("pen", PEN, (2, 3), &[("walker", 7, 3), ("goal", 10, 3)]);
+    assert_eq!(level.walkers.len(), 1, "the fixture must put a walker in the pen");
+    let mut sim = sim::Sim::new(&level, 47);
+    common::settle(&mut sim);
+
+    let obs = sim.observation();
+    let dir = sim.walkers()[0].dir;
+    assert!(
+        dir == 1 || dir == -1,
+        "the walker is walking one way or the other, got {dir}"
+    );
+    assert_eq!(obs[95], dir as f32, "the slot is the walker's own direction");
+    assert!(
+        obs[81].abs() > 0.0,
+        "and it is only reported for a walker that is actually in sight"
+    );
+
+    // Walk long enough for the pen's walls to turn it around more than once, and check the
+    // slot tracks the body on every tick — not merely at the start and the end.
+    let mut flips = 0;
+    let mut last = obs[95];
+    for tick in 0..400 {
+        sim.step(AgentAction::Walk);
+        let read = sim.observation()[95];
+        assert_eq!(
+            read,
+            sim.walkers()[0].dir as f32,
+            "tick {tick}: the slot disagrees with the walker it describes"
+        );
+        if read != last {
+            flips += 1;
+            last = read;
+        }
+    }
+    assert!(
+        flips >= 1,
+        "a walker penned between two walls must turn around inside 400 ticks, \
+         or this test cannot see the reading that matters"
+    );
+    assert!(
+        !sim.outcome().is_finished(),
+        "the body watching from outside the pen must survive the test"
+    );
+
+    // Out of sight is `0.0`, exactly like the two position slots it is appended after: there
+    // is no walker to have a heading, and a phantom ±1 from across the level would be the same
+    // lie v5 set out to remove.
+    let far = common::fixture("pen-far", PEN, (2, 3), &[("walker", 10, 3), ("goal", 10, 3)]);
+    let mut sim_far = sim::Sim::new(&far, 47);
+    common::settle(&mut sim_far);
+    let far_obs = sim_far.observation();
+    assert_eq!(
+        (far_obs[81], far_obs[82], far_obs[95]),
+        (0.0, 0.0, 0.0),
+        "a walker beyond ENEMY_VIEW_DISTANCE has no position and no heading"
+    );
 }
 
 #[test]
@@ -441,6 +530,17 @@ fn the_enemy_slots_point_at_the_nearest_live_walker() {
         ((wy - py) / sensors::ENEMY_VIEW_DISTANCE).clamp(-1.0, 1.0),
         "enemy_dy must be dy / ENEMY_VIEW_DISTANCE"
     );
+
+    // A walker beyond ENEMY_VIEW_DISTANCE is out of sight and reads (0.0, 0.0).
+    let far = common::fixture("far-enemy", GROUND, (1, 3), &[("walker", 10, 3), ("goal", 11, 3)]);
+    let mut sim_far = sim::Sim::new(&far, 47);
+    common::settle(&mut sim_far);
+    let obs_far = sim_far.observation();
+    assert_eq!(
+        (obs_far[81], obs_far[82]),
+        (0.0, 0.0),
+        "a walker 9 tiles away is beyond ENEMY_VIEW_DISTANCE and should read as no enemy in sight"
+    );
 }
 
 /// The three v2 slots, measured on a body that is doing the thing they describe.
@@ -526,19 +626,32 @@ fn the_ability_slots_report_the_wall_and_the_sprint() {
 /// Pinned hash of the observation vector at a fixed state.
 ///
 /// The slot-by-slot tests above document the layout one field at a time; this
-/// pins the whole 95-float vector so an accidental edit anywhere in the patch
+/// pins the whole 96-float vector so an accidental edit anywhere in the patch
 /// loop is caught even if it lands in a slot nobody asserts on directly. If this
 /// fails, the fix is a `sensors::VERSION` bump and a new constant -- never a
 /// quiet update, because every champion file records the version (§8).
 ///
 /// Re-pinned for **v4**, which is the one deliberate change it has ever had
 /// besides v2's and v3's: `gap_ahead` became `gap_right` + `gap_left`, so index 83
-/// changed meaning and index 94 is new.
+/// changed meaning and index 94 is new. Re-pinned again for **v6**, which moved the
+/// enemy vector's normaliser from four tiles to eight; the fixture now carries a walker
+/// four tiles to the right, because until v6 the fixture had none and slots 81-82 were
+/// pinned as a constant zero — a drift in them would have gone unnoticed here.
+///
+/// Re-pinned a third time for **v7**, which appends slot 95 (`enemy_dir`). This is what the
+/// golden blob is for: that fixture's walker is in sight, so the new slot is a drawn `±1`
+/// rather than a zero, and an accidental change to a walker's own direction — or to the
+/// tie-break between two walkers — lands on this number.
+///
+/// Re-pinned a fourth time for **v8**, which appends slots 96-97 (`waypoint_dx, waypoint_dy`).
+/// The fixture is a one-crossing floor with the flag to the right, so both new slots are drawn
+/// non-zero here: an accidental change to which stand the route aims at, or to the waypoint's
+/// normaliser, lands on this number.
 #[test]
 fn golden_observation_hash_at_a_fixed_state() {
-    const GOLDEN_OBSERVATION_HASH: u64 = 12_157_216_002_490_698_026;
+    const GOLDEN_OBSERVATION_HASH: u64 = 968_527_753_083_078_216;
 
-    let level = common::fixture("ground", GROUND, (5, 3), &[("goal", 11, 3)]);
+    let level = common::fixture("ground", GROUND, (5, 3), &[("walker", 9, 3), ("goal", 11, 3)]);
     let mut sim = sim::Sim::new(&level, 5);
     common::settle(&mut sim);
     let obs = sim.observation();

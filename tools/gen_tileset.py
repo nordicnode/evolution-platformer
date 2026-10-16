@@ -15,6 +15,7 @@ The art itself lives in `tools/art/`, one module per family:
 | `art/terrain.py` | the autotiled ground, sand and the rock under both, the spikes, and the material seams |
 | `art/characters.py` | the player's animation set, the walker, the goal flag, the spawn |
 | `art/props.py` | decor (bushes, trees, flowers, rocks, mushrooms), butterflies, clouds and effect puffs |
+| `art/ui.py` | the window's own tool glyphs — undo, redo, frame, details, restart — which the game never draws |
 
 Each module returns `(name, image)` pairs; this file owns the *grid* and the
 manifest, so a new sprite is one entry in one module and nothing else. Every module
@@ -36,7 +37,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from art import characters, props, terrain  # noqa: E402
+from art import characters, props, terrain, ui  # noqa: E402
 from art.common import CELL, CHECKER, TRANSPARENT, cell, rgba  # noqa: E402
 
 # The atlas is deliberately wider than tall: sprite names are grouped by family, and a
@@ -47,8 +48,14 @@ from art.common import CELL, CHECKER, TRANSPARENT, cell, rgba  # noqa: E402
 # else. Widen it before the sprites stop fitting rather than after: the generator refuses
 # to write an atlas a sprite does not fit in, so the failure is a clear error and not a
 # silently missing tile.
+#
+# Fourteen rows held two hundred and twenty-three sprites with one cell to spare, which is
+# a full atlas and not a growable one: the window's own tool glyphs (`art/ui.py`) are the
+# family that made it fifteen. They are the first sprites here that the *game* never draws,
+# and they arrived last for the same reason the seams did — a family whose whole purpose is
+# the application's chrome can wait for one that goes in the level.
 COLS = 16
-ROWS = 10
+ROWS = 15
 
 # Read order, so the manifest is stable and the preview is readable: nothing may
 # reorder this except a change to `assets/README.md`, which lists the same names.
@@ -57,6 +64,9 @@ FAMILIES = (
     ("terrain", terrain.sprites),
     ("characters", characters.sprites),
     ("props", props.sprites),
+    # The window's tool icons, in front of the seams for the seam family's own reason (see
+    # `art/ui.py`): they are drawn on the app's plates and over nothing at all.
+    ("ui", ui.sprites),
     # The material seams go last, after every sprite that was here before them: they are
     # the only family drawn *over* other families' art, and keeping them at the end means
     # a new one is an additive change to a generated file rather than a reshuffle.

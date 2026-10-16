@@ -131,6 +131,42 @@
 //! levels have no checkpoint to collect (`Level::checkpoint_zone` returns `None` everywhere
 //! on flat ground, which is asserted), so their landscape is untouched, and the shipped
 //! difficulty ladder passes unchanged.
+//!
+//! ## v8: a win pays for the time it did not spend
+//!
+//! Every version above is about *getting* to the flag. v8 is the first that cares how long it
+//! took, and it adds exactly one term: [`SPEED_BONUS`], paid **only on a win**, scaled by the
+//! fraction of the level's own frame budget the episode left unspent.
+//!
+//! The budget is the denominator, and it is not a new number: `sim::frame_budget` is
+//! `max(width, height) × FRAMES_PER_TILE`, the same cap the sim already stops episodes at, so
+//! "finished quickly" has a definition that every level already had, needs no per-level par to
+//! hand-tune, and cannot drift away from the rule that ends an episode. A very short level and a
+//! very long one are both measured against what their own terrain allows.
+//!
+//! Three properties are the reason the term is shaped this way rather than as a multiplier on
+//! the goal:
+//!
+//! * **It cannot be farmed, because it pays only on a win.** A bonus that scaled *progress* by
+//!   speed would make a fast death the best move on the level — the same class of mistake as the
+//!   park trap, pointing the other way. A winning episode is the only one that has a time to be
+//!   praised for.
+//!
+//! * **It is a tie-break between winners, not a second objective.** On a level the population can
+//!   win, most of a generation arrives at the flag, where progress is saturated: what is left to
+//!   rank them by is the hopping they did and how long they took. Before v8 those two were the
+//!   only signal a winner had over another winner, and `JUMP_PENALTY` alone is a weak reason to
+//!   find a *shorter route* — a genome that hops twelve times and arrives in half the budget beat
+//!   one that walks straight and hopped three times, for the same score. Now it does not.
+//!
+//! * **It is bounded and small against the goal.** `SPEED_BONUS` is worth about twelve tiles of
+//!   progress against `GOAL_BONUS`'s ten thousand, so a hundred maximally fast wins still could
+//!   not buy what one flag does: it reorders winners, it never makes losing pay.
+//!
+//! Speed is also, as of the same change, a *behaviour* the archive keeps: `ga::MapElitesArchive`
+//! keys its cells on the finish band as well as on progress and checkpoints, so the fastest
+//! route found in a niche survives as its incumbent instead of being bred out by a marginally
+//! slower genome the moment its lineage stops improving. See `ga::ARCHIVE_TIME_BINS`.
 
 use sim::hash::StateHasher;
 use sim::physics::AgentAction;
@@ -145,7 +181,15 @@ use crate::genome::{ActScratch, Genome};
 /// `progress_pixels` *is*, from rightmost x to distance-closed-on-the-flag, which re-scores
 /// every level in the pack whose goal is not due right. See the module docs, which carry
 /// the measurement that set all of them.
-pub const FITNESS_VERSION: u32 = 5;
+/// v6: directional checkpoint arrivals (`Level::checkpoint_zone_from`), so a leftward crossing
+/// credits the far landing zone symmetrically with a rightward one.
+/// v7: geodesic route-hop bonus (`ROUTE_HOP_BONUS`): each canonical crossing closed toward the
+/// flag along the level's move graph (`EpisodeStats::route_hops_closed`) pays a monotone reward,
+/// so a zig-zag tower whose route turns away from the flag still has a strictly ascending hill.
+/// v8: the speed term below ([`SPEED_BONUS`]) — a win pays for the budget it did not spend —
+/// and the archive gained a finish-time axis, which changes what the search *keeps* without
+/// changing what it scores.
+pub const FITNESS_VERSION: u32 = 8;
 
 /// Physics ticks between network queries (§7.3): 60 Hz sim → a decision every ~67 ms; the
 /// chosen action repeats in between. Exposed as a tuning knob; the plan's range is 3–6.
@@ -228,6 +272,53 @@ pub const JUMP_PENALTY: f32 = -2.0;
 /// checkpoint, so a level with no hazards pays nothing and its landscape is untouched.
 pub const CHECKPOINT_BONUS: f32 = 16.0;
 
+/// Fitness paid for finishing **inside the level's own frame budget** (new in v8).
+///
+/// The term is `SPEED_BONUS × unspent / budget`, where `unspent` is `budget_frames - frames`
+/// from the episode's own stats, so an episode that spent its whole budget earns nothing and a
+/// maximally fast one earns the lot. The budget is `sim::frame_budget` — `max(width, height) ×
+/// FRAMES_PER_TILE`, the cap the sim already stops episodes at — which is what makes "quickly"
+/// a fact about the level rather than a number someone typed in per level.
+///
+/// **Paid only on a win.** That is the load-bearing half of the design and not a detail: the
+/// term's whole job is to rank the winners of a generation, which is where progress has
+/// saturated and the only signals left are `JUMP_PENALTY` and the clock. Paying it for any
+/// finished episode would make dying fast a strategy — `Outcome::Stuck` and `Outcome::Died` also
+/// stop the clock — and that is the park trap with the sign flipped: a race to be killed. A
+/// losing episode can never claim it.
+///
+/// **Twelve tiles of progress**, and the size is derived rather than tuned: one pixel is one
+/// point ([`PROGRESS_PER_PIXEL`]) and a tile is sixteen, so 200 is about a fifth of a
+/// sixty-tile level's whole frontier. Against `GOAL_BONUS` (10 000) that is 2%, which is the
+/// point — the term decides *which* winner is the winner and can never make losing look like
+/// winning, since even a hundred clean runs bank less than one flag. Against the other terms a
+/// winner's score is made of it is decisive: a champion of a full-width level pays roughly
+/// sixty points of `JUMP_PENALTY` over its episode and collects a handful of checkpoints, so a
+/// few hundred points of speed is the only term large enough to reshape the *route* rather
+/// than the style.
+///
+/// The honest risk, stated because the number is small enough to be missed: on a level the
+/// population wins in its first generation, this changes nothing about *whether* it learns
+/// (there is nothing left to learn) and everything about which genome is kept as the champion —
+/// the champion being the top-scoring genome, which is what a `Save champion` writes and what
+/// the panel calls the best agent so far. It is *not* what the window replays: the replay and
+/// the playtest's ghost both follow the quickest **win** (`FastWin`), because those are two
+/// agents whenever a slower route collects enough checkpoints and route hops to outscore a
+/// quicker one — roughly 50 points of clock on a minute-long level against 32 a hop — and a view
+/// that races a time has to show the agent that set it. On a hard level this term is worth
+/// nothing until the flag is reached at all.
+pub const SPEED_BONUS: f32 = 200.0;
+
+/// Fitness for each canonical route crossing closed toward the flag (`EpisodeStats::route_hops_closed`,
+/// new in v7).
+///
+/// Two tiles of progress (`2.0 × PIXELS_PER_TILE = 32.0`), paid only when grounded on a stand that
+/// has strictly fewer crossings left to the flag than any stand reached earlier in the episode.
+/// On a zig-zag tower where straight-line Euclidean distance reverses up every switchback leg,
+/// `progress_pixels` plateaus across the leg while `route_hops_closed` rises by 1 on every platform,
+/// giving evolution a true geodesic gradient all the way to the top.
+pub const ROUTE_HOP_BONUS: f32 = 32.0;
+
 /// Knobs the evaluation depends on. Part of the champion metadata, because
 /// changing the cadence changes the trajectory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,11 +346,21 @@ pub fn score(stats: &EpisodeStats, outcome: Outcome) -> f32 {
     let mut f = stats.progress_pixels * PROGRESS_PER_PIXEL;
     f += stats.jumps as f32 * JUMP_PENALTY;
     f += stats.checkpoints as f32 * CHECKPOINT_BONUS;
+    f += stats.route_hops_closed as f32 * ROUTE_HOP_BONUS;
     if outcome == Outcome::Died {
         f += DEATH_PENALTY;
     }
     if outcome == Outcome::Won {
         f += GOAL_BONUS;
+        // The clock, and only for an agent that actually got there: see [`SPEED_BONUS`], where
+        // the reason this is inside the `Won` arm — rather than paid to anything that stopped —
+        // is the whole design. An episode whose budget is unknown (a stats value built by hand
+        // rather than by the sim) has nothing to measure against and scores the same as it did
+        // before this term existed, which keeps the arithmetic finite in every caller.
+        if stats.budget_frames > 0 {
+            let unspent = stats.budget_frames.saturating_sub(stats.frames) as f32;
+            f += SPEED_BONUS * (unspent / stats.budget_frames as f32);
+        }
     }
     f
 }
@@ -272,6 +373,11 @@ pub struct EpisodeResult {
     /// Fitness of the **representative episode** (trial 0). This is the number a
     /// champion records and the number `replay` must reproduce exactly, which is
     /// why it is always trial 0 rather than whichever trial happened to score best.
+    ///
+    /// On a **suite** ([`crate::ga::evaluate_suite`]) the representative episode is trial 0 of
+    /// the suite's **first** level, and that is deliberate: a champion is a claim about one
+    /// level, so the file has to record an episode somebody can replay — the suite score is a
+    /// selection metric and lives in [`EpisodeResult::mean_fitness`].
     pub fitness: f32,
     /// Mean fitness over all trials; equal to `fitness` when `trials == 1`.
     ///
@@ -280,6 +386,12 @@ pub struct EpisodeResult {
     /// so the two are kept apart instead of being conflated: without this split, a
     /// champion trained with `--trials 4` would advertise an average and then fail
     /// its own replay check.
+    ///
+    /// On a **suite** it is not a mean of trials at all but the *aggregate* across levels —
+    /// the mean of the level this genome is worst at (see [`crate::ga::evaluate_suite`] for the
+    /// arithmetic, and for why it is the minimum rather than a sum). Everything that records a
+    /// number about a genome reads [`EpisodeResult::fitness`]; everything that *ranks* one
+    /// reads this.
     pub mean_fitness: f32,
     pub outcome: Outcome,
     pub frames: u32,
@@ -292,6 +404,18 @@ pub struct EpisodeResult {
     /// got that the frontier alone does not say: a body that sailed over a pit and fell in
     /// has frontier but no checkpoints.
     pub checkpoints: u32,
+    /// Route crossings closed toward the flag while grounded (fitness v7).
+    pub route_hops_closed: u32,
+    /// Deepest route stand index reached while grounded in this episode.
+    pub best_stand: Option<usize>,
+    /// Levels of a **suite** this genome won, when it was judged on more than one level
+    /// ([`crate::ga::evaluate_suite`]). `0` on an ordinary single-level run.
+    ///
+    /// A count of *wins*, not of levels evaluated: a genome that reached ninety percent of
+    /// every level in a three-level suite has zero, because nothing on a suite is solved by
+    /// being close. It is the number that makes "the suite fell" a statement a reader can
+    /// check — the run's own solve signal is every level won, not one.
+    pub suite_wins: u32,
     pub death_pos: Option<(f32, f32)>,
     pub seed: u64,
     /// Hash of the decision trace and final state. Champion round-trip tests
@@ -404,6 +528,11 @@ impl EpisodeRunner {
             stomps: stats.stomps,
             jumps: stats.jumps,
             checkpoints: stats.checkpoints,
+            route_hops_closed: stats.route_hops_closed,
+            best_stand: stats.best_stand,
+            // One level was played, so no suite was solved: `evaluate_suite` is the only
+            // thing that raises this, and it raises it after this episode is finished.
+            suite_wins: 0,
             death_pos: stats.death_pos,
             seed: self.seed,
             trajectory_hash: self.trace.finish(),
@@ -439,9 +568,17 @@ mod tests {
     use sim::rng::rng_from_seed;
     use sim::EpisodeStats;
 
+    /// A synthetic episode on a sixty-tile level: 60 × `FRAMES_PER_TILE` = 2400 frames of
+    /// budget, which is the shape every shipped level has and what [`SPEED_BONUS`] is measured
+    /// against.
+    fn budget() -> u32 {
+        60 * sim::FRAMES_PER_TILE
+    }
+
     fn stats(progress_pixels: f32, frames: u32) -> EpisodeStats {
         EpisodeStats {
             frames,
+            budget_frames: budget(),
             progress_pixels,
             // Unused by `score` (which reads totals, never rates), so a synthetic episode has
             // no need of a trajectory to have produced them.
@@ -452,6 +589,8 @@ mod tests {
             stomps: 0,
             jumps: 0,
             checkpoints: 0,
+            route_hops_closed: 0,
+            best_stand: None,
             death_pos: None,
         }
     }
@@ -796,6 +935,109 @@ mod tests {
             "always-run must touch a flat level's flag, got {:?} at x={}",
             r.outcome,
             r.best_x
+        );
+    }
+
+    /// A win pays for the budget it did not spend, in proportion, and only a win does.
+    #[test]
+    fn a_win_pays_for_the_time_it_did_not_spend() {
+        let cap = budget();
+        // Two identical wins, one at the cap and one in half of it.
+        let at_the_cap = score(&stats(500.0, cap), Outcome::Won);
+        let half_spent = score(&stats(500.0, cap / 2), Outcome::Won);
+        let paid = half_spent - at_the_cap;
+        assert!(
+            (paid - SPEED_BONUS / 2.0).abs() < 1e-3,
+            "half the budget unspent is worth half the speed bonus, got {paid}"
+        );
+        // The term is bounded: a win that spent nothing earns the whole bonus and not a point
+        // more, so no episode can outrun the reward by being instantaneous.
+        let instant = score(&stats(500.0, 0), Outcome::Won) - at_the_cap;
+        assert!((instant - SPEED_BONUS).abs() < 1e-3, "got {instant}");
+        // And a *loss* earns nothing for being quick: dying early and dying at the cap score the
+        // same, or the fastest route to points would be to be killed, which is the park trap with
+        // the sign flipped.
+        assert_eq!(
+            score(&stats(500.0, cap), Outcome::Died),
+            score(&stats(500.0, cap / 4), Outcome::Died),
+            "a death must not bank the clock"
+        );
+        // Which leaves the ordering that matters intact: any win, however slow, still beats any
+        // death, however instant, by more than the whole speed bonus is worth.
+        assert!(at_the_cap - score(&stats(500.0, 0), Outcome::Died) > 9_000.0);
+    }
+
+    /// A quicker win cannot be bought by skipping a checkpoint, which is the trade the term's *size*
+    /// has to get right for the reward to be about pace rather than about cutting corners.
+    ///
+    /// The arithmetic, on the sixty-tile budget every shipped level has (2400 frames): a hundred
+    /// frames shaved off a win is `SPEED_BONUS × 100 / 2400` ≈ 8.3 points, and one checkpoint is worth
+    /// 16. So a solver that hops over a landing zone to save a sixth of a second comes out behind, and
+    /// the term can only be earned by being quick along a route that still collects what the level
+    /// pays for. Two hundred frames — a tenth of the budget — is still only 16.7 against one zone.
+    #[test]
+    fn a_quicker_win_cannot_be_bought_by_skipping_a_checkpoint() {
+        let cap = budget();
+        let collected = score(&stats_with_checkpoints(1, 500.0, cap - 100), Outcome::Won);
+        let skipped = score(&stats_with_checkpoints(0, 500.0, cap - 200), Outcome::Won);
+        assert!(
+            collected > skipped,
+            "skipping a zone for 100 frames paid {skipped:.2} against {collected:.2}"
+        );
+        // And the bound the whole design rests on: no quantity of saved time can turn a loss into a
+        // win, however quickly the loss ended.
+        let fastest_loss = score(&stats_with_checkpoints(0, 500.0, 0), Outcome::Died);
+        let slowest_win = score(&stats_with_checkpoints(0, 500.0, cap), Outcome::Won);
+        assert!(slowest_win - fastest_loss > 9_000.0);
+    }
+
+    /// The clock a real episode is paid on is the sim's own frame count against the level's own
+    /// budget — not a number the caller supplied, and not one the test supplied either.
+    #[test]
+    fn the_clock_an_episode_is_scored_on_is_the_sims_own() {
+        let level = level();
+        let mut g = Genome::zeros(0, default_shape());
+        // Always-run: the hand-wired seeker above, which is quick on this flat level.
+        let n_out = g.shape.outputs;
+        let out_b_off = g.shape.n_biases() - n_out;
+        g.biases[out_b_off] = 1.0;
+
+        let mut runner = EpisodeRunner::new(&level, g, &EvalConfig::default(), 42);
+        while !runner.is_finished() {
+            runner.step();
+        }
+        let stats = runner.sim().stats().clone();
+        let outcome = runner.sim().outcome();
+        let r = runner.result();
+        assert!(r.won(), "the fixture has to win for the term to be paid at all");
+
+        let budget_frames = sim::frame_budget(&level);
+        assert_eq!(stats.budget_frames, budget_frames, "the sim's own budget");
+        assert_eq!(r.frames, stats.frames, "the clock is the episode's frame count");
+        assert!(
+            stats.frames < budget_frames,
+            "a win inside the budget is what the term pays for: {} of {}",
+            stats.frames,
+            budget_frames
+        );
+
+        // The recorded fitness is the recorded stats scored once, and taking the speed term out
+        // of it costs exactly the unspent fraction of the bonus — no more, no less. Which is what
+        // says the term is *in* the number a champion file will advertise, rather than only in a
+        // synthetic `score` call a test made up.
+        assert_eq!(r.fitness, score(&stats, outcome));
+        let unspent_terms = stats.progress_pixels * PROGRESS_PER_PIXEL
+            + stats.jumps as f32 * JUMP_PENALTY
+            + stats.checkpoints as f32 * CHECKPOINT_BONUS
+            + stats.route_hops_closed as f32 * ROUTE_HOP_BONUS
+            + GOAL_BONUS;
+        let paid = r.fitness - unspent_terms;
+        let expected = SPEED_BONUS * (budget_frames - stats.frames) as f32 / budget_frames as f32;
+        assert!(
+            (paid - expected).abs() < 1e-2,
+            "the win was paid {paid} for its clock, expected {expected} from {} of {}",
+            stats.frames,
+            budget_frames
         );
     }
 

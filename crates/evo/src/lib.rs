@@ -12,6 +12,7 @@
 
 pub mod champion;
 pub mod curriculum;
+pub mod es;
 pub mod fitness;
 pub mod ga;
 pub mod genome;
@@ -21,14 +22,21 @@ pub use champion::{
     check_reproducibility, ChampionFile, ChampionMetadata, NetworkSpec, TrainingSummary,
     CHAMPION_FORMAT, CHAMPION_VERSION,
 };
-pub use curriculum::{curriculum_step, CurriculumStep, DEFAULT_CURRICULUM_GENERATIONS};
+pub use curriculum::{
+    curriculum_step, next_stand, practice_level, practice_level_for_stall, practice_step,
+    save_practice_level, stuck_point, CurriculumStep, DEFAULT_CURRICULUM_GENERATIONS,
+};
+pub use es::{EsConfig, EsRow, EsTrainer};
 pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};
 pub use fitness::{
     run_episode, score, EpisodeResult, EpisodeRunner, EvalConfig, ACTION_REPEAT, FITNESS_VERSION,
+    SPEED_BONUS,
 };
 pub use ga::{
-    evaluate_population, BestEver, GaConfig, GenerationReport, GenRow, LaneKind, MUTATION_RATES,
-    ShowcaseLane, Trainer,
+    evaluate_population, evaluate_suite, suite_score, ArchiveEntry, BestEver, FastWin, GaConfig,
+    GenRow, GenerationReport, LaneKind, MapElitesArchive, ShowcaseLane, Trainer,
+    ARCHIVE_BEHAVIOUR_CELLS, ARCHIVE_CELLS, ARCHIVE_CHECKPOINT_BINS, ARCHIVE_PROGRESS_BINS,
+    ARCHIVE_TIME_BINS, ARCHIVE_TIME_SLOTS, MUTATION_RATES,
 };
 pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
 
@@ -42,7 +50,7 @@ pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUT
 pub(crate) mod fixture {
     use sim::Level;
 
-    const GLYPHS: [char; 5] = ['.', '#', 'S', '^', 'G'];
+    const GLYPHS: [char; 7] = ['.', '#', 'S', 'B', 'W', '^', 'G'];
 
     pub fn level_src(
         name: &str,

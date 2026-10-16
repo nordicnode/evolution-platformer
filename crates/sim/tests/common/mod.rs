@@ -79,7 +79,7 @@ pub fn fixture<S: AsRef<str>>(
         );
         for (c, ch) in row.chars().enumerate() {
             assert!(
-                matches!(ch, '.' | '#' | 'S' | '^' | 'G'),
+                matches!(ch, '.' | '#' | 'S' | 'B' | 'W' | '^' | 'G'),
                 "fixture {name} row {i} column {c} has illegal glyph {ch:?}"
             );
         }

@@ -43,8 +43,40 @@ members = [
 # and is now `gap_right` + `gap_left` (sensors v4). Nothing about the physics constants or
 # the reward moved, but the action set and the observation did, so the trio moves and every
 # earlier champion is refused.
+# 0.7.0: bounded enemy vision, directional checkpoint arrivals, and brick/plank materials.
+# The nearest-enemy sensor now clips to ENEMY_VIEW_DISTANCE (sensors v5), and checkpoint
+# landings are credited symmetrically from whichever side the body left the ground
+# (fitness v6).
+#
+# 0.8.0: the clock is part of the objective. A win is paid for the time it did not spend
+# (`evo::fitness::SPEED_BONUS`, fitness v8), the archive gained a finish-band axis so a fast
+# route and a slow one to the same zone are different niches, and `EpisodeStats` carries the
+# level's own frame budget as the denominator of the ratio. Nothing about the physics moved,
+# but the state an episode is scored against did, so the trio moves with it.
+#
+# 0.10.0: the spike's kill zone is the spike you can see. The sprite has always drawn its
+# tips three of sixteen pixel rows below the tile's top, deliberately (a spike drawn to its
+# ceiling reads as part of the wall above it, `tools/art/terrain.py::spikes`), while the
+# hazard check tested the whole tile — so every spike carried an invisible kill band 0.1875
+# tiles tall above the topmost drawn pixel. Measured on a hand-drawn level whose only route
+# onto a platform passed over such a spike: 70% of a swept 6,480 scripted take-off/hold pairs
+# died without the body ever touching a drawn spike pixel, and the one take-off position that
+# survived had 0.025 tiles of clearance. The check is now box-versus-box against
+# `physics::spike_lethal_box` — the lower 0.8125 tiles of the cell, the art's own extent — so
+# clearing the drawing clears the hazard. A body can now stand in the spike's top
+# 0.1875-tile band, which moves the pack's hazard levels and the oracle's spike verdicts with
+# it: a physics change, so the trio moves and every earlier champion is refused rather than
+# replayed against physics it was not trained on. See REVIEW.md §2.12.
+#
+# 0.9.0: a grounded turn is crisp. `Physics::turn_accel_scale` multiplies the horizontal
+# acceleration when the press opposes the body's own velocity, but **only while grounded**: an
+# airborne reversal stays exactly as slow as it was, because that is what keeps the pack's
+# pits lethal (`crates/sim/tests/physics.rs::walking_into_a_pit_is_still_fatal` — a body that
+# walks off a lip must not be able to press back onto the pit wall). A physics constant moved,
+# so the trio moves and every earlier champion is refused rather than replayed against physics
+# it was not trained on.
 [workspace.package]
-version = "0.6.0"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"

@@ -152,23 +152,28 @@ def _player(
     # The scarf: a band across the shoulders and a tail streaming behind the runner.
     _box(px, 3, 7 + shift, 10, 7 + shift, PLAYER_TRIM)
     _put(px, 10, 7 + shift, PLAYER_TRIM_DARK)
-    _put(px, 2, 8 + shift, PLAYER_TRIM)
-    _put(px, 2, 9 + shift, PLAYER_TRIM_DARK)
-    _put(px, 1, 9 + shift, PLAYER_TRIM)
+    scarf_wave = 1 if (legs[0][1] > 1 or shift > 0) else 0
+    _put(px, 2, 7 + shift + scarf_wave, PLAYER_TRIM)
+    _put(px, 2, 8 + shift + scarf_wave, PLAYER_TRIM_DARK)
+    _put(px, 1, 8 + shift + scarf_wave, PLAYER_TRIM)
+    _put(px, 1, 9 + shift, PLAYER_TRIM_DARK)
 
-    # Head, with a rim of light along the top and the eye two pixels wide.
+    # Head, with a rim of light along the top, headband, and the eye two pixels wide.
     top = HEAD_TOP + shift + head_tilt
     bottom = HEAD_BOTTOM + shift + head_tilt
     _box(px, 4, top, 9, bottom, PLAYER_BODY)
     _box(px, 4, top, 9, top, PLAYER_LIGHT)
+    _box(px, 4, top + 1, 9, top + 1, PLAYER_TRIM)
+    _put(px, 9, top + 1, PLAYER_TRIM_DARK)
     _box(px, 4, bottom, 9, bottom, PLAYER_DARK)
-    _box(px, 9, top, 9, bottom, PLAYER_DARK)
-    _put(px, 5, top + 1, PLAYER_LIGHT)
+    _box(px, 9, top + 2, 9, bottom, PLAYER_DARK)
+    _put(px, 5, top, PLAYER_LIGHT)
 
     eye_row = EYE_ROW + shift + head_tilt
     if eye == "open":
-        _box(px, 6, eye_row, 7, eye_row + 1, PLAYER_EYE)
+        _box(px, 6, eye_row, 8, eye_row + 1, PLAYER_EYE)
         _put(px, 7, eye_row, PLAYER_PUPIL)
+        _put(px, 8, eye_row + 1, PLAYER_PUPIL)
     else:
         # A hurt eye is an X, which reads as "not running any more" at any zoom.
         for dx, dy in ((0, 0), (1, 1), (0, 1), (1, 0)):
@@ -237,6 +242,9 @@ def _walker(bob: int, feet: tuple[tuple[int, int], tuple[int, int]], dead: bool 
 
     top = 6 + bob
     bottom = 13 + bob
+    # Dorsal horn-crests and rounded carapace.
+    _put(px, 5, top - 2, WALKER_LIGHT)
+    _put(px, 10, top - 2, WALKER_LIGHT)
     _box(px, 3, top, 12, bottom, WALKER_BODY)
     _box(px, 4, top - 1, 11, top - 1, WALKER_LIGHT)
     _box(px, 3, top, 12, top, WALKER_LIGHT)
@@ -244,15 +252,16 @@ def _walker(bob: int, feet: tuple[tuple[int, int], tuple[int, int]], dead: bool 
     _box(px, 12, top, 12, bottom, WALKER_DARK)
     _box(px, 4, bottom - 1, 11, bottom - 1, WALKER_SHADE)
 
-    # One big eye, with the pupil a pixel off centre so the walker looks like it is
-    # looking where it is going.
+    # Expressive cyclops eye with brow and highlight.
+    _box(px, 5, top + 1, 10, top + 1, WALKER_SHADE)
     _box(px, 6, top + 2, 9, top + 4, WALKER_EYE)
-    _box(px, 7, top + 3, 8, top + 3, WALKER_PUPIL)
+    _box(px, 7, top + 3, 8, top + 4, WALKER_PUPIL)
+    _put(px, 6, top + 2, POLE_LIGHT)
 
     for x, y in feet:
         _box(px, x, y, x + 1, y, WALKER_DARK)
         _box(px, x, y - 1, x + 1, y - 1, WALKER_BODY)
-    return img
+    return _bump(img, PLAYER_OUTLINE)
 
 
 # --- the goal ---------------------------------------------------------------

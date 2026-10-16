@@ -86,6 +86,39 @@ SANDSTONE_DEEP = (114, 94, 66)
 SHELL = (246, 226, 206)
 SHELL_DARK = (206, 176, 148)
 
+# --- terrain: brick & masonry, and wood planks ---------------------------
+BRICK_TOP = (214, 118, 92)
+BRICK_LIGHT = (196, 98, 74)
+BRICK = (168, 76, 56)
+BRICK_MID = (138, 58, 44)
+BRICK_DARK = (106, 42, 34)
+BRICK_DEEP = (76, 28, 24)
+MORTAR = (196, 186, 172)
+MORTAR_DARK = (148, 138, 126)
+
+MASONRY_LIGHT = (156, 152, 164)
+MASONRY = (126, 122, 136)
+MASONRY_MID = (98, 94, 108)
+MASONRY_DARK = (74, 70, 84)
+MASONRY_DEEP = (52, 48, 60)
+
+WOOD_TOP = (218, 168, 108)
+WOOD_LIGHT = (194, 142, 86)
+WOOD = (164, 114, 66)
+WOOD_MID = (134, 90, 50)
+WOOD_DARK = (102, 66, 36)
+WOOD_DEEP = (72, 44, 24)
+IRON_BOLT = (92, 98, 112)
+IRON_LIGHT = (146, 154, 168)
+
+# --- new prop accents: lanterns, crystals, banners, crates ---------------
+CRYSTAL_LIGHT = (176, 244, 255)
+CRYSTAL = (96, 212, 238)
+CRYSTAL_DARK = (48, 148, 184)
+LANTERN_GLOW = (255, 236, 148)
+LANTERN_WARM = (255, 178, 72)
+IRON_FRAME = (58, 62, 74)
+
 # --- the player: a vermilion runner with a cream scarf -------------------
 # Chosen against the level rather than in the abstract. The backdrop is a light blue sky
 # over green hills, and the ground is green over brown, so a *cool* character — which is

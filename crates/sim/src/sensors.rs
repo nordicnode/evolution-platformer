@@ -22,6 +22,14 @@
 //! (`EpisodeStats::progress_pixels` is now distance-to-the-flag rather than rightmost x), so
 //! the sensor and the objective agree about what the goal is.
 //!
+//! v7 appends the nearest sighted walker's own direction of travel. A body could see *where* a
+//! walker was and never *which way it was going*, and that is not a detail a level can state:
+//! a patrol's initial direction is drawn from the episode RNG
+//! ([`Walker::spawn_spread`](crate::physics::Walker::spawn_spread)), which is v1's only gameplay
+//! randomness and the reason a trial count means anything at all on a walker level. So the one
+//! fact about a patrol that decides whether to cross in front of it was, until this slot,
+//! unobservable rather than merely unlearned.
+//!
 //! v4 splits the single `gap_ahead` probe into `gap_right` and `gap_left`. The one probe was
 //! the observation's last directional assumption, and it was the subtlest of the three: it
 //! asked about the side the body was *moving* toward — `PlayerState::facing`, which reads
@@ -50,18 +58,77 @@ use crate::physics::{AgentAction, Physics, PlayerState, Walker};
 /// v4: `gap_ahead` — a probe whose direction was `sign(vx)`, and therefore "right" for a
 /// body at rest — became `gap_right` and `gap_left`, one slot per direction. See the module
 /// docs.
-pub const VERSION: u32 = 4;
+/// v5: the nearest-enemy sensor is bounded to [`ENEMY_VIEW_DISTANCE`] so a walker far across
+/// the map (or outside it) reads `(0.0, 0.0)` instead of saturating the threat vector from
+/// tick 0.
+///
+/// v7: `enemy_dir`, the nearest sighted walker's direction of travel, is appended at index 95 —
+/// the last index, so every earlier slot keeps its meaning and its position. See the module
+/// docs for why the direction is not something the level format can state.
+///
+/// v7 is an *addition* rather than a re-reading, so there is one invariance to check and no
+/// sweep to report: the levels that cannot see it did not get harder. `l3-gauntlet`, twelve
+/// seeds at pop 200, `--stop-on-win`: **12 / 12 solved at a mean first-win generation of 17.9**
+/// against the 12 / 12 at 18 that §8 of `REVIEW.md` records for v6 — the same reading, on a
+/// genome that is sixteen genes larger. (No arm-level before/after exists for the slot itself:
+/// v6 is not a build this tree still has, and the honest claim is that the information went up
+/// and nothing regressed, not that a number moved.)
+///
+/// v6: that bound moved from four tiles to eight. Four was chosen to match
+/// [`PATCH_RADIUS`] — "the scalar says no more than the grid does" — and it made the walker
+/// levels *harder to learn* rather than easier, because a threat that is only legible once it
+/// is already inside the patch is a threat the population meets at contact range. Twelve
+/// seeds at pop 200 on `l3-gauntlet`, each stopping at its first win:
+///
+/// | enemy view | solved | mean first-win generation | wall clock, 12 runs |
+/// |---|---|---|---|
+/// | v4, unbounded | 12 / 12 | 25 | 3.8 s |
+/// | v5, four tiles | 12 / 12 | **41** | 15.2 s |
+/// | v6, eight tiles | 12 / 12 | **18** | 6.9 s |
+///
+/// So the phantom v5 removed was worth removing (it is a lie about where the threat is), but
+/// four tiles over-corrected: it took a walker out of the observation until it was inside the
+/// patch, and the population then learned to reach the flag later than it did with the
+/// unbounded, dishonest vector. Eight is the range at which a walker is a thing to plan
+/// around rather than a thing to collide with, it still reads `(0.0, 0.0)` for the walker on
+/// the far side of a 40-tile level — which is the phantom v5 set out to remove — and it is
+/// the only one of the three that also *beats* the committed v4 vector on the level that
+/// exposed the problem. The levels without walkers cannot see this change at all: between the
+/// four-tile and the eight-tile arm, `scratch-tower` is 10 of 12 at a mean first-win
+/// generation of 94 in both and `l2-first-gap`, `l5-tightrope` and `l7-ascent` are 12 of 12 at
+/// generations 2, 16 and 10 in both. (Those three levels do read the *scoring* change of the
+/// same pass — directional checkpoint credit — and the tower is measurably quicker for it, 94
+/// against the committed build's 122 at the same 10 of 12; that is a different arm and it is
+/// recorded as one in `REVIEW.md`.) The grid is unchanged: this is the scalar's own range.
+pub const VERSION: u32 = 8;
 
 /// Tiles per side of the local patch (`9×9 = 81` inputs).
 pub const PATCH_RADIUS: i32 = 4;
 /// Number of inputs in the observation vector.
-pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1;
+///
+/// **The enemy slots are a triple, and the third one is the direction**: `enemy_dx, enemy_dy` say
+/// where the nearest walker in sight is and `enemy_dir` says which way it is walking, so a body
+/// at the mouth of a corridor can answer "can I cross now" from one frame. The third was the only
+/// one of the three that no amount of training could recover, because the level format does not
+/// hold it — a patrol's initial direction is drawn from the episode RNG.
+///
+/// **v8 appends the route's next waypoint (`waypoint_dx, waypoint_dy`)** at indices 96 and 97.
+/// Straight-line `goal_dx, goal_dy` points through ceilings on zig-zag towers (`scratch-spike-tower`),
+/// telling a memoryless policy at the foot of a left-going leg to run right. The waypoint vector
+/// points from the body to the next landing stand along [`crate::reach::GoalRoutes`] (or to the
+/// flag itself once on the final stand), normalised by [`GOAL_VIEW_DISTANCE`].
+pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1 + 1 + 2;
 
 /// Inputs appended in v2: wall side, wall slide, sprint charge.
 pub const N_ABILITY_INPUTS: usize = 3;
 
-/// Normalizer for the nearest-enemy vector (tiles).
-pub const ENEMY_VIEW_DISTANCE: f32 = 4.0;
+/// Normalizer for the nearest-enemy vector (tiles), and the range beyond which a walker is
+/// simply not in the observation.
+///
+/// Eight, not [`PATCH_RADIUS`]: the vector's job is the warning the patch cannot give, and the
+/// measurement in [`VERSION`]'s v6 note is why. A walker further away on either axis is out of
+/// sight in both channels, so a level's far end is quiet rather than a constant threat.
+pub const ENEMY_VIEW_DISTANCE: f32 = 8.0;
 /// How far each gap probe looks, in tiles.
 ///
 /// Three, the radius of the patch, so the probe is "the patch, summarised": a hole at the
@@ -91,11 +158,11 @@ pub const ENC_ENEMY: f32 = -1.0;
 #[inline]
 fn encode_tile(t: Tile) -> f32 {
     match t {
-        // Sand is solid, and an agent is told so: the observation is about what a body can
-        // do, not what the world is made of. A material that looked different to the
-        // sensors would be a new problem for the population to solve, which is the one
+        // Sand, brick and plank are solid, and an agent is told so: the observation is about
+        // what a body can do, not what the world is made of. A material that looked different
+        // to the sensors would be a new problem for the population to solve, which is the one
         // thing adding a *colour* of ground must never be.
-        Tile::Solid | Tile::Sand => ENC_SOLID,
+        Tile::Solid | Tile::Sand | Tile::Brick | Tile::Plank => ENC_SOLID,
         Tile::Spike => ENC_SPIKE,
         Tile::Empty | Tile::Goal => ENC_EMPTY,
     }
@@ -119,6 +186,13 @@ fn encode_tile(t: Tile) -> f32 {
 /// | 92  | 1  | wall slide active |
 /// | 93  | 1  | sprint charge, 0 at `run_speed` and 1 at `sprint_speed` |
 /// | 94  | 1  | gap to the left of the feet |
+/// | 95  | 1  | the same walker's direction of travel (+1 right, −1 left, 0 none in sight) |
+///
+/// The v7 slot describes *the walker* the two slots above it describe, not a second, nearer one:
+/// a level with two walkers in sight reports the closest pair's position and that walker's
+/// heading, which is one fact about one body rather than three facts about two. A body that wants
+/// to reason about the other one has the patch, and the tie-break is walker index, so the reading
+/// is stable for a given frame.
 ///
 /// The two gap slots are a **pair, and neither is "forward"**. What they describe is the
 /// ground immediately beside each edge of the body, which is the thing a jump decision is
@@ -140,6 +214,24 @@ pub fn observe(
     walkers: &[Walker],
     ph: &Physics,
 ) -> [f32; N_INPUTS] {
+    let stand = if player.grounded {
+        let surface = Level::tile_y(player.y + player.h + 0.05);
+        let col = Level::tile_x(player.x + player.w * 0.5);
+        level.routes().zone_at(col, surface)
+    } else {
+        None
+    };
+    observe_from_stand(level, player, walkers, ph, stand)
+}
+
+/// Build the observation vector when the body's current or last grounded route stand is known.
+pub fn observe_from_stand(
+    level: &Level,
+    player: &PlayerState,
+    walkers: &[Walker],
+    ph: &Physics,
+    current_stand: Option<usize>,
+) -> [f32; N_INPUTS] {
     let mut out = [0.0f32; N_INPUTS];
     let (cx, cy) = player.aabb().center();
     let ctx = cx.floor() as i32;
@@ -155,22 +247,31 @@ pub fn observe(
     }
     debug_assert_eq!(i, 81);
 
-    // ---- nearest live enemy --------------------------------------------
-    // Ties break on walker index, so the observation is order-stable.
-    let mut best: Option<(f32, f32)> = None;
+    // ---- nearest live enemy (within ENEMY_VIEW_DISTANCE) ---------------
+    // Ties break on walker index, so the observation is order-stable. Walkers beyond
+    // ENEMY_VIEW_DISTANCE on both axes are out of sight and leave the slots at (0, 0),
+    // preventing a distant walker from feeding a constant phantom threat from spawn.
+    let mut best: Option<(f32, f32, i8)> = None;
     let mut best_d2 = f32::INFINITY;
     for w in walkers.iter().filter(|w| w.alive) {
         let (wx, wy) = w.aabb(ph).center();
         let (dx, dy) = (wx - cx, wy - cy);
+        if dx.abs() > ENEMY_VIEW_DISTANCE || dy.abs() > ENEMY_VIEW_DISTANCE {
+            continue;
+        }
         let d2 = dx * dx + dy * dy;
         if d2 < best_d2 {
             best_d2 = d2;
-            best = Some((dx, dy));
+            best = Some((dx, dy, w.dir));
         }
     }
-    if let Some((dx, dy)) = best {
+    if let Some((dx, dy, dir)) = best {
         out[81] = (dx / ENEMY_VIEW_DISTANCE).clamp(-1.0, 1.0);
         out[82] = (dy / ENEMY_VIEW_DISTANCE).clamp(-1.0, 1.0);
+        // v7: which way *it* is going, signed like `wall_dir` below and taken from the body's
+        // own state rather than from its last position, so it is exact on the tick a walker
+        // turns around as well as on the ticks in between.
+        out[95] = dir as f32;
     }
 
     // ---- ground beside each edge of the feet ---------------------------
@@ -202,6 +303,11 @@ pub fn observe(
     } else {
         0.0
     };
+
+    // ---- v8: next route waypoint ----------------------------------------
+    let (wdx, wdy) = waypoint_delta(level, player, current_stand, (gdx, gdy));
+    out[96] = (wdx / GOAL_VIEW_DISTANCE).clamp(-1.0, 1.0);
+    out[97] = (wdy / GOAL_VIEW_DISTANCE).clamp(-1.0, 1.0);
 
     debug_assert!(out.iter().all(|v| v.is_finite()));
     out
@@ -268,8 +374,29 @@ pub fn input_names() -> Vec<String> {
     names.push("clinging".into());
     names.push("sprint_charge".into());
     names.push("gap_left".into());
+    names.push("enemy_dir".into());
+    names.push("waypoint_dx".into());
+    names.push("waypoint_dy".into());
     debug_assert_eq!(names.len(), N_INPUTS);
     names
+}
+
+/// Vector from the body to the next landing stand along the level's move graph, falling
+/// back to `goal_fallback` when the body is already on the goal's own stand or off-route.
+fn waypoint_delta(
+    level: &Level,
+    player: &PlayerState,
+    current_stand: Option<usize>,
+    goal_fallback: (f32, f32),
+) -> (f32, f32) {
+    let (cx, cy) = player.aabb().center();
+    if let Some(stand) = current_stand {
+        let goal = level.goals.first().copied();
+        if let Some((wx, wy)) = level.routes().next_waypoint(stand, cx, goal) {
+            return (wx - cx, wy - cy);
+        }
+    }
+    goal_fallback
 }
 
 /// One row of the action table: name, horizontal input, jump held, sprint asked for.

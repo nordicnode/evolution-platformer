@@ -105,7 +105,16 @@ fn golden_state_hash_after_ten_thousand_frames() {
     // Re-recorded for 0.2.0 before that, for a longer list: jumps became edge-triggered,
     // the speed cap became state (sprint), and the wall slide and wall memory joined the
     // body.
-    const GOLDEN_LONG_RUNWAY_HASH: u64 = 16_244_207_928_716_265_123;
+    //
+    // Re-recorded for 0.8.0: the episode now carries its position along the level's move
+    // graph — `EpisodeStats::route_hops_closed` and `best_stand`, both folded into
+    // `state_hash` — and a grounded crossing that closes a route hop resets the anti-camper
+    // timer, which is an episode-termination rule. The runway has no route, so the readings
+    // are `0`/`None` throughout and it is the *hash* that moves rather than the trajectory,
+    // which is precisely why the pin has to be re-recorded with the version: a champion
+    // replayed against an older build would otherwise agree on every visible number and
+    // disagree on this one.
+    const GOLDEN_LONG_RUNWAY_HASH: u64 = 4_559_670_468_595_301_688;
 
     let level = common::long_runway();
     let mut sim = sim::Sim::new(&level, SEED);

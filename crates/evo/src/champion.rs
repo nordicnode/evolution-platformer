@@ -17,7 +17,7 @@ use sim::{Level, SIM_VERSION};
 
 use crate::fitness::{EpisodeResult, FITNESS_VERSION};
 use crate::ga::GaConfig;
-use crate::genome::{ActScratch, Genome, NetShape};
+use crate::genome::{ActScratch, Genome, NetShape, MAX_FEEDBACK};
 
 pub const CHAMPION_FORMAT: &str = "evo-platformer-champion";
 pub const CHAMPION_VERSION: u32 = 1;
@@ -28,6 +28,12 @@ pub struct NetworkSpec {
     pub n_inputs: usize,
     pub n_hidden: Vec<usize>,
     pub n_outputs: usize,
+    /// Width of the network's recurrent state. `0` is a memoryless feedforward net, which is
+    /// what every file written before this field existed holds; defaulted on load for exactly
+    /// that reason, so an older champion reads back as the net it was rather than as a
+    /// malformed one.
+    #[serde(default)]
+    pub feedback: usize,
     pub activation_hidden: String,
     pub activation_output: String,
     pub weights: Vec<f32>,
@@ -40,6 +46,7 @@ impl NetworkSpec {
             n_inputs: g.shape.inputs,
             n_hidden: g.shape.hidden.clone(),
             n_outputs: g.shape.outputs,
+            feedback: g.shape.feedback,
             activation_hidden: "tanh".into(),
             activation_output: "tanh".into(),
             weights: g.weights.clone(),
@@ -52,6 +59,7 @@ impl NetworkSpec {
             inputs: self.n_inputs,
             hidden: self.n_hidden.clone(),
             outputs: self.n_outputs,
+            feedback: self.feedback,
         }
     }
 
@@ -79,6 +87,26 @@ impl NetworkSpec {
             return Err(format!(
                 "unsupported activations ({:?} / {:?}); this build only implements tanh",
                 self.activation_hidden, self.activation_output
+            ));
+        }
+        if self.feedback > MAX_FEEDBACK {
+            return Err(format!(
+                "{kind} network feeds back {} values but this build builds at most {MAX_FEEDBACK}",
+                self.feedback
+            ));
+        }
+        // The weight count has to match the shape, memory included: the feedback matrix is
+        // `feedback x hidden[0]` weights that live at the front of the first layer, so a file
+        // whose genes were written for a memoryless net but whose spec claims memory would
+        // drive a network that read its own genes one offset out.
+        let shape = self.shape();
+        let n_w = shape.n_weights();
+        let n_b = shape.n_biases();
+        if self.weights.len() != n_w || self.biases.len() != n_b {
+            return Err(format!(
+                "{kind} network has {} weights and {} biases but its shape needs {n_w} and {n_b}",
+                self.weights.len(),
+                self.biases.len()
             ));
         }
         Ok(())
@@ -364,13 +392,21 @@ impl ChampionFile {
     /// questions and the pair is what a hazard level's progress actually looks like: on a
     /// floor of spikes a genome can have all the `best_x` in the world by leaping over them
     /// and none of the landings that went with it.
+    /// One line about the file, for the terminal.
+    ///
+    /// The clock is written as a **time** and the frame count beside it, rather than the frame count
+    /// alone: 505 frames is the number that reproduces the episode and 8.42 s is the number a person
+    /// races, and every front-end's champion line goes through here (train, watch, replay) so the two
+    /// are never two different answers. `sim::format_time` is the same formatter the window's panel
+    /// and the playtest's stopwatch use, which is the point of it being one function.
     pub fn summary(&self) -> String {
         format!(
-            "gen {} id {} fitness {:.2} ({}, {} frames, best_x {:.1}, checkpoints {})",
+            "gen {} id {} fitness {:.2} ({} in {}, {} frames, best_x {:.1}, checkpoints {})",
             self.metadata.generation,
             self.metadata.genome_id,
             self.fitness,
             self.metadata.outcome,
+            sim::format_time(self.metadata.frames),
             self.metadata.frames,
             self.metadata.best_x,
             self.metadata.checkpoints
@@ -420,6 +456,29 @@ mod tests {
         let cfg = GaConfig::default();
         let r = crate::fitness::run_episode(level, &g, &cfg.eval_config(), 99);
         ChampionFile::new(&g, &r, level, 3, &cfg)
+    }
+
+    /// The one line every front-end prints about a file says the clock as a **time** as well as a
+    /// frame count, and both are that episode's own numbers.
+    ///
+    /// The frame count is what reproduces the episode and the time is what a person races, and a
+    /// terminal that printed only the count left the reader to divide by sixty. One function writes
+    /// both (`sim::format_time`), so a champion line and the window's panel cannot disagree.
+    #[test]
+    fn a_champions_summary_says_its_clock_as_a_time_and_a_frame_count() {
+        let lv = level();
+        let champ = champion_for(&lv, 1);
+        let line = champ.summary();
+        let frames = champ.metadata.frames;
+        assert!(
+            line.contains(&format!("{} frames", frames)),
+            "the frame count is what reproduces the episode: {line}"
+        );
+        assert!(
+            line.contains(&sim::format_time(frames)),
+            "and the time is what a person races: {line}"
+        );
+        assert_eq!(sim::format_time(frames), format!("{:.2}s", frames as f64 / 60.0));
     }
 
     #[test]
@@ -602,8 +661,49 @@ mod tests {
         let lv = level();
         let mut champ = champion_for(&lv, 6);
         champ.network.weights.pop();
-        champ.check_compat(&lv).expect("versions still agree");
-        assert!(champ.to_genome().is_err(), "shape validation must catch it");
+        // The structural check catches this one now, and it is the stronger place to catch it:
+        // nothing about the build changed (the version trio agrees), while the genes and the
+        // declared shape disagree, which is a corrupt file rather than a stale one. Still
+        // refused before anything can run, which is the property the test is about.
+        let err = champ.check_compat(&lv).expect_err("must refuse");
+        assert!(err.contains("weights"), "{err}");
+        assert!(champ.to_genome().is_err(), "and the shape check would catch it too");
+    }
+
+    /// A network with memory survives the file, and a file written before memory existed
+    /// reads back as the memoryless net it was.
+    #[test]
+    fn memory_is_recorded_in_the_file_and_replays_identically() {
+        let lv = level();
+        let mut shape = default_shape();
+        shape.feedback = 8;
+        let mut rng = rng_from_seed(31);
+        let g = Genome::random(9, shape.clone(), &mut rng);
+        let cfg = GaConfig::default();
+        let r = crate::fitness::run_episode(&lv, &g, &cfg.eval_config(), 3);
+        let champ = ChampionFile::new(&g, &r, &lv, 0, &cfg);
+        assert_eq!(champ.network.feedback, 8, "the file records the state width");
+
+        let json = champ.to_json_pretty().expect("serializes");
+        let back = ChampionFile::from_json_str(&json).expect("parses");
+        assert_eq!(back.network.feedback, 8);
+        assert_eq!(back.network.shape(), shape);
+        back.check_compat(&lv).expect("compatible");
+
+        // The replay builds its own scratch, so a recurrent policy has to replay from a clean
+        // state to reproduce: this is the invariant the whole project rests on.
+        let (_, replayed) = replay(&lv, &back).expect("replay");
+        assert_eq!(replayed.trajectory_hash, r.trajectory_hash);
+        assert_eq!(replayed.outcome, r.outcome);
+
+        // A file from before the field existed: gone from the JSON, memoryless on load.
+        let mut old: serde_json::Value = serde_json::from_str(&json).expect("json");
+        old["network"]
+            .as_object_mut()
+            .expect("network object")
+            .remove("feedback");
+        let old = ChampionFile::from_json_str(&old.to_string()).expect("an older file parses");
+        assert_eq!(old.network.feedback, 0, "absence means memoryless, not unreadable");
     }
 
     #[test]

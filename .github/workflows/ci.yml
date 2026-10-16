@@ -1,0 +1,61 @@
+# The determinism suite, enforced rather than trusted (REVIEW.md §2.6).
+#
+# This workspace's central promise is that a run is a function of (genome, level,
+# seed): the sim is `std`, thread- and wall-clock-free, the trainer's RNG stream is
+# independent of thread count, and the version trio (`sim::SIM_VERSION`,
+# `sensors::VERSION`, `fitness::FITNESS_VERSION`) is stamped into every champion so
+# an old artifact can be refused rather than misbehave. All of that lives in
+# `cargo test --workspace`, and until this workflow existed nothing ran it.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A push that supersedes an in-flight run of the same ref cancels it: the older
+# answer is about code that no longer exists.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Cargo's registry and the incremental build artifacts, keyed on the lockfile:
+      # a dependency change re-downloads, a source-only change reuses the compile.
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Lints first, because a warning is cheaper to read than a failing test, and
+      # because `-D warnings` is what keeps the bar where this repository left it.
+      # No `|| true`: a lint regression fails the build here exactly as it would for
+      # a reader running the same command.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The suite the whole versioning contract rests on: the sim's determinism and
+      # episode termination, the sensor layout and its golden hashes, the oracle, the
+      # champion round trip, the difficulty ladder, and the command-line defaults that
+      # must match `GaConfig::default()`. Unfiltered — a filtered run is not the suite.
+      - name: Tests
+        run: cargo test --workspace

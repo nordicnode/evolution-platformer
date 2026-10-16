@@ -49,6 +49,39 @@ pub struct Physics {
     pub sprint_ramp: f32,
     /// Ground/air horizontal acceleration, tiles/tick².
     pub run_accel: f32,
+    /// Multiplier on `run_accel` for a **grounded** reversal: a turn, rather than an
+    /// acceleration.
+    ///
+    /// Pressing against your own momentum is the one horizontal move that has to feel
+    /// immediate. Everything else in this bible is a ramp, and a ramp is right for *building*
+    /// speed and wrong for *changing your mind*: at the bare `run_accel` a turn was an
+    /// acceleration with a negative sign — twenty ticks (0.33 s) to cross from `run_speed`,
+    /// thirty from `sprint_speed` — which is two thirds of a jump's airtime spent still
+    /// travelling the way you no longer want to go. That is the mushiness of a hand on the
+    /// keys, and it is also a policy's inability to stop where it means to.
+    ///
+    /// 2.5: a grounded turn becomes 0.025 tiles/tick², so it is **eight ticks** from run speed
+    /// and twelve from sprint — short enough to be a deliberate move, long enough that the body
+    /// still carries momentum through it. It is a multiplier rather than a second constant so
+    /// there is one "how hard does the body push" number and this only says how much harder the
+    /// push is when it is fighting the body's own motion.
+    ///
+    /// **Grounded only, and that is the whole design rather than a caveat.** An airborne
+    /// reversal is load-bearing for this game's difficulty: a body that walks off a pit lip at
+    /// running speed must not be able to press back onto the pit wall before the world runs out,
+    /// because every pit in the shipped pack is two rows of nothing and *that* is what makes
+    /// them lethal (`crates/sim/tests/physics.rs::walking_into_a_pit_is_still_fatal` measures
+    /// it: zero cling ticks, out of the world at frame 107). Scaling the turn in the air makes
+    /// the lip rescue reachable and turns the pack's pits into a wall-climbing exercise, which
+    /// is a difficulty change and not a comfort setting. So the air keeps the acceleration it
+    /// had, the way out of a pit stays the jump off the lip, and the turn that a player actually
+    /// feels — standing on the ground, deciding to go the other way — is the one that got
+    /// crisper.
+    ///
+    /// Accelerating from rest and pressing on in the direction already held are both unaffected
+    /// too, so the runway [`Physics::runway_to_speed`] documents and every launch speed the
+    /// reachability oracle derives from it are unchanged.
+    pub turn_accel_scale: f32,
     /// Airborne acceleration multiplier (`< 1` = less air control).
     pub air_accel_scale: f32,
     /// Deceleration when input is neutral and grounded, tiles/tick².
@@ -148,6 +181,7 @@ pub const PHYSICS: Physics = Physics {
     sprint_speed: 0.15,
     sprint_ramp: 0.005,
     run_accel: 0.010,
+    turn_accel_scale: 2.5,
     air_accel_scale: 0.60,
     ground_friction: 0.0150,
     air_friction: 0.0040,
@@ -244,6 +278,18 @@ impl Physics {
     /// Horizontal reach while airborne for `ticks` at `speed`.
     pub fn distance_over(&self, speed: f32, ticks: f32) -> f32 {
         speed * ticks
+    }
+
+    /// Ticks for a **grounded** turn to bring the body from `speed` to a standstill by pressing
+    /// against it: `speed / (run_accel × turn_accel_scale)`.
+    ///
+    /// The turn's own derivation, next to [`Physics::runway_to_speed`] which derives the same
+    /// relation for accelerations, so "eight ticks from run speed" is a claim a reader can check
+    /// rather than a number in a comment. The airborne figure is the same expression without the
+    /// scale — and, multiplied by [`Physics::air_accel_scale`], which is the one the pit invariant
+    /// above is measured against.
+    pub fn turn_ticks(&self, speed: f32) -> f32 {
+        speed / (self.run_accel * self.turn_accel_scale)
     }
 
     /// Peak height a held jump *actually* reaches under the sim's discrete Euler
@@ -453,6 +499,40 @@ pub fn row_span(top: f32, height: f32) -> (i32, i32) {
     tile_span(top, height)
 }
 
+/// How much of the **top** of a spike's tile is not the spike.
+///
+/// The sprite's top three of sixteen pixel rows are transparent, and deliberately so: a
+/// spike tile drawn all the way to its ceiling stops reading as a hazard and starts
+/// reading as part of the wall above it (`tools/art/terrain.py::spikes`). The kill zone
+/// follows the drawing instead of the tile, so the two cannot disagree — a body that
+/// clears every drawn pixel of a spike is clear of the spike. A spike is therefore lethal
+/// over the lower 0.8125 tiles of its cell, which is the height the player is looking at.
+///
+/// The alternative, drawing the spikes up to the tile edge, was rejected: it would have
+/// kept a full tile of hazard and made the *picture* the thing that changes, when the
+/// picture is the only contract the player has. `REVIEW.md` records the measured cost of
+/// the old rule — an invisible kill band 0.1875 tiles tall on top of every spike.
+pub const SPIKE_TOP_CLEARANCE: f32 = 3.0 / 16.0;
+
+/// The lethal box of a spike tile: the part of the cell the sprite actually covers.
+///
+/// Horizontally it is the whole cell — the spikes stand on the full width of their stone
+/// base, and their bases reach both cell edges — and vertically it starts
+/// [`SPIKE_TOP_CLEARANCE`] below the cell's top and runs to its floor. Box-versus-box
+/// rather than per-pixel: the triangles taper to thin points near their apexes, and a
+/// body clipping the blank air *between* two tips inside that band is still killed. That
+/// is the one place this box is stricter than the drawing, and it is the honest
+/// approximation — the alternative is pixel collision for one tile type.
+#[inline]
+pub fn spike_lethal_box(tx: i32, ty: i32) -> Rect {
+    Rect::new(
+        tx as f32,
+        ty as f32 + SPIKE_TOP_CLEARANCE,
+        1.0,
+        1.0 - SPIKE_TOP_CLEARANCE,
+    )
+}
+
 /// The player's body and movement state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerState {
@@ -599,7 +679,18 @@ impl PlayerState {
             self.wall_lock -= 1;
         } else if input != 0.0 {
             let scale = if self.grounded { 1.0 } else { ph.air_accel_scale };
-            self.vx += input * ph.run_accel * scale;
+            // A grounded turn is not an acceleration. `input * vx < 0` is "pressing against
+            // the way the body is already going"; on the ground that gets
+            // [`Physics::turn_accel_scale`], and in the air it deliberately does not — the
+            // airborne turn is what keeps the pack's pits lethal, and the field's own comment
+            // has the measurement. Building speed from rest, and pressing on, stay at
+            // `run_accel` either way, so every runway in the bible is unchanged.
+            let accel = if self.grounded && self.vx * input < 0.0 {
+                ph.run_accel * ph.turn_accel_scale
+            } else {
+                ph.run_accel
+            };
+            self.vx += input * accel * scale;
             self.vx = self.vx.clamp(-self.speed_cap, self.speed_cap);
         } else {
             // Brake is the one neutral action that is *not* a coast, and it decelerates in
@@ -680,11 +771,17 @@ impl PlayerState {
         }
 
         // ---- hazard overlap ---------------------------------------------
+        // The body is tested against the spike's *drawn* box, not against the tile: a
+        // spike's sprite leaves the top [`SPIKE_TOP_CLEARANCE`] of its cell transparent,
+        // and a body that clears every pixel of it has cleared the hazard. Killing on the
+        // whole tile instead put a 0.1875-tile invisible band above every spike — see
+        // `spike_lethal_box` and REVIEW.md §2.12.
         let (hx0, hx1) = tile_span(self.x, self.w);
         let (hy0, hy1) = row_span(self.y, self.h);
+        let body = self.aabb();
         'hazards: for ty in hy0..=hy1 {
             for tx in hx0..=hx1 {
-                if level.is_spike(tx, ty) {
+                if level.is_spike(tx, ty) && body.overlaps(&spike_lethal_box(tx, ty)) {
                     contact.touched_spike = true;
                     break 'hazards;
                 }

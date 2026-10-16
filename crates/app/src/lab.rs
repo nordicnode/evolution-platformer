@@ -37,8 +37,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use evo::{
-    curriculum_step, BestEver, ChampionFile, EpisodeResult, EpisodeRunner, EvalConfig, GaConfig,
-    Genome, LaneKind, PopulationFile, Trainer,
+    curriculum_step, practice_level_for_stall, practice_step, save_practice_level, BestEver,
+    ChampionFile, EpisodeResult, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind,
+    PopulationFile, Trainer,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use render::trace::{ChampionTrace, TraceLog, TracePoint, TRACE_SAMPLE_FRAMES};
@@ -196,8 +197,8 @@ pub fn save_champion(
 /// The genome *and* the episode it was scored on, because a genome alone cannot
 /// reproduce an episode: the seed is the other half of it. The lanes carry this pair for
 /// the eight agents the run draws; the packet carries it for all of them, because the
-/// replay ghosts every other agent of the generation and a ghost is only honest if it is
-/// running the episode that was actually scored.
+/// replay ghosts every other agent of the generation beside the star, and a ghost is only
+/// honest if it is running the episode that was actually scored.
 #[derive(Clone, Debug)]
 pub struct Agent {
     pub genome: Genome,
@@ -233,6 +234,38 @@ pub struct Packet {
     /// stall — so a non-zero value is also the statement that the run has stopped moving and
     /// done something about it.
     pub immigrants: usize,
+    /// Children bred out of the quality-diversity archive: perturbations of the best genome
+    /// in a behavioural niche, rather than of anything in the generation's ranking.
+    pub archive_children: usize,
+    /// Behavioural niches the archive holds, of `evo::ARCHIVE_CELLS`. The run's *diversity*
+    /// reading: a population that has collapsed onto one way of moving fills one or two
+    /// niches and stays there, which no chart of its scores can show.
+    pub archive_bits: usize,
+    /// Finish bands holding a winner, of `evo::ARCHIVE_TIME_BINS`. The run's *speed* coverage,
+    /// and a different reading from the one above: a run that won four times inside the same
+    /// quarter of the level's budget holds one band, so the count only climbs when the
+    /// population learns to solve the level *quicker* rather than solve it at all.
+    pub archive_time_bits: usize,
+    /// **The episode** the record above was made on: the genome, and the result carrying the
+    /// seed that replays it.
+    ///
+    /// [`Packet::fastest`] is the time and this is the agent, and they are written together by
+    /// the trainer, so `fastest.frames == fastest_agent.result.frames` holds. That is the whole
+    /// reason both are on the packet: the window quotes the time *and* races the ghost, and a
+    /// ghost drawn from any other genome would finish at a different moment from the number
+    /// beside it — a race against two different records, which is not a race.
+    pub fastest_agent: Option<evo::BestEver>,
+    /// The quickest winning episode the run has recorded, and whose it was (see
+    /// [`evo::FastWin`]).
+    ///
+    /// The clock a viewer races. A **run**-level record rather than a per-generation one:
+    /// a generation that won nothing leaves the previous best time standing, so the number on
+    /// screen is the same one from frame to frame — which is what makes it a time to beat
+    /// rather than a number that flickers. It is also a different record from `best`: `best`
+    /// is the genome with the highest fitness, and since fitness v8 that score includes the
+    /// clock but is not the clock, so the two can be different genomes as soon as a run has
+    /// two winners.
+    pub fastest: Option<evo::FastWin>,
     pub lanes: Vec<Lane>,
     /// Every agent the generation scored, in population order, index-aligned with the
     /// report's own results.
@@ -451,9 +484,15 @@ pub struct Generator {
     out_dir: PathBuf,
     /// The checkpoint this run started from, as a note for the viewer.
     origin: Option<String>,
-    /// The one curriculum step's note, kept for the rest of the run: "this run changed
+    /// The curriculum steps' notes, kept for the rest of the run: "this run changed
     /// shape" is not something the viewer should have to catch inside one generation.
+    /// One line per step — a run that practised its way past three spots says so three
+    /// times.
     curriculum: Option<String>,
+    /// The run's standing best when the last derived practice step fired: the gate that
+    /// allows one step per *stall spell* rather than one per run, and never two in the
+    /// same spell.
+    detour_best: f32,
     traces: TraceLog,
     history: Vec<HistoryPoint>,
     deaths: Vec<(f32, f32, u32)>,
@@ -479,7 +518,10 @@ impl Generator {
         plan: RunPlan,
         out_dir: PathBuf,
     ) -> Result<Generator, String> {
-        let cfg = cfg.sanitized(None);
+        let mut cfg = cfg.sanitized(None);
+        if cfg.trials <= 1 && !level.walkers.is_empty() {
+            cfg.trials = 3;
+        }
         let (trainer, origin) = match plan.resume.as_deref() {
             Some(path) => {
                 let checkpoint = PopulationFile::load(path)?;
@@ -502,6 +544,7 @@ impl Generator {
             out_dir,
             origin,
             curriculum: None,
+            detour_best: f32::NEG_INFINITY,
             traces: TraceLog::new(),
             history: Vec::new(),
             deaths: Vec::new(),
@@ -541,6 +584,7 @@ impl Generator {
         let mut cfg = self.cfg.clone();
         cfg.master_seed = seed;
         cfg.mutation_rate = mutation_rate;
+        cfg.trials = if level.walkers.is_empty() { 1 } else { 3 };
         self.eval = cfg.eval_config();
         self.trainer = Trainer::new(cfg.clone());
         self.cfg = cfg;
@@ -606,11 +650,16 @@ impl Generator {
             .collect(); // The whole population, not only the eight lanes: the replay ghosts all of it, and
                         // the pairing that makes a ghost faithful is (genome, the seed it was scored on),
                         // which is exactly what the report's index-aligned results hold.
+        // By value, because `population` is this function's own copy and nothing below reads it
+        // again: cloning every genome a second time to build this vector cost a full population's
+        // worth of allocation per generation (~1.2 MB at pop 200) for a vector that is then the
+        // only owner of the same data. The `report.results` are borrowed-into by clone instead,
+        // because the report itself is still needed for the history and the deaths below.
         let agents: Vec<Agent> = population
-            .iter()
+            .into_iter()
             .zip(report.results.iter())
             .map(|(genome, result)| Agent {
-                genome: genome.clone(),
+                genome,
                 result: result.clone(),
             })
             .collect();
@@ -656,35 +705,99 @@ impl Generator {
         // shows, so a run cannot step back to an easier level on a stall the viewer is
         // not being told about, and it happens before the packet is packaged so the note
         // and the history it describes arrive together.
-        if self.curriculum.is_none() {
-            let fallback = self
-                .plan
-                .curriculum
-                .as_ref()
-                .map(|c| (c.level.clone(), c.generations));
-            if let (Some((easier, generations)), Some(stall)) =
-                (fallback, fitness_stall(&self.history))
-            {
-                let path = self
-                    .out_dir
-                    .join(format!("{}.population.json", slug(&self.level.name)));
-                self.curriculum = Some(
-                    match curriculum_step(
-                        &mut self.trainer,
-                        &self.level,
-                        &easier,
-                        generations,
-                        &path,
-                        self.cfg.mutation_rate,
-                        &stall.label(),
-                    ) {
-                        Ok(step) => step.note(&self.level.name),
+        // The authored easier level steps back once per run (the plan's rule). The
+        // derived practice re-arms on every *new* stall spell — a practice run has to
+        // work through a spot, keep the gain, and meet the next spot — and never twice
+        // within one, so a detour that learns nothing cannot loop (finding 50).
+        let armed = match &self.plan.curriculum {
+            Some(_) => self.curriculum.is_none(),
+            None => report.max_fitness > self.detour_best,
+        };
+        if armed {
+            if let Some(stall) = fitness_stall(&self.history) {
+                // The authored easier level is the run's first choice (§12 M5). Without
+                // one the run practises *where it is stuck* instead (finding 50): its own
+                // level from the furthest stand its best genome has made, so every episode
+                // of the detour is the next move instead of the whole chain. The plan's
+                // `Curriculum` carries its own detour length; the derived one takes the
+                // constant both front-ends share.
+                let plan = match self.plan.curriculum.clone() {
+                    Some(c) => Some((c.level, c.generations, false)),
+                    None => match practice_level_for_stall(&self.trainer, &self.level) {
+                        Ok(p) => Some((p, DEFAULT_CURRICULUM_GENERATIONS, true)),
+                        Err(reason) => {
+                            // Nowhere to practise from joins the note the panel shows:
+                            // the stall line says the search stopped, this says why it
+                            // is not stepping back. Once per stall spell — the arm
+                            // closes until the run finds something better.
+                            self.detour_best = report.max_fitness;
+                            let taken = format!(
+                                "curriculum: {reason}; the run stays where it is ({})",
+                                stall.label()
+                            );
+                            self.curriculum = Some(match self.curriculum.take() {
+                                Some(prev) => format!("{prev}\n{taken}"),
+                                None => taken,
+                            });
+                            None
+                        }
+                    },
+                };
+                if let Some((easier, generations, derived)) = plan {
+                    let path = self
+                        .out_dir
+                        .join(format!("{}.population.json", slug(&self.level.name)));
+                    // The practice detour keeps the main level in its judgement, so
+                    // what it learns comes back able to reach the spot it left.
+                    let step = if derived {
+                        practice_step(
+                            &mut self.trainer,
+                            &self.level,
+                            &easier,
+                            generations,
+                            &path,
+                            self.cfg.mutation_rate,
+                            &stall.label(),
+                        )
+                    } else {
+                        curriculum_step(
+                            &mut self.trainer,
+                            &self.level,
+                            &easier,
+                            generations,
+                            &path,
+                            self.cfg.mutation_rate,
+                            &stall.label(),
+                        )
+                    };
+                    self.detour_best = report.max_fitness;
+                    let taken = match step {
+                        Ok(step) => {
+                            let mut note = step.note(&self.level.name);
+                            if derived {
+                                // The detour's landscape is written beside the
+                                // checkpoint so it can be opened and played; a failed
+                                // write is part of the note, not a lost detour.
+                                if let Err(err) = save_practice_level(&easier, &path) {
+                                    note.push_str(&format!(
+                                        " (practice level not written: {err})"
+                                    ));
+                                }
+                            }
+                            note
+                        }
                         // A step that cannot run is not a reason to lose the run: the
                         // stall line still says the search has stopped, which is the
                         // honest thing to leave on screen.
                         Err(err) => format!("curriculum step failed: {err}"),
-                    },
-                );
+                    };
+                    // Every step keeps its line: a run that practised its way past
+                    // three spots says so three times, not once.
+                    self.curriculum = Some(match self.curriculum.take() {
+                        Some(prev) => format!("{prev}\n{taken}"),
+                        None => taken,
+                    });
+                }
             }
         }
 
@@ -702,6 +815,11 @@ impl Generator {
             mutation_sigma: report.mutation_sigma,
             stagnation: self.trainer.stagnation(),
             immigrants: report.immigrants,
+            archive_children: report.archive_children,
+            archive_bits: report.archive_bits,
+            archive_time_bits: report.archive_time_bits,
+            fastest: report.fastest,
+            fastest_agent: self.trainer.fastest_agent().cloned(),
             lanes,
             agents,
             history: self.history.clone(),
@@ -810,10 +928,72 @@ struct State {
     restart: Option<(Level, u64)>,
     mutation_rate: Option<f32>,
     finished: bool,
+    /// A worker thread died of a panic rather than of `quit`.
+    ///
+    /// Set by [`WorkerGuard`] as the stack unwinds, because a panic that is only joined-and-
+    /// dropped is indistinguishable from a run that finished (AUDIT.md B4).
+    panicked: bool,
+}
+
+/// Reports a worker's death to the window as it unwinds.
+///
+/// **A panic used to look like success.** The scoring runs outside the lock, but the thread's
+/// handle is thrown away at the join (`let _ = handle.join()`), and [`Lanes::is_finished`] then
+/// answers `true` on its own: a run whose worker died mid-generation was drawn as a run that had
+/// *finished*, holding on the last generation it managed with nothing on screen to say why. A
+/// `Drop` guard is what survives an unwind — it is the only hook a panicking thread is guaranteed
+/// to run — so it costs one field and one `if`.
+///
+/// The two ways out of the loop that are *not* a panic both leave a mark: `quit` is set by
+/// [`Lab::stop`], and `finished` is set by the worker itself when the run reaches its generation
+/// cap. Anything else on the way out is a death.
+struct WorkerGuard {
+    hub: Arc<Hub>,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        // `if let Ok` rather than `unwrap`: the only code that holds this lock is the handshake
+        // around the generation, so a *poisoned* lock would mean the panic happened somewhere
+        // this guard cannot help with — and panicking again inside a drop during a panic turns a
+        // bad run into a dead process.
+        if let Ok(mut state) = self.hub.state.lock() {
+            if !state.quit && !state.finished {
+                state.panicked = true;
+                self.hub.cv.notify_all();
+            }
+        }
+    }
+}
+
+/// How many cores the trainer may use: every one but the window's.
+///
+/// The worker and the window are on one machine, and a generation is an embarrassingly
+/// parallel job that rayon would happily spread over **every** core — including the one the
+/// frame being drawn is running on. That is why a run stutters exactly while it is working:
+/// the window is not slow, it is queued behind its own trainer. Holding one core back leaves
+/// the frame being drawn somewhere to be drawn, and the price is one Nth of the training
+/// throughput on an N-core machine — which is the right trade for a view whose entire purpose
+/// is to be watched while it trains. A one-core machine still gets one thread: a run that will
+/// not start is worse than a run that stutters.
+fn training_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
 }
 
 /// The worker loop: one generation per request, parked in between.
-fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32) {
+fn work(
+    hub: Arc<Hub>,
+    mut generator: Generator,
+    initial_rate: f32,
+    pool: rayon::ThreadPool,
+) {
+    // Armed before the first generation and disarmed by neither branch: the guard reports a
+    // *panic*, and the loop's own exits already say what they are.
+    let _guard = WorkerGuard { hub: hub.clone() };
     loop {
         let (restart, rate) = {
             let mut state = hub.state.lock().unwrap();
@@ -833,7 +1013,11 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32) {
             generator.set_mutation_rate(rate);
         }
 
-        let packet = generator.next_packet();
+        // `install` is what makes the whole generation — evaluation, the trace episode and any
+        // curriculum work — run on this pool rather than rayon's global one. Without it the
+        // sizing above would be decoration: `evaluate_suite` is a `par_iter`, and a `par_iter`
+        // outside a pool uses every core on the machine.
+        let packet = pool.install(|| generator.next_packet());
         let finished = packet.finished;
 
         let mut state = hub.state.lock().unwrap();
@@ -916,7 +1100,10 @@ impl Lab {
         plan: RunPlan,
         out_dir: PathBuf,
     ) -> Result<Lab, String> {
-        let cfg = cfg.sanitized(None);
+        let mut cfg = cfg.sanitized(None);
+        if cfg.trials <= 1 && !level.walkers.is_empty() {
+            cfg.trials = 3;
+        }
         // A checkpoint that cannot be loaded is a startup error, not a run that quietly
         // trains something else: it is the same refusal the terminal's `--resume` makes.
         let generator = Generator::new(
@@ -938,11 +1125,18 @@ impl Lab {
             }),
             cv: Condvar::new(),
         });
+        // The trainer's pool, built once per run: the same `threads - 1` sizing for the whole
+        // session, so a generation's cost and the window's smoothness are the same every time.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(training_threads())
+            .thread_name(|i| format!("evaluate-{i}"))
+            .build()
+            .map_err(|e| format!("cannot start the evaluation pool: {e}"))?;
         let worker = {
             let hub = Arc::clone(&hub);
             thread::Builder::new()
                 .name("evolution".into())
-                .spawn(move || work(hub, generator, rate))
+                .spawn(move || work(hub, generator, rate, pool))
                 .map_err(|e| format!("cannot start the evolution thread: {e}"))?
         };
         Ok(Lab {
@@ -1001,8 +1195,15 @@ impl Lab {
         self.pop_size
     }
 
-    /// Build a replay of this run's best agent, with the generation's population as its
-    /// ghosts.
+    /// The eval config the run's generations were scored with: the cadence a ghost
+    /// of the starring agent has to replay under for its episode to be the recorded one
+    /// rather than a fresh sample of the same genome.
+    pub fn eval_config(&self) -> EvalConfig {
+        self.eval
+    }
+
+    /// Build a replay of this run's quickest win — or, on a run that has never won, its
+    /// best-scoring attempt ([`Replay`]) — with the generation's population as its ghosts.
     ///
     /// It lives here rather than in the window because the two things a roster needs —
     /// the level and the eval config the generation was scored with — are the run's, and
@@ -1107,6 +1308,15 @@ impl Lab {
         }
     }
 
+    /// Whether the run's worker died of a panic.
+    ///
+    /// What the window needs to tell a *dead* run from a finished one: without this, a worker
+    /// that panicked mid-generation was drawn as a run at its cap, frozen on the last generation
+    /// it managed (AUDIT.md B4).
+    pub fn panicked(&self) -> bool {
+        self.hub.state.lock().map(|s| s.panicked).unwrap_or(false)
+    }
+
     /// Stop the worker and wait for it. A run that outlived its window would keep
     /// training with nobody watching, which is exactly what this design forbids.
     pub fn stop(&mut self) {
@@ -1131,6 +1341,76 @@ impl Drop for Lab {
 mod tests {
     use super::*;
     use evo::score;
+
+    fn hub() -> Arc<Hub> {
+        Arc::new(Hub {
+            state: Mutex::new(State::default()),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// A worker that vanishes without finishing is reported as dead, and the two honest ways out
+    /// of the loop are not.
+    ///
+    /// The bug this pins: the worker's panic was thrown away at the join, `is_finished` answered
+    /// `true` on its own, and the window drew a run whose thread had died as a run at its cap —
+    /// frozen on the last generation it managed, with nothing on screen to say why (AUDIT.md B4).
+    #[test]
+    fn a_worker_that_leaves_without_finishing_is_reported_as_dead() {
+        // Dropping the guard with neither mark set is exactly what a panic looks like from
+        // outside the thread: the stack unwinds through it.
+        let vanished = hub();
+        {
+            let _guard = WorkerGuard {
+                hub: vanished.clone(),
+            };
+        }
+        assert!(
+            vanished.state.lock().unwrap().panicked,
+            "a worker that vanished must not read as a finished run"
+        );
+
+        // The window asked it to stop: a shutdown is not a death.
+        let stopped = hub();
+        {
+            stopped.state.lock().unwrap().quit = true;
+            let _guard = WorkerGuard {
+                hub: stopped.clone(),
+            };
+        }
+        assert!(!stopped.state.lock().unwrap().panicked);
+
+        // The run reached its generation cap, which the worker marks before it leaves.
+        let capped = hub();
+        {
+            capped.state.lock().unwrap().finished = true;
+            let _guard = WorkerGuard { hub: capped.clone() };
+        }
+        assert!(!capped.state.lock().unwrap().panicked);
+    }
+
+    /// A fresh run is not reported as dead, and a running one is not either.
+    ///
+    /// The banner that says "training stopped" hangs off this one predicate, so it has to be
+    /// false in the ordinary case — an alarm that fires on a healthy run is worse than no alarm.
+    #[test]
+    fn a_live_run_is_not_reported_as_dead() {
+        let level = shipped("l1-flat-run");
+        let mut lab = Lab::start(
+            &level,
+            tiny_config(),
+            2,
+            2,
+            RunPlan::default(),
+            scratch("lab-panic"),
+        )
+        .expect("thread starts");
+        assert!(!lab.panicked(), "a run that has just started is not dead");
+        let _ = lab.wait_for_first(Duration::from_secs(60));
+        assert!(!lab.panicked(), "a run that has scored a generation is not dead");
+        lab.stop();
+        assert!(!lab.panicked(), "stopping a run on purpose is not a death");
+    }
 
     fn shipped(slug: &str) -> Level {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1583,12 +1863,19 @@ mod tests {
         // which is exactly the trigger; L1 is easier, and a small population wins it at
         // once, so the detour is cheap to run. Same shape as the terminal's own test of
         // the same feature, because it is the same feature.
+        //
+        // **The cap is 60, and it is a measurement rather than a round number.** At pop 2 the
+        // run's last new best is generation 21 and the 25-flat window therefore opens at 46, so
+        // a cap of 40 left no room for the stall the test is about to happen in (sensor v7's
+        // extra input moved the trajectory, and this test caught it). Fourteen generations of
+        // margin is the point: the run has to *stall inside the window*, and the test says so
+        // when it does not.
         let dir = scratch("curriculum");
         let mut generator = generator_with(
             "l5-tightrope",
             stalling_config(),
             RunPlan {
-                cap: Some(40),
+                cap: Some(60),
                 curriculum: Some(Curriculum {
                     level: shipped("l1-flat-run"),
                     generations: 2,
@@ -1603,7 +1890,7 @@ mod tests {
         // appear, then insists that it never changes afterwards. A run that stepped a
         // second time would have a second set of numbers to report.
         let (mut note, mut first_seen, mut last) = (None, None, None);
-        for _ in 0..40 {
+        for _ in 0..60 {
             let packet = generator.next_packet();
             if let Some(text) = &packet.curriculum {
                 match &note {
@@ -1653,7 +1940,7 @@ mod tests {
             checkpoint.note
         );
         assert!(
-            checkpoint.generation > 0 && checkpoint.generation < 40,
+            checkpoint.generation > 0 && checkpoint.generation < 60,
             "the checkpoint was taken at the stall, not at the cap: generation {}",
             checkpoint.generation
         );
@@ -1671,32 +1958,35 @@ mod tests {
         // The run kept its own chart on its own level: the detour is a pause in the run,
         // not a new run, so the history is the main level's from start to finish.
         let last = last.expect("the loop scored at least one generation");
-        assert_eq!(last.generation, 39, "a capped run still runs to its cap");
-        assert_eq!(last.history.last().map(|p| p.generation), Some(39));
+        assert_eq!(last.generation, 59, "a capped run still runs to its cap");
+        assert_eq!(last.history.last().map(|p| p.generation), Some(59));
         assert_eq!(last.level_name, shipped("l5-tightrope").name);
     }
 
     /// A run without an easier level never steps back, however long it sits still: the
     /// stall line reports the stall, and nothing acts on it.
     #[test]
-    fn a_run_with_no_easier_level_stalls_without_stepping_back() {
+    fn a_run_with_no_easier_level_practises_where_it_is_stuck() {
+        // Finding 50: with no authored fallback, a stalled run derives one — its own
+        // level from the furthest stand its best genome has made — and steps back to
+        // it. The note, the checkpoint and the practice level all appear, and the
+        // note names the spot: "this run changed shape" is the viewer's to read.
+        let dir = scratch("practice");
         let mut generator = generator_with(
             "l5-tightrope",
             stalling_config(),
             RunPlan {
-                cap: Some(40),
+                cap: Some(60),
                 ..RunPlan::default()
             },
-            "stalls",
+            "practice",
         );
         let mut stalled = false;
-        for _ in 0..40 {
+        let mut note = None;
+        for _ in 0..60 {
             let packet = generator.next_packet();
-            assert!(
-                packet.curriculum.is_none(),
-                "there is no level to fall back to"
-            );
             stalled |= fitness_stall(&packet.history).is_some();
+            note = packet.curriculum.or(note);
             if packet.finished {
                 break;
             }
@@ -1705,9 +1995,18 @@ mod tests {
             stalled,
             "this run has to actually stall, or it proves nothing about stepping back"
         );
+        let note = note.expect("a stalled run with no easier level practises where it is stuck");
         assert!(
-            !scratch("lab").join("l5-tightrope.population.json").exists(),
-            "a run with nowhere to fall back to writes no checkpoint"
+            note.contains("practice at tile"),
+            "the note names the spot it practised from: {note:?}"
+        );
+        assert!(
+            dir.join("l5-tightrope.population.json").exists(),
+            "the stuck population is checkpointed"
+        );
+        assert!(
+            dir.join("l5-tightrope.practice.json").exists(),
+            "the practice level is written beside the checkpoint"
         );
     }
 

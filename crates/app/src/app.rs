@@ -36,18 +36,32 @@ use egui::{Color32, Context, Pos2, Rect, Sense, Stroke, Vec2};
 use evo::GaConfig;
 use sim::{Level, Tile};
 
-use crate::atlas::Atlas;
-use crate::editor::{Brush, Editor};
+use crate::atlas::{self, Atlas};
+use crate::editor::{free_level_name, Brush, Editor, Shape};
+use crate::help;
 use crate::lab::{self, Lab, Lanes, Packet};
 use crate::panel::{self, BestLine, Command, RunSummary, ViewState};
 use crate::play;
 use crate::replay::Replay;
+use crate::shelf;
 use crate::splash::{Action, Splash};
+use crate::theme;
+use crate::ui;
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 use render::chart::HistoryPoint;
 
 /// Height of the fitness chart's strip at the bottom of the window.
 const CHART_PANEL_HEIGHT: f32 = 150.0;
+
+/// How long the shutter between two of the window's four views stays closed.
+///
+/// Short on purpose. A mode change here is a whole different screen — sky, hills and agents where
+/// graph paper and a brush were — and an instant cut between two such screens reads as a glitch
+/// rather than as a change; but this is a tool that is switched between constantly while a level
+/// is drawn, and anything longer than a fifth of a second is a tax on the person doing that
+/// (AUDIT.md V1). The same order as the title screen's own camera ease, which is where the
+/// window's idea of "a movement" was already set.
+const MODE_FADE: f32 = 0.18;
 
 /// Points per tile the follow camera zooms to.
 ///
@@ -74,12 +88,38 @@ pub enum Mode {
     Replay,
 }
 
-/// How a run is set up, from the command line.
+impl Mode {
+    /// The four modes in the order the dock's switch draws them, which is also the order they were
+    /// reached in before there was a switch: what a document is, then the three things to do with it.
+    ///
+    /// One list rather than a `match` at each end, so the cell the pointer picks and the mode it
+    /// selects cannot drift apart — an off-by-one in a hand-written pair of matches turns *Play* into
+    /// *Evolve*, which is a bug nobody would look for in a tool bar.
+    pub const ALL: [Mode; 4] = [Mode::Edit, Mode::Play, Mode::Evolve, Mode::Replay];
+
+    /// This mode's cell in [`Mode::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            Mode::Edit => 0,
+            Mode::Play => 1,
+            Mode::Evolve => 2,
+            Mode::Replay => 3,
+        }
+    }
+}    /// How the window is set up to open, and how a run on it is set up, from the command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabOptions {
+    /// Open in the playtest rather than the editor.
+    ///
+    /// The one field here that is not about a run: the playtest is the mode a person enters to
+    /// *race* a run, and racing needs the AI's best time, which only exists after something has
+    /// been scored. Started this way it is still worth the flag — the window opens on the level's
+    /// physics with the clock running, which is what a person who drew a level wants next — and
+    /// `--evolve` is how a script asks for both `--play` and a run to beat.
+    pub play: bool,
     /// Open in the evolution view rather than the editor.
     pub evolve: bool,
-    /// Open in the replay of the run's best agent rather than the editor.
+    /// Open in the replay of the run's quickest win rather than the editor.
     ///
     /// It starts a run, like `--evolve`, and takes it to its cap first when one was given:
     /// a replay needs something scored, and with `--generations N` what is replayed is the
@@ -111,6 +151,7 @@ pub struct LabOptions {
 impl Default for LabOptions {
     fn default() -> Self {
         LabOptions {
+            play: false,
             evolve: false,
             replay: false,
             ghosts: true,
@@ -125,6 +166,36 @@ impl Default for LabOptions {
     }
 }
 
+/// Whether a document-replacing control should refuse this press, and what to remember about it.
+///
+/// The rule behind [`EvoApp::refuses_to_discard`], split out as a pure function so the pair of
+/// facts it is made of can be tested without a window: `(refused, armed)`. A clean document is
+/// never asked about; a dirty one is refused once and the press is remembered against the
+/// document's **content hash**; the same content pressed again goes through; and an edit in
+/// between is a different document, so it is asked about again — which is exactly the sequence
+/// a person who *is* looking at the level produces.
+fn discard_guard(dirty: bool, armed: Option<u64>, hash: u64) -> (bool, Option<u64>) {
+    if !dirty || armed == Some(hash) {
+        return (false, None);
+    }
+    (true, Some(hash))
+}
+
+/// The string the OS window's title bar should be wearing, for a mode and a document title.
+///
+/// Pure, so the *shape* of the rule is testable without a window: the document leads, because
+/// that is the part a narrow taskbar keeps and the part that tells two windows of this game
+/// apart; the mode follows, because "which of the four things is this window doing" is the
+/// second question asked of a title; the app's name trails, where a title bar puts it.
+fn window_title_for(mode: Mode, doc: &str) -> String {
+    match mode {
+        Mode::Edit => format!("{doc} — evolution platformer"),
+        Mode::Play => format!("{doc} — playtest — evolution platformer"),
+        Mode::Evolve => format!("{doc} — evolve — evolution platformer"),
+        Mode::Replay => format!("{doc} — replay — evolution platformer"),
+    }
+}
+
 /// Open the window and run until the user closes it.
 pub fn run(
     level: PathBuf,
@@ -133,11 +204,19 @@ pub fn run(
     lab: LabOptions,
     splash: Option<bool>,
 ) -> Result<(), String> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1360.0, 800.0])
+        .with_min_inner_size([900.0, 560.0])
+        .with_title("evolution platformer");
+    // The runner, at four times its sixteen pixels: the size a taskbar's icon slot wants, cut
+    // from the game's own art rather than drawn twice (AUDIT.md F5). No icon at all when the
+    // assets cannot be read — the atlas load below reports *that* failure in full, and a second
+    // complaint about the same missing directory would help nobody.
+    if let Some(icon) = atlas::window_icon(&assets, "player_idle_a", 4) {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1360.0, 800.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("evolution platformer"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -162,6 +241,14 @@ struct EvoApp {
     /// Pending grid size, applied by the Resize button.
     pending_size: (i32, i32),
     grid: bool,
+    /// Whether the inspector is showing the level's *numbers* — its size, what it is made of,
+    /// the physics it may ask for — or just its verdict.
+    ///
+    /// Closed by default, and that is the point rather than a preference: a document's
+    /// diagnostics are not what a person looks at while drawing, and a panel that shows them
+    /// all the time is a panel nobody reads. The verdict stays, because that one is a fact
+    /// about the level rather than a fact about the sim.
+    details_open: bool,
     /// Brush being dragged out of the palette, if any.
     dragging: Option<Brush>,
     /// Pointer position from the previous frame, for panning.
@@ -199,7 +286,10 @@ struct EvoApp {
     /// animation of it has ended.
     packet: Option<Packet>,
     summary: Option<RunSummary>,
-    /// The run's best agent being replayed, with the last scored generation ghosted.
+    /// The run's quickest win being replayed, with the last scored generation ghosted.
+    ///
+    /// A run that has not won yet replays its best-scoring attempt instead
+    /// ([`crate::replay::StarBasis`]).
     ///
     /// `Some` only in [`Mode::Replay`]: the roster is built on the way in from the newest
     /// packet and dropped on the way out, so a stale field can never be drawn under a run
@@ -223,6 +313,44 @@ struct EvoApp {
     /// genome when a watched run ends, and this is the same promise kept per run rather
     /// than per keypress.
     saved_end: bool,
+
+    // --- the level shelf ---------------------------------------------------
+    /// Whether the shelf is open. A window rather than a menu, because a menu is a list of
+    /// names and the whole point of the shelf is the picture beside each name.
+    shelf_open: bool,
+    /// The pack as it was when the shelf was last opened, or last written to. Scanning it per
+    /// frame would be a directory read and a parse per level per frame (see [`shelf::scan`]).
+    shelf: Vec<shelf::Entry>,
+
+    // --- the document's own state ------------------------------------------
+    /// The content hash the "this would discard your work" warning was armed against.
+    ///
+    /// `Some(hash)` means the last press was *refused* because the document was edited, and
+    /// this is what it looked like at the time (see [`EvoApp::refuses_to_discard`]).
+    discard_armed: Option<u64>,
+    /// The string currently on the OS window's title bar. Held so the title is only ever set
+    /// when it actually changes (see [`EvoApp::sync_window_title`]).
+    os_title: String,
+    /// Whether the key card is up ([`help`]).
+    help_open: bool,
+    /// Seconds left of the shutter between two modes, and the mode the last frame was in.
+    ///
+    /// The comparison is made *after* a frame has drawn rather than by every writer of `mode`
+    /// remembering to say so: there are four places that change it — [`EvoApp::set_mode`], two key
+    /// handlers and [`EvoApp::open_level`] — and a transition that only happened on the polite
+    /// one would be worse than none at all.
+    mode_fade: f32,
+    last_mode: Mode,
+    /// The rename field's working text, and whether the field is being typed in right now.
+    ///
+    /// A buffer rather than a `TextEdit` bound straight to the document, because a half-typed
+    /// name must not be pushed into the level and its undo history one keystroke at a time. The
+    /// `bool` is what keeps the buffer honest: while the field is focused it belongs to the
+    /// typist, and the moment it is not, it is reseeded from the document — so a name that
+    /// changed some other way (an undo, a save that numbered a collision, the shelf opening
+    /// another level entirely) can never leave this field showing the previous document's name.
+    rename_buf: String,
+    rename_focused: bool,
 }
 
 impl EvoApp {
@@ -235,7 +363,9 @@ impl EvoApp {
         splash: Option<bool>,
     ) -> Result<EvoApp, String> {
         let ctx = &cc.egui_ctx;
-        ctx.set_visuals(egui::Visuals::dark());
+        // The window's own look, installed once: every panel, button and slider after this
+        // line draws itself in the game's palette rather than egui's stock one.
+        theme::apply(ctx);
         let atlas = Atlas::load(ctx, &assets)?;
         let sprites = Sprites::load(&atlas)?;
 
@@ -249,9 +379,20 @@ impl EvoApp {
         let editor = match Editor::open(&level_path) {
             Ok(editor) => editor,
             Err(err) => {
-                // Opening a bad file must not lose the window: start from a fresh
-                // level and say what happened.
-                let mut editor = Editor::fresh("untitled", 60, 15);
+                // A *scripted* frame is the one caller that cannot read the message below.
+                // `--screenshot` exists to verify the renderer without a human watching, and
+                // a PNG of a blank 60 × 15 level is a green check for a level that never
+                // opened: the exit code is the only channel that script has (AUDIT.md B3), so
+                // an unreadable `--level` fails the process rather than photographing the
+                // fallback. A person at a window still gets their editor — opening a bad file
+                // must not lose the window, and they can see what it says.
+                if screenshot.is_some() {
+                    return Err(format!("--level {}: {err}", level_path.display()));
+                }
+                // The fallback is a *new document*, so it takes a free name like any other:
+                // two failed opens in one directory must not both want `untitled.json`.
+                let name = free_level_name(&levels_dir, "untitled");
+                let mut editor = Editor::fresh(&name, 60, 15);
                 editor.message = format!("could not open {}: {err}", level_path.display());
                 editor
             }
@@ -288,6 +429,7 @@ impl EvoApp {
             levels_dir,
             pending_size,
             grid: true,
+            details_open: false,
             dragging: None,
             last_pointer: None,
             hover_tile: None,
@@ -311,11 +453,29 @@ impl EvoApp {
             note: None,
             applied_rate: None,
             primed: false,
+            shelf_open: false,
+            shelf: Vec::new(),
+            discard_armed: None,
+            os_title: String::new(),
+            rename_buf: String::new(),
+            rename_focused: false,
+            help_open: false,
+            mode_fade: 0.0,
+            // The editor, always — and the comparison in `update` does the rest: a `--play` or
+            // `--evolve` launch enters its mode below, before the first frame, so the first frame
+            // sees the difference and the window opens *into* its view behind the same shutter the
+            // switch uses rather than cutting to it.
+            last_mode: Mode::Edit,
         };
         // `--replay` is a run too: it opens the evolution view, scores what it was asked
         // for, and then shows the best agent it found.
         if app.options.evolve || app.options.replay {
             app.enter_evolve();
+        } else if app.options.play {
+            // Opening on the playtest, for the person who has just built a level and wants to run
+            // it: the clock starts at the spawn and the run's best time — when this window has one
+            // — is what the line in the dock is measured against.
+            app.enter_play();
         }
         Ok(app)
     }
@@ -359,7 +519,44 @@ impl EvoApp {
         // behind the one being played. Going back rebuilds it from the same packet.
         self.replay = None;
         self.session = Some(play::Session::new(&self.editor.level, 1));
+        self.attach_champion_ghost();
         self.mode = Mode::Play;
+    }
+
+    /// Attach the record-holder as the playtest's ghost, when there is one to race.
+    ///
+    /// **The ghost is the episode the dock's time was measured on**, not merely some good
+    /// agent: [`Packet::fastest_agent`] is the genome and seed behind [`Packet::fastest`], and
+    /// the two are written together by the trainer. So the ghost reaches the flag on exactly
+    /// the tick the line beside it quotes, and the player is racing one record rather than a
+    /// time from one agent and the shape of another. Taking the best-ever genome instead — a
+    /// different agent the moment a run has two winners, and often not a winner at all — put a
+    /// ghost on screen that could die, or finish seconds late, while the line above it claimed
+    /// a time it had never run. That was the bug this signature fixes.
+    ///
+    /// Nothing to race yet is not an error and not a placeholder: with no win recorded there is
+    /// no time to quote either, so the playtest is simply solo until there is one, and the
+    /// ghost button says so. The guard on the level is the other half — an edit since the run
+    /// started makes the run's numbers a claim about terrain nobody can see
+    /// ([`Lab::trained_on`]), and a ghost replayed on the wrong level would be a second player
+    /// rather than a record.
+    fn attach_champion_ghost(&mut self) {
+        let (Some(lab), Some(packet), Some(session)) =
+            (&self.lab, &self.packet, &mut self.session)
+        else {
+            return;
+        };
+        if !lab.trained_on(&self.editor.level) {
+            return;
+        }
+        let Some(record) = &packet.fastest_agent else {
+            return;
+        };
+        session.attach_ghost(play::GhostSpec {
+            genome: record.genome.clone(),
+            eval: lab.eval_config(),
+            seed: record.result.seed,
+        });
     }
 
     fn leave_play(&mut self) {
@@ -371,13 +568,21 @@ impl EvoApp {
     // the replay
     // -----------------------------------------------------------------------
 
-    /// Watch the run's best agent play the level, with the population ghosted beside it.
+    /// Watch the run's quickest win play the level, with the population ghosted beside it.
     ///
-    /// The roster comes from the newest scored packet: the best-ever genome with the exact
-    /// episode that earned the record, and the population of that packet's generation —
-    /// the last one the run scored, which is older than the champion's own generation as
-    /// soon as the search moves past its best idea. Building it trains nothing and the run
-    /// stays parked behind this view, where it was, until the viewer goes back to it.
+    /// The roster comes from the newest scored packet: the episode the run's quickest time was
+    /// measured on, and the population of that packet's generation — the last one the run scored,
+    /// which is older than the record's own generation as soon as the search moves past it. Building
+    /// it trains nothing and the run stays parked behind this view, where it was, until the viewer
+    /// goes back to it.
+    ///
+    /// **The quickest win, not the champion**, and the same record the playtest's ghost is built
+    /// from ([`Self::attach_champion_ghost`]): the champion is the highest-*fitness* genome, and
+    /// quickness is only part of that score, so following it put a slower agent in front of a field
+    /// of ghosts that reached the flag first — while the dock and the strip quoted the quicker time
+    /// that agent had never run. A viewer racing a clock gets the agent that set it; a run that has
+    /// never won has no clock and gets its best attempt, and says so
+    /// ([`crate::replay::StarBasis`]).
     fn enter_replay(&mut self) {
         let built = match (&self.lab, &self.packet) {
             (Some(lab), Some(packet)) => lab.replay(packet),
@@ -392,15 +597,15 @@ impl EvoApp {
             }
         };
         let Some(mut replay) = built else {
-            // The first evaluation always sets a best agent, so this is the one case of a
-            // packet that describes a population and no champion.
-            self.editor.message = "this run has no best agent to replay yet".into();
+            // No packet, or no record in one: the first evaluation always sets a best-scoring
+            // agent, so this is a window that has not been handed a scored generation at all.
+            self.editor.message = "this run has no agent to replay yet".into();
             return;
         };
         // The opening view is the whole level, because the field is the thing this mode
-        // exists to show: a camera pinned to the champion would hide most of the population
+        // exists to show: a camera pinned to the star would hide most of the population
         // behind the frame's edges, and "who else got through" is unreadable from a window
-        // that follows one agent. `f` follows the champion for a viewer who wants that
+        // that follows one agent. `f` follows the star for a viewer who wants that
         // instead, and `f` again brings the whole field back.
         self.view.follow = false;
         self.fit_pending = true;
@@ -415,7 +620,7 @@ impl EvoApp {
         self.replay = None;
         self.mode = to;
         // Following was the replay's opening view, and the camera is left wherever the
-        // champion stood: going back to a view that is not following gets the whole level
+        // star stood: going back to a view that is not following gets the whole level
         // back, which is the same rule the follow toggle keeps.
         if to == Mode::Edit || !self.view.follow {
             self.fit_pending = true;
@@ -752,6 +957,20 @@ impl EvoApp {
     /// Act on the keys that are not part of playing: undo, save, mode switching, and the
     /// evolution view's own controls.
     fn handle_shortcuts(&mut self, ctx: &Context) {
+        // A field with the keyboard *has* the keyboard: typing a level's name must not also be
+        // pressing P for playtest and E for evolve, which is what happened to every letter this
+        // view binds the moment the details window grew a text field. egui knows when a widget
+        // wants the keys, so ask it rather than tracking focus in a second place.
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        // The key card is one key in every view, and it is *not* mode-split: the question it
+        // answers — "what can I press here?" — is the same question in all four.
+        if ctx.input(|i| {
+            i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1)
+        }) {
+            self.help_open = !self.help_open;
+        }
         let (undo, redo, grid, play, evolve, fit, save, restart, watch) = ctx.input(|i| {
             (
                 // Undo excludes shift so it does not also fire on ctrl+shift+Z: that chord
@@ -814,6 +1033,14 @@ impl EvoApp {
                 if restart {
                     if let Some(session) = &mut self.session {
                         session.restart(&self.editor.level);
+                    }
+                }
+                // `grid` is the G key, which the editor claims for its grid: here it is
+                // the ghost instead, the same mode-split the F key already works by. A
+                // playtest with no champion is simply solo — the key quietly does nothing.
+                if grid {
+                    if let Some(session) = &mut self.session {
+                        session.toggle_ghost();
                     }
                 }
             }
@@ -952,7 +1179,7 @@ impl EvoApp {
         self.save_if_run_ended();
     }
 
-    /// The replay canvas: the level the episode is on, the ghosts, then the champion.
+    /// The replay canvas: the level the episode is on, the ghosts, then the star.
     ///
     /// The level comes from the **replay** rather than from the editor: the episode was
     /// scored on the run's terrain, and drawing it on an edit made since would be showing
@@ -969,23 +1196,40 @@ impl EvoApp {
     }
 
     /// The right-hand panel in the evolution view.
+    ///
+    /// The panel and the Details window are two halves of one board: the panel is the menu a viewer
+    /// acts on while a run is going (see [`panel::lab_panel`]) and the window is the instrument board
+    /// behind it ([`panel::lab_details`]). Both report the same [`panel::Actions`], so what a widget
+    /// *means* is handled once, in [`Self::apply_actions`], wherever it was drawn.
     fn evolve_panel(&mut self, ui: &mut egui::Ui) {
         let Some(summary) = self.summary.take() else {
-            // Before the first generation lands there is nothing to summarise, and a
-            // panel of zeros would read as a run that is going nowhere rather than one
-            // that has not started.
-            ui.heading("Evolution");
+            // Before the first generation lands there is nothing to summarise, and a panel of zeros
+            // would read as a run that is going nowhere rather than one that has not started.
             match &self.lab {
                 Some(lab) => {
                     ui.label(format!(
                         "{}: evaluating the first generation…",
                         lab.level_name()
                     ));
-                    ui.small(format!("pop {}   seed {}", lab.pop_size(), self.seed));
+                    ui.label(
+                        egui::RichText::new(format!("pop {}   seed {}", lab.pop_size(), self.seed))
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
                 }
                 None => {
                     ui.label("no run on this level yet");
-                    if ui.button("Start a run").clicked() {
+                    if ui::menu_row(
+                        ui,
+                        Some(&self.atlas),
+                        Some(ui::GLYPH_PLAY),
+                        "Start a run",
+                        ui.available_width(),
+                        false,
+                        true,
+                    )
+                    .clicked()
+                    {
                         self.enter_evolve();
                     }
                 }
@@ -997,9 +1241,32 @@ impl EvoApp {
             .lab
             .as_ref()
             .is_some_and(|lab| !lab.trained_on(&self.editor.level));
-        let actions = panel::lab_panel(ui, &summary, &mut self.view, changed);
+        let actions = panel::lab_panel(ui, Some(&self.atlas), &summary, &mut self.view, changed);
         self.summary = Some(summary);
+        self.apply_actions(actions);
+    }
 
+    /// The right-hand panel in the replay: the transport for one episode, and the way to its numbers.
+    fn replay_panel(&mut self, ui: &mut egui::Ui) {
+        // Scoped, so the replay is handed to the widgets and the window gets it back before anything
+        // is acted on: a widget that changed the state it was drawing would be two implementations of
+        // one control.
+        let actions = {
+            let Some(replay) = &mut self.replay else {
+                return;
+            };
+            panel::replay_panel(ui, Some(&self.atlas), replay, &self.view)
+        };
+        self.apply_actions(actions);
+    }
+
+    /// Do what the panels' widgets asked for.
+    ///
+    /// One place for one vocabulary: a pause is a pause whether it came from the run's menu, from the
+    /// window behind it, from a key, or from the replay's own transport. Every widget reports intent
+    /// and nothing acts on itself, which is what keeps a key and a button from disagreeing about what
+    /// the same word means.
+    fn apply_actions(&mut self, actions: panel::Actions) {
         if actions.pause {
             self.apply(Command::TogglePause);
         }
@@ -1018,39 +1285,25 @@ impl EvoApp {
         if actions.follow {
             self.apply(Command::ToggleFollow);
         }
-        if actions.scrub_delta != 0 {
-            self.apply(Command::Scrub(actions.scrub_delta));
-        }
-        if actions.watch {
-            self.enter_replay();
-        }
-        if self.applied_rate != Some(self.view.mutation_rate) {
-            self.apply(Command::MutationRate(self.view.mutation_rate));
-        }
-    }
-
-    /// The right-hand panel in the replay: whose episode it is, and its controls.
-    fn replay_panel(&mut self, ui: &mut egui::Ui) {
-        let actions = {
-            let Some(replay) = &mut self.replay else {
-                return;
-            };
-            panel::replay_panel(ui, replay, &self.view)
-        };
-        if actions.pause {
-            self.apply(Command::TogglePause);
-        }
-        if actions.restart {
-            self.apply(Command::Restart);
-        }
-        if actions.follow {
-            self.apply(Command::ToggleFollow);
-        }
         if actions.ghosts {
             self.apply(Command::ToggleGhosts);
         }
-        if actions.resume {
-            self.leave_replay(Mode::Evolve);
+        if actions.scrub_delta != 0 {
+            self.apply(Command::Scrub(actions.scrub_delta));
+        }
+        // The panel's pace buttons reach the run through the same command the `+`/`-` keys do, so a
+        // button and a key cannot come to different conclusions about what "one rung faster" means.
+        if actions.speed != 0 {
+            self.apply(Command::Speed(actions.speed));
+        }
+        // Not a command: the window itself is what this one opens.
+        if actions.details {
+            self.details_open = !self.details_open;
+        }
+        // The run's rate, not the view's: the worker applies it from the next generation on, so a
+        // change shows up in the very next offspring.
+        if self.applied_rate != Some(self.view.mutation_rate) {
+            self.apply(Command::MutationRate(self.view.mutation_rate));
         }
     }
 
@@ -1135,125 +1388,588 @@ impl EvoApp {
         }
     }
 
-    fn save(&mut self, path: Option<PathBuf>) {
-        // An untitled level saves by its own name, into the levels directory.
-        let target = path.or_else(|| {
-            self.editor.path.clone().or_else(|| {
-                Some(
-                    self.levels_dir
-                        .join(format!("{}.json", lab::slug(&self.editor.level.name))),
-                )
-            })
-        });
-        if let Err(err) = self.editor.save(target) {
-            self.editor.message = format!("not saved: {err}");
+    // -----------------------------------------------------------------------
+    // the level shelf
+    // -----------------------------------------------------------------------
+
+    /// Read the pack and open the shelf on it.
+    ///
+    /// Scanned here rather than per frame: the shelf is opened by a person, and a directory
+    /// read plus a parse of every level in it is a tenth of a second at worst — once, when it
+    /// is asked for, rather than sixty times a second.
+    fn open_shelf(&mut self) {
+        self.shelf = shelf::scan(&self.levels_dir, Some(&self.options.champions));
+        self.shelf_open = true;
+    }
+
+    /// The shelf window: the pack as pictures, and what a click on one means.
+    fn shelf_window(&mut self, ctx: &Context) {
+        if !self.shelf_open {
+            return;
+        }
+        let mut open = true;
+        let mut chosen: Option<(PathBuf, bool)> = None;
+        egui::Window::new("Levels")
+            .open(&mut open)
+            .default_width(220.0)
+            .max_height(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} — {}",
+                            self.levels_dir.display(),
+                            if self.shelf.is_empty() {
+                                "nothing here".to_string()
+                            } else {
+                                format!("{} levels", self.shelf.len())
+                            }
+                        ))
+                        .small()
+                        .color(theme::TEXT_DIM),
+                    );
+                    if ui.button("Rescan").clicked() {
+                        self.shelf = shelf::scan(&self.levels_dir, Some(&self.options.champions));
+                    }
+                });
+                ui.separator();
+                match shelf::show(ui, &self.shelf, self.editor.path.as_deref()) {
+                    shelf::Action::Open(path) => chosen = Some((path, false)),
+                    shelf::Action::Play(path) => chosen = Some((path, true)),
+                    shelf::Action::None => {}
+                }
+            });
+        self.shelf_open = open;
+        if let Some((path, play)) = chosen {
+            self.open_level(&path);
+            if play {
+                self.enter_play();
+            }
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading(self.editor.title());
-            ui.separator();
-            if ui.button("New").clicked() {
-                self.editor = Editor::fresh("untitled", 60, 15);
-                self.pending_size = (60, 15);
+    /// Open a level from the shelf, and put the camera on it.
+    ///
+    /// The editor, the playtest and the shelf all go through this, so "open a level" means
+    /// one thing: a document, a camera fitted to it, and no session left over from whatever
+    /// was on screen before.
+    fn open_level(&mut self, path: &std::path::Path) {
+        // The shelf is the other control that throws the document away, and it is the easier
+        // one to hit by accident: a card is a click, and the palette of brushes is right
+        // beside it.
+        if self.refuses_to_discard("opening that level") {
+            return;
+        }
+        match Editor::open(path) {
+            Ok(editor) => {
+                self.editor = editor;
+                self.pending_size = (self.editor.level.width, self.editor.level.height);
                 self.fit_pending = true;
+                self.session = None;
+                self.mode = Mode::Edit;
             }
-            let levels = Editor::levels_in(&self.levels_dir);
-            ui.menu_button("Open", |ui| {
-                if levels.is_empty() {
-                    ui.label(format!("no levels in {}", self.levels_dir.display()));
-                }
-                for path in levels {
-                    let label = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let current = self.editor.path.as_deref() == Some(path.as_path());
-                    if ui.selectable_label(current, label).clicked() {
-                        match Editor::open(&path) {
-                            Ok(editor) => {
-                                self.editor = editor;
-                                self.pending_size =
-                                    (self.editor.level.width, self.editor.level.height);
-                                self.fit_pending = true;
-                                self.session = None;
-                            }
-                            Err(err) => self.editor.message = err,
-                        }
-                        ui.close();
-                    }
-                }
-            });
-            if ui.button("Save").clicked() {
-                self.save(None);
-            }
-            ui.separator();
-            ui.add_enabled_ui(self.editor.can_undo(), |ui| {
-                if ui.button("Undo").clicked() && self.editor.undo() {
-                    self.editor.message = "undo".into();
-                }
-            });
-            ui.add_enabled_ui(self.editor.can_redo(), |ui| {
-                if ui.button("Redo").clicked() && self.editor.redo() {
-                    self.editor.message = "redo".into();
-                }
-            });
-            ui.separator();
+            Err(err) => self.editor.message = err,
+        }
+    }
 
-            let mut mode = self.mode;
-            ui.selectable_value(&mut mode, Mode::Edit, "Edit");
-            ui.selectable_value(&mut mode, Mode::Play, "Play");
-            ui.selectable_value(&mut mode, Mode::Evolve, "Evolve");
-            // The replay is offered once there is something to replay: a mode that opens
-            // on an empty field would be a button that cannot do what it says.
-            ui.add_enabled_ui(self.can_replay(), |ui| {
-                ui.selectable_value(&mut mode, Mode::Replay, "Replay")
-                    .on_hover_text(
-                        "the run's best agent, at real time, with the population it last \
-                         scored ghosted behind it",
-                    )
+    /// Write the document, naming an unnamed one first.
+    fn save(&mut self, path: Option<PathBuf>) {
+        // An unsaved document saves by its own name, into the levels directory — and takes a
+        // free variant of it if the pack already holds that name (see [`Self::name_the_document`]).
+        let target = path
+            .or_else(|| self.editor.path.clone())
+            .unwrap_or_else(|| self.name_the_document());
+        if let Err(err) = self.editor.save(Some(target)) {
+            self.editor.message = format!("not saved: {err}");
+            return;
+        }
+        // A save can *create* a level, so the shelf's copy of the pack is now stale. It is
+        // refreshed where the write happened rather than when the shelf is opened, so the
+        // card for the level just written is there the first time it is looked for.
+        if self.shelf_open {
+            self.shelf = shelf::scan(&self.levels_dir, Some(&self.options.champions));
+        }
+    }
+
+    /// The path an unnamed document saves to, naming the document after it.
+    ///
+    /// The document's own name is preferred — it is what the person typed, and a save should
+    /// not quietly rename what something is called — and only a name the pack has already used
+    /// is replaced by the first free variant of it. **The level is renamed, not just the
+    /// file:** a document called `untitled` living in `untitled-3.json` would be a lie the
+    /// shelf, the dock and the window title all tell back, so the two move together.
+    ///
+    /// No undo step is pushed. This is not an edit; it is the write deciding what to call
+    /// itself, and it happens *before* the save clears `dirty` — so a person who renames the
+    /// document afterwards still has their own rename on the top of the history, not this one.
+    fn name_the_document(&mut self) -> PathBuf {
+        let name = free_level_name(&self.levels_dir, &self.editor.level.name);
+        self.editor.level.name = name.clone();
+        self.levels_dir.join(format!("{}.json", lab::slug(&name)))
+    }
+
+    /// Whether the document about to be replaced is edited, in which case this press was the
+    /// *warning* and the caller must not replace it.
+    ///
+    /// Two controls throw the document away — the dock's **New** and any click on a level card
+    /// — and both did it silently: forty dragged tiles died to a mis-click, and the only sign
+    /// that anything had been pending was a dot in a plaque nobody was looking at (AUDIT.md
+    /// B1). The guard is a second press rather than a modal dialog, because a question nobody
+    /// reads is worse than a question the *same gesture* answers, and the status line is
+    /// already the editor's voice. `what` names the control, because "are you sure" is only a
+    /// question if it says what about.
+    ///
+    /// The arming is keyed to the document's **content hash**, not to a `bool`: an edit made
+    /// between the two presses re-arms the warning instead of being discarded by it, which is
+    /// exactly what a person who *is* paying attention produces — look at the level, touch it,
+    /// click the card again.
+    fn refuses_to_discard(&mut self, what: &str) -> bool {
+        let (refused, armed) = discard_guard(
+            self.editor.dirty,
+            self.discard_armed,
+            self.editor.level.content_hash(),
+        );
+        self.discard_armed = armed;
+        if refused {
+            self.editor.message = format!(
+                "{what} would throw away the unsaved edits to this level — do it again to \
+                 discard them, or Ctrl+S to save first"
+            );
+        }
+        refused
+    }
+
+    /// The title bar this window should be wearing right now.
+    fn window_title(&self) -> String {
+        window_title_for(self.mode, &self.editor.title())
+    }
+
+    /// Keep the OS window title on the document.
+    ///
+    /// The title bar was the constant `"evolution platformer"` for the life of the window, so
+    /// the two windows a person most often has open — a level and the level it was copied
+    /// from — were indistinguishable in a taskbar, a window list or a bundle of screenshots
+    /// (AUDIT.md B5). Sent only when the string changes: a viewport command per frame is a
+    /// window message per frame for a title that has not moved.
+    fn sync_window_title(&mut self, ctx: &Context) {
+        let title = self.window_title();
+        if title != self.os_title {
+            self.os_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+    }
+
+    /// The dock: the game's own tool bar, carried across the top of the window.
+    ///
+    /// The window used to open on a row of egui's stock buttons lying flat on a stock panel, which
+    /// is what a *tool* looks like rather than what a game looks like. This is the furniture
+    /// instead: the level's name chalked on a sign, the six things a person does to the document as
+    /// pictures in a row, the switch that changes what the window *is* — Edit, Play, Evolve, Replay
+    /// — and, at the right, the reading of whatever is running.
+    ///
+    /// Three rules live here, and they are the ones a call site gets wrong.
+    ///
+    /// * **What the window is doing is one object, not four buttons.** The four modes are
+    ///   exclusive, so they are drawn inside one socket with the chosen cell standing out of the
+    ///   group ([`ui::segmented`]); four independent plates would say four things that could all be
+    ///   on at once.
+    /// * **The controls are the game's own art.** Each button carries a sprite out of the shipped
+    ///   atlas — the signpost for the shelf, the crate for a save, the runner for Play — so the tool
+    ///   bar is made of the same sixteen-pixel pictures as the level behind it.
+    /// * **The right-hand end is dropped, not clipped, when the window is narrow.** A dock that
+    ///   silently eats its own reading is worse than one that says less, so the file path goes
+    ///   first and the run's banner second, and the controls that *do* something never do.
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        theme::dock_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                let (title, subtitle) = self.dock_title();
+                let _ = ui::plaque(ui, &title, &subtitle).on_hover_text(format!(
+                    "{} — a save writes this file; the details window renames the level",
+                    self.editor.title()
+                ));
+                ui.add_space(2.0);
+                self.dock_tools(ui);
+                ui.add_space(2.0);
+                self.dock_modes(ui);
+                ui.add_space(2.0);
+                self.dock_readout(ui);
             });
-            if mode != self.mode {
-                match mode {
-                    Mode::Play => self.enter_play(),
-                    Mode::Evolve => {
-                        if self.mode == Mode::Replay {
-                            // Back to the run as it was left: the replay trained nothing,
-                            // so there is nothing here to restart.
-                            self.leave_replay(Mode::Evolve);
-                        } else {
-                            self.enter_evolve();
-                        }
-                    }
-                    Mode::Replay => self.enter_replay(),
-                    Mode::Edit => {
-                        if self.mode == Mode::Play {
-                            self.leave_play();
-                        } else if self.mode == Mode::Replay {
-                            self.leave_replay(Mode::Edit);
-                        } else {
-                            // The run keeps going — paused and parked — so coming back to
-                            // it does not mean starting from generation zero again.
-                            self.mode = Mode::Edit;
-                        }
-                    }
-                }
-            }
-            if self.mode == Mode::Play && ui.button("Restart (R)").clicked() {
+        });
+    }
+
+    /// What the sign at the left of the dock says: the document, and where it lives.
+    ///
+    /// The level's own name leads, because that is the thing being worked on; the file is the
+    /// second line, where it reads as the *where* rather than as the what. The dot on that line is
+    /// the one fact the window cannot recover for a person who misses it: the disk has fallen behind
+    /// the canvas, and a closed window loses the difference.
+    fn dock_title(&self) -> (String, String) {
+        let file = self
+            .editor
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{}.json", self.editor.level.name));
+        let subtitle = if self.editor.dirty {
+            format!("● {file} — not on disk")
+        } else {
+            file
+        };
+        (self.editor.level.name.clone(), subtitle)
+    }
+
+    /// The seven tools down the left of the dock, in the order a person reaches for them.
+    ///
+    /// Every response is collected before any of them is acted on. Acting is what mutates the
+    /// editor, and the buttons have to be laid out from one frame's state: a *Save* that moved the
+    /// levels directory out from under *Levels…* mid-row would be a bar that disagreed with itself
+    /// for a frame, which is exactly the kind of flicker a prototype has and a game does not.
+    ///
+    /// **Each is a picture and its own name.** Two of the six show the thing they act on out of the
+    /// game's own art — the signpost for the pack of levels, the crate a save writes — and the four
+    /// the world has no picture of carry a glyph drawn for this row alone (`tools/art/ui.py`): a turn
+    /// arrow each way for the stroke history, a bracket frame for *Fit*'s cousin *Details*, a
+    /// magnifier for the level's own numbers. Every one of them carries its name under the picture:
+    /// the art is what makes the bar part of the game, and the word is what makes it readable to
+    /// somebody who has not memorised six pictures yet — see [`ui::icon_button`]. What is on the
+    /// hovers is the sentence a word cannot hold.
+    fn dock_tools(&mut self, ui: &mut egui::Ui) {
+        let levels = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some("signpost"),
+            "Levels",
+            ui::TOOL_SIZE,
+            self.shelf_open,
+            true,
+        )
+        .on_hover_text("the pack, as pictures: click to open, double-click to playtest")
+        .clicked();
+        let new = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some("spawn_marker"),
+            "New",
+            ui::TOOL_SIZE,
+            false,
+            true,
+        )
+        .on_hover_text("a fresh 60 × 15 level")
+        .clicked();
+        let save = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some("crate"),
+            "Save",
+            ui::TOOL_SIZE,
+            // Gold while the canvas is ahead of the disk. It is the one control in the dock that
+            // has something to say about the *document* rather than about the run, and a save
+            // waiting to happen is the thing this bar exists to not let anyone forget.
+            self.editor.dirty,
+            true,
+        )
+        .on_hover_text("write the level to disk — Ctrl+S")
+        .clicked();
+        let undo = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some(ui::GLYPH_UNDO),
+            "Undo",
+            ui::TOOL_SIZE,
+            false,
+            self.editor.can_undo(),
+        )
+        .on_hover_text("step back through the stroke history — Ctrl+Z")
+        .clicked();
+        let redo = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some(ui::GLYPH_REDO),
+            "Redo",
+            ui::TOOL_SIZE,
+            false,
+            self.editor.can_redo(),
+        )
+        .on_hover_text("step forward again — Ctrl+Y")
+        .clicked();
+        // The one control here that opens rather than acts: the level's own numbers, which are
+        // looked at once and then wanted out of the way (see [`Self::details_window`]).
+        let details = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some(ui::GLYPH_INFO),
+            "Details",
+            ui::TOOL_SIZE,
+            self.details_open,
+            true,
+        )
+        .on_hover_text(
+            "what this level is made of: its size, its materials, and the physics it may ask for",
+        )
+        .clicked();
+        // The one tool in the row that acts on the *document* rather than on a tile: mirroring.
+        // It sits after the history because that is where its undo step lands — flip, look, and
+        // Ctrl+Z puts it back — and it is a tool rather than a palette cell because it is not
+        // something you *paint* with: `sim` has always known how to flip a level and the editor
+        // had no way to ask (AUDIT.md F3).
+        let mirror = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some(ui::GLYPH_MIRROR),
+            "Mirror",
+            ui::TOOL_SIZE,
+            false,
+            true,
+        )
+        .on_hover_text("flip the whole level left to right — one undo step, and the name stays")
+        .clicked();
+
+        if levels {
+            self.open_shelf();
+        }
+        if new && !self.refuses_to_discard("New") {
+            // A new document starts with a name the pack does not already hold, because the
+            // name *is* the file it will be saved as (AUDIT.md B2).
+            let name = free_level_name(&self.levels_dir, "untitled");
+            self.editor = Editor::fresh(&name, 60, 15);
+            self.pending_size = (60, 15);
+            self.fit_pending = true;
+        }
+        if save {
+            self.save(None);
+        }
+        if mirror && self.editor.mirror_horizontal() {
+            // A mirror can move the spawn and the flag, so the pending grid size is re-read and
+            // any session on the old terrain is dropped: the playtest is a run of *this* level,
+            // and a level that has just been flipped is a different one.
+            self.pending_size = (self.editor.level.width, self.editor.level.height);
+            self.session = None;
+        }
+        if undo && self.editor.undo() {
+            self.editor.message = "undo".into();
+        }
+        if redo && self.editor.redo() {
+            self.editor.message = "redo".into();
+        }
+        if details {
+            self.details_open = !self.details_open;
+        }
+    }
+
+    /// The mode switch, and the two controls that belong to the mode it selects.
+    ///
+    /// *Fit* sits here rather than in the document tools because it is about the *view* of the level
+    /// rather than about the level, and *Restart* appears only while a person is playing: a control
+    /// that cannot do what it says is worse than a control that is not there, and this is the bar
+    /// that teaches the window.
+    ///
+    /// The switch names all four of its cells rather than only the chosen one: a mode a person has
+    /// not entered yet is exactly the mode they cannot identify from a picture of a walker, and the
+    /// gold plate already says which one is on. See [`ui::segmented`].
+    fn dock_modes(&mut self, ui: &mut egui::Ui) {
+        const OPTIONS: [(Option<&str>, &str); 4] = [
+            (Some("ground_1"), "Edit"),
+            (Some("player_run_1"), "Play"),
+            (Some("walker_a"), "Evolve"),
+            // The run's answer is the flag: `goal_flag_2` is the waving banner rather than the
+            // pole, and at eighteen points the banner is the half of it that reads.
+            (Some("goal_flag_2"), "Replay"),
+        ];
+        // Replay is offered once there is something to replay: a mode that opens on an empty field
+        // would be a cell that cannot do what it says.
+        let enabled = [true, true, true, self.can_replay()];
+        let (chosen, _) = ui::segmented(
+            ui,
+            Some(&self.atlas),
+            &OPTIONS,
+            self.mode.index(),
+            &enabled,
+        );
+        if self.mode == Mode::Play {
+            let restart = ui::icon_button(
+                ui,
+                Some(&self.atlas),
+                Some(ui::GLYPH_RESTART),
+                "Restart",
+                ui::TOOL_SIZE,
+                false,
+                true,
+            )
+            .on_hover_text("put the agent back at the spawn — R")
+            .clicked();
+            if restart {
                 if let Some(session) = &mut self.session {
                     session.restart(&self.editor.level);
                 }
             }
-            if ui.button("Fit (F)").clicked() {
-                self.fit_pending = true;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.editor.dirty {
-                    ui.colored_label(Color32::from_rgb(240, 190, 90), "unsaved");
+            // The record-holder's ghost, when there is one to race: the same walker icon
+            // the replay's Ghosts row wears, because it is the same idea — another
+            // agent's episode, drawn translucent over your own.
+            let (has_ghost, ghost_shown) = self
+                .session
+                .as_ref()
+                .map(|s| (s.has_ghost(), s.ghost_sim().is_some()))
+                .unwrap_or((false, false));
+            let ghost = ui::icon_button(
+                ui,
+                Some(&self.atlas),
+                Some("walker_a"),
+                "Ghost",
+                ui::TOOL_SIZE,
+                ghost_shown,
+                has_ghost,
+            )
+            .on_hover_text(if has_ghost {
+                "show the run's quickest win racing beside you — G"
+            } else {
+                "no time to race yet — press E to train on this level"
+            })
+            .clicked();
+            if ghost {
+                if let Some(session) = &mut self.session {
+                    session.toggle_ghost();
                 }
-            });
+            }
+        }
+        let fit = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            Some(ui::GLYPH_FIT),
+            "Fit",
+            ui::TOOL_SIZE,
+            false,
+            true,
+        )
+        .on_hover_text("frame the whole level — F")
+        .clicked();
+        if fit {
+            self.fit_pending = true;
+        }
+        if let Some(cell) = chosen {
+            self.set_mode(Mode::ALL[cell]);
+        }
+    }
+
+    /// The right-hand end: the one line about what is running.
+    ///
+    /// The file this document would be saved to used to live out here as well, and it is gone — the
+    /// plaque at the other end already names it, twice, and a dock that says the same thing at both
+    /// ends is spending the middle of the bar on a caption. What is left is the reading, which is the
+    /// only thing on this bar that changes on its own.
+    ///
+    /// It is drawn only where there is room for it, and the room is *measured* rather than guessed:
+    /// the width of everything to its left depends on the level's name and on which mode is on, and
+    /// a banner cut in half by a clip rectangle reads as a bug rather than as a smaller window.
+    fn dock_readout(&mut self, ui: &mut egui::Ui) {
+        let Some((text, lamp)) = self.dock_banner() else {
+            return;
+        };
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let _ = ui::banner(ui, &text, lamp, ui.available_width());
         });
+    }
+
+    /// The one line the dock carries about what is happening, if anything is.
+    ///
+    /// It is the run's own numbers, not a label: the mode is already said twice, by the gold cell
+    /// and by the status bar, so what is worth the space here is the thing that changes — which
+    /// generation is on screen, how good it is, and how many of the population touched the flag.
+    /// The lamp is that reading's own colour: green once anything has won, amber once the search has
+    /// stopped moving, the accent while it is still improving.
+    ///
+    /// **A run has no line here.** It used to, and it was the same three numbers the panel beside
+    /// the canvas was already showing — a generation, a best fitness, and a win count — read out a
+    /// second time two hundred points away from themselves. What is left is the two modes whose
+    /// panel does *not* carry their number: a playthrough's score, and the replay's line, whose seed
+    /// belongs to the run behind the episode rather than to the episode a viewer is watching.
+    fn dock_banner(&self) -> Option<(String, Color32)> {
+        match self.mode {
+            Mode::Edit => None,
+            // The one thing the dock has to say about a run: a run that died quietly. The
+            // worker's panic used to be thrown away at the join, `is_finished` went true on its
+            // own, and the window drew a dead run as a finished one — leaving the viewer to
+            // wonder why the curve had stopped (AUDIT.md B4).
+            Mode::Evolve => self.lab.as_ref().filter(|lab| lab.panicked()).map(|_| {
+                (
+                    "training stopped: a worker thread died — Restart to run it again".to_string(),
+                    theme::BAD,
+                )
+            }),
+            // The race, not the readout: the strip along the bottom already prints this episode's
+            // frame count, its position and its progress, and the one thing the dock can add is the
+            // comparison a person is playing for — their own clock against the AI's best time, which
+            // is the number the Evolve panel showed them before they came here.
+            Mode::Play => self.session.as_ref().map(|session| {
+                let record = self.packet.as_ref().and_then(|packet| packet.fastest);
+                // The lamp follows the race rather than the episode: gold while the clock is at or
+                // under the AI's best time (which is `Session::beating`, the same rule while the
+                // agent runs and once it has touched the flag), the runner's own colour otherwise.
+                let lamp = match record {
+                    Some(fast) if session.beating(fast) => theme::GOOD,
+                    _ => theme::RUN,
+                };
+                (session.race_line(record), lamp)
+            }),
+            Mode::Replay => self.replay.as_ref().map(|replay| {
+                let star = replay.star();
+                (
+                    format!(
+                        "replay  {} ({} frames)  best {:.1}  seed {}",
+                        sim::format_time(star.frames),
+                        star.frames,
+                        star.fitness,
+                        self.seed
+                    ),
+                    theme::GOOD,
+                )
+            }).or_else(|| {
+                self.packet.as_ref().map(|packet| {
+                    (
+                        format!("replay  best {:.1}  seed {}", packet.max_fitness, self.seed),
+                        theme::GOOD,
+                    )
+                })
+            }),
+        }
+    }
+
+    /// Change what the window is doing, with the bookkeeping each transition owes.
+    ///
+    /// The switch says *which* mode was chosen and this decides what that means: leaving the replay
+    /// drops the pool of episodes it built (a second simulation parked behind the first is not
+    /// something either view wants), leaving Play drops the session, and coming back to the editor
+    /// from Evolve keeps the run paused and parked rather than starting it over.
+    fn set_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            return;
+        }
+        match mode {
+            Mode::Play => self.enter_play(),
+            Mode::Evolve => {
+                if self.mode == Mode::Replay {
+                    // Back to the run as it was left: the replay trained nothing, so there is
+                    // nothing here to restart.
+                    self.leave_replay(Mode::Evolve);
+                } else {
+                    self.enter_evolve();
+                }
+            }
+            Mode::Replay => self.enter_replay(),
+            Mode::Edit => {
+                if self.mode == Mode::Play {
+                    self.leave_play();
+                } else if self.mode == Mode::Replay {
+                    self.leave_replay(Mode::Edit);
+                } else {
+                    // The run keeps going — paused and parked — so coming back to it does not
+                    // mean starting from generation zero again.
+                    self.mode = Mode::Edit;
+                }
+            }
+        }
     }
 
     /// The atlas name a palette entry draws its icon from.
@@ -1269,84 +1985,140 @@ impl EvoApp {
         }
     }
 
+    /// The palette: what to paint with, in two rows of tiles, and the shape the stroke is.
+    ///
+    /// A wrapped *grid* rather than one brush per row (which is what this was): eleven
+    /// brushes laid out one to a line is a column the height of the panel that says nothing
+    /// about which of them go together. Wrapped, the five materials and the hazard sit
+    /// together at the top and the entities under them, and the whole palette fits above
+    /// the scenery picker without scrolling.
+    ///
+    /// **The panel has one line of type in it, and it names the brush that is on.** The title used
+    /// to be a bare *Parts*, with the selected brush named under the grid and a sentence about
+    /// dragging between them: three separate lines saying what the gold cell and its hover already
+    /// said, in the one panel a person looks at the level beside. What is left is a heading that
+    /// carries the answer to "what am I holding" for the two seconds a person wonders it.
+    ///
+    /// Every cell is a [`ui::icon_button`]'s plate, drawn through the same [`ui::bevel`] as the
+    /// dock's tools: a resting cell is a card, the one under the pointer lifts, the one being
+    /// pressed sinks into its socket, and the selected brush is the palette's gold with its picture
+    /// still legible on it. That is the whole point of having the vocabulary in one place — the
+    /// thing a person paints with and the thing a person opens a level with answer the pointer the
+    /// same way, so the window reads as one object rather than as a panel beside a tool bar.
     fn palette(&mut self, ui: &mut egui::Ui) {
-        ui.label("Palette — drag onto the level, or click to select");
-        ui.add_space(4.0);
-        let cell = 40.0;
-        for brush in Brush::ALL {
-            let selected = self.editor.brush == Some(brush);
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(cell, cell), Sense::click_and_drag());
-            let painter = ui.painter_at(rect);
-            let frame = if selected {
-                Stroke::new(2.0_f32, Color32::from_rgb(250, 214, 102))
-            } else {
-                Stroke::new(1.0_f32, Color32::from_gray(90))
-            };
-            painter.rect_filled(rect, egui::CornerRadius::same(4), Color32::from_gray(38));
-            if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
-                painter.image(
-                    self.atlas.texture_id(),
-                    rect.shrink(5.0),
-                    uv,
-                    Color32::WHITE,
-                );
+        // The one line of type in the panel, and it answers the one question a person asks of a
+        // palette: which brush is in hand. The instruction the window needs — that a brush is
+        // dragged onto the level — is on every cell's own hover, where a person asking "what is
+        // this cell" is already looking, and that is the difference between a game that teaches and
+        // a tutorial that never ends.
+        let heading = match self.editor.brush {
+            Some(brush) => format!("PARTS · {}", brush.label().to_uppercase()),
+            None => "PARTS".to_string(),
+        };
+        ui.label(egui::RichText::new(heading).small().color(theme::TEXT_DIM));
+        ui.add_space(6.0);
+        // Forty-eight rather than forty: a cell drawn as a plate spends [`theme::PRESS_SINK`] and
+        // its lip on the picture, and a sixteen-pixel tile at twenty-six points is the smallest an eye
+        // can still tell a plank from a brick at.
+        let cell = 48.0;
+        ui.horizontal_wrapped(|ui| {
+            for brush in Brush::ALL {
+                let selected = self.editor.brush == Some(brush);
+                let (rect, response) =
+                    ui.allocate_exact_size(Vec2::new(cell, cell), Sense::click_and_drag());
+                let state = ui::PlateState::of(&response, selected, true);
+                let plate = ui::bevel(state, rect);
+                let painter = ui.painter_at(rect);
+                ui::paint(&painter, &plate);
+                if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
+                    painter.image(
+                        self.atlas.texture_id(),
+                        plate.content.shrink(2.0),
+                        uv,
+                        Color32::WHITE,
+                    );
+                }
+                let response = response.on_hover_text(format!(
+                    "{}: {}\nDrag onto the level to place it.",
+                    brush.label(),
+                    brush.about()
+                ));
+                if response.clicked() {
+                    self.editor.brush = Some(brush);
+                    self.editor.message = format!("{} brush", brush.label());
+                }
+                if response.drag_started() {
+                    self.dragging = Some(brush);
+                    self.editor.brush = Some(brush);
+                }
             }
-            painter.rect_stroke(
-                rect,
-                egui::CornerRadius::same(4),
-                frame,
-                egui::StrokeKind::Inside,
-            );
-            let response = response.on_hover_text(format!(
-                "{}: {}\nDrag onto the level to place it.",
-                brush.label(),
-                brush.about()
-            ));
-            if response.clicked() {
-                self.editor.brush = Some(brush);
-                self.editor.message = format!("{} brush", brush.label());
-            }
-            if response.drag_started() {
-                self.dragging = Some(brush);
-                self.editor.brush = Some(brush);
-            }
-            ui.label(brush.label());
-            ui.add_space(2.0);
+        });
+        // The shape of the stroke: one tile at a time, or a box, or a line. A switch rather than
+        // a menu, because it is changed as often as the brush itself — and the same switch the
+        // dock uses for the modes, so the window has one way of saying "one of these three".
+        // The switch, under the grid it modifies: the heading already named the brush, so this is
+        // the whole of what is left of the panel's words — three four-letter ones, on the control
+        // that spends them.
+        ui.add_space(12.0);
+        let shapes: [(Option<&str>, &str); 3] = [
+            (None, Shape::Free.label()),
+            (None, Shape::Rect.label()),
+            (None, Shape::Line.label()),
+        ];
+        let chosen = Shape::ALL
+            .iter()
+            .position(|shape| *shape == self.editor.shape)
+            .unwrap_or(0);
+        let (picked, row) = ui::segmented_sized(
+            ui,
+            None,
+            &shapes,
+            chosen,
+            &[true; 3],
+            Vec2::new(52.0, 30.0),
+        );
+        // The row's own sentence, on the row rather than repeated under it: what the three cells
+        // are for is the question a person has once, and the answer belongs where the question is.
+        row.on_hover_text(format!(
+            "the shape of the stroke\n{}\n{}\n{}",
+            Shape::Free.about(),
+            Shape::Rect.about(),
+            Shape::Line.about()
+        ));
+        if let Some(cell) = picked {
+            let shape = Shape::ALL[cell];
+            self.editor.shape = shape;
+            self.editor.message = format!("{} stroke", shape.label());
         }
 
         // The scenery picker, shown only while the scenery brush is the active one: two
-        // dozen thumbnails would bury the eight brushes that are used together, and the
+        // dozen thumbnails would bury the eleven brushes that are used together, and the
         // choice only matters to the one brush that needs it.
         if self.editor.brush == Some(Brush::Scenery) {
             ui.add_space(6.0);
-            ui.label("Which piece of scenery?");
+            ui.label(egui::RichText::new("Scenery").small().color(theme::TEXT_DIM));
             ui.horizontal_wrapped(|ui| {
                 for name in crate::editor::SCENERY_SPRITES {
                     let selected = self.editor.scene_sprite == *name;
+                    // The same plate as a brush cell, a size down: picking a tree is picking a brush,
+                    // and it should not be a different kind of object because it lives in a
+                    // conditional row. The colours used to be four literals — a grey here, the
+                    // accent's own gold written out as "250, 214, 102" there — which is how a window
+                    // ends up with two golds in it.
                     let (rect, response) =
-                        ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::click());
+                        ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::click());
+                    let state = ui::PlateState::of(&response, selected, true);
+                    let plate = ui::bevel(state, rect);
                     let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, egui::CornerRadius::same(3), Color32::from_gray(30));
+                    ui::paint(&painter, &plate);
                     if let Ok(uv) = self.atlas.uv(name) {
                         painter.image(
                             self.atlas.texture_id(),
-                            rect.shrink(4.0),
+                            plate.content.shrink(1.0),
                             uv,
                             Color32::WHITE,
                         );
                     }
-                    let stroke = if selected {
-                        Stroke::new(2.0_f32, Color32::from_rgb(250, 214, 102))
-                    } else {
-                        Stroke::new(1.0_f32, Color32::from_gray(70))
-                    };
-                    painter.rect_stroke(
-                        rect,
-                        egui::CornerRadius::same(3),
-                        stroke,
-                        egui::StrokeKind::Inside,
-                    );
                     if response.on_hover_text(*name).clicked() {
                         self.editor.scene_sprite = name;
                         self.editor.message = format!("place {name}");
@@ -1356,15 +2128,237 @@ impl EvoApp {
         }
     }
 
-    fn inspector(&mut self, ui: &mut egui::Ui) {
-        ui.label("Validation");
-        let verdict = self.editor.verdict();
+    /// The level's numbers, in a window of their own, closed until they are asked for.
+    ///
+    /// What stood here was a *column*: a verdict at the top and six labelled sections of readings
+    /// beneath it, permanently on screen beside the canvas. That is a properties window, and a
+    /// properties window beside a level is the single clearest thing that makes an editor look like
+    /// a tool instead of like a game — half a panel of cream, most of the time, saying nothing. So
+    /// the canvas has the whole width now, the one reading that has to be up *at all times* — can
+    /// the spawn reach the flag — lives in the strip along the bottom ([`Self::status_line`]), and
+    /// everything else waits behind the dock's magnifier.
+    ///
+    /// A floating window rather than a panel because of what it is *for*: it is about the document
+    /// while it is open and about nothing at all while it is closed, and a panel that can be empty
+    /// is a panel that is mostly empty. The dock is what says whether it exists.
+    ///
+    /// **One window, four answers** ([`Self::details`]). It holds what the mode on screen has that
+    /// its panel does not: the level's own numbers and its verdict in the editor, and a run's — the
+    /// search's step and stall, the field, the record — beside a population. That is what lets the
+    /// panels be menus ([`panel::lab_panel`]) without losing a single number.
+    fn details_window(&mut self, ctx: &Context) {
+        if !self.details_open {
+            return;
+        }
+        // The title bar's own ✕ and the dock's plate write the same flag: two ways out of one
+        // window, because a floating window with no close of its own is a window a person leaves
+        // open by accident.
+        let mut open = true;
+        egui::Window::new("Details")
+            .open(&mut open)
+            .resizable(false)
+            // Wide enough for a label and its reading on one line with room between them: a board of
+            // `label        value` rows needs the two columns to be separated or it reads as prose
+            // again, which is the thing the rows exist to stop.
+            .default_width(340.0)
+            // A run's board is long — a row per agent in the field, the record, the ladders — and a
+            // window that grew to fit it would put its own title bar off the top of a small display.
+            // Scrolled rather than truncated, because the numbers at the bottom are as wanted as the
+            // ones at the top.
+            .scroll([false, true])
+            .max_height((ctx.screen_rect().height() - 140.0).max(160.0))
+            // Sits where the panel used to, so the muscle memory still lands — and it is dragged
+            // from there like any window.
+            .default_pos(Pos2::new((ctx.screen_rect().right() - 320.0).max(12.0), 76.0))
+            .show(ctx, |ui| self.details(ui));
+        self.details_open = open;
+    }
+
+    /// The verdict as a lamp and a word: the one reading that is always on screen.
+    ///
+    /// Shared by the details window and the strip along the bottom, so the two cannot come to
+    /// disagree about whether this level can be beaten — the colour and the sentence are one
+    /// reading, and a lamp of one colour beside a word of another is worse than no lamp at all.
+    fn verdict_lamp(&self, ui: &mut egui::Ui) {
         let colour = if self.editor.beatable() {
-            Color32::from_rgb(120, 216, 120)
+            theme::GOOD_INK
         } else {
-            Color32::from_rgb(240, 120, 110)
+            theme::BAD_INK
         };
-        ui.colored_label(colour, verdict);
+        // A light reads from across the room in a way a sentence does not, and the verdict is read
+        // while looking at the *level*, not at the words.
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        let centre = rect.center();
+        painter.circle_filled(centre, 5.0, colour);
+        painter.circle_stroke(centre, 5.0, Stroke::new(1.0_f32, colour.gamma_multiply(0.6)));
+        ui.colored_label(colour, self.editor.verdict());
+    }
+
+    /// What the details window holds, which depends on what the window is showing.
+    ///
+    /// One window rather than one per mode, because it answers the same question in each: *what else
+    /// is true here that the panel beside the canvas is not saying?* In the editor that is the
+    /// verdict, the physics a jump may ask for, and what the level is made of; in a run it is the
+    /// search's own numbers, the field, and the record. A viewer learns one control — the dock's
+    /// magnifier — and gets whichever answer belongs to the mode they are in.
+    fn details(&mut self, ui: &mut egui::Ui) {
+        match self.mode {
+            Mode::Evolve => self.details_run(ui),
+            Mode::Replay => self.details_replay(ui),
+            Mode::Edit | Mode::Play => self.details_level(ui),
+        }
+    }
+
+    /// The Details window while a run is on screen: the board behind the run's menu.
+    ///
+    /// The summary is taken and put back exactly as [`Self::evolve_panel`] does it, and for the same
+    /// reason: the widget layer borrows what it draws, and the window needs it again the moment the
+    /// frame is over.
+    fn details_run(&mut self, ui: &mut egui::Ui) {
+        self.run_settings_section(ui);
+        let Some(summary) = self.summary.take() else {
+            // The same sentence the panel shows before the first generation: opening the window on a
+            // run that has not scored yet should say so rather than show an empty board.
+            match &self.lab {
+                Some(lab) => {
+                    ui.label(format!(
+                        "{}: evaluating the first generation…",
+                        lab.level_name()
+                    ));
+                }
+                None => {
+                    ui.label("no run on this level yet");
+                }
+            }
+            return;
+        };
+        let actions = panel::lab_details(ui, &summary, &mut self.view);
+        self.summary = Some(summary);
+        self.apply_actions(actions);
+    }
+
+    /// The run's own settings, for the person who wants a different run.
+    ///
+    /// Every knob here was the command line's alone: the window showed a banner reading "pop 200
+    /// seed 1" and had no way to make it anything else, so trying a population of 400 meant
+    /// killing the window and relaunching — which abandons the run on screen and everything it has
+    /// already scored (AUDIT.md F2). Four fields, because four are the ones a person actually
+    /// turns while watching a run.
+    ///
+    /// **The button starts a *new* run and says so.** The population size, the generation cap and
+    /// the curriculum are all fixed when a run starts (`Lab::start`): there is no such thing as
+    /// changing them mid-run, and a control that accepted the numbers and then ignored them would
+    /// be a lie told by a widget. What is *not* here says the same thing in reverse — the curriculum
+    /// level, the resume checkpoint and the champions directory are paths, and a file picker in a
+    /// window with no file manager is a worse answer than the flag whose name is written beside it.
+    fn run_settings_section(&mut self, ui: &mut egui::Ui) {
+        panel::section(ui, "Run settings");
+        ui.horizontal(|ui| {
+            ui.label("population");
+            ui.add(egui::DragValue::new(&mut self.options.pop_size).range(2..=4096));
+        });
+        ui.horizontal(|ui| {
+            ui.label("seed");
+            ui.add(egui::DragValue::new(&mut self.seed));
+        });
+        // The cap is a *choice* rather than a number, because "run until I close the window" is
+        // the default and has no number that means it.
+        ui.horizontal(|ui| {
+            let mut capped = self.options.generations.is_some();
+            if ui.checkbox(&mut capped, "stop after").changed() {
+                self.options.generations = if capped {
+                    Some(self.options.generations.unwrap_or(100))
+                } else {
+                    None
+                };
+            }
+            if let Some(cap) = &mut self.options.generations {
+                ui.add(egui::DragValue::new(cap).range(1..=100_000));
+                ui.label("generations");
+            } else {
+                ui.label(egui::RichText::new("until the window closes").small().color(theme::TEXT_DIM));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("curriculum step");
+            ui.add(
+                egui::DragValue::new(&mut self.options.curriculum_generations).range(1..=10_000),
+            );
+            ui.label("generations");
+        });
+        ui.small(
+            egui::RichText::new(
+                "--curriculum <PATH>, --resume <PATH> and --champions <DIR> are the command \
+                 line's: paths are set where the window is opened",
+            )
+            .color(theme::TEXT_DIM),
+        );
+        let live = self.lab.is_some();
+        let label = if live {
+            "Apply — starts a new run"
+        } else {
+            "Start a run with these"
+        };
+        if ui.button(label).clicked() {
+            self.apply_run_settings();
+        }
+        if live {
+            ui.small(
+                egui::RichText::new(
+                    "a run's population and cap are fixed when it starts, so these make a \
+                     *new* run rather than changing this one",
+                )
+                .color(theme::TEXT_DIM),
+            );
+        }
+    }
+
+    /// Start a fresh run on the settings as they now stand.
+    ///
+    /// One function rather than two paths, because the two cases are the same case: a run that is
+    /// going is dropped and a new one built from `self.options` and `self.seed`, and a level with no
+    /// run yet simply builds the one. `enter_evolve` is where that construction lives — it is the
+    /// only place that knows how a run is made, and a second one here would be a second answer to
+    /// what a run is.
+    fn apply_run_settings(&mut self) {
+        self.lab = None;
+        self.lanes = None;
+        self.packet = None;
+        self.summary = None;
+        self.replay = None;
+        self.view.scrub = None;
+        self.saved_end = false;
+        self.enter_evolve();
+        if self.lab.is_some() {
+            // The seed is on the note because a run *is* a function of it: a population worth
+            // keeping is a number worth reading off the screen (the same bargain the Restart
+            // button makes).
+            self.note = Some((
+                format!(
+                    "new run: pop {} seed {}",
+                    self.options.pop_size, self.seed
+                ),
+                6.0,
+            ));
+        }
+    }
+
+    /// The Details window while an episode is on screen: whose record it is, and the field behind it.
+    fn details_replay(&mut self, ui: &mut egui::Ui) {
+        let Some(replay) = &mut self.replay else {
+            ui.label("no replay on screen");
+            return;
+        };
+        let actions = panel::replay_details(ui, replay);
+        self.apply_actions(actions);
+    }
+
+    /// The Details window while a level is on screen: the verdict first, because it is what a person
+    /// opens the window to argue with, then the physics a jump may ask for, what the level is made
+    /// of, and the size of its grid.
+    fn details_level(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| self.verdict_lamp(ui));
         if let Some(culprit) = &self.editor.report.culprit {
             ui.small(format!(
                 "stuck at platform {} take-off x {}{}",
@@ -1380,43 +2374,95 @@ impl EvoApp {
             ui.small("Reddish tint = the spawn cannot get there.");
         }
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.label("Physics (from sim::PHYSICS)");
+        // The rest of the window is a *board*: a label on the left, the reading on the right, and
+        // one right edge down the page. It used to be eight `ui.small(format!(...))` sentences — the
+        // same information, but a reader had to find the number inside each sentence and there was no
+        // column to compare down. `ui::stat_row` is that decision as one function (see its doc), and
+        // `panel::section` is the same section rule every other board in the window uses, so the four
+        // Details windows cannot drift into four different machines for drawing a heading.
         let physics = &sim::PHYSICS;
-        ui.small(format!(
-            "jump {:.2} tiles high, {:.2} tiles far",
-            physics.max_jump_height(),
-            physics.max_jump_distance()
-        ));
-        // The two abilities that change what a level may ask for, in the same units as
-        // the jump above: a pit wider than the running jump is a sprint jump, and a rise
-        // taller than the jump height is a wall climb. A designer reading this panel is
-        // exactly who finding 44's numbers are for.
-        ui.small(format!(
-            "sprint jump {:.2} tiles far, wall climb {:.2} high",
-            physics.sprint_jump_distance(),
-            physics.wall_jump_height()
-        ));
-        ui.small(format!(
-            "run speed {:.2}/tick ({:.2} sprinting), gravity {:.4}",
-            physics.run_speed, physics.sprint_speed, physics.gravity
-        ));
+        panel::section(ui, "What a jump can do");
+        ui::stat_row(
+            ui,
+            "jump",
+            format!(
+                "{:.2} tiles high, {:.2} far",
+                physics.max_jump_height(),
+                physics.max_jump_distance()
+            ),
+        );
+        // The two abilities that change what a level may ask for, in the same units as the jump
+        // above: a pit wider than the running jump is a sprint jump, and a rise taller than the jump
+        // height is a wall climb. A designer reading this board is exactly who finding 44's numbers
+        // are for.
+        ui::stat_row(
+            ui,
+            "sprint jump",
+            format!("{:.2} tiles far", physics.sprint_jump_distance()),
+        );
+        ui::stat_row(
+            ui,
+            "wall climb",
+            format!("{:.2} tiles high", physics.wall_jump_height()),
+        );
+        ui::stat_row(
+            ui,
+            "run speed",
+            format!(
+                "{:.2}/tick ({:.2} sprinting)",
+                physics.run_speed, physics.sprint_speed
+            ),
+        );
+        ui::stat_row(ui, "gravity", format!("{:.4}", physics.gravity));
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.label("Level");
+        panel::section(ui, "The level");
+        // **The name is the file.** Renaming is the other half of the naming bug: a level's name
+        // is what its file is called, so a document that cannot be renamed is a document that
+        // cannot be named at all — every level a person drew was called `untitled` (AUDIT.md B2).
+        // Commit on Enter or on the button, never per keystroke, and let [`Editor::rename`] refuse
+        // a blank: an empty field is somebody still typing.
+        if !self.rename_focused {
+            self.rename_buf = self.editor.level.name.clone();
+        }
+        ui.horizontal(|ui| {
+            ui.label("name");
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.rename_buf)
+                    .desired_width(150.0)
+                    .hint_text("level name"),
+            );
+            self.rename_focused = field.has_focus();
+            let typed = field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if typed || ui.button("Rename").clicked() {
+                let name = self.rename_buf.clone();
+                if self.editor.rename(&name) {
+                    self.rename_buf = self.editor.level.name.clone();
+                }
+            }
+        });
         let level = &self.editor.level;
-        ui.small(format!("grid {}x{}", level.width, level.height));
-        ui.small(format!("spawn {:?}", level.spawn_tile()));
-        ui.small(match level.goal_tiles().first() {
-            Some((gx, gy)) => format!("goal ({gx}, {gy})"),
+        ui::stat_row(ui, "grid", format!("{}x{}", level.width, level.height));
+        ui::stat_row(ui, "spawn", format!("{:?}", level.spawn_tile()));
+        // The frame cap this level's own size sets, and the clock an agent is scored against: the
+        // one number that says how long a solution is allowed to take, which is what the run's best
+        // time is read against.
+        ui::stat_row(
+            ui,
+            "episode cap",
+            format!("{} frames ({})", sim::frame_budget(level), sim::format_time(sim::frame_budget(level))),
+        );
+        ui::stat_row(ui, "goal", match level.goal_tiles().first() {
+            Some((gx, gy)) => format!("({gx}, {gy})"),
             // A level has one flag, or none at all for the moment between deleting the flag
             // and placing it again — and a flag-less document is one the writer refuses, which
             // is worth knowing here rather than at Save.
-            None => "no goal — place one before saving".into(),
+            None => "none — place one before saving".into(),
         });
-        ui.small(format!("{} walker(s)", level.walkers.len()));
+        ui::stat_row(
+            ui,
+            "walkers",
+            level.walkers.len().to_string(),
+        );
         let (mut solid, mut sand, mut spike) = (0, 0, 0);
         for ty in 0..level.height {
             for tx in 0..level.width {
@@ -1431,16 +2477,21 @@ impl EvoApp {
                 }
             }
         }
-        ui.small(if sand > 0 {
-            format!("{} solid tiles ({sand} sand), {spike} spikes", solid + sand)
-        } else {
-            format!("{solid} solid tiles, {spike} spikes")
-        });
-        ui.small(level.content_hash_string());
+        ui::stat_row(
+            ui,
+            "tiles",
+            if sand > 0 {
+                format!("{} solid ({sand} sand), {spike} spikes", solid + sand)
+            } else {
+                format!("{solid} solid, {spike} spikes")
+            },
+        );
+        // The content hash, which a champion file records: shown because a viewer comparing a run
+        // against a level wants to know the two are the same terrain, and it is the hash rather
+        // than a date because that is what the file can be checked against.
+        ui::stat_row(ui, "content", level.content_hash_string());
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.label("Resize the grid");
+        panel::section(ui, "Resize the grid");
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut self.pending_size.0).range(8..=400));
             ui.label("x");
@@ -1456,6 +2507,11 @@ impl EvoApp {
             ui.add_space(8.0);
             ui.small(path.display().to_string());
         }
+        // The zoom, which used to be the status bar's business: a number about the view that is set
+        // with the wheel and read once, so it belongs with the readings a person looks up rather
+        // than with the two the editor watches.
+        ui.add_space(6.0);
+        ui::stat_row(ui, "zoom", format!("{:.0} px/tile", self.camera.scale()));
     }
 
     /// The canvas: level, ghosts, and every pointer gesture.
@@ -1478,6 +2534,16 @@ impl EvoApp {
             let tile = self.camera.to_tile(p, rect);
             (tile.x.floor() as i32, tile.y.floor() as i32)
         });
+        // The pointer over the editor's canvas is a *tool* rather than a pointer at something: the
+        // crosshair is where the next tile lands. Moving the level under it is the one gesture that
+        // is not a placement, so it wears the grab hand while it is happening (AUDIT.md F5).
+        if self.mode == Mode::Edit && hover.is_some() {
+            ui.ctx().set_cursor_icon(if self.dragging.is_some() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Crosshair
+            });
+        }
         if let Some(hover) = hover {
             let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.1 {
@@ -1514,6 +2580,10 @@ impl EvoApp {
 
         // --- draw ------------------------------------------------------------
         let opts = self.opts();
+        // The camera the frame is drawn through is exactly the viewer's: it is not displaced by
+        // anything the simulation does. A landing, a stomp and a death each put a burst on the
+        // agent's own animation, which is where they belong — a jolt that moved the whole level
+        // under the eye read as the window being kicked rather than the body hitting the ground.
         let sheet = Sheet::new(&painter, &self.atlas, &self.sprites, &self.camera, rect);
         // What keeps the scene alive — the swaying grass, the flag, the clouds — runs on
         // the replay's own clock while an episode is on screen, so pausing the replay
@@ -1551,10 +2621,26 @@ impl EvoApp {
             Mode::Play => {
                 if let Some(session) = &self.session {
                     view::draw_sim(sheet, session.sim(), opts, session.clock, session.anim());
+                    // The champion beside the player, translucent so it never hides them:
+                    // the best band's own tint, because that is what a ghost looks like
+                    // everywhere else in this window.
+                    if let (Some(gsim), Some(ganim)) =
+                        (session.ghost_sim(), session.ghost_anim())
+                    {
+                        view::draw_agent_body(sheet, gsim, view::cohort_tint(0), ganim);
+                    }
                 }
             }
             Mode::Evolve => self.canvas_evolve(sheet, clock),
             Mode::Replay => self.canvas_replay(sheet, clock),
+        }
+
+        // The light the frame is *seen* through, over everything it contains: a vignette at
+        // the edges and a soft band of shade under the top of the window, which is what stops
+        // a pixel landscape from reading as a flat sheet of tiles. Not in the editor: a
+        // document is about what the file says, and the editor passes no judgement on it.
+        if self.mode != Mode::Edit {
+            view::draw_atmosphere(&painter, rect);
         }
 
         if self.mode == Mode::Edit {
@@ -1685,57 +2771,9 @@ impl EvoApp {
 
         if let Some(brush) = self.dragging {
             if inside {
-                let target = self.camera.tile_rect(tx, ty, rect);
-                // A goal is two tiles of art, and the ghost has to show both: the flag hangs
-                // in the cell *above* the one being clicked (`Level::goal_covers`), so a ghost
-                // drawing only the clicked cell would promise the flag in the wrong place —
-                // and hide the fact that the cell the outline is really asking about is the
-                // one above the cursor.
-                let footprint = if brush == Brush::Goal {
-                    let above = self.camera.tile_rect(tx, ty - 1, rect);
-                    for (cell, name) in [
-                        (target, "goal_bottom"),
-                        (above, "goal_top"),
-                        (above, "goal_flag_1"),
-                    ] {
-                        if let Ok(uv) = self.atlas.uv(name) {
-                            painter.image(
-                                self.atlas.texture_id(),
-                                cell,
-                                uv,
-                                Color32::from_white_alpha(170),
-                            );
-                        }
-                    }
-                    target.union(above)
-                } else {
-                    if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
-                        painter.image(
-                            self.atlas.texture_id(),
-                            target,
-                            uv,
-                            Color32::from_white_alpha(170),
-                        );
-                    }
-                    target
-                };
-                // The ghost shows the *drop*, so it has to show a refused drop too: the
-                // outline is the colour of the answer, and the sprite is faded when the
-                // answer is no.
-                let placeable = self.editor.can_place(brush, tx, ty);
-                painter.rect_stroke(
-                    footprint,
-                    egui::CornerRadius::ZERO,
-                    Stroke::new(
-                        1.5_f32,
-                        if placeable {
-                            Color32::from_rgb(250, 214, 102)
-                        } else {
-                            Color32::from_rgb(226, 90, 74)
-                        },
-                    ),
-                    egui::StrokeKind::Inside,
-                );
+                // The same ghost the hover draws, because it is the same promise: this is the
+                // tile, and this is whether the level will take it.
+                self.draw_brush_ghost(painter, rect, brush, tx, ty);
             }
             let released = ui.ctx().input(|i| i.pointer.any_released());
             if released {
@@ -1749,11 +2787,15 @@ impl EvoApp {
             return;
         }
 
-        let (primary, secondary, released) = ui.ctx().input(|i| {
+        let (primary, secondary, released, picking, line) = ui.ctx().input(|i| {
             (
                 i.pointer.primary_down(),
                 i.pointer.secondary_down(),
                 i.pointer.any_released(),
+                // `command` rather than `ctrl` so the key is the platform's own modifier, the same
+                // one Ctrl+Z and Ctrl+S already answer to.
+                i.modifiers.command,
+                i.modifiers.shift,
             )
         });
         if released {
@@ -1762,12 +2804,100 @@ impl EvoApp {
         if !inside || !(response.hovered() || response.dragged()) {
             return;
         }
-        // Right-click erases whatever is under the cursor, regardless of the brush.
-        if secondary {
+        // The brush in hand, drawn at the tile the *next* press would take. Until this existed the
+        // brush's target was invisible until the click landed, which is the one piece of feedback
+        // every drawing tool has (AUDIT.md V2) — and it is the same picture the drag out of the
+        // palette draws, on purpose: a brush in hand looks the same whether it was picked up a
+        // moment ago or an hour ago.
+        let hover_ghost = !primary && !secondary;
+        if hover_ghost {
+            if let Some(brush) = self.editor.brush {
+                self.draw_brush_ghost(painter, rect, brush, tx, ty);
+            }
+        }
+        // The shift key is the *stroke's* shape, not the palette's (see [`Editor::line`]): a long
+        // straight floor is what a steady hand cannot draw, so the constraint is asked for per
+        // stroke rather than becoming a mode somebody forgets they are in.
+        self.editor.line = line;
+        // `command`-click takes the brush *from* the level instead of putting it down: the
+        // eyedropper. It accepts **either** button deliberately: on the platform where ctrl-click
+        // is translated into a right-click, a person holding the modifier to pick arrives as
+        // `secondary`, and answering that with the eraser would be the one gesture the modifier
+        // exists to prevent. A plain right-click has no modifier and still erases.
+        if picking && (primary || secondary) {
+            self.editor.pick_at(tx, ty);
+        } else if secondary {
+            // Right-click erases whatever is under the cursor, regardless of the brush.
             self.editor.erase_at(tx, ty);
         } else if primary {
             self.editor.paint(tx, ty);
         }
+    }
+
+    /// The ghost of the held brush, at the tile the pointer is over.
+    ///
+    /// Extracted because two gestures need to draw it — dragging a brush out of the palette, and
+    /// simply hovering the canvas with one in hand — and two copies of the goal's two-tile footprint
+    /// would be two chances for the flag's ghost to promise the wrong cell (AUDIT.md V2).
+    fn draw_brush_ghost(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        brush: Brush,
+        tx: i32,
+        ty: i32,
+    ) {
+        let target = self.camera.tile_rect(tx, ty, rect);
+        // A goal is two tiles of art, and the ghost has to show both: the flag hangs
+        // in the cell *above* the one being clicked (`Level::goal_covers`), so a ghost
+        // drawing only the clicked cell would promise the flag in the wrong place —
+        // and hide the fact that the cell the outline is really asking about is the
+        // one above the cursor.
+        let footprint = if brush == Brush::Goal {
+            let above = self.camera.tile_rect(tx, ty - 1, rect);
+            for (cell, name) in [
+                (target, "goal_bottom"),
+                (above, "goal_top"),
+                (above, "goal_flag_1"),
+            ] {
+                if let Ok(uv) = self.atlas.uv(name) {
+                    painter.image(
+                        self.atlas.texture_id(),
+                        cell,
+                        uv,
+                        Color32::from_white_alpha(170),
+                    );
+                }
+            }
+            target.union(above)
+        } else {
+            if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
+                painter.image(
+                    self.atlas.texture_id(),
+                    target,
+                    uv,
+                    Color32::from_white_alpha(170),
+                );
+            }
+            target
+        };
+        // The ghost shows the *drop*, so it has to show a refused drop too: the
+        // outline is the colour of the answer, and the sprite is faded when the
+        // answer is no.
+        let placeable = self.editor.can_place(brush, tx, ty);
+        painter.rect_stroke(
+            footprint,
+            egui::CornerRadius::ZERO,
+            Stroke::new(
+                1.5_f32,
+                if placeable {
+                    theme::ACCENT
+                } else {
+                    theme::BAD
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
     }
 
     /// Move the camera to keep the player in view while playing.
@@ -1784,35 +2914,67 @@ impl EvoApp {
 
     /// The status line in the evolution view: where the run is, and what the viewer just
     /// did to it.
+    ///
+    /// Short on purpose, and it reads nothing that the panel beside the canvas cannot be asked
+    /// about: this is the strip a viewer passes their eye along, not a report. It used to spell the
+    /// field out ("40 of 40 lanes still running"), name the animation clock to a tenth of a second,
+    /// and put the seed in the middle of the sentence, which is three more numbers to walk past on
+    /// the way to the one that changed. What is left is the generation, whether the field is still
+    /// moving, how fast it is going, and whether it is paused — plus the seed, because a number
+    /// nobody can reproduce is a number nobody can check.
     fn evolve_status(&self) -> String {
         let speed = format!("{}x", self.view.speed);
-        let paused = if self.view.paused { "  paused" } else { "" };
-        match (&self.lanes, &self.packet) {
+        let mut line = match (&self.lanes, &self.packet) {
             (Some(lanes), _) => format!(
-                "generation {} — {} of {} lanes still running — {:.1}s animated — {} — seed {}{}",
+                "gen {} · {} of {} running · {}",
                 lanes.packet().generation + 1,
                 lanes.running(),
                 lanes.len(),
-                lanes.clock(),
-                speed,
-                self.seed,
-                paused
+                speed
             ),
-            (None, Some(packet)) => format!(
-                "generation {} scored — watching it finished — {} — seed {}{}",
-                packet.generation + 1,
-                speed,
-                self.seed,
-                paused
-            ),
-            (None, None) => format!(
-                "evaluating the first generation… — {} — seed {}",
-                speed, self.seed
-            ),
+            (None, Some(packet)) => {
+                format!("gen {} scored · {}", packet.generation + 1, speed)
+            }
+            (None, None) => format!("evaluating the first generation… · {speed}"),
+        };
+        if self.view.paused {
+            line.push_str(" · paused");
         }
+        line.push_str(&format!(" · seed {}", self.seed));
+        line
     }
 
+    /// The strip along the bottom of the window.
+    ///
+    /// Cut into the window rather than lying on it ([`theme::sunk_frame`]): it is a readout, and
+    /// the four views each put their own sentence in it. Its height is what the frame's own padding
+    /// makes it and nothing more — the strip is the one piece of the window that is allowed to be
+    /// quiet, because everything in it is either a light or a number.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let frame = theme::sunk_frame();
+        frame.show(ui, |ui| {
+            self.status_line(ui);
+        });
+    }
+
+    /// The line along the bottom: what this view is doing, and what the pointer is over.
+    ///
+    /// The mode used to lead this line — `edit`, `play`, `evolve`, `replay` in the mode's own
+    /// colour — and it is gone, because the dock's switch says it in gold two hundred points above
+    /// and saying it twice is the kind of redundancy that reads as a prototype: a bar that repeats
+    /// the tool bar is a bar with nothing of its own to say.
+    ///
+    /// What is left in the editor is the **verdict** and then what just happened: the one reading a
+    /// person drawing a level needs at all times, as a lamp and a word, and the sentence a stroke, an
+    /// undo or a refusal just produced. The verdict lives here — and not in a panel of its own — for
+    /// the reason the panel it came from is gone: half a window of cream to say four words is a
+    /// properties pane, and this bar has the room.
+    ///
+    /// The zoom is gone from the right-hand end as well, into the window that holds the other
+    /// numbers ([`Self::details_window`]). It is a fact about the *view* that is read once after it
+    /// is set, and this end of the bar is for what a person asks while drawing: the tile under the
+    /// pointer, and anything wrong with the atlas.
+    fn status_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if matches!(self.mode, Mode::Evolve | Mode::Replay) {
                 // Each view speaks for itself: the run's line is about generations, and the
@@ -1824,26 +2986,56 @@ impl EvoApp {
                 } else {
                     Some(self.evolve_status())
                 };
-                ui.label(line.unwrap_or_else(|| "no replay on screen".to_string()));
+                // Truncated rather than allowed to run off the end of the window: these two
+                // sentences are the longest in the window (a replay's line names the episode, its
+                // score and the field behind it; a save confirmation names a path), and a strip
+                // whose left-hand label is as wide as it likes pushes everything after it —
+                // including the tile under the pointer — off the screen entirely. An ellipsis says
+                // "there is more of this sentence" instead of hiding the rest of the bar.
+                ui.add(
+                    egui::Label::new(line.unwrap_or_else(|| "no replay on screen".to_string()))
+                        .truncate(),
+                );
                 if let Some((note, _)) = &self.note {
-                    ui.colored_label(Color32::from_rgb(250, 214, 102), note.clone());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(note.clone()).color(theme::ACCENT_INK),
+                        )
+                        .truncate(),
+                    );
                 }
             } else if let Some(session) = &self.session {
-                ui.label(session.summary());
+                // The playthrough's line in the runner's own colour, which is what the removed
+                // `play` word was saying: the bar still says which of the four things this is,
+                // it just says it in ink rather than in a label.
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(session.summary()).color(theme::RUN_INK),
+                    )
+                    .truncate(),
+                );
             } else {
-                ui.label(if self.editor.message.is_empty() {
-                    "drag from the palette, or pick a brush and click".to_string()
-                } else {
-                    self.editor.message.clone()
-                });
+                // The editor's line: the verdict, then only what just happened. Its message is
+                // empty while nothing is happening on purpose — a bar that talks to itself is
+                // chatter — which leaves the lamp and the word, and those never stop mattering.
+                self.verdict_lamp(ui);
+                ui.label(egui::RichText::new(self.editor.message.clone()).color(theme::TEXT_DIM));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(format!("zoom {:.0} px/tile", self.camera.scale()));
+                // **The one hint that has to be permanent.** A window with two dozen keys and no
+                // menu to hold them has to say where the list is, or nobody goes looking for it:
+                // the card existed as a keybinding nobody was told about (AUDIT.md F1).
+                ui.label(egui::RichText::new("? keys").small().color(theme::TEXT_FAINT))
+                    .on_hover_text("the keys for this view — F1 does the same");
                 if let Some((tx, ty)) = self.hover_tile {
-                    ui.label(format!("tile ({tx}, {ty})"));
+                    ui.label(
+                        egui::RichText::new(format!("tile ({tx}, {ty})"))
+                            .small()
+                            .color(theme::TEXT_FAINT),
+                    );
                 }
                 if let Some(warning) = &self.warning {
-                    ui.colored_label(Color32::from_rgb(240, 150, 90), warning);
+                    ui.colored_label(theme::WARN, warning);
                 }
             });
         });
@@ -1906,6 +3098,10 @@ impl EvoApp {
 
 impl eframe::App for EvoApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // The title bar follows the document from the first frame, splash or not: a window
+        // that named itself once and never again is how two open levels came to look like one
+        // window twice (AUDIT.md B5).
+        self.sync_window_title(ctx);
         // The title screen owns the frame while it is up: the app's own panels are not drawn
         // and nothing else runs, so a key that dismisses it cannot also reach a button in the
         // editor behind it — the same event would otherwise both close the screen and start a
@@ -1938,9 +3134,21 @@ impl eframe::App for EvoApp {
 
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         if self.mode == Mode::Play {
-            let keys = play::Keys::read(ctx);
+            // Same rule as the shortcuts: a text field with the keyboard is typing, not running
+            // the agent — otherwise renaming a level mid-run makes the runner walk into a pit.
+            let keys = if ctx.wants_keyboard_input() {
+                play::Keys::default()
+            } else {
+                play::Keys::read(ctx)
+            };
             if let Some(session) = &mut self.session {
                 session.advance(dt, keys);
+                // A death restarts itself after a beat ([`play::AUTO_RESTART_DELAY`]):
+                // the window does for the player what the session's signal asks for, and
+                // `R` still restarts at once — this is the pause doing it instead.
+                if session.restart_due() {
+                    session.restart(&self.editor.level);
+                }
             }
             ctx.request_repaint();
         }
@@ -1963,23 +3171,39 @@ impl eframe::App for EvoApp {
         if self.mode == Mode::Edit {
             egui::SidePanel::left("palette")
                 .default_width(190.0)
+                // A panel of *chrome*: cream, with the same gold lip as the dock. The window's
+                // menus are one material and the two things you look at — the canvas and the
+                // chart — are another, which is the whole of what stops this reading as a tool.
+                .frame(theme::panel_frame())
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| self.palette(ui))
                 });
         }
-        egui::SidePanel::right("inspector")
-            .default_width(if matches!(self.mode, Mode::Evolve | Mode::Replay) {
-                310.0
-            } else {
-                250.0
-            })
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| match self.mode {
-                    Mode::Evolve => self.evolve_panel(ui),
-                    Mode::Replay => self.replay_panel(ui),
-                    Mode::Edit | Mode::Play => self.inspector(ui),
-                })
-            });
+        // A run's panel, and *only* a run's. The editor used to have one as well — the verdict at
+        // the top and six sections of readings under it — and it is gone: everything the editor has
+        // to say that must be up all the time fits in the strip along the bottom, and the rest is a
+        // window a person opens ([`Self::details_window`]). An empty panel is the cheapest way to
+        // make a game look like an application, and it was doing exactly that.
+        //
+        // What the two run views keep is different: their panel holds the controls a run is *driven*
+        // with — pausing it, spending a generation, saving the champion — so it is busy by nature
+        // rather than empty by default, and it sits beside the chart that says whether any of it is
+        // working.
+        if matches!(self.mode, Mode::Evolve | Mode::Replay) {
+            egui::SidePanel::right("run")
+                .frame(theme::panel_frame())
+                .default_width(310.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| match self.mode {
+                        Mode::Evolve => self.evolve_panel(ui),
+                        Mode::Replay => self.replay_panel(ui),
+                        // Unreachable — the panel only exists for the two modes above. Written out
+                        // rather than `unreachable!()` so that adding a mode to the enum is a
+                        // compile error here rather than a panic at runtime.
+                        Mode::Edit | Mode::Play => {}
+                    })
+                });
+        }
         // The chart is the run's shape, and the replay is a moment *of* that run: keeping
         // it up is what makes a jump in the curve and an agent clearing the obstacle it
         // stands for two views of one thing rather than two screens.
@@ -1997,6 +3221,12 @@ impl eframe::App for EvoApp {
                 });
         }
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+        // Over everything, like a window should be: the shelf is a separate thing the viewer
+        // opened, not a panel of the view they were in.
+        self.shelf_window(ctx);
+        // Over the canvas like the shelf, and over the shelf's own z-order if both are up: the
+        // card answers a question about the window, not about a level.
+        help::window(ctx, self.mode, &mut self.help_open);
 
         let mut canvas_rect = Rect::NOTHING;
         egui::CentralPanel::default()
@@ -2005,6 +3235,10 @@ impl eframe::App for EvoApp {
                 canvas_rect = ui.available_rect_before_wrap();
                 self.canvas(ui);
             });
+
+        // The level's numbers float over the canvas rather than holding a column of their own, so
+        // they are drawn after it and end up in front of it — which is where a window belongs.
+        self.details_window(ctx);
 
         if self.mode == Mode::Play {
             self.follow_player(canvas_rect);
@@ -2019,9 +3253,111 @@ impl eframe::App for EvoApp {
             self.prime_scripted_run();
         }
 
+        // **The cut between the four things this window does.** A whole different screen — sky,
+        // hills and agents where graph paper and a brush were — arrived instantly, and a cut that
+        // hard reads as a glitch rather than as a change (AUDIT.md V1). Compared *here*, after
+        // everything has drawn, so every way into a mode fades: the switch, the keys, the shelf
+        // opening a level, the title screen's doors.
+        if self.mode != self.last_mode {
+            self.last_mode = self.mode;
+            // **A scripted frame is a fixed frame.** `--screenshot` is how the renderer is verified
+            // without a human watching, and the first frame of a `--play` or `--evolve` launch is
+            // exactly when the shutter is fully closed: the photograph would be of the shutter.
+            // The window a person watches gets the fade; the camera does not.
+            if self.screenshot.is_none() {
+                self.mode_fade = MODE_FADE;
+            }
+        }
+        if self.mode_fade > 0.0 {
+            self.mode_fade = (self.mode_fade - dt).max(0.0);
+            // Eased out, and over *everything* — the dock, the panels, the shelf, the key card:
+            // a shutter that left a strip of the old screen showing would be the flicker it
+            // exists to cover.
+            let t = self.mode_fade / MODE_FADE;
+            let alpha = (t * t * 235.0) as u8;
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("mode-shutter"),
+            ))
+            .rect_filled(
+                ctx.screen_rect(),
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(
+                    theme::SHELL.r(),
+                    theme::SHELL.g(),
+                    theme::SHELL.b(),
+                    alpha,
+                ),
+            );
+            ctx.request_repaint();
+        }
+
         if let Err(err) = self.handle_screenshot(ctx) {
             eprintln!("error: {err}");
             std::process::exit(1);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The discard guard asks twice, and an edit between the two presses starts the question over.
+    ///
+    /// The bug this pins lost work: **New** and any click on a level card replaced the document
+    /// unconditionally, and the only sign that anything was pending was a dot in a plaque nobody
+    /// was looking at (AUDIT.md B1). Three facts make the rule: a clean document is never asked
+    /// about, a dirty one is refused once, and the *same* content pressed again goes through —
+    /// while an edit in between re-arms it, because that is what looking at the level and
+    /// touching it produces.
+    #[test]
+    fn the_discard_guard_asks_twice_and_an_edit_between_the_asks_re_arms_it() {
+        // Clean: nothing to lose, no question.
+        assert_eq!(discard_guard(false, None, 7), (false, None));
+        // Dirty: the first press only warns, and remembers *what* it warned about.
+        let (refused, armed) = discard_guard(true, None, 7);
+        assert!(refused, "the first press on a dirty document is refused");
+        assert_eq!(armed, Some(7));
+        // The second press on the same content is the answer to the question.
+        assert_eq!(discard_guard(true, armed, 7), (false, None));
+        // An edit between the two presses makes it a different document, so it is asked again.
+        let (refused, armed) = discard_guard(true, armed, 8);
+        assert!(
+            refused,
+            "a press after an edit must warn again, not discard the newer version"
+        );
+        assert_eq!(armed, Some(8));
+        // And a document that was saved (so no longer dirty) is never guarded, whatever was armed
+        // before it: the guard cannot outlive the work it was protecting.
+        assert_eq!(discard_guard(false, Some(8), 8), (false, None));
+    }
+
+    /// The title bar names the document first, then the mode, then the game.
+    ///
+    /// The bug this pins: the title was the constant `"evolution platformer"` for the life of
+    /// the window, so two open levels were indistinguishable in a taskbar — and the part a
+    /// narrow taskbar keeps is the left-hand end, which was the part that never changed
+    /// (AUDIT.md B5).
+    #[test]
+    fn the_window_title_leads_with_the_document_and_names_the_mode() {
+        let edit = window_title_for(Mode::Edit, "l1-flat-run.json");
+        assert!(edit.starts_with("l1-flat-run.json"), "{edit}");
+        assert!(edit.ends_with("evolution platformer"), "{edit}");
+        // Every mode says which of the four things this window is doing, and no two agree: a
+        // window in play and a window in evolve have to be told apart in a taskbar too.
+        let titles: Vec<String> = Mode::ALL
+            .iter()
+            .map(|mode| window_title_for(*mode, "l1-flat-run.json"))
+            .collect();
+        for (i, a) in titles.iter().enumerate() {
+            for b in &titles[i + 1..] {
+                assert_ne!(a, b, "two modes wear the same window title");
+            }
+        }
+        assert!(titles[1].contains("playtest"), "{}", titles[1]);
+        assert!(titles[2].contains("evolve"), "{}", titles[2]);
+        assert!(titles[3].contains("replay"), "{}", titles[3]);
     }
 }
