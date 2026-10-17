@@ -102,7 +102,17 @@ impl Default for ReachOptions {
 /// to a rule — the same terrain can now answer "not reachable" where it used to answer "reachable via
 /// a jump from inside the wall", and a route now stores the take-off whose landing is further inside
 /// the ledge — so cached verdicts and route graphs from v2 are misses.
-pub const MOVE_SET_VERSION: u32 = 3;
+/// v4: a tie between two plans of equal cost and margin is resolved by the sweep's own order again —
+/// the first move found is kept, as [`better_plan`] has always said. A third term had been added,
+/// breaking ties by take-off position, and it is the position a body is walked to that made it a
+/// move-set change: preferring the later take-off left the replay unable to press from a stand's lip
+/// (`l2`..`l5` stalled with the hop uncrossed), preferring the earlier one put `l9`'s first crossing at
+/// an aim the four-tick cadence cannot stop on. No canonical move, script or grid changed, but which
+/// of several swept take-offs an edge stores did, so the stamp moves. It is also why this one was
+/// expensive to find: a v3 sidecar survived the first change, so the same terrain answered with two
+/// different routes under one version — green on the machine holding the cache, red in CI, which
+/// rebuilds the graph from the terrain.
+pub const MOVE_SET_VERSION: u32 = 4;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -1539,15 +1549,20 @@ impl RouteEdge {
 
 /// Whether `candidate` is a better move to *keep* for a landing than the `held` one.
 ///
-/// Cost first (see [`RouteEdge::demand`]), then margin (see [`RouteEdge::landing_margin`]), then the
-/// earlier take-off — the last only so that two equally good moves are resolved the same way every
-/// time the graph is built.
+/// Cost first (see [`RouteEdge::demand`]), then margin (see [`RouteEdge::landing_margin`]). A tie keeps
+/// the move the sweep found first, which is what "the sweep's order is fixed" means: no position is
+/// privileged beyond the two rules above. There used to be a third term breaking ties by take-off
+/// position, and it was wrong in both directions — preferring the *later* take-off walked the replay to
+/// the very lip of a stand, where it could not press and stalled with the hop uncrossed on `l2`..`l5`;
+/// preferring the *earlier* one moved `l9-wait-and-climb`'s first crossing to a take-off the four-tick
+/// cadence cannot stop on (aim 6.00, pressed at 6.15), and the walk died at the ledge. Both are the
+/// same discovery: which swept position an edge stores is a *move-set* decision, not a cosmetic one.
+/// See `MOVE_SET_VERSION` 4.
 fn better_plan(candidate: &RouteEdge, held: &RouteEdge, landing: (i32, i32, i32)) -> bool {
     candidate
         .demand()
         .cmp(&held.demand())
         .then(held.landing_margin(landing).cmp(&candidate.landing_margin(landing)))
-        .then((held.takeoff_x).total_cmp(&candidate.takeoff_x))
         .is_lt()
 }
 

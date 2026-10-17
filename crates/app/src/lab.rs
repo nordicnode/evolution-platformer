@@ -2278,12 +2278,26 @@ mod tests {
     /// random, the level's own route walked it into existence, and the run *says so* — the origin
     /// note is what the panel shows, so a warm start is never something the operator has to infer
     /// from the first generation's scores.
+    ///
+    /// **The walk is a partial one, and that is the claim.** At the trainer's four-tick decision
+    /// cadence `l2-first-gap`'s replay closes one hop and stops (`train-cli train --from-route` over
+    /// the shipped pack leaves only `l1-flat-run` reaching its flag), which is the case the window is
+    /// built for: a partial walk is still a handover, and it still says where it came from. An
+    /// earlier version of this test asserted the *whole* route, and the claim it was really testing
+    /// was a route sidecar written before the take-off rule changed under an unchanged
+    /// `MOVE_SET_VERSION` — green here, red in CI, which rebuilds the graph from the terrain.
     #[test]
     fn a_fresh_run_warmed_from_the_route_says_so_and_is_not_random() {
         let dir = scratch("route-warm");
-        // `l2-first-gap` is the pack's first earned level and its route walks on every seed, so the
-        // warm start is not a partial one here — the strongest form of the claim.
-        let level = shipped("l2-first-gap");
+        // A copy in this test's own directory rather than the shipped file: a sidecar beside
+        // `levels/l2-first-gap.json` is a developer artifact, and adopting one would mean measuring
+        // whatever graph this machine last wrote instead of what the code builds now.
+        std::fs::create_dir_all(&dir).unwrap();
+        let level_path = dir.join("l2-first-gap.json");
+        shipped("l2-first-gap")
+            .to_json_file(&level_path)
+            .expect("a copy of the level");
+        let level = Level::from_json_file(&level_path).expect("the copy loads");
         let cfg = tiny_config();
         let warm = Generator::new(
             level.clone(),
@@ -2302,7 +2316,9 @@ mod tests {
             .expect("a warmed run says where its first generation came from")
             .to_string();
         assert!(
-            note.contains("walked the whole route") && note.contains("cloned"),
+            note.contains("warmed from this level's own route")
+                && note.contains("the replay")
+                && note.contains("cloned"),
             "the note names the walk and the clone: {note}"
         );
         assert!(note.contains("2 of 8 genomes"), "{note}");

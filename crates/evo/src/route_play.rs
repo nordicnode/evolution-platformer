@@ -46,9 +46,9 @@
 //!   the far ledge and the pit. So the press is triggered on the tick that reaches the position, not
 //!   on the block that comes closest to it.
 //! * **Take-off positions inside solid ground are not positions.** Found first in the walk and fixed
-//!   in the oracle itself (`sim::reach::takeoff_fits`, `MOVE_SET_VERSION` 3): the sweep used to place
-//!   bodies inside a step and record the landing the physics ejected them onto, which handed the
-//!   graph a "cheapest" move up a staircase that no body could make.
+//!   in the oracle itself (`sim::reach::takeoff_fits`, the rule that moved `MOVE_SET_VERSION` to 3):
+//!   the sweep used to place bodies inside a step and record the landing the physics ejected them
+//!   onto, which handed the graph a "cheapest" move up a staircase that no body could make.
 //!
 //! The last consequence is visible in the trace rather than in the outcome: a stand can offer several
 //! moves for one hop, the graph's own preference is not always executable, and an attempt that closes
@@ -244,19 +244,21 @@ fn block_travel(vx: f32, repeat: u32) -> f32 {
     (vx.abs() * repeat as f32).max(0.15)
 }
 
-/// Whether this tick is the tick to press `plan`, given the closest the body has been to its
-/// take-off position so far.
+/// Whether this tick is a candidate to press `plan`, given how close the body has come to its take-off
+/// position so far.
 ///
-/// **The tick after the closest approach.** A body cannot stop on an arbitrary sub-tile position —
-/// the cadence moves it a tenth of a tile a tick at run speed — so "press at the plan's position" can
-/// only be honoured to within one tick, and the walk has to choose which side of the target to be
-/// wrong on. Pressing *early* is the wrong side: the oracle's trajectory leaves the ground *at* the
-/// position, and a tenth of a tile short on a pit cleared by a pixel is the pit. So the press waits
-/// until the distance has started to grow again, which is the tick the body was closest, or until it
-/// is at the position exactly. A body that has come to rest short of the target is pressed by
-/// proximity instead, and the guard keeps the check from firing while the plan is still being chosen
-/// from the far side of the stand.
-fn press_due(plan: Plan, x: f32, vx: f32, closest: &mut f32) -> bool {
+/// **Either side of the aim, within one block.** A body cannot stop on an arbitrary sub-tile position —
+/// the cadence moves it two fifths of a tile a block at run speed — so "press at the plan's position"
+/// can only be honoured to within one block, and the walk has to choose which side of the target to be
+/// wrong on. It used to wait for the distance to start growing again, which made every press a *late*
+/// one, and that is wrong wherever the hop's window closes as the body runs: `l9-wait-and-climb`'s
+/// first crossing is the worked example — aimed at 6.00 with a spike in column 7, the body pressed at
+/// 6.15 and its leading edge clipped the spike that the press on the aim clears. So the question "does
+/// this press clear the hop" is asked on the near side too. [`press_lands`] is the arbiter and it asks
+/// the oracle's own simulator from the live position and speed, which is a stronger answer than the aim
+/// alone; the guard still keeps the check from firing while the plan is being chosen from the far side
+/// of the stand.
+fn press_due(plan: Plan, x: f32, vx: f32, window: f32, closest: &mut f32) -> bool {
     let dx = (plan.target_x - x).abs();
     if dx > 1.0 {
         return false;
@@ -272,7 +274,7 @@ fn press_due(plan: Plan, x: f32, vx: f32, closest: &mut f32) -> bool {
     if *closest <= 0.02 {
         return true;
     }
-    near && (at_rest || was_closest)
+    near && (at_rest || was_closest || dx <= window)
 }
 
 /// **Does this press actually clear the hop, from *here*, at *this* speed?**
@@ -550,7 +552,7 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                 let ready = matches!(p.move_, RouteMove::Climb { .. })
                     || (grounded && vy.abs() <= VY_TOL);
                 let due = ready
-                    && press_due(p, x, vx, &mut closest_dx)
+                    && press_due(p, x, vx, tol, &mut closest_dx)
                     && (vx - desired).abs() <= VX_TOL;
                 // The aim is where the graph says to press; the physics says whether the press in
                 // hand clears the hop from where the body is. Both have to agree.

@@ -45,11 +45,17 @@ const WARM: usize = POP / 4;
 
 /// Generations a first win has to arrive within.
 ///
-/// The measured spread on these two levels is one to forty generations, so a cap of thirty would
-/// flake; this is generous enough that only a real regression (the warm arm *not* being a warm
-/// start) fails it, and the assertion is on the total of three seeds rather than on any one of them
-/// for the same reason.
-const CAP: u32 = 60;
+/// **Re-measured under the paired default** (`GaConfig::common_episodes`, on with racing), on the
+/// three seeds this test runs: `l2-first-gap` warm 4, 7 and 1 against random's 5, 4 and 6, and
+/// `l5-tightrope` warm 349, 10 and 10 against random's *none*, 345 and 10. The spread is therefore one
+/// to three hundred and fifty, not the one-to-forty of the per-genome measurement this cap was sized
+/// for: pairing costs the hard level the seeds it used to save (the review's chain table says the same
+/// thing about `l9`), and a cap of sixty censored the one l5 seed that needs the long run, which fails
+/// the claim about a *rate* for a reason that has nothing to do with warming. Four hundred is above
+/// the hardest measured solve and still bounded, so a null result is a censored sum, not a hang. The
+/// assertion stays on the total of three seeds rather than on any one of them, for the same reason it
+/// always was: a first win is a draw, and the claim is about the arm.
+const CAP: u32 = 400;
 
 fn level(slug: &str) -> Level {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
