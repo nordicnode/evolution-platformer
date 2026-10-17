@@ -30,9 +30,9 @@
 //! advances **when the viewer has finished watching, not when a timer fires**.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use egui::{Color32, Context, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Color32, Context, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use evo::GaConfig;
 use sim::{Level, Tile};
 
@@ -106,7 +106,9 @@ impl Mode {
             Mode::Replay => 3,
         }
     }
-}    /// How the window is set up to open, and how a run on it is set up, from the command line.
+}
+
+/// How the window is set up to open, and how a run on it is set up, from the command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabOptions {
     /// Open in the playtest rather than the editor.
@@ -860,12 +862,13 @@ impl EvoApp {
             // happening on a level with nobody on it.
             //
             // It is worth a generation of slack because generations are not all the same
-            // size. A scored generation is 27-50 ms at pop 200 on a shipped level, but the
-            // packet that contains a stall's practice detour is forty generations of the
-            // search in one piece — **1.73 s** measured on `scratch-tower`, forty times the
-            // median — and it was that stall, and only that stall, that the viewer saw as a
-            // one-to-two second freeze (a generation's animation is 0.6-5 s at 8x, so the
-            // work is almost always cheaper than the animation covering it).
+            // size. A scored generation is 27-50 ms at pop 200 on a shipped level, and the
+            // one packet that used to be forty times that — the stall's practice detour, forty
+            // generations of practice in one piece, **1.73 s** measured on `scratch-tower` — no
+            // longer arrives here at all: `lab::Detour` runs it on its own thread and the
+            // practised population is adopted the generation after it lands. What is left for
+            // the lookahead to hide is ordinary variation, which is what a generation of slack
+            // is for.
             //
             // The bound the old rule existed for is unchanged: the worker computes at most
             // one generation beyond the one on screen, because `Lab::request_next` refuses a
@@ -2009,16 +2012,28 @@ impl EvoApp {
         }
     }
 
-    /// The atlas name a palette entry draws its icon from.
+    /// The picture a palette entry draws, as `(atlas name, mirrored)`.
     ///
-    /// The scenery brush is the one entry whose icon is not fixed: it places whichever
-    /// sprite the picker under the palette has selected, so its button — and the drag
-    /// ghost — have to track that selection, or the palette shows a bush while the brush
-    /// plants a tree.
-    fn brush_icon(&self, brush: Brush) -> &'static str {
+    /// Two brushes do not have one fixed picture, and both are the same kind of mistake if
+    /// they are drawn from [`Brush::sprite`] anyway:
+    ///
+    /// * **Scenery** places whichever prop the picker under the palette has selected, so its
+    ///   button and its ghost have to track that selection, or the palette shows a bush while
+    ///   the brush plants a tree.
+    /// * **Turret** has a *direction*, and the direction is the placement: a turret that fires
+    ///   left is drawn firing left everywhere else in the window, so a palette that showed the
+    ///   right-facing picture for both would be promising a turret the level will not get.
+    ///
+    /// The turret is answered by [`crate::view::turret_picture`] — the *same* function the canvas
+    /// uses — rather than by a name looked up here, because the two ways of getting this picture
+    /// (a second atlas cell here, a mirror there) are exactly how the window can end up showing
+    /// two different turrets for one setting. The `flip` half of the answer is why this returns a
+    /// pair: the palette and the ghost paint through [`crate::view::facing`] with it.
+    fn brush_icon(&self, brush: Brush) -> (&'static str, bool) {
         match brush {
-            Brush::Scenery => self.editor.scene_sprite,
-            _ => brush.sprite(),
+            Brush::Scenery => (self.editor.scene_sprite, false),
+            Brush::Turret => crate::view::turret_picture(self.editor.turret_dir),
+            _ => (brush.sprite(), false),
         }
     }
 
@@ -2070,8 +2085,7 @@ impl EvoApp {
             Some(brush) => format!("PARTS · {}", brush.label().to_uppercase()),
             None => "PARTS".to_string(),
         };
-        ui.label(egui::RichText::new(heading).small().color(theme::TEXT_DIM));
-        ui.add_space(6.0);
+        panel::section(ui, &heading);
         // Forty-eight rather than forty: a cell drawn as a plate spends [`theme::PRESS_SINK`] and
         // its lip on the picture, and a sixteen-pixel tile at twenty-six points is the smallest an eye
         // can still tell a plank from a brick at.
@@ -2091,7 +2105,8 @@ impl EvoApp {
                 // size. That is the pair the level draws for a brittle tile, and it is what makes
                 // a cracked cell read as "the floor above this one, about to go" rather than as a
                 // scratch on the palette. Every other brush has no base layer and is unchanged.
-                for name in [Self::brush_base(brush), Some(self.brush_icon(brush))]
+                let (icon, flip) = self.brush_icon(brush);
+                for (name, flip) in [Self::brush_base(brush).map(|n| (n, false)), Some((icon, flip))]
                     .into_iter()
                     .flatten()
                 {
@@ -2099,7 +2114,7 @@ impl EvoApp {
                         painter.image(
                             self.atlas.texture_id(),
                             plate.content.shrink(2.0),
-                            uv,
+                            crate::view::facing(uv, flip),
                             Color32::WHITE,
                         );
                     }
@@ -2155,6 +2170,67 @@ impl EvoApp {
             let shape = Shape::ALL[cell];
             self.editor.shape = shape;
             self.editor.message = format!("{} stroke", shape.label());
+        }
+
+        // The three brushes that carry a number, and the numbers, shown only while one of them
+        // is in hand: a flyer's beat and a platform's travel are the same knob (how far it
+        // goes), a platform also has a width, and a turret has a direction instead. The row is
+        // conditional for the scenery picker's own reason — a control that belongs to one brush
+        // is noise in front of the other twenty.
+        if matches!(
+            self.editor.brush,
+            Some(Brush::Flyer | Brush::Turret | Brush::Platform)
+        ) {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if self.editor.brush == Some(Brush::Turret) {
+                    let right = self.editor.turret_dir > 0;
+                    let options: [(Option<&str>, &str); 2] = [(None, "fire left"), (None, "fire right")];
+                    let (picked, row) = ui::segmented_sized(
+                        ui,
+                        None,
+                        &options,
+                        usize::from(right),
+                        &[true; 2],
+                        Vec2::new(74.0, 28.0),
+                    );
+                    row.on_hover_text("Which way the turret's row is dangerous.");
+                    if let Some(cell) = picked {
+                        self.editor.turret_dir = if cell == 0 { -1 } else { 1 };
+                    }
+                } else if self.editor.brush == Some(Brush::Flyer) {
+                    ui.label(egui::RichText::new("beat").small().color(theme::TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut self.editor.enemy_span).range(1..=24))
+                        .on_hover_text(
+                            "How many tiles the flyer beats across, centred on the click. \
+                             The default is eight, and the whole point of a flyer is the span: \
+                             two tiles is a nuisance in one doorway, eight is a thing to time.",
+                        );
+                } else {
+                    ui.label(egui::RichText::new("travel").small().color(theme::TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut self.editor.platform_span).range(1..=12))
+                        .on_hover_text("How far the platform travels, from where it is placed.");
+                }
+                if self.editor.brush == Some(Brush::Platform) {
+                    ui.label(egui::RichText::new("width").small().color(theme::TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut self.editor.platform_tiles).range(1..=8))
+                        .on_hover_text("How many tiles wide the shelf is.");
+                    let vertical = self.editor.platform_vertical;
+                    let options: [(Option<&str>, &str); 2] = [(None, "slide"), (None, "lift")];
+                    let (picked, row) = ui::segmented_sized(
+                        ui,
+                        None,
+                        &options,
+                        usize::from(vertical),
+                        &[true; 2],
+                        Vec2::new(58.0, 28.0),
+                    );
+                    row.on_hover_text("Slide right, or rise like a lift.");
+                    if let Some(cell) = picked {
+                        self.editor.platform_vertical = cell == 1;
+                    }
+                }
+            });
         }
 
         // The scenery picker, shown only while the scenery brush is the active one: two
@@ -2706,14 +2782,30 @@ impl EvoApp {
             ),
             Mode::Play => {
                 if let Some(session) = &self.session {
-                    view::draw_sim(sheet, session.sim(), opts, session.clock, session.anim());
+                    // The body is drawn *between* the simulator's ticks (`Session::body_at`):
+                    // the sim runs at 60 Hz whatever the display does, and drawing the last
+                    // tick's position is what made the playtest stutter on a fast screen.
+                    view::draw_sim_at(
+                        sheet,
+                        session.sim(),
+                        opts,
+                        session.clock,
+                        session.anim(),
+                        Some(session.body_at()),
+                    );
                     // The champion beside the player, translucent so it never hides them:
                     // the best band's own tint, because that is what a ghost looks like
                     // everywhere else in this window.
                     if let (Some(gsim), Some(ganim)) =
                         (session.ghost_sim(), session.ghost_anim())
                     {
-                        view::draw_agent_body(sheet, gsim, view::cohort_tint(0), ganim);
+                        view::draw_agent_body_at(
+                            sheet,
+                            gsim,
+                            view::cohort_tint(0),
+                            ganim,
+                            session.ghost_at(),
+                        );
                     }
                 }
             }
@@ -2728,9 +2820,132 @@ impl EvoApp {
         if self.mode != Mode::Edit {
             view::draw_atmosphere(&painter, rect);
         }
+        // The scoreboard goes *over* the atmosphere, not under it: it is a readout on the
+        // machine the game is running on, and a vignette over a number is a number somebody
+        // has to lean in to read.
+        if self.mode == Mode::Play {
+            self.play_hud(&painter, rect);
+        }
 
         if self.mode == Mode::Edit {
             self.canvas_edit_gestures(ui, &response, rect, &painter);
+        }
+    }
+
+    /// The playtest's scoreboard: the three numbers a player reads while playing.
+    ///
+    /// A dark, gold-framed strip in the corner of the picture, the way every game that has ever
+    /// had a timer printed it: a label in gold caps over a value in cream, one cell per number,
+    /// cells divided by the same gold hairline the panels use. It is deliberately not the status
+    /// bar — the strip along the bottom is the *window's* readout (the mode, the keys, this
+    /// episode's speed run of statistics), and this is the *player's*: the clock they are racing,
+    /// their own best attempt at this level, and how much of the distance to the flag is behind
+    /// them. Reading it while playing means it has to be where the eye already is.
+    fn play_hud(&self, painter: &egui::Painter, rect: Rect) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let stats = session.sim().stats();
+        // The same quantity the fitness scores and the status line prints: the share of the
+        // distance to the flag that has been closed, so a level whose goal is above the start
+        // reads honestly rather than as a number about `x`.
+        let progress = if stats.goal_distance_pixels > 0.0 {
+            (100.0 * stats.progress_pixels / stats.goal_distance_pixels).clamp(0.0, 100.0)
+        } else {
+            100.0
+        };
+        let cells: [(&str, String); 3] = [
+            ("TIME", sim::format_time(session.frames())),
+            (
+                "YOUR BEST",
+                session
+                    .best()
+                    .map(sim::format_time)
+                    .unwrap_or_else(|| "--".to_string()),
+            ),
+            ("TO THE FLAG", format!("{progress:.0}%")),
+        ];
+        let label_font = FontId::monospace(9.0);
+        let value_font = FontId::monospace(17.0);
+        // Measured before it is drawn, like every plate in the window: a cell sized by a guess
+        // clips the one value that happened to be wider than the guess.
+        let widths: Vec<f32> = cells
+            .iter()
+            .map(|(label, value)| {
+                let l = painter.layout_no_wrap(
+                    label.to_string(),
+                    label_font.clone(),
+                    theme::RIBBON,
+                );
+                let v = painter.layout_no_wrap(
+                    value.clone(),
+                    value_font.clone(),
+                    theme::OUTLINE,
+                );
+                l.size().x.max(v.size().x) + 26.0
+            })
+            .collect();
+        let height = 46.0;
+        let total: f32 = widths.iter().sum();
+        let panel = Rect::from_min_size(
+            Pos2::new(rect.left() + 16.0, rect.top() + 16.0),
+            Vec2::new(total, height),
+        );
+        // A warm-white card with the same brown outline and rounded corner as the window's own
+        // panels, and a gold hairline inside it: the scoreboard is a piece of the game's menu
+        // pinned over the picture, not a bar of the operating system.
+        painter.rect_filled(
+            panel.translate(Vec2::new(0.0, 4.0)),
+            CornerRadius::same(theme::RADIUS_LG),
+            Color32::from_rgba_unmultiplied(74, 52, 32, 90),
+        );
+        painter.rect_filled(
+            panel,
+            CornerRadius::same(theme::RADIUS_LG),
+            theme::CARD,
+        );
+        painter.rect_stroke(
+            panel,
+            CornerRadius::same(theme::RADIUS_LG),
+            Stroke::new(3.0_f32, theme::OUTLINE),
+            StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            panel.shrink(5.0),
+            CornerRadius::same(theme::RADIUS),
+            Stroke::new(1.0_f32, theme::GOLD_EDGE.gamma_multiply(0.7)),
+            StrokeKind::Inside,
+        );
+        let mut x = panel.left();
+        for (index, ((label, value), width)) in cells.iter().zip(widths.iter()).enumerate() {
+            let cell = Rect::from_min_size(Pos2::new(x, panel.top()), Vec2::new(*width, height));
+            if index > 0 {
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(cell.left(), cell.top() + 8.0),
+                        Vec2::new(1.0, height - 16.0),
+                    ),
+                    CornerRadius::ZERO,
+                    theme::EDGE,
+                );
+            }
+            let l = painter.layout_no_wrap(
+                label.to_string(),
+                label_font.clone(),
+                theme::RIBBON,
+            );
+            painter.galley(Pos2::new(cell.left() + 13.0, cell.top() + 7.0), l, theme::RIBBON);
+            let v = painter.layout_no_wrap(
+                value.clone(),
+                value_font.clone(),
+                theme::OUTLINE,
+            );
+            painter.galley(
+                Pos2::new(cell.left() + 13.0, cell.bottom() - 7.0 - v.size().y),
+                v,
+                theme::OUTLINE,
+            );
+            x += width;
         }
     }
 
@@ -2779,7 +2994,20 @@ impl EvoApp {
         let Some(lab) = &self.lab else {
             return;
         };
-        view::draw_level(sheet, lab.level(), self.opts(), None, clock);
+        // With no generation on screen there is no simulation to draw the level's enemies, so
+        // the document's own placement stands in for them — the same static pass the editor
+        // draws. Without this the frame between entering the view and the first packet (and
+        // any paused or restarted run) is a level with nothing alive in it, which reads as the
+        // editor having lost the chaser that is plainly there in Edit and Play.
+        let opts = if self.lanes.is_none() {
+            view::RenderOpts {
+                entities: true,
+                ..self.opts()
+            }
+        } else {
+            self.opts()
+        };
+        view::draw_level(sheet, lab.level(), opts, None, clock);
 
         if let Some(generation) = self.view.scrub {
             // A recorded route replaces the live lanes rather than joining them: the two
@@ -2956,10 +3184,39 @@ impl EvoApp {
                 }
             }
             target.union(above)
+        } else if brush == Brush::Platform {
+            // A moving platform is several tiles wide, and a one-cell ghost would promise a
+            // shelf the click will not place. The width is the brush's own setting, so the
+            // ghost draws exactly the shelf about to land — ends and middle included.
+            let tiles = self.editor.platform_tiles.max(1);
+            let mut span = target;
+            for i in 0..tiles {
+                let cell = self.camera.tile_rect(tx + i, ty, rect);
+                span = span.union(cell);
+                let piece = if i == 0 && tiles == 1 {
+                    "mover_m"
+                } else if i == 0 {
+                    "mover_l"
+                } else if i == tiles - 1 {
+                    "mover_r"
+                } else {
+                    "mover_m"
+                };
+                if let Ok(uv) = self.atlas.uv(piece) {
+                    painter.image(
+                        self.atlas.texture_id(),
+                        cell,
+                        uv,
+                        Color32::from_white_alpha(170),
+                    );
+                }
+            }
+            span
         } else {
             // The same two layers the palette cell draws, for the same reason: the ghost of a
             // cracked brush has to promise a *cracked tile* on the level, not a bare crack.
-            for name in [Self::brush_base(brush), Some(self.brush_icon(brush))]
+            let (icon, flip) = self.brush_icon(brush);
+            for (name, flip) in [Self::brush_base(brush).map(|n| (n, false)), Some((icon, flip))]
                 .into_iter()
                 .flatten()
             {
@@ -2967,7 +3224,7 @@ impl EvoApp {
                     painter.image(
                         self.atlas.texture_id(),
                         target,
-                        uv,
+                        crate::view::facing(uv, flip),
                         Color32::from_white_alpha(170),
                     );
                 }
@@ -2994,15 +3251,18 @@ impl EvoApp {
     }
 
     /// Move the camera to keep the player in view while playing.
-    fn follow_player(&mut self, rect: Rect) {
+    fn follow_player(&mut self) {
         let Some(session) = &self.session else {
             return;
         };
-        let p = session.sim().player();
-        self.camera.centre = Vec2::new(p.x + p.w * 0.5, p.y + p.h * 0.5);
+        let (x, y) = session.camera_centre();
+        self.camera.centre = Vec2::new(x, y);
         self.camera.clamp_to(&self.editor.level, 6.0);
         self.camera.zoom = self.camera.zoom.clamp(18.0, 48.0);
-        let _ = rect;
+        // The camera is placed, so there is nothing left to fit. Without this the canvas would fit
+        // the whole level for the first frame of a playtest and the follow would snap in on the
+        // second — a flash of the map where the game should be.
+        self.fit_pending = false;
     }
 
     /// The status line in the evolution view: where the run is, and what the viewer just
@@ -3039,12 +3299,16 @@ impl EvoApp {
 
     /// The strip along the bottom of the window.
     ///
-    /// Cut into the window rather than lying on it ([`theme::sunk_frame`]): it is a readout, and
+    /// Cut into the window rather than lying on it ([`theme::hud_frame`]): it is a readout, and
     /// the four views each put their own sentence in it. Its height is what the frame's own padding
     /// makes it and nothing more — the strip is the one piece of the window that is allowed to be
     /// quiet, because everything in it is either a light or a number.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let frame = theme::sunk_frame();
+        // The HUD: the same warm cream as the dock, outlined in the same brown, drawn edge to
+        // edge (the panel's own frame is cleared at the call site) so the strip is the bottom of
+        // the window rather than a well cut into it.
+        ui.style_mut().visuals.override_text_color = Some(theme::TEXT);
+        let frame = theme::hud_frame();
         frame.show(ui, |ui| {
             self.status_line(ui);
         });
@@ -3069,66 +3333,80 @@ impl EvoApp {
     /// pointer, and anything wrong with the atlas.
     fn status_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if matches!(self.mode, Mode::Evolve | Mode::Replay) {
-                // Each view speaks for itself: the run's line is about generations, and the
-                // replay's is about the one episode it is showing. Both carry the seed or
-                // the record, because a number nobody can reproduce is a number nobody can
-                // check.
-                let line = if self.mode == Mode::Replay {
-                    self.replay.as_ref().map(|replay| replay.summary())
-                } else {
-                    Some(self.evolve_status())
-                };
-                // Truncated rather than allowed to run off the end of the window: these two
-                // sentences are the longest in the window (a replay's line names the episode, its
-                // score and the field behind it; a save confirmation names a path), and a strip
-                // whose left-hand label is as wide as it likes pushes everything after it —
-                // including the tile under the pointer — off the screen entirely. An ellipsis says
-                // "there is more of this sentence" instead of hiding the rest of the bar.
-                ui.add(
-                    egui::Label::new(line.unwrap_or_else(|| "no replay on screen".to_string()))
-                        .truncate(),
-                );
-                if let Some((note, _)) = &self.note {
+            // The left-hand sentence is capped before it is drawn: a long line — a replay's
+            // summary, a save confirmation with a path in it — must end in an ellipsis rather
+            // than run under the pointer readout at the other end of the strip. Measured from
+            // the strip's own width so a narrow window truncates sooner rather than later.
+            let room = (ui.available_width() - 150.0).max(120.0);
+            ui.scope(|ui| {
+                ui.set_max_width(room);
+                if matches!(self.mode, Mode::Evolve | Mode::Replay) {
+                    // Each view speaks for itself: the run's line is about generations, and the
+                    // replay's is about the one episode it is showing. Both carry the seed or
+                    // the record, because a number nobody can reproduce is a number nobody can
+                    // check.
+                    let line = if self.mode == Mode::Replay {
+                        self.replay.as_ref().map(|replay| replay.summary())
+                    } else {
+                        Some(self.evolve_status())
+                    };
+                    // Truncated rather than allowed to run off the end of the window: these two
+                    // sentences are the longest in the window (a replay's line names the episode,
+                    // its score and the field behind it; a save confirmation names a path), and a
+                    // strip whose left-hand label is as wide as it likes pushes everything after
+                    // it — including the tile under the pointer — off the screen entirely. An
+                    // ellipsis says "there is more of this sentence" instead of hiding the rest.
+                    ui.add(
+                        egui::Label::new(line.unwrap_or_else(|| "no replay on screen".to_string()))
+                            .truncate(),
+                    );
+                    if let Some((note, _)) = &self.note {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(note.clone()).color(theme::ACCENT_INK),
+                            )
+                            .truncate(),
+                        );
+                    }
+                } else if let Some(session) = &self.session {
+                    // The playthrough's line in the runner's own colour, which is what the removed
+                    // `play` word was saying: the bar still says which of the four things this is,
+                    // it just says it in ink rather than in a label.
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(note.clone()).color(theme::ACCENT_INK),
+                            egui::RichText::new(session.summary()).color(theme::RUN_INK),
                         )
                         .truncate(),
                     );
+                } else {
+                    // The editor's line: the verdict, then only what just happened. Its message is
+                    // empty while nothing is happening on purpose — a bar that talks to itself is
+                    // chatter — which leaves the lamp and the word, and those never stop mattering.
+                    self.verdict_lamp(ui);
+                    ui.label(
+                        egui::RichText::new(self.editor.message.clone()).color(theme::TEXT_DIM),
+                    );
                 }
-            } else if let Some(session) = &self.session {
-                // The playthrough's line in the runner's own colour, which is what the removed
-                // `play` word was saying: the bar still says which of the four things this is,
-                // it just says it in ink rather than in a label.
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(session.summary()).color(theme::RUN_INK),
-                    )
-                    .truncate(),
-                );
-            } else {
-                // The editor's line: the verdict, then only what just happened. Its message is
-                // empty while nothing is happening on purpose — a bar that talks to itself is
-                // chatter — which leaves the lamp and the word, and those never stop mattering.
-                self.verdict_lamp(ui);
-                ui.label(egui::RichText::new(self.editor.message.clone()).color(theme::TEXT_DIM));
-            }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // **The one hint that has to be permanent.** A window with two dozen keys and no
                 // menu to hold them has to say where the list is, or nobody goes looking for it:
                 // the card existed as a keybinding nobody was told about (AUDIT.md F1).
-                ui.label(egui::RichText::new("? keys").small().color(theme::TEXT_FAINT))
+                // Both of these sit on the *sunken* status bar, which is the one chrome surface
+                // the tertiary ink is not cleared for: readouts on the well take `TEXT_DIM`.
+                ui.label(egui::RichText::new("? keys").small().color(theme::TEXT_DIM))
                     .on_hover_text("the keys for this view — F1 does the same");
                 if let Some((tx, ty)) = self.hover_tile {
                     ui.label(
                         egui::RichText::new(format!("tile ({tx}, {ty})"))
                             .small()
-                            .color(theme::TEXT_FAINT),
+                            .color(theme::TEXT_DIM),
                     );
                 }
                 if let Some(warning) = &self.warning {
-                    ui.colored_label(theme::WARN, warning);
+                    // The warning's *ink*, not its fill: `WARN` is 1.5:1 on this surface and is a
+                    // lamp's colour, not a label's.
+                    ui.colored_label(theme::WARN_INK, warning);
                 }
             });
         });
@@ -3189,8 +3467,27 @@ impl EvoApp {
     }
 }
 
+/// A frame longer than this is one a viewer can feel, and the threshold [`FrameClock`] reports at.
+///
+/// Two frames at 60 Hz, which is the smallest hitch that reads as a stutter rather than as a
+/// frame: the instrument is for attributing a *freeze*, and a log of every 17 ms frame would be
+/// noise nobody reads.
+const SLOW_FRAME: Duration = Duration::from_millis(33);
+
+/// The frame time log, on when `EVO_FRAME_LOG` is set.
+///
+/// "The window freezes" is a report no profiler can take, because the window is not doing
+/// anything: it is waiting. This prints every frame that took longer than [`SLOW_FRAME`], with
+/// the mode and the work the frame did, so a stall can be attributed instead of guessed at —
+/// which is how the practice detour's 1.7 s packet was found to be the one freeze worth fixing.
+/// Off by default and one env-var read when set, so the shipped window pays nothing.
+fn slow_frame_log() -> bool {
+    std::env::var_os("EVO_FRAME_LOG").is_some()
+}
+
 impl eframe::App for EvoApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        let frame_started = Instant::now();
         // The title bar follows the document from the first frame, splash or not: a window
         // that named itself once and never again is how two open levels came to look like one
         // window twice (AUDIT.md B5).
@@ -3313,7 +3610,9 @@ impl eframe::App for EvoApp {
                     panel::chart_panel(ui, history, CHART_PANEL_HEIGHT - 22.0, self.view.scrub);
                 });
         }
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+        egui::TopBottomPanel::bottom("status")
+            .frame(egui::Frame::new())
+            .show(ctx, |ui| self.status_bar(ui));
         // Over everything, like a window should be: the shelf is a separate thing the viewer
         // opened, not a panel of the view they were in.
         self.shelf_window(ctx);
@@ -3321,21 +3620,24 @@ impl eframe::App for EvoApp {
         // card answers a question about the window, not about a level.
         help::window(ctx, self.mode, &mut self.help_open);
 
-        let mut canvas_rect = Rect::NOTHING;
+        // The playtest's camera is placed **before** the canvas is drawn, and on the same
+        // interpolated clock the body is drawn on. Setting it afterwards is a camera one frame
+        // behind the body it follows; setting it from the sim's last tick while the body is drawn
+        // between two ticks is worse — the body's offset from the centre saws from zero to a whole
+        // tick's travel every tick, which is the playtest's "jerky" (see
+        // [`play::Session::camera_centre`]). Both are free to get right and both are invisible
+        // until a screen draws faster than the simulation.
+        if self.mode == Mode::Play {
+            self.follow_player();
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::default())
-            .show(ctx, |ui| {
-                canvas_rect = ui.available_rect_before_wrap();
-                self.canvas(ui);
-            });
+            .show(ctx, |ui| self.canvas(ui));
 
         // The level's numbers float over the canvas rather than holding a column of their own, so
         // they are drawn after it and end up in front of it — which is where a window belongs.
         self.details_window(ctx);
-
-        if self.mode == Mode::Play {
-            self.follow_player(canvas_rect);
-        }
 
         // A scripted frame has to contain a real run, and `--replay` needs something
         // scored to replay: both paths prime the run with actual generations first, and
@@ -3388,6 +3690,18 @@ impl eframe::App for EvoApp {
         if let Err(err) = self.handle_screenshot(ctx) {
             eprintln!("error: {err}");
             std::process::exit(1);
+        }
+        if slow_frame_log() {
+            let took = frame_started.elapsed();
+            if took > SLOW_FRAME {
+                eprintln!(
+                    "frame {:?} in {:?} (generation {:?}, {} lanes)",
+                    took,
+                    self.mode,
+                    self.packet.as_ref().map(|p| p.generation),
+                    self.lanes.as_ref().map(|l| l.len()).unwrap_or(0)
+                );
+            }
         }
     }
 }

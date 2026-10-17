@@ -138,7 +138,12 @@ fn the_vector_has_the_documented_named_layout() {
     // is what two cells of the patch *say* (a brittle tile and a pad, see [`sensors::ENC_CRUMBLE`]).
     // A champion replayed against a build with pads in it is being read a world it was never
     // trained on, which is a version bump whether the vector got wider or not.
-    assert_eq!(sensors::VERSION, 10);
+    // v11 is the same kind of change as v9: no slot moved and `N_INPUTS` is unmoved, but the
+    // nearest-threat triple now answers about flyers and shots, so a champion trained before it
+    // is being read a world it never saw.
+    // v12 is v9's kind again, for three tiles at once: water, lava and a vine are their own values
+    // in the patch, and a champion trained before it reads a pool as air.
+    assert_eq!(sensors::VERSION, 12);
 
     let names = sensors::input_names();
     assert_eq!(names.len(), sensors::N_INPUTS);

@@ -995,9 +995,132 @@ settle it — that a population learns to cross a bridge at speed, and that the 
 are enough for it to *find* a pad — are a training run each. Until then the honest statement is that
 both tiles are correct as physics, visible to an agent, and unproven as curriculum.
 
+The enemies-and-objects pass moved the workspace to **0.12.1**, sensors to **v11**, the level format
+to **v2**, and left fitness at **v8**. It is the largest single widening of the *world* the pack has
+had: three enemies (a chaser, a flyer, a turret with projectiles) and two objects (a one-way platform
+tile and a moving platform entity) all in one go, which is why every one of them was designed to fit
+an existing rule rather than to add a mode. The chaser is the sim's existing `Walker` with a
+`WalkerMode::Chase` and no new contact rule; a flyer reuses the stomp rule one row up; a turret's shot
+is the pack's first hazard that moves and cannot be stomped, and the one-way shelf is the first tile
+whose answer to `is_solid` and `is_opaque` differs. That last distinction is the whole design: the
+player's x-resolution and ceiling test ask `is_opaque`, the landing probes, the walkers' floor probe,
+the route graph and the sensors' patch ask `is_solid`, and one tile is the difference between the two.
+
+Sensors moved to **v11** and the vector did **not** get wider: `N_INPUTS` stays 100 and no index
+changed meaning. What changed is what the nearest-threat triple (81, 82, 95) *searches* over — flyers
+and live shots as well as walkers, nearest wins, ties keeping the earlier kind so a level with none of
+the new enemies observes exactly what it did before — and that a moving platform is drawn into the
+patch as one-way ground, so an agent can plan a landing on a shelf it can see coming. v11 was the
+number a previous pass had provisionally taken for a held-arm slot that was measured and reverted
+(finding 62); the slot is not in the tree, so the version was free, and this pass is the one that uses
+it.
+
+The level format went to **v2** because a v1 build meeting a `=` row would call the level corrupt and
+one meeting a `turret` would refuse the entity, so the file has to say which alphabet it is written
+in. The *reader* accepts **1..=2** rather than only 2, and that is deliberate: v2 only added glyphs,
+entities and an optional set of entity fields whose absence means "none", so every v1 file means
+exactly what it meant and the shipped pack did not need migrating. The writer always emits 2. A future
+v3 has no such promise to make, and `level_format_version 3 must be refused` is the test that keeps
+the distinction honest.
+
+The sim moved for the same reason the trap pass moved it: new state. `Sim` carries flyers, turrets,
+shots and riders, and `state_hash` folds all of them in — including a *count* of each kind, even when
+it is zero, so a level that has gained a flyer cannot hash like one that never had one. The long-runway
+golden hash was re-recorded for it while the episode stayed bit-identical, which is the same honest
+shape as the last two hash bumps.
+
+**The pass needed one more version before anything was trained on it: 0.12.0 → 0.12.1.** The first
+moving platform was janky in four separate ways, all of them found by playing it rather than by a test,
+which is the sentence worth recording:
+
+* **Carry order.** The rider was carried *after* its own tick, so gravity pulled it down from the
+  shelf's old position and the landing snap pushed it back up — once per frame, forever. It is carried
+  first now: the body begins its tick on the deck as it is.
+* **The landing test was a position, not a crossing.** "The feet are above the deck" is true three
+  tiles up, so a falling body was teleported onto a shelf it never crossed. A landing now needs the
+  feet above the deck last frame *and* at or below it now, which is the same surface test the tiles use.
+* **The shelf passed through terrain.** Nothing clamped the travel, so a platform authored through a
+  wall slid through it. `Mover.limit` is the clear part of the path, computed once per episode from
+  the same `is_opaque` test the body's collision uses, so a shelf turns at the first wall or ceiling
+  instead — and its rider stops with it.
+* **The view snapped it to whole tiles.** `draw_mover` drew in the *cell* the shelf was over, so a
+  platform moving two hundredths of a tile per tick held still for fifty frames and then jumped a
+  cell. It is drawn at its own continuous position now, with the sprite's top edge on the deck.
+
+Two smaller things came with it: the flyer's beat is centred on the cell (measuring from the box's
+left edge put it half a tile off the click and quietly shortened every span) and defaults to eight
+tiles rather than four, and the turret's palette icon now follows its firing direction — the canvas
+already mirrored a left-facing turret, so the button was the one place in the window promising the
+other one.
+
+**That was not the end of it: 0.12.1 → 0.13.0 is the same four things again, and the lesson is that
+"fixed the bug" and "made the mechanic feel right" are two different passes.** Playing the 0.12.1
+build produced the same three complaints word for word — a janky platform, a flyer with a tiny
+flight path, a turret icon on the wrong way, plus a fourth (the projectiles) — and every one of them
+turned out to be a *second* defect that the first fix had hidden:
+
+* **The shelf was drawn continuously but not rigidly.** The 0.12.1 fix removed the tile snap and then
+  cut each column where the *level's* grid fell, so at a fractional x the first piece was a fraction
+  of a cell and the last was the sliver left over: the shelf's cut ends squeezed and stretched while
+  it slid, and each tile boundary it crossed swapped which piece was which. It is `w` whole cells at
+  `rect.x + i` now — one layout function, `mover_pieces`, with a test that every piece is exactly one
+  cell wide and exactly one cell from the next at a fractional x. Continuous position was only half
+  of "rigid".
+* **The shelf's speed was chosen by feel and could not be drawn smoothly.** `mover_speed` was 0.02
+  tiles a tick — half a screen pixel per tick at the usual zoom, which means the shelf holds still
+  for two frames and then jumps one pixel, and the rider (snapped independently) slips a pixel
+  against the deck while it does. The constant is **1/16 of a tile**, one 16-pixel art pixel a tick:
+  the renderer's scale is a whole number of points per art tile, so every integer zoom moves the
+  shelf exactly `scale` pixels a tick and the shelf and its rider step *together*. A derived speed
+  rather than a tuned one, pinned by `a_platform_moves_one_art_pixel_a_tick`.
+* **The landing test still measured the feet after the shelf had moved them.** `prev_bottom` was
+  sampled after the carry, so on a rising lift the shelf's own motion was already counted as the
+  body's — the crossing test passed for the wrong reason, and the ride was re-derived from scratch
+  every frame instead of being kept. The feet are recorded *before* the carry now, and the ride is
+  sticky while the body is still over the deck (`Sim::riding` is the state; a crossing is only how
+  it starts). A lift test pins it: four hundred ticks of rise and fall, the feet never leave the
+  deck.
+* **The flyer's span was still short by the box's width.** 0.12.1 recentred the beat, which fixed the
+  half-tile offset, but the ends still named the box's *edges*: bounds at `centre ± span/2` move a
+  box of width `w` exactly `span - w` tiles. On a four-tile beat that is a fifth of the flight path
+  — measurably "very small". `FlyerSpec::at` now adds the width back to both ends, so `span: 12`
+  moves the flyer twelve tiles (`a_flyer_travels_the_span_it_was_given`), and the default rose from
+  eight to twelve because eight was a band you could stand beside. `FlyerSpec::span()` is the inverse
+  — writing the raw distance between the ends back to a file made the beat grow 0.7 tiles per save.
+* **The turret's icon had two sources.** The palette read a second atlas cell (`turret_l`), the
+  canvas mirrored `turret_r`; two pictures that are identical today and free to drift. There is now
+  one function, `view::turret_picture(dir)`, and the palette and the drop ghost paint through
+  `view::facing` with its `flip` half. The direction switch also had a real interaction bug: every
+  segmented control in the palette shared a widget id (`ui.id().with(("segment", i))`), so the shape
+  switch and the turret's direction switch fought over one hover and one click.
+* **The projectile was slower than a walk and died in mid-air.** `shot_speed` was 0.08 against
+  `run_speed` 0.10 and `sprint_speed` 0.15 while its own doc said "faster than a run, so a shot cannot
+  be outrun" — a promise the physics did not keep, and a bullet a player can stroll away from. It is
+  **0.18** now (above every gear the body has, below the terminal fall so the eye can track it) and
+  `shot_range` is 18 rather than 12, with a **wall** as the stop and the range as the backstop for a
+  row with none — so the demo's turret fires across a ledge and a five-tile pit and dies over the pit
+  instead of vanishing in the middle of the air twelve tiles out. And the *picture* was wrong for it:
+  a 16-pixel cell with a tail drawn into it, squeezed into a 0.3-tile `actor` box and stood on the
+  box's floor, is a two-pixel dot floating above the row it kills in. It is drawn from the art's own
+  geometry now — the hot core anchored on the hitbox, the tail trailing behind it, mirrored by `vx` —
+  with a muzzle flash read off the turret's own cooldown so the *firing* is visible before the bullet
+  arrives.
+
+What is measured for 0.13.0: the whole workspace suite (635 tests, 224 of them the app's); the levels
+still load and L10 still reaches (`platforms 4, reachable 4`); the flyer's travel is 12.0 for
+`span: 12` against 7.99 for the same file under 0.12.1; the mover's 4-tile slide takes 64 ticks; a
+shot crosses a 14-tile corridor and stops at the wall; and the faster bullet is still survivable —
+`l10-the-hunt` at **pop 40, 60 generations, seed 1, `--stop-on-win`** won at **generation 12**, in
+**9.67 s / 580 frames** (`best_x 56.3, jumps 7, checkpoints 3`, champion written). That is one arm on
+one seed and it is slower than the 6.3-6.5 s of the 0.12 build, which is what a turret whose row now
+covers the shelf crossing should cost — but it is a *win*, and it is the check the first pass never
+ran on the numbers it shipped. What remains open: whether the twelve-tile beat and the 18-tile shot
+are the right *difficulty* rather than merely survivable, and whether a 0.12 champion (none exists)
+would have transferred.
+
 # Agent interface
 
-**Sensors (v10, 100 inputs).** A 9×9 tile patch around the body (solid `1.0`,
+**Sensors (v11, 100 inputs).** A 9×9 tile patch around the body (solid `1.0`,
 spike `-0.5`, enemy `-1.0`, empty `0.0`, cracked ground `-0.25`, spring pad `0.5`),
 then nearest-enemy `dx`/`dy`, `gap_right`,
 `grounded`, normalised `vx`/`vy`, `can_jump`, the goal vector, a bias input,
@@ -3766,6 +3889,138 @@ deliberate, documented decision — not drift.
     world lottery, and it now sweeps the first eight generations, asserting the invariants on each and
     the premise — that the phase reaches *somebody's* score — on the population it finds.
 
+# Enemies and objects: five mechanics, and what makes each one a decision
+
+The pass added a chaser, a flyer, a turret with projectiles, a one-way platform tile and a moving
+platform entity. The design rule for all five was the same: **fit an existing rule rather than add a
+mode**, because every new mode is a new thing the population's observation has to distinguish, and
+the observation is the expensive surface.
+
+| thing | what it adds | rule it reuses |
+|---|---|---|
+| **one-way platform** (`=`, `Tile::OneWay`) | a route that goes up through a floor | ground from above, air from below: the first tile whose `is_solid` and `is_opaque` answers differ |
+| **chaser** (`chaser` entity) | a threat that closes distance | `Walker` with `WalkerMode::Chase`: same body, same stomp, same contact |
+| **flyer** (`flyer` entity, `span` in tiles) | a threat that holds a height | gravity-free patrol between authored ends, plus the walker's stomp rule one row up |
+| **turret** (`turret` entity, `dir`) | a row that is dangerous on a clock | a stationary enemy that fires `Shot`s along its own row, on `turret_period` ticks, bounded by walls and `shot_range` |
+| **moving platform** (`platform` entity, `tiles`/`span`/`axis`) | a route that is not terrain | the one-way rule stated as a *box* rather than a tile, with the rider carried, a **crossing** landing test and a travel clamped to the clear part of its path |
+
+The three numbers that were derived rather than tuned:
+
+* **The chaser stops at a ledge instead of falling off it.** It is the difference between an enemy and
+a level's own auto-solver: a chaser that walks into the first pit kills itself the moment a body
+crosses a gap, which makes every level with a chaser in it a level that plays itself. Stopping also
+makes baiting one to an edge a legitimate answer, which is the kind of thing a difficulty curve wants
+to *teach* rather than forbid. A patrol still turns at a ledge, so nothing about walker levels changed.
+* **A mover's position is a function of the frame count, not accumulated state.** `Mover::rect_at` is
+a triangle wave over `home`, `span` and `mover_speed`, so two runs of one seed agree without hashing a
+phase, a platform cannot drift from float accumulation, and any frame can be asked where the shelf was
+without replaying to it. The only state is the rider (`Sim::riding`).
+* **The shell doesn't have to walk.** `is_solid` is the surface question and `is_opaque` the wall and
+ceiling question, and the one-way tile is the only thing in the pack that answers them differently.
+That is exactly one match arm apart in each of the four places that ask — the player's x resolution,
+the ceiling test, the walkers' wall probe, the sensors' patch — which is why the tile cost a fraction
+of what a fifth mode would have.
+
+**The oracle does not model the mover, and that is a decision.** A route is a statement about the
+terrain; a mover is not terrain, because the sweep would have to know which frame it will be at, which
+is a fact about the episode rather than about the level. So a level with a mover is swept as if the
+mover were not there. That makes the rule for authors a single sentence — *a level that needs a mover
+reads as unbeatable, so a mover is a shortcut or a decoration, never the only route* — and it is why
+the demo level's slider crosses a five-tile pit that a sprint jump also clears. The alternative,
+refusing to answer at all, would make every level with a lift unverifiable.
+
+What is verified, all of it by `cargo test --workspace`: ten new integration tests in
+`crates/sim/tests/entities.rs` (the shelf stops a fall and passes a rising body; the chaser closes
+distance and stops at the edge; the flyer turns at both ends of its span; the turret fires the way it
+faces and a shot ends the episode; a mover carries its rider; every new entity round-trips through the
+writer with its fields; the sensors see a flyer and read the shelf as its own value; the oracle stands
+on a shelf), the editor's own tests (each new brush places, is pickable, is erasable, and refuses
+what the loader would refuse; a pick adopts a turret's facing and a platform's shape), the atlas test
+that every palette brush has an icon, and the pack's round trip with the new level in it.
+
+`train-cli reach --level levels/l10-the-hunt.json` reports it beatable (`platforms 4, reachable 4`)
+and `train-cli render` shows all five on one screen — `F` the flyer over the shelf, `h` the chaser on
+the middle ledge, `T` the turret behind it, `MMM` the slider and `=` the shelf.
+
+What **is** measured, on the demo level: at pop 40 and 60 generations, `l10-the-hunt` was solved on
+**4 of 4 seeds** on the first build (first wins at generations 8, 12, 25, 26; best runs 6.3-6.5 s /
+374-387 frames, `replay` bit for bit, `stomps 2, jumps 5, checkpoints 3`), and **2 of 2 seeds** after
+the mover fixes and the wider flyer beat (first wins at 33 and 7, bests 6.15 s and 6.87 s / 369-412
+frames) — the level is still won across the one-way shelf, which is the claim the oracle cannot make. The crossing is the
+shelf: the first pit is twelve tiles wide, so no jump clears it and a win means the policy went up
+through a one-way platform and along it. That is one careful reading, not a difficulty study — pop 40
+is small and the pack's slow level takes more than twice this many generations at pop 200 — but it is
+the claim the oracle cannot make and the reason the level is in the pack.
+
+What is **not** measured, and should be read as open:
+
+* **Whether the enemies teach anything.** A policy won while stomping two of them, which is evidence
+  that they are *survivable*, not that they are *curriculum*: no arm has compared a level with and
+  without them, so the honest statement is that the five mechanics are correct as physics, visible in
+  the sensors, placeable in the editor, and won through by one small population.
+* **The flyer's span and the turret's period are authored numbers with no measurement behind them.**
+Four tiles and 120 ticks are chosen to be legible at `run_speed` — a flyer crosses its beat in about
+the time a run jump is in the air — not because a sweep said so.
+* **Two document operations had to learn about the new entities, and both are tested.** `mirror`
+  reflects every kind and flips the two things that face: a turret's firing direction and a flyer's
+  two ends (a slider still travels right); `resize` drops what the new grid cannot hold, which it did
+  not at first — an entity left outside the grid makes `validate` refuse the document, so a shrink
+  turned "a level that lost a flyer" into "a level that cannot be saved".
+* **A mover is the one mechanic that can make a level's oracle verdict wrong in the *safe* direction**
+(it says unreachable for a level whose only route is a shelf that moves), and there is no test that
+says so beyond the demo's own design note.
+
+# The elements: three tiles, and a fluid that is drawn like the ground
+
+The pass added water (`~`), lava (`L`) and vines (`V`), and the numbers that make them
+mechanics rather than decoration are in the README's physics table. What this section is
+for is the *drawing*, because fluids are the one family in the atlas that cannot be drawn
+one cell at a time and the first two attempts at them were wrong in instructive ways.
+
+A solid tile is a **mask**: `ground_mask` asks the four neighbours, the mask picks one of
+sixteen crown/body sprites, and the art is the art of that tile. A fluid cannot work that
+way, because a fluid has no silhouette — the basin it is cut into is its silhouette — and
+because two stacked fluid cells are supposed to be *one body of liquid*. So a fluid cell is
+built out of four pieces instead, and its neighbours decide which pieces it gets:
+
+| piece | chosen by | shape of the answer |
+|---|---|---|
+| body | the cell's position modulo four into one picture four tiles square | a texture, continuous across every cut |
+| surface | nothing above it is the same fluid | two frames, phased by column |
+| bed | nothing below it is the same fluid | an overlay over the body cell |
+| wall | the side is neither the same fluid nor solid | an overlay, mirrored for the right |
+
+**Three things that looked like answers and were not**, each caught by looking at a pool ten
+cells deep rather than by reasoning:
+
+* **A body with a depth gradient in the cell.** Every cell drew light at its top and dark at
+  its bottom, so a two-deep pool drew the gradient twice and the boundary between the cells
+  was a band. The fix was to move all of that structure out of the body and into the cells a
+  pool *ends* in, which occur once per column: the surface and the bed.
+* **A per-cell variant, the ground's `_b`/`_c` trick.** It removes the repeat and replaces it
+  with a seam: two different textures meeting at a cell boundary draw a line there, and a
+  pool has a boundary at every tile. A four-cell pool hid it; a ten-cell column showed a stack
+  of shelves. The answer is the one every tile game uses for a large surface — one picture,
+  cut into cells and indexed by position — so the picture is continuous *at* the cuts and the
+  repeat is four tiles instead of one.
+* **A per-cell tint for depth.** The same failure as the variant, one step subtler: a uniform
+  4.5% darkening per cell below the surface is a gradient at a distance and a visible step at
+  every boundary up close. Depth is the bed's job; there is no value per cell anywhere in a
+  fluid, because a value per cell *is* the grid.
+
+The renderer's side is `view::fluid_body_sprite` (the block index) and
+`view::draw_fluid_edges` (the bed and the two walls), which is a few lines each precisely
+because the art is cut that way. The one number the two languages share is
+`FLUID_BLOCK = 4`, and `view::tests::fluid_bodies_tile_as_one_four_by_four_picture` pins it:
+all sixteen cells per fluid must be in the shipped atlas, the index must wrap at four in both
+axes, and the thirty-two cells must be thirty-two different pictures rather than one pasted
+twice over. That last assertion is the one that would have caught the first attempt.
+
+What is **not** measured: whether a pool now *reads* as liquid is a judgement made by looking
+at screenshots of a four-deep pool, a ten-deep column and the shipped level, not a number.
+The surface is still one cell of every pool, so a very tall pool has exactly one waterline;
+the walls are only drawn against open air, so a basin's own walls are still the terrain's.
+
 # The M3 problem
 
 The plan's M3 gate is "watch evolution for 10+ minutes and decide whether it is
@@ -3849,6 +4104,322 @@ looked broken (one frame per press), and it turned the exit criterion into two
 measurements instead of an assumption: L1 and L2 are beatable by holding right and
 jumping when something appears, L3 is not measured, and the whole check now runs in
 CI (`crates/render/tests/playability.rs`) rather than in someone's memory.
+
+# The elements, part two: what a route needs to know, and what a frame can pay for
+
+The element pass above was the tiles and their drawing. This one is what the **search**
+does with them, and it started from two reports that turned out to be two sides of one
+question: the oracle marked long stretches of water unreachable, and the agents ignored
+vines.
+
+## The oracle's move set, at `MOVE_SET_VERSION` 6
+
+The oracle knew how to jump, fall, wall-jump and ride a spring. It did not know that a
+body can *swim* a pool and climb out, or that a vine is a route. So a lake between two
+banks — the most ordinary thing water is for — had no edge across it, and the goal on the
+far side read as unreachable however obviously a swimmer could cross. The fix is two
+moves of the graph rather than a special case in the verdict:
+
+* `RouteMove::Swim { dir, dive }` — a stroke from a surface cell in one direction, with the
+  dive variant for the pool that has to be crossed under a lip;
+* `RouteMove::Vine { exit }` — grab, climb the run to its top, and leave toward `exit`.
+
+Both are ordinary graph edges: the sweep simulates them with the oracle's own simulator
+(`simulate_swim`, `simulate_vine_climb`), `press_lands` asks the same "does the script,
+run from here, reach the stand the graph promised" question it asks of a jump, and the
+route replay executes them at the policy's cadence (`vine_action` holds the button for the
+climb and steers for the exit; `swim_action` presses for the stroke). `MOVE_SET_VERSION`
+is 6 because an answer is only worth caching while the same oracle would give it again, so
+every cached verdict from a five-move graph was thrown away rather than trusted.
+
+**Measured on purpose-built levels**, oracle verdict first and then a real run (pop 200,
+seed 1, `train-cli train`, first-win generation):
+
+| level | shape | oracle | first win |
+|---|---|---|---|
+| `lake-42` | 42-tile lake, banks level with the surface | reachable | — |
+| `lake-lip` | 22-tile pool, banks one tile above the water | reachable | gen 0 |
+| `lip0`-`lip3` | same bank, lifted 0-3 tiles above the water | reachable | — |
+| `vine-gap` | 8-tile pit with a vine hanging into it, far ledge two tiles up | reachable | gen 11 (149 frames, 3 jumps) |
+| `vine-route` | a vine shaft to a ledge above the spawn | reachable | gen 1 |
+| `l11-the-elements` | the shipped level: lava, a pool, a three-tile wall and a seven-tile vine shaft | reachable, 8 of 9 stands | gen 4 (458 frames) |
+
+So the two claims that started this are both false of the current graph: a long pool is an
+edge, and a vine is a route the population finds. What is *not* measured is the human
+half — whether watching an agent climb reads as climbing — because that is a judgement
+about the animation, not a number.
+
+## The stall's detour, off the packet path
+
+The one freeze the window could not hide was its own: a stalled run's practice detour —
+forty generations on an easier level, plus the sweep that derives that level, plus two
+file writes — ran between two generations. **1.73 s on `scratch-tower`** against a 20-50 ms
+median generation, and a generation's animation is 0.6-5 s, so the viewer saw a still
+frame for the difference. One generation of lookahead could not cover forty.
+
+It runs on its own thread now (`lab::Detour`): the detour takes a clone of the trainer,
+the worker keeps producing generations from the run's own population, and the practised
+population is adopted the generation after the thread lands (`Trainer::adopt`, the same
+entry a curriculum step always returned through). At a cap the run waits for a detour in
+flight — the note and the artifacts are the run's last word, and nothing is animating
+behind it.
+
+Measured, `LAB_PROFILE=1` on `scratch-tower` at pop 200:
+
+| reading | before | after |
+|---|---|---|
+| detour cost | 1.73-2.44 s | 2.44 s, on another thread |
+| slowest packet in 120 generations | ~2.4 s | **69 ms** |
+
+And in the window itself, `EVO_FRAME_LOG=1 evo-app --evolve --no-splash` now prints every
+frame over two vsyncs; 40 s on `scratch-tower` and 25 s on `l11-the-elements`, stall and
+detour included, produced **zero** such frames. The instrument is the point as much as the
+fix: "the window freezes" could not be attributed from a log that did not exist.
+
+Still on the UI thread: the warm start (`warm_seed_from_route`) runs inside
+`Lab::start`, which is the window's own call — 0.3 s measured on a cold route cache
+(`l11`, pop 64), so it is a hitch rather than a freeze, and it is the next thing to move
+if a bigger level makes it one.
+
+# The polish pass: ink you can read, and two kinds of line
+
+The window's look was already a designed one — cream chrome, dark screens, bevels, a gold lip —
+so this pass was not a redesign. It was the measurement the palette had never had, and the three
+defects that measurement found. All ratios below are WCAG 2.x relative-luminance contrast.
+
+## Type: 4.5:1 on every surface it is drawn on
+
+The chrome has four depths (panel, card, card-hover, sunken well) and the palette had one ink
+scale, chosen by eye. Measured, the small print of the window was partly unreadable:
+
+| ink | on a panel, before | on the sunken status bar, before | after |
+|---|---|---|---|
+| `TEXT_DIM` | 4.49 | 3.58 | **5.82 / 4.64** |
+| `TEXT_FAINT` | 2.43 | 1.93 | **5.07 / 4.04** |
+| `ACCENT_INK` | 4.20 | 3.34 | **5.81 / 4.63** |
+| `WARN_INK` | 4.12 | 3.28 | **5.82 / 4.64** |
+| `GOOD_INK` | 4.70 | 3.75 | **5.83 / 4.64** |
+| `BAD_INK` | 5.29 | 4.22 | **5.78 / 4.60** |
+
+Four of those are under AA (4.5:1) on a panel and all of them are under it on the well. The fix
+is eight bytes in `theme.rs` — each ink is the same hue, taken down until it clears the floor — and
+the interesting part is that it stays fixed: `theme::tests::every_type_colour_clears_the_contrast_floor`
+computes the ratio from the same sRGB curve the standard defines and walks the *inventory* of inks
+against the *inventory* of surfaces, so a future retune of the cream cannot quietly make the
+window's coloured type unreadable.
+
+The pass also found three places where a **fill** was being used as **type**, which no amount of
+ink retuning can fix: the status bar's warning line drew `WARN` (a lamp colour) on the sunk well
+at **1.5:1**, the shelf's "open" badge drew `ACCENT` on a card at **1.5:1**, and an unloadable
+level's reason drew `BAD` at **3.3:1**. They are `WARN_INK` (5.8:1), a filled chip of `ACCENT`
+with `INK_ON_ACCENT` on it (9.8:1), and `BAD_INK` (6.2:1).
+
+## Two kinds of line, and the states that had none
+
+`EDGE` (a hairline between surfaces) was also the outline of everything pressable, at **1.53:1**
+on a panel and **1.77:1** on a card, and the hover state was a gold rim at **1.48:1**. A resting
+control therefore read as a word on a shadow and a hovered one was indistinguishable from it. The
+palette now has both: `EDGE` stays decorative at 1.5:1, and `CONTROL_EDGE` is the boundary of
+something you press — 3.0:1 on the well, 4.4:1 on a card, the WCAG 1.4.11 floor for a non-text
+boundary. Hover is `ACCENT_INK` (5.8:1 on a card) rather than the accent fill, and the chart got
+the same treatment with `SCREEN_EDGE` for its frame (3.0:1 on the plot) over `SCREEN_GRID` for
+the rules inside it (2.2:1) — three rules at the frame's weight had no floor and no edge.
+
+Two affordances came out of the same review. The shelf's cards were clickable only on their
+thumbnail: the frame's own response is drawn-only, so a click on the name or the facts did
+nothing. The whole rect is the control now, with a pointing hand and an accent-ink outline on
+hover. And every lane's tag bar — eight pastel colours on whatever terrain the body is over —
+gained a one-pixel dark halo, so a tag reads on pale sand as well as on a pit.
+
+## What was checked and left alone
+
+The graphics pipeline already does the things this pass would otherwise have added: the atlas is
+uploaded with `TextureOptions::NEAREST`, the camera's origin and every sprite rect are rounded to
+whole pixels before drawing, and zoom is snapped to an integer, so a sixteen-pixel tile is never
+resampled into a smudge. The generated art is clean by the same kind of audit — no colour under
+transparent pixels (which is what produces a halo when a sprite is filtered or composited), no
+sprite over forty colours, no single flat colour anywhere except the ten `ui_*` glyphs, which are
+deliberately one ink.
+
+What a pass like this cannot do is *look*: the frames were verified structurally (each mode still
+renders to a screenshot, and the composition's mean colour and colour count are unchanged within
+noise), not by eye. The next pass should be a human looking at `--screenshot` renders of the four
+modes beside these numbers.
+
+# The playtest's feel: a body drawn between ticks, and a vine you can climb over
+
+Three reports, one playtest: the body was jerky, a vine whose top was under a block could not be
+climbed, and the oracle called a goal behind such a vine unreachable. The first is a view bug and the
+other two are the same missing move seen from the sim and from the graph.
+
+## Jerky: the body was smooth and the camera was not
+
+The playtest already interpolated the body between physics ticks (`Session::body_at`) — 60 Hz physics
+under a 144 Hz display, `prev + alpha * (current - prev)`. What it did not do was put the **camera** on
+the same clock: `follow_player` ran after the canvas, from `sim.player()` rather than from the drawn
+position. So the body was drawn at a point between two ticks while the scene behind it was drawn from
+the last tick, and the body's offset from the centre swept a whole tick's travel and snapped back
+every tick.
+
+Measured on `l1-flat-run` at run speed, at 144 Hz, over 120 frames:
+
+| reading | before | after |
+|---|---|---|
+| frames that drew a body which had not moved | 71 of 120 | **0 of 120** |
+| step per frame, in tiles | 0 or 0.1000 | **0.0417 on every frame** |
+| body's offset from the camera centre | sweeps 0.1 tile | **0** |
+| that offset on screen, zoom 24 / 48 | 2.4 / 4.8 px sawtooth at 60 Hz | **none** |
+
+0.0417 is exactly `0.1 × 60/144`: the accumulator's own share of a tick, which is what "the view is a
+linear function of the simulation clock" looks like on a row of frames.
+
+The second half was the animation. `Session::advance_actions` advanced the run cycle by
+`ticks * TICK`, so on the 71 frames that ran no tick the legs stood still and on the 49 that did they
+stepped — a 60 Hz run cycle under a body gliding at 144, which reads as a sprite skating on smooth
+position. The animator is advanced by the frame's own **simulated** time now,
+`frames * TICK + render_alpha * TICK`, kept as a clock and advanced by its difference; it is still the
+simulation's time and not the wall clock, so a stalled frame that ran no tick still advances the
+animation by exactly the fraction of a tick the body moved through. Two tests pin both halves through
+what is actually drawn (`the_drawn_body_advances_on_every_frame_of_a_fast_display` and
+`the_run_cycle_advances_on_frames_that_run_no_tick`, the latter counting sprite changes on frames with
+no tick), because "smooth" is not a thing a screenshot can check.
+
+What is *not* fixed, deliberately: the drawn position and the camera are still rounded to whole
+pixels, so a slow scroll of less than a pixel a frame is quantised. That is the pixel grid the whole
+game is drawn on — unrounded sprites at an integer zoom are the shimmer the renderer exists to avoid —
+and it is a sub-pixel difference, not a frame-rate one.
+
+## A vine's own block is a route, and it is a script rather than a jump
+
+A vine that hangs beside a ledge is left sideways: climb to the top, press the side, land on the
+ledge. A vine that hangs from a **one-tile-thick block** has no sideways exit at all — the body climbs
+until its head meets the underside and then has nowhere to go, because the only way on is *over* the
+thing it is holding. Holding climb there now hauls the body over that block.
+
+The pull-up is scripted (`MANTLE_TICKS = 10`, a sixth of a second) for the reason a spring's throw is:
+it is a traversal air control cannot express — it passes *through* the corner it is climbing over, so
+collisions are ignored for its ten ticks — and a script that is identical every time is replayable,
+sweepable by the oracle and cheap to animate. It eases on a smoothstep in both axes, so the body leaves
+the vine slowly, crosses the lip quickly and settles onto the block rather than being placed on it;
+its last tick reports `landed`, which is what makes the oracle's script end where a real landing does.
+
+The trigger is the climb button the player is already holding — no new verb. The geometry is one
+function (`vine_mantle_anchor`) rather than a rule the physics and the oracle each keep: it answers
+"the block this vine hangs from, and is there room above it for a body", and it says *no* for a
+two-tile lid, because there is no stand above its anchor and a pull-up there would put the body inside
+a wall. That negative is a test as well.
+
+## The oracle: the up-exit, and a flag that was "already home"
+
+`MOVE_SET_VERSION` 7 adds the third vine exit to the sweep: `TakeoffDir::Still` climbs straight up with
+no sideways press and lets the pull-up land the body on the block. It is swept only where
+`vine_mantle_anchor` says the geometry is there, and it is an ordinary edge — `press_lands` asks the
+same question of it, and `evo::route_play` executes it by holding `JumpInPlace`, which is the whole
+move.
+
+The graph fix that came out of testing it is version 8. The flag's own stand was the topmost stand
+sharing the flag's **column**, which is true of a flag on a floor and false of one near the top of a
+level: on the vine-block fixture the ground seven tiles below shares the column, so the graph answered
+"you are already on the goal's stand" and the route walked a body to the flag's x on the floor instead
+of up the vine. Only stands a body standing on them can actually *touch* the flag from count now; a
+flag out of standing reach keeps its hop through the crossing that touches it in flight.
+
+Verified at three levels rather than one, since each could pass alone:
+
+* the sim — `holding_the_climb_hauls_the_body_onto_the_block_the_vine_hangs_from` (10 ticks of
+  pull-up land the body standing, and the flag on the block is then walkable), plus the two-tile lid
+  that must stay a dead end;
+* the oracle — `the_oracle_reaches_the_top_of_the_block_a_vine_hangs_from`, which read *unreachable*
+  before the up-exit;
+* the replay — `the_replay_pulls_up_over_the_block_a_vine_hangs_from` in `evo`, which drives the plan
+  through the real episode loop. The shipped table is unchanged: the ten levels in
+  `crates/evo/tests/route_play.rs` walk exactly what they walked before, so the new exit is an
+  addition and not a different route on old terrain.
+
+What is still not measured: whether the ten-tick pull-up *looks* like a body hauling itself over a
+lip, and whether the playtest now feels right to a person. Both are judgements, and the honest next
+step is a human at the keyboard with `EVO_FRAME_LOG=1`, which prints every frame over two vsyncs.
+
+## The furniture: what a Nintendo menu is made of, and what the window took from it
+
+The title screen and the editor were built twice in one sitting: once in a palette of near-black
+slate panels with gold keylines, which read as a *tool* with a coat of paint, and then again after
+going and looking at how the games this one is descended from actually draw a menu. The second
+version is in the tree. The rules it follows are conventions rather than specifications — Nintendo
+publishes no style guide with hex values or radii — but they are consistent across *New Super Mario
+Bros.*, *Super Mario Maker* and *Super Mario 3D World*, and the source material is the games
+themselves: the NSMB manual's screen inventory ([manual](https://www.manualslib.com/manual/111808/Nintendo-Super-Mario-Bros-Wii-69151a.html)),
+Maker's menu and palette structure ([Nintendo Support](https://en-americas-support.nintendo.com/app/answers/detail/a_id/15176/~/how-to-access-the-main-menu-%28super-mario-maker%29)),
+and 3D World's edge-anchored in-course HUD ([manual](https://www.scribd.com/document/522690877/manual-WiiU-Super-Mario-3D-World)).
+
+The six rules, and where each one landed:
+
+* **No black.** Every outline is a warm chocolate (`#4A3420`), every panel a warm white (`#FFF9EB`),
+  and the darkest surface in the window is the *level*, not the furniture. A neutral black keyline
+  was the single change that made the first attempt read as a terminal; replacing it is most of the
+  difference between the two versions. [`theme::OUTLINE`].
+* **Colour is a material, not a tint.** Coin gold (`#FBC531`) is the accent and the dock's sign,
+  ribbon blue (`#2B85D6`) is every heading, and the runner's vermilion is the menu cursor. Each is
+  used for exactly one job, so a glance at a colour says what kind of thing it is.
+  [`theme::ACCENT`], [`theme::RIBBON`], [`theme::RUN`].
+* **Rounded plates with a thick outline and a hard shadow.** 6 px on a cell, 14 px on a panel,
+  a 3 px outline, and a 3 px offset shadow with no blur — the depth is a printed plate lying on
+  paper, not a modern floating card. [`theme::panel_frame`], [`theme::dock_frame`].
+* **The selection is filled, and the cursor blinks.** The chosen menu line is a gold bar with a
+  red triangle beside it blinking at 2.2 Hz, and the chosen tool is the same gold: "this is the one
+  that is on" is one idea in both rooms.
+* **A HUD is labels over values, in the corner, on a card.** The playtest's scoreboard is a warm
+  white card with a gold hairline inside it: `TIME`, `YOUR BEST`, `TO THE FLAG` in blue caps over
+  brown monospace values, drawn over the picture rather than in a bar of chrome.
+* **Headers are ribbons.** Panel sections are blue tabs with white caps on a brown outline; the
+  title screen's box has a `SELECT` tab stuck onto its top edge. This is what makes a column of
+  sections read as a menu screen rather than as a document with subheads.
+
+What is *not* verified: none of the numbers above are measured from Nintendo's output — they are
+reconstruction values chosen to read correctly at this window's scale (a 40-point tool plate, a
+21-point menu line). The contrast floors the palette already enforces still hold under the new
+colours (`theme::tests::every_type_colour_clears_the_contrast_floor`), and the window was checked
+by rendering a frame of each view (`--screenshot`, `--play`, `--evolve`, `--splash`), but "does it
+feel like a Mario menu" is a judgement no test makes.
+
+## Three ways a level and its window disagreed
+
+Three reports, one theme: the picture in the window was not always the level the simulation was
+running. Each is fixed in the layer that was actually wrong rather than papered over in the view.
+
+**A chaser placed after a run started was missing from Evolve.** Edit and Play read the editor's
+document; Evolve draws the run's own copy of the level, and it decides whether that copy is stale
+with a hash. That hash was `Level::content_hash` — the terrain, spawn, patrols and flag — which
+predates chasers, flyers, turrets and movers and never learned about them. Adding a chaser changed
+the document but not the hash, so `Lab::trained_on` said "same level", the run kept its copy, and the
+one view that draws a copy was the one view without the creature. The run now keys on
+`Level::scene_hash`, which hashes every entity box as well; `content_hash` is untouched on purpose,
+because it is the champion's and population's identity and changing it would invalidate every file
+on disk. The window also draws the document's own entity placement in Evolve when there is no live
+generation to draw — the first frame, a restart, a paused run — so an empty street is never mistaken
+for a deleted enemy. Tests: `every_placeable_entity_changes_the_scene_hash_but_not_the_terrain_hash`
+(sim) and `an_entity_placed_after_a_run_starts_makes_its_level_stale` (app).
+
+**A moving platform's travel was invisible.** A shelf's span is a number in the file and the shelf's
+own art only shows where it is *now*, which made placing one and timing a jump a guess. The view now
+draws the travel under everything else: a ghost box at the far end of the **clear** span, and a dashed
+band around the swept region. The far end comes from `physics::clear_travel`, the same function the
+episode uses, so a shelf authored through a wall is drawn stopping at the wall rather than promising
+a route the sim refuses. It is one pass in `draw_level`, so Edit, Play, Evolve and Replay all get it
+for free and it is not drawn eight times over eight lanes. Test:
+`a_platforms_travel_guide_ends_where_the_shelf_can_reach`.
+
+**A stomped turret no longer exists, and a turret you could not stomp would be a wall.** The turret
+was in the enemy pass: landing on it destroyed it and bounced the body, anything else killed. It is
+now a solid box — its lid is ground, its sides stop the body, and neither is a death or a stomp — so
+the only hazard it owns is the shot, which was always the point of the creature. The resolution runs
+after the body's tile pass: a *crossing* from above lands on the lid (the same test a moving platform
+uses, so a body falling beside it is not magnetised onto it), and a side overlap is pushed out along
+the direction of travel. `stats.stomps` no longer counts a turret because nothing was stomped. Test:
+`a_turret_is_a_solid_box_not_a_stompable_enemy` covers both halves and asserts the turret survives.
+
+Docs corrected in the same pass: the README's enemy table, the editor's turret tooltip and the
+`TurretSpec` comment all said "stompable", and the platform row now documents the travel guide.
 
 # Deliberately deferred
 

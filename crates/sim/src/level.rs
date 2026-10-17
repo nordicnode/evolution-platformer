@@ -3,7 +3,7 @@
 //! ```jsonc
 //! {
 //!   "format": "evo-platformer-level",
-//!   "level_format_version": 1,
+//!   "level_format_version": 3,
 //!   "name": "L1-flat-run",
 //!   "width": 60, "height": 15,
 //!   "spawn": {"x": 2, "y": 12},
@@ -27,7 +27,26 @@ use crate::route_cache::Slot;
 use crate::PIXELS_PER_TILE;
 
 pub const LEVEL_FORMAT: &str = "evo-platformer-level";
-pub const LEVEL_FORMAT_VERSION: u32 = 1;
+/// **Bumped to 2 when the trap tiles' generation added a tile and four entity kinds.**
+///
+/// The version is a promise about what a file *means*, and the promise is what lets an
+/// older build refuse a document instead of misreading one. A v1 build meeting a `=` row
+/// would call the level corrupt (its glyph table is shorter), and one meeting a `turret`
+/// would refuse the entity — but both would be reading a file labelled with a version that
+/// says they can. So a format that grew new glyphs and new entity types is version 2.
+///
+/// **A v2 build reads v1**, because v2 only *added*: every v1 glyph, entity and rule means
+/// exactly what it meant, and a v1 file has no field this build reads differently. That is
+/// the constraint that makes accepting it safe, and it is why the shipped pack did not have
+/// to be migrated to open in this build. The writer always emits 2.
+///
+/// **Bumped to 3 when the elements arrived** — lava (`L`), water (`~`) and vines (`V`). Same
+/// rule, same reason: a v2 build meeting a `~` calls the level corrupt (its glyph table is
+/// shorter), so a file that may contain one cannot say "version 2". Three glyphs, three new
+/// meanings for a cell, so version 3. **A v3 build reads v1 and v2**, because this pass only
+/// *added*: every earlier glyph, entity and rule means exactly what it meant. The writer
+/// always emits 3.
+pub const LEVEL_FORMAT_VERSION: u32 = 3;
 
 /// Smallest grid the editor will build. Not a loader rule — a level is legal from
 /// 1x1 — but a painter with less room than this has nothing to paint with.
@@ -53,6 +72,8 @@ pub const GLYPH_CRACKED: char = 'd';
 pub const GLYPH_CRACKED_SAND: char = 's';
 pub const GLYPH_CRACKED_BRICK: char = 'b';
 pub const GLYPH_CRACKED_PLANK: char = 'w';
+/// A one-way platform (`=`): ground from above, air from below and from the side.
+pub const GLYPH_ONEWAY: char = '=';
 /// A spring pad (`v`). Not solid, and it throws a **falling** body upward.
 ///
 /// The inverted spike, deliberately: `^` is the tile that ends an episode and `v` is the
@@ -60,6 +81,32 @@ pub const GLYPH_CRACKED_PLANK: char = 'w';
 /// legend. Every other unclaimed symbol in a level file is either a letter a material wants
 /// or a character that does not read as a thing standing in a cell.
 pub const GLYPH_SPRING: char = 'v';
+
+/// Water (`~`): not solid, not lethal, and **it pulls a body down**.
+///
+/// The glyph is the wave, which is the one ASCII character that reads as a fluid rather than
+/// as a thing standing in a cell. A body whose centre is in a water cell sinks at
+/// [`crate::physics::Physics::water_sink`] until it presses jump, which swims it up at
+/// [`crate::physics::Physics::water_swim`] — and near the surface the same press is a push
+/// *off* the surface, so a pool with a lip can be left. See [`Tile::Water`].
+pub const GLYPH_WATER: char = '~';
+
+/// Lava (`L`): not solid, and lethal on contact like a spike.
+///
+/// A capital letter rather than a symbol because it is the one hazard that is a *material*
+/// as well as a hazard, and because the surviving symbols in the legend are already doing
+/// work (`^` spike, `v` spring, `=` shelf, `~` water). It is also the only tile that
+/// **fires**: a lava cell with open air above it is a vent, and it spits a ball up on a
+/// rhythm. See [`Tile::Lava`].
+pub const GLYPH_LAVA: char = 'L';
+
+/// A vine (`V`): not solid, not lethal, and **climbable**.
+///
+/// `V` beside the spring's lowercase `v` is the legend's own joke and its own warning: the
+/// two are the same character at different heights, and the one that is a *capital* is the
+/// one that holds a body up rather than throwing it. A body overlapping a vine climbs it
+/// while jump is held and slides down it when it is not. See [`Tile::Vine`].
+pub const GLYPH_VINE: char = 'V';
 
 /// Tile ids (§6): small integers so the grid stays cheap to clone and hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +183,56 @@ pub enum Tile {
     /// pad with a ceiling over it pogoes for as long as the episode's no-progress timer allows;
     /// that is the pad working, not a bug.
     Spring = 11,
+    /// A one-way platform (`=`): **ground from above, air from below and from the side.**
+    ///
+    /// The tile that gives the format a vertical route. A body falling onto it lands and can
+    /// jump from it; a body rising through it from below passes straight through, and a body
+    /// walking into its edge is not stopped. That is what makes a shelf something you jump
+    /// *up through* rather than a ledge you go around, and it is the one collision shape the
+    /// level format could not express before this.
+    OneWay = 12,
+    /// Water (`~`): a cell that **carries a body down** instead of holding it up.
+    ///
+    /// The first tile that changes the *body* rather than the terrain. Water is not solid,
+    /// not opaque and not lethal: a body falls into it, and from the moment its centre is
+    /// inside, gravity is replaced by a slow sink. Holding jump swims up; a press near the
+    /// surface is a push off it. Horizontal speed is capped at
+    /// [`Physics::water_speed`](crate::physics::Physics::water_speed), so a pool is crossed
+    /// slowly, and that slowness *is* the cost of the route.
+    ///
+    /// **Submersion is decided by the body's centre**, not by any overlap. A body at the
+    /// waterline whose centre is still above it is a body in the air, which makes the surface
+    /// a line the physics agrees with the art about rather than a band of half-states — and it
+    /// is what makes the bobbing at a surface read as bobbing rather than as a body that
+    /// cannot decide what it is in.
+    Water = 13,
+    /// Lava (`L`): not solid, **lethal on contact**, and a **vent** when open to the air.
+    ///
+    /// Two mechanics in one cell, and they are deliberately the same material: the pool is
+    /// what ends an episode that steps in it, and the pool's own surface is what throws the
+    /// balls that end the episodes above it. A body is killed by the *cell* rather than by a
+    /// drawn box the way a spike is, because a lava tile is full: there is no transparent band
+    /// at its top for a body to stand in, and `tools/art/terrain.py::lava` fills the cell.
+    ///
+    /// A lava cell is a vent when the cell above it is open — not solid, not lava, not water.
+    /// The vents and their rhythm live in [`crate::Sim`] because the balls are state; the
+    /// *positions* are a fact about the level, which is why [`Level::lava_vents`] derives them
+    /// once rather than the sim remembering them.
+    Lava = 14,
+    /// A vine (`V`): not solid, and **climbable**.
+    ///
+    /// The vertical route that needs no jump: while the body's box overlaps a vine and the
+    /// body is off the ground, holding jump climbs at
+    /// [`Physics::vine_climb`](crate::physics::Physics::vine_climb) and releasing it slides
+    /// down at [`Physics::vine_slide`](crate::physics::Physics::vine_slide). Gravity is the
+    /// vine's to replace while the body is on it, so a climber hangs still at the top of a
+    /// stroke rather than falling off it.
+    ///
+    /// **A vine is not ground.** A body standing on the floor at the foot of a vine is
+    /// standing on the floor, with its jump intact: the vine only takes over once the body is
+    /// airborne, which is what lets a body jump onto a vine, grab it and climb, instead of
+    /// being caught by the first one it walks past.
+    Vine = 15,
 }
 
 impl Tile {
@@ -148,7 +245,7 @@ impl Tile {
     /// the one where it shows: five letters were still being offered as agent names after the trap
     /// tiles took them (`d`, `s`, `b`, `w`, `v`). So a tile is added **here** as well as to the enum,
     /// and every list that matters is derived from this.
-    pub const ALL: [Tile; 12] = [
+    pub const ALL: [Tile; 16] = [
         Tile::Empty,
         Tile::Solid,
         Tile::Sand,
@@ -161,6 +258,10 @@ impl Tile {
         Tile::CrackedBrick,
         Tile::CrackedPlank,
         Tile::Spring,
+        Tile::OneWay,
+        Tile::Water,
+        Tile::Lava,
+        Tile::Vine,
     ];
 
     pub fn from_glyph(c: char) -> Option<Tile> {
@@ -177,6 +278,10 @@ impl Tile {
             GLYPH_CRACKED_BRICK => Some(Tile::CrackedBrick),
             GLYPH_CRACKED_PLANK => Some(Tile::CrackedPlank),
             GLYPH_SPRING => Some(Tile::Spring),
+            GLYPH_ONEWAY => Some(Tile::OneWay),
+            GLYPH_WATER => Some(Tile::Water),
+            GLYPH_LAVA => Some(Tile::Lava),
+            GLYPH_VINE => Some(Tile::Vine),
             _ => None,
         }
     }
@@ -195,10 +300,20 @@ impl Tile {
             Tile::CrackedBrick => GLYPH_CRACKED_BRICK,
             Tile::CrackedPlank => GLYPH_CRACKED_PLANK,
             Tile::Spring => GLYPH_SPRING,
+            Tile::OneWay => GLYPH_ONEWAY,
+            Tile::Water => GLYPH_WATER,
+            Tile::Lava => GLYPH_LAVA,
+            Tile::Vine => GLYPH_VINE,
         }
     }
 
-    /// Does this tile block movement from every side?
+    /// Is there ground here: does a body stand on this tile?
+    ///
+    /// **The question the rest of the crate means when it says "solid".** Standability,
+    /// landing zones, walkers' floor probes, the route graph, the oracle's platform table and
+    /// the sensors' patch all want this answer, and a one-way platform is ground to every one
+    /// of them — which is why it is included here rather than given a parallel concept at
+    /// twenty call sites.
     ///
     /// **Cracked tiles are solid**, and that is the whole of what makes a brittle bridge a
     /// bridge rather than a row of holes: a level paints one, the sim stands a body on it, and
@@ -215,10 +330,30 @@ impl Tile {
                 | Tile::CrackedSand
                 | Tile::CrackedBrick
                 | Tile::CrackedPlank
+                | Tile::OneWay
         )
     }
 
-    /// Is this tile one that a body standing on it will break?
+    /// Is this tile a one-way platform: ground from above and air from every other side?
+    ///
+    /// The whole of the rule, and it is deliberately one question rather than three. A body
+    /// falling onto it stands; a body rising through it passes; a body walking into its side
+    /// passes. That is what makes a one-way platform a *route* rather than a wall, and it is
+    /// why the collision code asks [`Tile::is_opaque`] for its side and ceiling tests while
+    /// everything that asks "is there ground here" keeps asking [`Tile::is_solid`].
+    pub fn is_one_way(self) -> bool {
+        matches!(self, Tile::OneWay)
+    }
+
+    /// Does this tile stop a body travelling sideways or upward: the wall/ceiling question.
+    ///
+    /// Every solid tile but the one-way platform. The player's x resolution and ceiling
+    /// resolution ask this, as does the oracle's "is this take-off inside a wall" check — a
+    /// body standing *under* a shelf is not inside anything solid.
+    pub fn is_opaque(self) -> bool {
+        self.is_solid() && !self.is_one_way()
+    }
+
     pub fn is_cracked(self) -> bool {
         matches!(
             self,
@@ -229,6 +364,28 @@ impl Tile {
     /// Is this tile a spring pad?
     pub fn is_spring(self) -> bool {
         matches!(self, Tile::Spring)
+    }
+
+    pub fn is_water(self) -> bool {
+        matches!(self, Tile::Water)
+    }
+
+    pub fn is_lava(self) -> bool {
+        matches!(self, Tile::Lava)
+    }
+
+    pub fn is_vine(self) -> bool {
+        matches!(self, Tile::Vine)
+    }
+
+    /// Does this cell end an episode on contact?
+    ///
+    /// Two tiles, and they differ in *where* the killing box is rather than in whether there
+    /// is one: a spike's poison is the drawn sprite's box ([`crate::physics::spike_lethal_box`]),
+    /// a lava cell's is the cell. The question is what a caller that only wants "is this place
+    /// death" should ask, so it does not have to know the difference.
+    pub fn is_lethal(self) -> bool {
+        matches!(self, Tile::Spike | Tile::Lava)
     }
 
     /// The tile this one is a *material of*, with any brittleness stripped off.
@@ -325,6 +482,34 @@ struct RawEntity {
     /// an existing file's shape is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sprite: Option<String>,
+    /// A flyer's travel or a platform's travel, in tiles. Omitted from every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    span: Option<i32>,
+    /// A turret's firing direction (`+1` right, `-1` left).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dir: Option<i8>,
+    /// A moving platform's width, in tiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tiles: Option<i32>,
+    /// A moving platform's axis: `"x"` (default, a slider) or `"y"` (a lift).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    axis: Option<String>,
+}
+
+impl RawEntity {
+    /// An entity of `kind` anchored at a tile, with every optional field left out.
+    fn of(kind: &str, x: i32, y: i32) -> RawEntity {
+        RawEntity {
+            kind: kind.to_string(),
+            x,
+            y,
+            sprite: None,
+            span: None,
+            dir: None,
+            tiles: None,
+            axis: None,
+        }
+    }
 }
 
 /// A placed piece of scenery: an atlas sprite name, standing in a tile cell.
@@ -342,6 +527,147 @@ pub struct Scenery {
     /// The tile cell the sprite stands in.
     pub x: i32,
     pub y: i32,
+}
+
+/// A **flyer**: an enemy that ignores gravity and patrols a horizontal band.
+///
+/// The first enemy in the pack that is not standing on something, and that is the whole of
+/// what it adds as a decision: height stops being safety. A jump over a walker is a timing
+/// problem on one row; a jump past a flyer is a timing problem on the row the body has to
+/// pass *through*, which is the row a jump is spent in.
+///
+/// Its span is authored rather than derived from the ground, because there is no ground: the
+/// entity carries the two ends of its patrol in tiles, and the sim keeps it between them and
+/// inside any wall it meets. Deterministic like every other patrol — the phase comes from the
+/// episode seed through the same per-entity draw the walkers use, so a flyer level is
+/// stochastic in the same, single way a walker level is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlyerSpec {
+    /// The authored box, with its bottom edge on the bottom of its tile row.
+    pub rect: Rect,
+    /// Left end of the patrol, in world tiles.
+    pub min_x: f32,
+    /// Right end of the patrol, in world tiles.
+    pub max_x: f32,
+}
+
+/// A flyer's beat when the file does not say one, in tiles **of travel**.
+///
+/// Twelve, and it is the same number the editor's beat field starts at, because the two used to
+/// be two literals in two files: a level authored in the window and a level written by hand
+/// disagreed about what "a flyer" means, and only one of them was the one the palette promised.
+/// Twelve tiles is a fifth of a short level and long enough that the flyer is a *band* to time a
+/// crossing against rather than a nuisance guarding one doorway — which is the whole of what the
+/// creature adds as a decision.
+pub const DEFAULT_FLYER_SPAN: i32 = 12;
+
+impl FlyerSpec {
+    /// A flyer anchored in tile `(tx, ty)`, with a beat of `span` tiles **of travel**, centred
+    /// on the cell.
+    ///
+    /// **`span` is the distance the box moves**, not the distance between two abstract ends. The
+    /// two are not the same number: a box has width, so bounds that name its left edge at
+    /// `centre ± span/2` move it `span - w`. That half-tile loss was invisible on a twelve-tile
+    /// beat and enormous on a four-tile one ("my flyer only patrols three tiles"), and it is the
+    /// sort of arithmetic a level author should never have to do. Here the box's own width is
+    /// added to both ends, so the centre of the flyer goes exactly `span` tiles and the beat is
+    /// symmetric about the cell that was clicked.
+    pub fn at(tx: i32, ty: i32, span: i32) -> FlyerSpec {
+        let span = span.max(1) as f32;
+        let w = PHYSICS.flyer_w;
+        let centre = tx as f32 + 0.5;
+        FlyerSpec {
+            rect: Rect::new(
+                centre - w * 0.5,
+                crate::physics::bottom_of(ty) - PHYSICS.flyer_h,
+                w,
+                PHYSICS.flyer_h,
+            ),
+            min_x: centre - span * 0.5 - w * 0.5,
+            max_x: centre + span * 0.5 + w * 0.5,
+        }
+    }
+
+    /// The beat's length, in tiles **of travel**: the distance the box moves.
+    ///
+    /// The inverse of [`FlyerSpec::at`], and the only correct way to read the span back out of a
+    /// spec: the authored ends name the box's edges, so the distance between them is the travel
+    /// *plus the box's own width*. Writing that number back to a file as the span is how a
+    /// save/load round trip makes a flyer's beat grow by 0.7 tiles every time a level is saved.
+    pub fn span(&self) -> f32 {
+        (self.max_x - self.min_x - PHYSICS.flyer_w).max(0.0)
+    }
+}
+
+/// A **turret**: a fixed enemy that fires a shot along the row it stands on.
+///
+/// The one enemy that attacks at a distance, so it is the first thing in the pack a body has
+/// to cross *while* it is crossing something else. It does not move, does not chase and is
+/// **solid** rather than stompable — a body stands on its lid and is stopped by its sides, and
+/// the box itself never kills — which keeps it a level-design tool rather than a second game:
+/// the shot is a period the author sets by where they put it, and the answer is always a route
+/// or a jump over the muzzle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurretSpec {
+    pub rect: Rect,
+    /// `+1` fires right, `-1` fires left. The file carries it because a turret's whole
+    /// meaning is which way its row is dangerous, and inferring it from a wall would make
+    /// two visually different placements behave the same.
+    pub dir: i8,
+}
+
+/// A **moving platform**: a shelf that slides along one axis on a fixed cycle.
+///
+/// Authored as a box plus the length of its travel; the position at a tick is a pure function
+/// of the episode's frame count ([`crate::physics::Mover::rect_at`]), so two runs of one seed
+/// agree and the state hash needs no extra state for it. It carries a body standing on it,
+/// which is the reason it is worth the machinery: a platform that did not carry you would be
+/// a decoration, and a lift that did not is a staircase.
+///
+/// **The oracle does not model it.** A route is a statement about the terrain, and a mover is
+/// not terrain: the sweep would have to know the phase it will be at, which is a fact about
+/// the episode rather than about the level. So a level with a mover is swept as if the mover
+/// were not there, and the level's own note is where the author says what that means. The
+/// alternative — refusing to answer at all — would make every level with a lift unverifiable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlatformSpec {
+    /// The box at the low end of its travel: `w` tiles wide and half a tile tall, its **bottom
+    /// edge** on the bottom of row `y` (so the deck is mid-row).
+    pub rect: Rect,
+    /// How far it travels, in tiles.
+    pub span: f32,
+    /// True for a lift (travels up), false for a slider (travels right).
+    pub vertical: bool,
+}
+
+/// A platform's width and travel when the file does not say: three tiles wide, four of travel.
+///
+/// Shared with the editor for the same reason [`DEFAULT_FLYER_SPAN`] is — one default, in the
+/// module that defines the entity, so a shelf placed in the window and one written by hand are
+/// the same shelf.
+pub const DEFAULT_PLATFORM_TILES: i32 = 3;
+pub const DEFAULT_PLATFORM_SPAN: i32 = 4;
+
+impl PlatformSpec {
+    /// A shelf anchored at tile `(tx, ty)`, `tiles` wide, travelling `span` tiles to the right (or
+    /// up, for a lift).
+    ///
+    /// The one place the geometry of a shelf is stated. The loader and the editor's platform
+    /// brush both come through here, because two copies of "half a tile tall, bottom edge on the
+    /// row below the cell" is exactly the shape of bug that has the editor drawing a shelf where
+    /// the sim will not put it.
+    pub fn at(tx: i32, ty: i32, tiles: i32, span: i32, vertical: bool) -> PlatformSpec {
+        PlatformSpec {
+            rect: Rect::new(
+                tx as f32,
+                crate::physics::bottom_of(ty) - PHYSICS.platform_h,
+                tiles.max(1) as f32,
+                PHYSICS.platform_h,
+            ),
+            span: span.max(1) as f32,
+            vertical,
+        }
+    }
 }
 
 /// The on-disk shape, in write order. Serializing this rather than hand-building
@@ -365,6 +691,10 @@ struct RawLevel {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResizeReport {
     pub dropped_walkers: usize,
+    /// Chasers, flyers and turrets the new grid had no room for.
+    pub dropped_enemies: usize,
+    /// Moving platforms the new grid had no room for.
+    pub dropped_platforms: usize,
     /// Placed scenery that fell outside the new grid. Decoration is disposable, so it is
     /// simply dropped (like a walker) rather than clamped back in (like the goal).
     pub dropped_scenery: usize,
@@ -380,7 +710,10 @@ pub struct ResizeReport {
 
 impl ResizeReport {
     pub fn dropped_anything(&self) -> bool {
-        self.dropped_walkers > 0 || self.dropped_scenery > 0
+        self.dropped_walkers > 0
+            || self.dropped_enemies > 0
+            || self.dropped_platforms > 0
+            || self.dropped_scenery > 0
     }
 }
 
@@ -406,6 +739,16 @@ pub struct Level {
     pub goals: Vec<Rect>,
     /// Placed scenery, in draw order. Inert: not simulated, not hashed, not sensed.
     pub scenery: Vec<Scenery>,
+    /// Chasers: walkers that hunt the body instead of patrolling a span. Simulated, hashed
+    /// and sensed exactly as the walkers are, in their own list so that adding one cannot
+    /// renumber a level's patrols (the enemy vector's tie-break is walker index).
+    pub chasers: Vec<Rect>,
+    /// Flyers, with the patrol each one walks.
+    pub flyers: Vec<FlyerSpec>,
+    /// Turrets, with the direction each one fires.
+    pub turrets: Vec<TurretSpec>,
+    /// Moving platforms, with the travel each one slides over.
+    pub platforms: Vec<PlatformSpec>,
     /// Lazily computed move-graph route table for this level.
     ///
     /// **The slot is shared between clones, not copied by them.** The graph is a pure
@@ -453,9 +796,9 @@ impl Level {
                 raw.format, LEVEL_FORMAT
             ));
         }
-        if raw.level_format_version != LEVEL_FORMAT_VERSION {
+        if !(1..=LEVEL_FORMAT_VERSION).contains(&raw.level_format_version) {
             return Err(format!(
-                "level_format_version {} is not supported (this build reads {})",
+                "level_format_version {} is not supported (this build reads 1..={})",
                 raw.level_format_version, LEVEL_FORMAT_VERSION
             ));
         }
@@ -498,6 +841,10 @@ impl Level {
             tiles,
             spawn: Rect::new(0.0, 0.0, PHYSICS.player_w, PHYSICS.player_h),
             walkers: Vec::new(),
+            chasers: Vec::new(),
+            flyers: Vec::new(),
+            turrets: Vec::new(),
+            platforms: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -522,6 +869,52 @@ impl Level {
                     PHYSICS.walker_w,
                     PHYSICS.walker_h,
                 )),
+                // A walker that hunts: same box, same stomp, different brain. It is a
+                // separate entity kind rather than a flag on the walker so that a level file
+                // reads as what it does, and so an older build refuses it by name instead of
+                // silently dropping the hunt.
+                "chaser" => level.chasers.push(Rect::new(
+                    e.x as f32 + (1.0 - PHYSICS.walker_w) * 0.5,
+                    crate::physics::bottom_of(e.y) - PHYSICS.walker_h,
+                    PHYSICS.walker_w,
+                    PHYSICS.walker_h,
+                )),
+                // A flyer's span is authored in tiles of travel, **centred on its cell**: the
+                // file says where it beats and how far, not two absolute ends, so a moved level
+                // keeps its patrol. [`FlyerSpec::at`] is the whole of that geometry, and
+                // `DEFAULT_FLYER_SPAN` is the whole of the default.
+                "flyer" => {
+                    let span = e.span.unwrap_or(DEFAULT_FLYER_SPAN);
+                    level.flyers.push(FlyerSpec::at(e.x, e.y, span));
+                }
+                "turret" => level.turrets.push(TurretSpec {
+                    rect: Rect::new(
+                        e.x as f32 + (1.0 - PHYSICS.turret_w) * 0.5,
+                        crate::physics::bottom_of(e.y) - PHYSICS.turret_h,
+                        PHYSICS.turret_w,
+                        PHYSICS.turret_h,
+                    ),
+                    dir: if e.dir.unwrap_or(1) < 0 { -1 } else { 1 },
+                }),
+                // A platform's box is anchored like every other entity: its **bottom edge**
+                // rests on the bottom of row `y`, so the shelf hangs in its own cell with its
+                // deck half a tile above the row's bottom — a shelf authored in the row above
+                // a floor sits half a tile over that floor, which is a hop up and a step off.
+                // It is `tiles` wide and half a tile tall. The travel is upward for a lift and
+                // rightward for a slider, which is why the axis is a name in the file rather
+                // than a sign on the span. [`PlatformSpec::at`] owns the geometry so the
+                // editor's brush and this reader cannot disagree about it.
+                "platform" => {
+                    let vertical = matches!(e.axis.as_deref(), Some("y") | Some("up"))
+                        || matches!(e.axis.as_deref(), Some("down"));
+                    level.platforms.push(PlatformSpec::at(
+                        e.x,
+                        e.y,
+                        e.tiles.unwrap_or(DEFAULT_PLATFORM_TILES),
+                        e.span.unwrap_or(DEFAULT_PLATFORM_SPAN),
+                        vertical,
+                    ));
+                }
                 "goal" => {
                     // One flag per level, refused here as well as in the editor: the oracle,
                     // the sensors and the score all answer about *the* goal, so a second one
@@ -759,6 +1152,65 @@ impl Level {
         self.get(tx, ty) == Tile::Spike
     }
 
+    pub fn is_water(&self, tx: i32, ty: i32) -> bool {
+        self.get(tx, ty).is_water()
+    }
+
+    pub fn is_lava(&self, tx: i32, ty: i32) -> bool {
+        self.get(tx, ty).is_lava()
+    }
+
+    pub fn is_vine(&self, tx: i32, ty: i32) -> bool {
+        self.get(tx, ty).is_vine()
+    }
+
+    /// The top of the water column containing `(tx, ty)`: the surface a swimmer is measured
+    /// against, or `None` when the cell is not water.
+    ///
+    /// A column, because a body swims up a *shaft* and the surface it has to reach is the top
+    /// of that shaft, not the cell beside it. The scan is bounded by the grid's own height and
+    /// walks up a run of water cells, so it costs what the pool is deep.
+    pub fn water_top(&self, tx: i32, ty: i32) -> Option<f32> {
+        if !self.is_water(tx, ty) {
+            return None;
+        }
+        let mut top = ty;
+        while top > 0 && self.is_water(tx, top - 1) {
+            top -= 1;
+        }
+        Some(top as f32)
+    }
+
+    /// Every lava cell open to the air: the vents a lava ball is spat from.
+    ///
+    /// Row-major, so the order — and therefore the rhythm each vent fires on, which is derived
+    /// from its index — is a property of the level rather than of a hash map's iteration order.
+    /// "Open" is the cell above being neither solid nor another liquid: a lava cell under a
+    /// ceiling, or under more lava, is not a surface and does not fire.
+    pub fn lava_vents(&self) -> Vec<(i32, i32)> {
+        let mut vents = Vec::new();
+        for ty in 0..self.height {
+            for tx in 0..self.width {
+                if !self.is_lava(tx, ty) {
+                    continue;
+                }
+                let above = self.get(tx, ty - 1);
+                if !above.is_solid() && !above.is_lava() && !above.is_water() {
+                    vents.push((tx, ty));
+                }
+            }
+        }
+        vents
+    }
+
+    /// Does this cell stop a body travelling sideways or upward?
+    ///
+    /// The wall/ceiling question, as opposed to [`Level::is_solid`]'s "is there ground here".
+    /// A one-way platform is the difference between the two and the reason both exist.
+    pub fn is_opaque(&self, tx: i32, ty: i32) -> bool {
+        self.get(tx, ty).is_opaque()
+    }
+
     /// Is there a spring pad in this cell?
     pub fn is_spring(&self, tx: i32, ty: i32) -> bool {
         self.get(tx, ty).is_spring()
@@ -777,6 +1229,7 @@ impl Level {
     pub fn is_standable(&self, tx: i32, surface_row: i32) -> bool {
         self.is_solid(tx, surface_row)
             && !self.is_spike(tx, surface_row - 1)
+            && !self.is_lava(tx, surface_row - 1)
             && !self.is_solid(tx, surface_row - 1)
     }
 
@@ -900,6 +1353,17 @@ impl Level {
     /// valid, which keeps the champions on disk valid too.
     pub fn content_hash(&self) -> u64 {
         let mut h = StateHasher::new();
+        self.hash_core(&mut h);
+        h.finish()
+    }
+
+    /// The half of the hash that `content_hash` and [`Level::scene_hash`] share: the name, the
+    /// grid, the spawn, the patrols and the goal.
+    ///
+    /// Split out so the two hashes cannot disagree about the terrain. They differ only in the
+    /// entities appended after this, and appending nothing is exactly the old byte stream —
+    /// which is what keeps every content hash this build has ever written still valid.
+    fn hash_core(&self, h: &mut StateHasher) {
         for b in self.name.as_bytes() {
             h.u8(*b);
         }
@@ -908,21 +1372,67 @@ impl Level {
         for t in &self.tiles {
             h.u8(*t as u8);
         }
-        self.spawn.hash_into(&mut h);
+        self.spawn.hash_into(h);
         h.u32(self.walkers.len() as u32);
         for w in &self.walkers {
-            w.hash_into(&mut h);
+            w.hash_into(h);
         }
         h.u32(self.goals.len() as u32);
         for g in &self.goals {
-            g.hash_into(&mut h);
+            g.hash_into(h);
         }
-        h.finish()
     }
 
     /// The plan's `"sha256:…"` metadata string, with the algorithm this build uses.
     pub fn content_hash_string(&self) -> String {
         format!("fnv1a64:{:016x}", self.content_hash())
+    }
+
+    /// A hash of **everything an episode can see**: [`Level::content_hash`] plus the entities it
+    /// leaves out — chasers, flyers, turrets and moving platforms.
+    ///
+    /// This is the identity a *run* is kept against. A run is a claim about the episodes its
+    /// population was scored on, and placing a chaser changes those episodes while leaving the
+    /// terrain untouched; keying the run on [`Level::content_hash`] alone meant the window
+    /// decided the run had not moved, kept its copy of the level, and drew the evolve view on a
+    /// level that no longer had the chaser in it. The editor and the playtest read the document
+    /// directly, so they showed it — the one view that did not was the one with a stale copy.
+    ///
+    /// Deliberately *not* the champion's [`Level::content_hash`]: a saved champion is a claim
+    /// about the route it learned over the terrain, and an enemy added later does not make that
+    /// route a claim about a different level. Keeping the two hashes separate keeps every
+    /// champion and population file on disk loadable, while the run still restarts when an
+    /// enemy moves.
+    pub fn scene_hash(&self) -> u64 {
+        let mut h = StateHasher::new();
+        self.hash_core(&mut h);
+        h.u32(self.chasers.len() as u32);
+        for c in &self.chasers {
+            c.hash_into(&mut h);
+        }
+        h.u32(self.flyers.len() as u32);
+        for f in &self.flyers {
+            f.rect.hash_into(&mut h);
+            h.f32(f.min_x);
+            h.f32(f.max_x);
+        }
+        h.u32(self.turrets.len() as u32);
+        for t in &self.turrets {
+            t.rect.hash_into(&mut h);
+            h.i8(t.dir);
+        }
+        h.u32(self.platforms.len() as u32);
+        for p in &self.platforms {
+            p.rect.hash_into(&mut h);
+            h.f32(p.span);
+            h.u8(p.vertical as u8);
+        }
+        h.finish()
+    }
+
+    /// [`Level::scene_hash`] in the metadata string form the run's packets carry.
+    pub fn scene_hash_string(&self) -> String {
+        format!("fnv1a64:{:016x}", self.scene_hash())
     }
 
     /// Build the initial player state for this level.
@@ -964,6 +1474,10 @@ impl Level {
             tiles: vec![Tile::Empty; (width * height) as usize],
             spawn: Rect::new(0.0, 0.0, PHYSICS.player_w, PHYSICS.player_h),
             walkers: Vec::new(),
+            chasers: Vec::new(),
+            flyers: Vec::new(),
+            turrets: Vec::new(),
+            platforms: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1064,6 +1578,44 @@ impl Level {
                 y: s.y,
             })
             .collect();
+
+        // The later enemies and the movers, mirrored by the same far-edge rule. Two of
+        // them carry something that has to turn with them: a turret's **firing direction**
+        // is a fact about which way its row is dangerous, so a mirrored turret fires left
+        // from its new home; and a flyer's beat is stored as two ends, which swap. A
+        // slider still slides *right* after a mirror — the level flipped, not the clock —
+        // so a platform's span and axis are untouched.
+        out.chasers = self
+            .chasers
+            .iter()
+            .map(|r| Rect::new(w - (r.x + r.w), r.y, r.w, r.h))
+            .collect();
+        out.flyers = self
+            .flyers
+            .iter()
+            .map(|f| FlyerSpec {
+                rect: Rect::new(w - (f.rect.x + f.rect.w), f.rect.y, f.rect.w, f.rect.h),
+                min_x: w - f.max_x,
+                max_x: w - f.min_x,
+            })
+            .collect();
+        out.turrets = self
+            .turrets
+            .iter()
+            .map(|t| TurretSpec {
+                rect: Rect::new(w - (t.rect.x + t.rect.w), t.rect.y, t.rect.w, t.rect.h),
+                dir: -t.dir,
+            })
+            .collect();
+        out.platforms = self
+            .platforms
+            .iter()
+            .map(|p| PlatformSpec {
+                rect: Rect::new(w - (p.rect.x + p.rect.w), p.rect.y, p.rect.w, p.rect.h),
+                span: p.span,
+                vertical: p.vertical,
+            })
+            .collect();
         out
     }
 
@@ -1131,6 +1683,42 @@ impl Level {
             !tx_out(tx, ty, width, height)
         });
         report.dropped_walkers = before - self.walkers.len();
+
+        // The later enemies and the movers fall off a shrinking map like anything else, and
+        // they have to be *dropped* rather than left outside the grid: a document with an
+        // entity past its edge is one the writer refuses, so leaving them would only move
+        // the failure from "a level that lost a flyer" to "a level that cannot be saved".
+        let before = self.chasers.len() + self.flyers.len() + self.turrets.len();
+        self.chasers
+            .retain(|r| !tx_out(tile_of_x(r.x, PHYSICS.walker_w), tile_of_bottom(r.bottom()), width, height));
+        self.flyers.retain(|f| {
+            !tx_out(
+                tile_of_x(f.rect.x, PHYSICS.flyer_w),
+                tile_of_bottom(f.rect.bottom()),
+                width,
+                height,
+            )
+        });
+        self.turrets.retain(|t| {
+            !tx_out(
+                tile_of_x(t.rect.x, PHYSICS.turret_w),
+                tile_of_bottom(t.rect.bottom()),
+                width,
+                height,
+            )
+        });
+        report.dropped_enemies = before - (self.chasers.len() + self.flyers.len() + self.turrets.len());
+
+        let before = self.platforms.len();
+        self.platforms.retain(|p| {
+            !tx_out(
+                p.rect.x.round() as i32,
+                tile_of_bottom(p.rect.bottom()),
+                width,
+                height,
+            )
+        });
+        report.dropped_platforms = before - self.platforms.len();
 
         let before = self.scenery.len();
         self.scenery
@@ -1270,6 +1858,202 @@ impl Level {
             PHYSICS.walker_h,
         ));
         true
+    }
+
+    // ---- the newer enemies and the moving platform --------------------------------------
+
+    /// Tile positions of every chaser, in sim order (after the patrols).
+    pub fn chaser_tiles(&self) -> Vec<(i32, i32)> {
+        self.chasers
+            .iter()
+            .map(|c| (tile_of_x(c.x, PHYSICS.walker_w), tile_of_bottom(c.bottom())))
+            .collect()
+    }
+
+    /// Tile positions of every flyer: the cell its body is authored in.
+    pub fn flyer_tiles(&self) -> Vec<(i32, i32)> {
+        self.flyers
+            .iter()
+            .map(|f| {
+                (
+                    tile_of_x(f.rect.x, PHYSICS.flyer_w),
+                    tile_of_bottom(f.rect.bottom()),
+                )
+            })
+            .collect()
+    }
+
+    /// Tile positions of every turret: the cell it stands in.
+    pub fn turret_tiles(&self) -> Vec<(i32, i32)> {
+        self.turrets
+            .iter()
+            .map(|t| {
+                (
+                    tile_of_x(t.rect.x, PHYSICS.turret_w),
+                    tile_of_bottom(t.rect.bottom()),
+                )
+            })
+            .collect()
+    }
+
+    /// Tile positions of every moving platform: the cell its left end rests on.
+    pub fn platform_tiles(&self) -> Vec<(i32, i32)> {
+        self.platforms
+            .iter()
+            .map(|p| (p.rect.x.round() as i32, tile_of_bottom(p.rect.bottom())))
+            .collect()
+    }
+
+    /// Whether a chaser may be placed at `(tx, ty)`: on the map, standing on ground.
+    ///
+    /// A chaser walks, so it needs exactly what a walker needs — the same feet-on-the-row-
+    /// below rule — and the editor colours its ghost from this answer.
+    pub fn chaser_placeable(&self, tx: i32, ty: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height) && self.walker_stands_on_ground(tx, ty)
+    }
+
+    /// Add a chaser at a tile if it may stand there. Returns whether it landed.
+    pub fn add_chaser_tile(&mut self, tx: i32, ty: i32) -> bool {
+        if !self.chaser_placeable(tx, ty) {
+            return false;
+        }
+        self.chasers.push(Rect::new(
+            tx as f32 + (1.0 - PHYSICS.walker_w) * 0.5,
+            crate::physics::bottom_of(ty) - PHYSICS.walker_h,
+            PHYSICS.walker_w,
+            PHYSICS.walker_h,
+        ));
+        true
+    }
+
+    /// Whether a flyer may be placed at `(tx, ty)`: on the map, with a clear cell.
+    ///
+    /// A flyer hangs in the air, so the rule is the *scenery* rule rather than the walker's:
+    /// the cell has to be empty. Nothing else is asked — the patrol's ends are clamped to the
+    /// map and to whatever walls it meets when the sim runs it.
+    pub fn flyer_placeable(&self, tx: i32, ty: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height) && self.tile(tx, ty) == Some(Tile::Empty)
+    }
+
+    /// Add a flyer at a tile, with a beat `span` tiles long **centred on that tile**. A span
+    /// under one tile is widened to one: a flyer that does not travel is a turret that cannot
+    /// shoot.
+    ///
+    /// Centred on the *cell*, not on the box's left edge. The first version measured the beat
+    /// from the box's left edge, which put the flyer half a tile off the click in one direction
+    /// and made a "four-tile" beat three-and-change tiles of visible travel — the kind of
+    /// arithmetic that makes a placement feel like it ignored the pointer.
+    pub fn add_flyer_tile(&mut self, tx: i32, ty: i32, span: i32) -> bool {
+        if !self.flyer_placeable(tx, ty) {
+            return false;
+        }
+        self.flyers.push(FlyerSpec::at(tx, ty, span));
+        true
+    }
+
+    /// Whether a turret may be placed at `(tx, ty)`: on the map, standing on ground.
+    pub fn turret_placeable(&self, tx: i32, ty: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height) && self.walker_stands_on_ground(tx, ty)
+    }
+
+    /// Add a turret at a tile, firing towards `dir` (`+1` right, `-1` left).
+    pub fn add_turret_tile(&mut self, tx: i32, ty: i32, dir: i8) -> bool {
+        if !self.turret_placeable(tx, ty) {
+            return false;
+        }
+        self.turrets.push(TurretSpec {
+            rect: Rect::new(
+                tx as f32 + (1.0 - PHYSICS.turret_w) * 0.5,
+                crate::physics::bottom_of(ty) - PHYSICS.turret_h,
+                PHYSICS.turret_w,
+                PHYSICS.turret_h,
+            ),
+            dir: if dir < 0 { -1 } else { 1 },
+        });
+        true
+    }
+
+    /// Whether a platform `tiles` wide may start at `(tx, ty)`: the whole low walk of its
+    /// travel has to be on the map, and the shelf has to have room to be seen.
+    ///
+    /// Only the *authored* box is checked, not the far end of the travel: a slider whose far
+    /// end runs into a wall is a shelf that stops early, which the sim already handles, and
+    /// refusing it here would make the author hunt for the exact tile the wall is on.
+    pub fn platform_placeable(&self, tx: i32, ty: i32, tiles: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height)
+            && tx + tiles.max(1) - 1 < self.width
+            && ty >= 0
+    }
+
+    /// Add a moving platform anchored at a tile. `tiles` is its width, `span` its travel, and
+    /// `vertical` whether it is a lift (up) rather than a slider (right).
+    pub fn add_platform_tile(
+        &mut self,
+        tx: i32,
+        ty: i32,
+        tiles: i32,
+        span: i32,
+        vertical: bool,
+    ) -> bool {
+        if !self.platform_placeable(tx, ty, tiles) {
+            return false;
+        }
+        self.platforms
+            .push(PlatformSpec::at(tx, ty, tiles, span, vertical));
+        true
+    }
+
+    /// The enemy whose cell is `(tx, ty)`, as its file kind, topmost of the kinds a click can
+    /// mean. Used by the editor's eraser and the inspector.
+    pub fn enemy_at(&self, tx: i32, ty: i32) -> Option<&'static str> {
+        if self.turret_tiles().contains(&(tx, ty)) {
+            Some("turret")
+        } else if self.walker_tiles().contains(&(tx, ty)) {
+            Some("walker")
+        } else if self.chaser_tiles().contains(&(tx, ty)) {
+            Some("chaser")
+        } else if self.flyer_tiles().contains(&(tx, ty)) {
+            Some("flyer")
+        } else if self.platform_tiles().contains(&(tx, ty)) {
+            Some("platform")
+        } else {
+            None
+        }
+    }
+
+    /// Remove whatever enemy or platform owns tile `(tx, ty)`. Returns whether one went.
+    pub fn remove_enemy_at(&mut self, tx: i32, ty: i32) -> bool {
+        let before =
+            self.walkers.len() + self.chasers.len() + self.flyers.len() + self.turrets.len() + self.platforms.len();
+        self.walkers.retain(|w| {
+            (
+                tile_of_x(w.x, PHYSICS.walker_w),
+                tile_of_bottom(w.bottom()),
+            ) != (tx, ty)
+        });
+        self.chasers.retain(|c| {
+            (
+                tile_of_x(c.x, PHYSICS.walker_w),
+                tile_of_bottom(c.bottom()),
+            ) != (tx, ty)
+        });
+        self.flyers.retain(|f| {
+            (
+                tile_of_x(f.rect.x, PHYSICS.flyer_w),
+                tile_of_bottom(f.rect.bottom()),
+            ) != (tx, ty)
+        });
+        self.turrets.retain(|t| {
+            (
+                tile_of_x(t.rect.x, PHYSICS.turret_w),
+                tile_of_bottom(t.rect.bottom()),
+            ) != (tx, ty)
+        });
+        self.platforms
+            .retain(|p| (p.rect.x.round() as i32, tile_of_bottom(p.rect.bottom())) != (tx, ty));
+        self.walkers.len() + self.chasers.len() + self.flyers.len() + self.turrets.len()
+            + self.platforms.len()
+            != before
     }
 
     /// Place **the** goal at a tile position, which also makes the level valid again if it
@@ -1450,6 +2234,10 @@ impl Level {
         for (what, tiles) in [
             ("walker", self.walker_tiles()),
             ("goal", self.goal_tiles()),
+            ("chaser", self.chaser_tiles()),
+            ("flyer", self.flyer_tiles()),
+            ("turret", self.turret_tiles()),
+            ("platform", self.platform_tiles()),
         ] {
             for (tx, ty) in tiles {
                 if tx_out(tx, ty, self.width, self.height) {
@@ -1477,30 +2265,61 @@ impl Level {
     /// produces must be a file this crate can load.
     pub fn to_json_pretty(&self) -> Result<String, String> {
         self.validate()?;
-        let mut entities: Vec<RawEntity> =
-            Vec::with_capacity(self.walkers.len() + self.goals.len() + self.scenery.len());
+        let mut entities: Vec<RawEntity> = Vec::with_capacity(
+            self.walkers.len()
+                + self.chasers.len()
+                + self.flyers.len()
+                + self.turrets.len()
+                + self.platforms.len()
+                + self.goals.len()
+                + self.scenery.len(),
+        );
         for (tx, ty) in self.walker_tiles() {
+            entities.push(RawEntity::of("walker", tx, ty));
+        }
+        for r in &self.chasers {
+            let (tx, ty) = (tile_of_x(r.x, PHYSICS.walker_w), tile_of_bottom(r.bottom()));
+            entities.push(RawEntity::of("chaser", tx, ty));
+        }
+        for f in &self.flyers {
             entities.push(RawEntity {
-                kind: "walker".into(),
-                x: tx,
-                y: ty,
-                sprite: None,
+                span: Some(f.span().round().max(1.0) as i32),
+                ..RawEntity::of(
+                    "flyer",
+                    tile_of_x(f.rect.x, PHYSICS.flyer_w),
+                    tile_of_bottom(f.rect.bottom()),
+                )
+            });
+        }
+        for t in &self.turrets {
+            entities.push(RawEntity {
+                dir: Some(t.dir),
+                ..RawEntity::of(
+                    "turret",
+                    tile_of_x(t.rect.x, PHYSICS.turret_w),
+                    tile_of_bottom(t.rect.bottom()),
+                )
+            });
+        }
+        for p in &self.platforms {
+            entities.push(RawEntity {
+                tiles: Some(p.rect.w.round().max(1.0) as i32),
+                span: Some(p.span.round().max(1.0) as i32),
+                axis: Some(if p.vertical { "y" } else { "x" }.to_string()),
+                ..RawEntity::of(
+                    "platform",
+                    p.rect.x.round() as i32,
+                    tile_of_bottom(p.rect.bottom()),
+                )
             });
         }
         for (tx, ty) in self.goal_tiles() {
-            entities.push(RawEntity {
-                kind: "goal".into(),
-                x: tx,
-                y: ty,
-                sprite: None,
-            });
+            entities.push(RawEntity::of("goal", tx, ty));
         }
         for s in &self.scenery {
             entities.push(RawEntity {
-                kind: "scenery".into(),
-                x: s.x,
-                y: s.y,
                 sprite: Some(s.sprite.clone()),
+                ..RawEntity::of("scenery", s.x, s.y)
             });
         }
         let (sx, sy) = self.spawn_tile();
@@ -1584,7 +2403,7 @@ fn goal_rect(tx: i32, ty: i32) -> Rect {
 mod editing_tests {
     use super::*;
 
-    const PACK: [&str; 10] = [
+    const PACK: [&str; 12] = [
         "l1-flat-run",
         "l2-first-gap",
         "l3-gauntlet",
@@ -1595,6 +2414,8 @@ mod editing_tests {
         "l7-wall-school",
         "l8-long-jump",
         "l9-wait-and-climb",
+        "l10-the-hunt",
+        "l11-the-elements",
     ];
 
     fn shipped(slug: &str) -> Level {
@@ -2020,6 +2841,88 @@ mod editing_tests {
             "the last valid tile, not one inside the old goal's row"
         );
         assert!(level.to_json_pretty().is_ok());
+    }
+
+    /// **A resize drops what it cannot fit, and never leaves an entity outside the grid.**
+    ///
+    /// The failure this is written for: an entity past the new edge makes `validate` refuse
+    /// the document, so a shrink would turn "a level that lost a flyer" into "a level that
+    /// cannot be saved". Every kind is placed past column 10 and the grid is cut to it.
+    #[test]
+    fn resize_drops_the_later_entities_and_leaves_a_saveable_document() {
+        let mut level = Level::starter("shrink-later", 40, 12);
+        for tx in 0..40 {
+            level.set_tile(tx, 10, Tile::Solid);
+        }
+        assert!(level.add_chaser_tile(30, 9));
+        assert!(level.add_flyer_tile(32, 6, 2));
+        assert!(level.add_turret_tile(34, 9, 1));
+        assert!(level.add_platform_tile(36, 6, 2, 2, false));
+        assert_eq!(level.goal_tiles().len(), 1);
+
+        let report = level.resize(10, 8, Tile::Empty);
+        assert_eq!(report.dropped_enemies, 3, "a chaser, a flyer and a turret");
+        assert_eq!(report.dropped_platforms, 1);
+        assert!(level.chasers.is_empty() && level.flyers.is_empty() && level.turrets.is_empty());
+        assert!(level.platforms.is_empty());
+        assert!(level.validate().is_ok(), "{:?}", level.validate());
+        assert!(level.to_json_pretty().is_ok(), "and it can still be saved");
+    }
+
+    /// **The mirror keeps every new entity, and is its own inverse.**
+    ///
+    /// The kind of omission a mirror test is for: the terrain is mirrored by a loop over
+    /// tiles, so an entity family nobody remembered is simply *gone* from the reflection —
+    /// and the editor's Mirror button is one click away from a level that lost its enemies.
+    /// The turret's facing and the flyer's beat have to turn with the level; a slider's
+    /// direction of travel does not, because the level flipped and the clock did not.
+    #[test]
+    fn the_mirror_keeps_the_later_entities_and_turns_what_faces() {
+        let mut level = Level::starter("mirror-later", 40, 12);
+        for tx in 0..40 {
+            level.set_tile(tx, 10, Tile::Solid);
+        }
+        assert!(level.add_walker_tile(6, 9));
+        assert!(level.add_chaser_tile(8, 9));
+        assert!(level.add_flyer_tile(12, 6, 4));
+        assert!(level.add_turret_tile(20, 9, -1));
+        assert!(level.add_platform_tile(24, 6, 3, 4, true));
+        assert!(level.set_goal_tile(36, 9));
+
+        let mirrored = level.mirrored_horizontal();
+        assert_eq!(mirrored.chasers.len(), 1, "a chaser survived the mirror");
+        assert_eq!(mirrored.flyers.len(), 1);
+        assert_eq!(mirrored.turrets.len(), 1);
+        assert_eq!(mirrored.platforms.len(), 1);
+        assert_eq!(
+            mirrored.turret_tiles(),
+            vec![(40 - 1 - 20, 9)],
+            "the turret moved to the reflected column"
+        );
+        assert_eq!(
+            mirrored.turrets[0].dir, 1,
+            "and now fires the other way: its row is dangerous from the other side"
+        );
+        assert!(
+            mirrored.platforms[0].vertical,
+            "a lift is still a lift after a mirror"
+        );
+        assert_eq!(mirrored.platforms[0].span, level.platforms[0].span);
+        // The beat reflected: its two ends swap places.
+        let stretch = |f: &FlyerSpec| (f.max_x - f.min_x, f.rect.w);
+        assert_eq!(stretch(&mirrored.flyers[0]), stretch(&level.flyers[0]));
+
+        // And the mirror of the mirror is the document again, entity for entity.
+        let back = mirrored.mirrored_horizontal();
+        assert_eq!(back.chaser_tiles(), level.chaser_tiles());
+        assert_eq!(back.flyer_tiles(), level.flyer_tiles());
+        assert_eq!(back.turret_tiles(), level.turret_tiles());
+        assert_eq!(back.platform_tiles(), level.platform_tiles());
+        assert_eq!(back.turrets[0].dir, level.turrets[0].dir);
+        for (a, b) in back.flyers.iter().zip(level.flyers.iter()) {
+            assert!((a.min_x - b.min_x).abs() < 1e-3 && (a.max_x - b.max_x).abs() < 1e-3);
+        }
+        assert!(back.validate().is_ok(), "{:?}", back.validate());
     }
 
     #[test]

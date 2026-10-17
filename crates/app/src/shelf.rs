@@ -328,11 +328,14 @@ pub fn show(ui: &mut Ui, entries: &[Entry], current: Option<&Path>) -> Action {
     action
 }
 
-/// One card: the thumbnail, the name, the facts, and a Play button.
+/// One card: the thumbnail, the name, the facts, and what a click does.
 fn card(ui: &mut Ui, entry: &Entry, selected: bool) -> Response {
-    let mut clicked = false;
+    // A selected card wears the accent's *ink*, not its gold: a gold hairline is 1.5:1 on a cream
+    // card, so "this is the one you have open" was the quietest thing on the shelf rather than the
+    // loudest. The ink is the same hue at 5.8:1, and it is drawn a little heavier than a resting
+    // card's edge so the two states cannot be confused.
     let frame = if selected {
-        theme::card_frame().stroke(Stroke::new(1.0_f32, theme::ACCENT))
+        theme::card_frame().stroke(Stroke::new(1.5_f32, theme::ACCENT_INK))
     } else {
         theme::card_frame()
     };
@@ -352,24 +355,36 @@ fn card(ui: &mut Ui, entry: &Entry, selected: bool) -> Response {
                             .strong(),
                     );
                     if selected {
-                        ui.label(egui::RichText::new("open").small().color(theme::ACCENT));
+                        // A filled chip rather than gold type on cream: the gold is the window's
+                        // *fill* accent, and as 11-point type on a card it measured 1.5:1. Filled,
+                        // it is dark ink on the accent — 9.8:1 — and reads as a badge.
+                        ui.label(
+                            egui::RichText::new(" open ")
+                                .small()
+                                .background_color(theme::ACCENT)
+                                .color(theme::INK_ON_ACCENT),
+                        );
                     }
                 });
-                let thumb = draw_thumbnail(ui, entry);
-                if thumb.clicked() {
-                    clicked = true;
-                }
+                // The thumbnail is drawn, not interacted with: the card's own rect is the
+                // control (see below), so a click on the map and a click on the name are one
+                // action rather than two widgets that have to agree about it.
+                let _ = draw_thumbnail(ui, entry);
                 ui.label(
                     egui::RichText::new(entry.summary())
                         .small()
                         .color(if entry.loadable() {
                             theme::TEXT_DIM
                         } else {
-                            theme::BAD
+                            // The failure *ink*: `BAD` is a fill and measured 3.3:1 as small type
+                            // on a card, which is under the floor a sentence has to clear.
+                            theme::BAD_INK
                         }),
                 );
                 if !entry.materials.is_empty() {
                     ui.label(
+                        // Metadata on a card: the tertiary ink, which is measured at 5.9:1 there
+                        // rather than the 2.8:1 the old value drew.
                         egui::RichText::new(entry.materials.join(" · "))
                             .small()
                             .color(theme::TEXT_FAINT),
@@ -389,14 +404,25 @@ fn card(ui: &mut Ui, entry: &Entry, selected: bool) -> Response {
             });
         })
         .response;
-    if clicked {
-        // A click anywhere on the card is a click on the card: the thumbnail is the biggest
-        // thing on it and aiming at the 20-pixel label above it would be the sort of
-        // precision a shelf exists to avoid.
-        return ui.interact(
+    // **The whole card is the control, and it says so before the click.** The frame's own
+    // response is drawn-only, so a click on the name or the facts used to do nothing — the card
+    // was one big target in the tooltip and a thumbnail-sized target in fact. The interactive
+    // response is taken over the finished rect so the picture, the words and the space between
+    // them all answer, and hover lifts the card's outline to the accent's ink and the pointer to
+    // a hand: a card that opens on click but looks inert is the sort of thing a person discovers
+    // by accident.
+    let response = ui.interact(
+        response.rect,
+        ui.id().with(("shelf-card", entry.name.as_str())),
+        Sense::click(),
+    );
+    if response.hovered() && entry.loadable() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_stroke(
             response.rect,
-            ui.id().with(("shelf-card", entry.name.as_str())),
-            Sense::click(),
+            egui::CornerRadius::same(theme::RADIUS),
+            Stroke::new(1.5_f32, theme::ACCENT_INK),
+            egui::StrokeKind::Inside,
         );
     }
     response

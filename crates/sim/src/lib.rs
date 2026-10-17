@@ -37,8 +37,11 @@ mod route_cache;
 use crate::physics::tile_span;
 
 pub use crate::hash::StateHasher;
-pub use crate::level::{Level, Rect, Scenery, Tile};
-pub use crate::physics::{AgentAction, Physics, PlayerState, Walker, PHYSICS};
+pub use crate::level::{FlyerSpec, Level, PlatformSpec, Rect, Scenery, Tile, TurretSpec};
+pub use crate::physics::{
+    AgentAction, Flyer, LavaBall, Mover, Physics, PlayerState, Shot, Turret, Walker, WalkerMode,
+    PHYSICS,
+};
 pub use crate::rng::{common_episode_seed, episode_seed, rng_from_seed, Rng};
 
 /// Sim behaviour version. Bump on *any* change to physics, tile semantics, or
@@ -291,6 +294,25 @@ pub struct Sim {
     level: Level,
     player: PlayerState,
     walkers: Vec<Walker>,
+    /// Flyers, in file order.
+    flyers: Vec<Flyer>,
+    /// Turrets, in file order.
+    turrets: Vec<Turret>,
+    /// Shots in flight.
+    shots: Vec<Shot>,
+    /// Lava balls in flight, oldest first.
+    lava_balls: Vec<LavaBall>,
+    /// Every lava cell open to the air, in row-major order: the vents a ball is spat from.
+    ///
+    /// Derived from the level once rather than stored as state — a vent is a fact about the
+    /// terrain, so two runs of one level cannot disagree about where the fountains are. What is
+    /// state is the balls, and those are hashed.
+    lava_vents: Vec<(i32, i32)>,
+    /// Moving platforms. Their *positions* are a function of the frame count; only which one
+    /// the body is riding is state, and that is [`Sim::riding`].
+    movers: Vec<Mover>,
+    /// The mover the body stood on last frame, so this frame's motion can carry it.
+    riding: Option<usize>,
     stats: EpisodeStats,
     outcome: Outcome,
     rng: Rng,
@@ -334,11 +356,50 @@ impl Sim {
     /// walker count, so the state hash stays comparable across frames.
     pub fn new(level: &Level, seed: u64) -> Self {
         let mut rng = rng_from_seed(seed);
-        let walkers = level
+        let mut walkers: Vec<Walker> = level
             .walkers
             .iter()
             .enumerate()
             .map(|(i, r)| Walker::spawn_spread(i as u32, *r, level, &PHYSICS, &mut rng))
+            .collect();
+        // **Chasers are appended after the patrols, and draw no RNG.** Two reasons that matter:
+        // a walker level's enemy-vector tie-break is walker index, so adding chasers must not
+        // renumber the patrols; and a level that has none must consume the identical RNG stream
+        // it did before this pass, or every recorded walker episode in the pack would change.
+        for r in &level.chasers {
+            let id = walkers.len() as u32;
+            walkers.push(Walker::chaser(id, *r, &PHYSICS));
+        }
+        let flyers = level
+            .flyers
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| Flyer::spawn_spread(i as u32, *spec, &PHYSICS, &mut rng))
+            .collect();
+        let turrets = level
+            .turrets
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| Turret::new(i as u32, *spec, &PHYSICS))
+            .collect();
+        let movers = level
+            .platforms
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| Mover {
+                id: i as u32,
+                home: spec.rect,
+                span: spec.span,
+                vertical: spec.vertical,
+                // Where the clear part of the travel ends. A platform authored through a
+                // wall/ceiling turns early rather than passing through it.
+                limit: crate::physics::clear_travel(
+                    spec.rect,
+                    spec.span,
+                    spec.vertical,
+                    level,
+                ),
+            })
             .collect();
         let spawn_player = level.spawn_player();
         let current_route_stand = spawn_route_stand(level);
@@ -346,6 +407,13 @@ impl Sim {
         Sim {
             player: spawn_player,
             walkers,
+            flyers,
+            turrets,
+            shots: Vec::new(),
+            lava_balls: Vec::new(),
+            lava_vents: level.lava_vents(),
+            movers,
+            riding: None,
             stats: EpisodeStats::new(&spawn_player, level),
             level: level.clone(),
             outcome: Outcome::Running,
@@ -374,6 +442,39 @@ impl Sim {
         &self.walkers
     }
 
+    pub fn flyers(&self) -> &[Flyer] {
+        &self.flyers
+    }
+
+    pub fn turrets(&self) -> &[Turret] {
+        &self.turrets
+    }
+
+    pub fn shots(&self) -> &[Shot] {
+        &self.shots
+    }
+
+    /// The lava balls in flight this frame.
+    pub fn lava_balls(&self) -> &[LavaBall] {
+        &self.lava_balls
+    }
+
+    /// The lava cells that are spitting: one per open-air lava cell in the level.
+    pub fn lava_vents(&self) -> &[(i32, i32)] {
+        &self.lava_vents
+    }
+
+    /// The moving platforms, as the boxes they occupy **this frame**.
+    ///
+    /// A renderer or a test asks this rather than the specs, because a platform's position is
+    /// a fact about a frame and the specs only carry the travel.
+    pub fn platforms(&self) -> Vec<Rect> {
+        self.movers
+            .iter()
+            .map(|m| m.rect_at(self.stats.frames, &PHYSICS))
+            .collect()
+    }
+
     pub fn stats(&self) -> &EpisodeStats {
         &self.stats
     }
@@ -389,13 +490,81 @@ impl Sim {
         }
         let ph = &PHYSICS;
         self.stats.frames += 1;
+        let frame = self.stats.frames;
 
-        // Walker patrols advance whatever the player does: the level is alive.
+        // The level is alive whatever the player does: enemies move, turrets fire, shots fly.
+        // A chaser is handed the body's position; a patrol ignores it.
+        let target_x = self.player.x;
         for w in self.walkers.iter_mut() {
-            w.tick(&self.level, ph);
+            w.tick_against(&self.level, Some(target_x), ph);
+        }
+        for f in self.flyers.iter_mut() {
+            f.tick(&self.level, ph);
+        }
+        for t in self.turrets.iter_mut() {
+            if t.tick(ph) {
+                self.shots.push(Shot::from_turret(t, ph));
+            }
+        }
+        for s in self.shots.iter_mut() {
+            s.tick(&self.level, ph);
+        }
+        self.shots.retain(|s| s.alive);
+
+        // ---- lava: the pool throws, gravity brings it back -----------------
+        //
+        // Every vent fires on its own phase of one period, derived from its index rather than
+        // drawn from the episode RNG — a fountain is a property of the level, like a walker's
+        // patrol path, and two runs of one seed must see the same rhythm. The phase stride
+        // (`37` against a period of 150) is coprime with the period, so a row of vents fires
+        // in a rolling order and a body reading the row has a gap to move through.
+        for (i, vent) in self.lava_vents.iter().enumerate() {
+            if LavaBall::fires(i, frame, ph) {
+                self.lava_balls.push(LavaBall::spawn(*vent, i, ph));
+            }
+        }
+        for b in self.lava_balls.iter_mut() {
+            b.tick(&self.level, ph);
+        }
+        self.lava_balls.retain(|b| b.alive);
+
+        // ---- moving platforms: the shelf carries its rider *before* the body moves ---
+        //
+        // The order is the whole of the jitter the first version had. Carrying *after* the
+        // body's tick means gravity pulls the rider down from the shelf's old position and
+        // then the landing snap fights it back up, once per frame, forever. Carrying before
+        // means the body starts its tick on the deck as it is now, so there is nothing to
+        // fight. The horizontal half is refused when it would put the body inside terrain:
+        // the player's own x movement is blocked that way, and a shelf must not push a body
+        // into a wall that the body cannot walk into.
+        //
+        // **The feet are recorded before the carry, not after it.** The landing test below is a
+        // *crossing* — above the deck on one frame, at or below it on the next — and both halves
+        // of that crossing have to be measured the same way. Measured after the carry, the
+        // shelf's own motion was counted as the body's: a lift rising 0.0625 a tick moved the
+        // feet by exactly that much before the test looked at them, so "where the feet were"
+        // was already "where the shelf put them". The crossing then passed for the wrong reason
+        // on a lift and could fail for the wrong reason anywhere else — a carried body refused
+        // at a wall, or one a tolerance away from the deck, lost its ride for a frame and was
+        // re-caught by the snap, which looks like a platform that grabs.
+        let prev_bottom = self.player.y + self.player.h;
+        for (i, m) in self.movers.iter().enumerate() {
+            if self.riding != Some(i) {
+                continue;
+            }
+            let (dx, dy) = m.delta_at(frame, ph);
+            if dx != 0.0 {
+                let before = self.player.x;
+                self.player.carry(dx, 0.0);
+                if crate::physics::rect_hits_opaque(&self.level, self.player.aabb()) {
+                    self.player.x = before;
+                }
+            }
+            if dy != 0.0 {
+                self.player.carry(0.0, dy);
+            }
         }
 
-        let prev_bottom = self.player.y + self.player.h;
         let touched = self.player.tick(&self.level, ph, action);
         if touched.jumped {
             self.stats.jumps += 1;
@@ -409,8 +578,52 @@ impl Sim {
         // is what makes a pad-only crossing something it can find (`REVIEW.md` §1.12).
         crate::physics::spring_launch(&self.level, &mut self.player, ph);
 
+        // ---- landing on a mover: a crossing, not a position -----------------
+        //
+        // A mover is **ground from above and air from the side**, exactly like a one-way
+        // platform. The first version's test — "the feet are above the deck" — was true for a
+        // body *three tiles* above the shelf, so a falling body was teleported down onto it
+        // from any height, and a body walking under one was yanked up through the deck. A
+        // landing has to be a **crossing**: the feet were at or above the deck last frame and
+        // are at or below it now. That is the same surface test the tile grid's own landing
+        // does, and it is the difference between a platform and a lift-shaped magnet.
+        let mut ride = None;
+        for (i, m) in self.movers.iter().enumerate() {
+            let rect = m.rect_at(frame, ph);
+            let feet = self.player.y + self.player.h;
+            let horiz = self.player.x + self.player.w > rect.x
+                && self.player.x < rect.x + rect.w;
+            let crossed = prev_bottom <= rect.y + ph.enemy_stomp_tol
+                && feet >= rect.y - ph.enemy_stomp_tol;
+            // A body that was *already* riding keeps riding while it is still over the deck and
+            // still standing on it, and this is not a refinement — it is what makes the ride
+            // continuous. The crossing test alone re-asks "did the feet just arrive?" on every
+            // frame, so any frame where the answer slipped — the horizontal carry refused at a
+            // wall, a lift that outran the tolerance, the one frame after a stoppped jump —
+            // dropped the ride and left the body in the air a tick later, to be re-caught by the
+            // snap. A rider is a *state*, and `self.riding` is where it is kept.
+            let stayed = self.riding == Some(i)
+                && (feet - rect.y).abs() <= ph.enemy_stomp_tol;
+            if horiz && self.player.vy >= 0.0 && (crossed || stayed) {
+                self.player.land_on(rect.y);
+                ride = Some(i);
+            }
+        }
+        self.riding = ride;
+
         // ---- hazards ------------------------------------------------------
         if touched.touched_spike {
+            self.die();
+            return;
+        }
+        // Lava kills twice: the pool a body steps into, and the ball it did not see coming.
+        // Both are the same death, which is the point of the tile having two mechanics.
+        if touched.touched_lava
+            || self
+                .lava_balls
+                .iter()
+                .any(|b| b.alive && self.player.aabb().overlaps(&b.aabb()))
+        {
             self.die();
             return;
         }
@@ -435,6 +648,45 @@ impl Sim {
         }
         if stomped {
             self.stats.stomps += 1;
+        }
+
+        // ---- flyers: the same stomp rule as a walker, one row up ------------
+        for f in self.flyers.iter_mut() {
+            if !f.alive || !self.player.aabb().overlaps(&f.aabb()) {
+                continue;
+            }
+            let descending = self.player.vy > 0.0;
+            let above = prev_bottom <= f.y + ph.enemy_stomp_tol;
+            if descending && above {
+                f.alive = false;
+                self.player.vy = -ph.jump_v0 * ph.stomp_bounce;
+                self.player.grounded = false;
+                self.stats.stomps += 1;
+            } else {
+                self.die();
+                return;
+            }
+        }
+
+        // ---- turrets: a solid obstacle, not an enemy -----------------------
+        //
+        // A turret used to be stompable like a walker: coming down on one destroyed it and
+        // bounced the body, and touching its side was a death. Both halves are gone. It is a
+        // **block that happens to shoot**: the body stands on its lid, is stopped by its sides,
+        // and is never killed by the box itself — the shot keeps its whole role as the row's
+        // hazard, which is what the turret is for. The lid is not a stomp and does not count in
+        // `stats.stomps`; it is the same surface a tile would be, and a body that walks off it
+        // falls like any other.
+        //
+        // Resolved *after* the body's own tile pass, because the box is not in the grid: the
+        // tile pass is what stops it at the floor and the walls, and this is a second solid
+        // surface laid over the cells the turret occupies.
+        self.resolve_turret_solidity(prev_bottom);
+
+        // ---- shots: there is no stomping a bullet ----------------------------
+        if self.shots.iter().any(|s| s.alive && self.player.aabb().overlaps(&s.aabb())) {
+            self.die();
+            return;
         }
 
         // ---- goal --------------------------------------------------------
@@ -596,6 +848,48 @@ impl Sim {
         frame_budget(&self.level)
     }
 
+    /// **A turret is a solid box.** Stand on its lid; a side stops the body.
+    ///
+    /// The turret used to live in the enemy pass above: a stomp destroyed it (and bounced the
+    /// body), and any other touch killed. It is furniture now — a barrel on a plinth that fires
+    /// — so the two questions a solid tile answers are answered here, after the body's own tile
+    /// pass has run: **from above** the lid is ground, and **from the side** the box is a wall.
+    /// Neither is a stomp and neither is a death; the shot is the only hazard the turret owns.
+    ///
+    /// A landing is a *crossing*, exactly as on a moving platform: the feet were at or above
+    /// the lid on the previous tick and are inside the box now. Without the crossing half, a
+    /// body falling beside a turret would be snapped up onto it from a tile away.
+    fn resolve_turret_solidity(&mut self, prev_bottom: f32) {
+        let ph = &PHYSICS;
+        for t in self.turrets.iter().filter(|t| t.alive) {
+            let lid = Rect::new(t.x, t.y, t.w, t.h);
+            let body = self.player.aabb();
+            if !body.overlaps(&lid) {
+                continue;
+            }
+            if self.player.vy >= 0.0 && prev_bottom <= lid.y + ph.enemy_stomp_tol {
+                // `land_on` stops the fall, grounds the body and clears the jump cut, so the
+                // next tick is a standing one rather than another fall into the lid.
+                self.player.land_on(lid.y);
+                continue;
+            }
+            // The side: put the body back out along the way it was travelling. Pushing the
+            // other way would be a wall that teleports a body through itself, and a body with
+            // no horizontal speed is pushed out the nearer face so it can never end up on the
+            // wrong side of the turret after standing still against it.
+            if self.player.vx > 0.0 {
+                self.player.x = lid.x - self.player.w;
+            } else if self.player.vx < 0.0 {
+                self.player.x = lid.x + lid.w;
+            } else if body.x + body.w * 0.5 < lid.x + lid.w * 0.5 {
+                self.player.x = lid.x - self.player.w;
+            } else {
+                self.player.x = lid.x + lid.w;
+            }
+            self.player.vx = 0.0;
+        }
+    }
+
     fn die(&mut self) {
         self.outcome = Outcome::Died;
         self.stats.death_pos = Some((self.player.x, self.player.y));
@@ -618,11 +912,22 @@ impl Sim {
     }
 
     /// Observation vector for the agent policy (§7.2). See [`sensors`].
+    ///
+    /// Everything alive is handed over, because the enemy slots answer about the *nearest
+    /// threat* and a flyer or a shot is one: an agent that could only see walkers would be
+    /// blind to exactly the two enemies added to make height and distance dangerous.
     pub fn observation(&self) -> [f32; sensors::N_INPUTS] {
-        sensors::observe_from_stand(
+        let movers = self.platforms();
+        sensors::observe_scene(
             &self.level,
             &self.player,
-            &self.walkers,
+            &sensors::Scene {
+                walkers: &self.walkers,
+                flyers: &self.flyers,
+                shots: &self.shots,
+                lava_balls: &self.lava_balls,
+                movers: &movers,
+            },
             &PHYSICS,
             self.current_route_stand,
         )
@@ -686,6 +991,38 @@ impl Sim {
         h.u32(self.walkers.len() as u32);
         for w in &self.walkers {
             w.hash_into(&mut h);
+        }
+        // The enemies this pass added, and the shelf a body may be riding. A platform's
+        // *position* is already implied by `frames`, which is the first thing hashed — what is
+        // not implied is which one the body stands on, and that is state.
+        h.u32(self.flyers.len() as u32);
+        for f in &self.flyers {
+            f.hash_into(&mut h);
+        }
+        h.u32(self.turrets.len() as u32);
+        for t in &self.turrets {
+            t.hash_into(&mut h);
+        }
+        h.u32(self.shots.len() as u32);
+        for s in &self.shots {
+            s.hash_into(&mut h);
+        }
+        // The pools' own attack: a ball is state, and the count is folded in even at zero so a
+        // level that has gained a vent cannot hash like one that never had one.
+        h.u32(self.lava_balls.len() as u32);
+        for b in &self.lava_balls {
+            b.hash_into(&mut h);
+        }
+        h.u32(self.movers.len() as u32);
+        for m in &self.movers {
+            m.hash_into(&mut h);
+        }
+        match self.riding {
+            Some(i) => {
+                h.u8(1);
+                h.u32(i as u32);
+            }
+            None => h.u8(0),
         }
         h.u64(self.rng_probe());
         h.finish()

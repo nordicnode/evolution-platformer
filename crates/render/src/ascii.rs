@@ -61,7 +61,8 @@
 
 use sim::level::{
     GLYPH_BRICK, GLYPH_CRACKED, GLYPH_CRACKED_BRICK, GLYPH_CRACKED_PLANK, GLYPH_CRACKED_SAND,
-    GLYPH_EMPTY, GLYPH_PLANK, GLYPH_SAND, GLYPH_SOLID, GLYPH_SPIKE, GLYPH_SPRING,
+    GLYPH_EMPTY, GLYPH_LAVA, GLYPH_PLANK, GLYPH_SAND, GLYPH_SOLID, GLYPH_SPIKE, GLYPH_SPRING,
+    GLYPH_VINE, GLYPH_WATER,
 };
 use sim::{Level, Sim};
 
@@ -71,6 +72,26 @@ pub const GLYPH_PLAYER: char = '@';
 pub const GLYPH_WALKER_ALIVE: char = 'e';
 /// Removed walker glyph.
 pub const GLYPH_WALKER_DEAD: char = 'x';
+/// Live chaser glyph. A different letter from a patroller's, because the two ask for
+/// different answers and a terminal frame is where a reader checks its own reasoning.
+pub const GLYPH_CHASER_ALIVE: char = 'h';
+/// Removed chaser glyph.
+pub const GLYPH_CHASER_DEAD: char = 'x';
+/// Flyer glyph.
+pub const GLYPH_FLYER: char = 'F';
+/// Turret glyph.
+pub const GLYPH_TURRET: char = 'T';
+/// A shot in flight.
+pub const GLYPH_SHOT: char = 'o';
+/// A moving platform.
+pub const GLYPH_MOVER: char = 'M';
+/// A ball of lava in flight.
+///
+/// A star rather than a letter, for the same reason a shot is `o`: it is the one body in the
+/// frame that is not a creature, and a terminal frame is where a reader checks its own reading
+/// of a level. Water, lava and vines are *tiles*, so they carry their own glyphs (`~`, `L`, `V`)
+/// and need no body of their own.
+pub const GLYPH_LAVA_BALL: char = '*';
 /// Goal trigger glyph.
 pub const GLYPH_GOAL: char = '!';
 /// Substitute for a glyph that cannot be drawn in one cell.
@@ -80,7 +101,7 @@ pub const GLYPH_UNKNOWN: char = '?';
 ///
 /// A legend, not a whitelist — see the module docs. Watch mode draws each agent
 /// with its own letter and those letters are not listed here.
-pub const GLYPHS: [(char, &str); 15] = [
+pub const GLYPHS: [(char, &str); 26] = [
     (GLYPH_SOLID, "solid tile"),
     (GLYPH_SAND, "sand tile (solid, a beach)"),
     (GLYPH_BRICK, "stone brick tile (solid masonry)"),
@@ -92,12 +113,23 @@ pub const GLYPHS: [(char, &str); 15] = [
     (GLYPH_CRACKED_SAND, "cracked sand (solid, breaks away underfoot)"),
     (GLYPH_CRACKED_BRICK, "cracked brick (solid, breaks away underfoot)"),
     (GLYPH_CRACKED_PLANK, "cracked timber (solid, breaks away underfoot)"),
+    (sim::level::GLYPH_ONEWAY, "one-way platform (ground from above, air from below)"),
     (GLYPH_SPIKE, "spike (lethal, not solid)"),
     (GLYPH_SPRING, "spring pad (not solid, throws a falling body up)"),
+    (GLYPH_WATER, "water (not solid: a body sinks in it and swims out)"),
+    (GLYPH_LAVA, "lava (not solid, lethal, and a vent when open to the air)"),
+    (GLYPH_VINE, "vine (not solid, climbable)"),
     (GLYPH_EMPTY, "empty space"),
     (GLYPH_GOAL, "goal flag"),
     (GLYPH_WALKER_ALIVE, "live walker enemy"),
     (GLYPH_WALKER_DEAD, "removed walker"),
+    (GLYPH_CHASER_ALIVE, "live chaser (hunts the player)"),
+    (GLYPH_CHASER_DEAD, "removed chaser"),
+    (GLYPH_FLYER, "flyer (holds its height, beats across a span)"),
+    (GLYPH_TURRET, "turret (fires along its row)"),
+    (GLYPH_SHOT, "a turret's shot in flight"),
+    (GLYPH_LAVA_BALL, "a lava ball in flight"),
+    (GLYPH_MOVER, "a moving platform"),
     (GLYPH_PLAYER, "the player"),
 ];
 
@@ -250,18 +282,47 @@ impl<'a> Scene<'a> {
     /// The player goes at index 0 so it is the primary body and therefore drawn
     /// last, exactly as this module drew it before it took scenes.
     pub fn from_sim(sim: &Sim) -> Scene<'_> {
-        let mut bodies = Vec::with_capacity(sim.walkers().len() + 1);
+        let mut bodies = Vec::with_capacity(
+            sim.walkers().len() + sim.flyers().len() + sim.turrets().len() + sim.shots().len() + 6,
+        );
         let p = sim.player();
         bodies.push(Body::from_rect(p.aabb(), GLYPH_PLAYER, true));
         for w in sim.walkers() {
+            let (live, dead) = match w.mode {
+                sim::WalkerMode::Chase => (GLYPH_CHASER_ALIVE, GLYPH_CHASER_DEAD),
+                sim::WalkerMode::Patrol => (GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD),
+            };
             bodies.push(Body::from_rect(
                 w.aabb(&sim::PHYSICS),
-                if w.alive {
-                    GLYPH_WALKER_ALIVE
-                } else {
-                    GLYPH_WALKER_DEAD
-                },
+                if w.alive { live } else { dead },
                 w.alive,
+            ));
+        }
+        // The air and the floor of the new mechanics: a flyer and a turret are bodies, so
+        // they take a cell; a shot is one too; and a mover is drawn as the shelf it is.
+        for f in sim.flyers() {
+            bodies.push(Body::from_rect(f.aabb(), GLYPH_FLYER, f.alive));
+        }
+        for t in sim.turrets() {
+            bodies.push(Body::from_rect(t.aabb(), GLYPH_TURRET, t.alive));
+        }
+        for s in sim.shots().iter().filter(|s| s.alive) {
+            bodies.push(Body::from_rect(s.aabb(), GLYPH_SHOT, true));
+        }
+        // A lava ball is a body in the air, so it takes a cell like the shot it shares a
+        // pass with: a scene that left them out would draw a level whose fountains are
+        // invisible and whose deaths are unexplained.
+        for b in sim.lava_balls().iter().filter(|b| b.alive) {
+            bodies.push(Body::from_rect(b.aabb(), GLYPH_LAVA_BALL, true));
+        }
+        for shelf in sim.platforms() {
+            bodies.push(Body::new(
+                shelf.x,
+                shelf.y,
+                shelf.w,
+                shelf.h,
+                GLYPH_MOVER,
+                true,
             ));
         }
         Scene::new(sim.level(), bodies)

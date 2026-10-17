@@ -111,6 +111,33 @@ WOOD_DEEP = (72, 44, 24)
 IRON_BOLT = (92, 98, 112)
 IRON_LIGHT = (146, 154, 168)
 
+# --- the elements: water, lava, vines -----------------------------------
+# Three families in one section because they are one pass: the tiles that are not ground.
+# Each is a single hue with a light and a dark end, the way every material here is, so a pool
+# is read as "the world's water" rather than as a fourth kind of light.
+#
+# Water is the cold end of the sky the backdrop already uses, darkened until it reads as a
+# body with depth rather than as a hole in the level; lava is the warm accent the lantern
+# already owns, pushed to red so the two never read as the same liquid; and a vine is the
+# grass family at its darkest, because it grows out of the ground it is drawn beside.
+WATER_FOAM = (214, 244, 250)
+WATER_LIGHT = (112, 200, 224)
+WATER = (66, 154, 192)
+WATER_MID = (46, 118, 158)
+WATER_DEEP = (32, 86, 124)
+
+LAVA_GLOW = (255, 232, 148)
+LAVA_HOT = (255, 206, 92)
+LAVA = (246, 138, 46)
+LAVA_MID = (206, 84, 28)
+LAVA_DEEP = (132, 44, 22)
+LAVA_CRUST = (86, 40, 30)
+
+VINE_LIGHT = (146, 210, 100)
+VINE = (94, 172, 68)
+VINE_DARK = (56, 116, 48)
+VINE_STEM = (84, 72, 44)
+
 # --- new prop accents: lanterns, crystals, banners, crates ---------------
 CRYSTAL_LIGHT = (176, 244, 255)
 CRYSTAL = (96, 212, 238)

@@ -86,8 +86,32 @@ members = [
 # walks off a lip must not be able to press back onto the pit wall). A physics constant moved,
 # so the trio moves and every earlier champion is refused rather than replayed against physics
 # it was not trained on.
+# 0.13.0: the enemies-and-objects pass, second pass — the numbers the first one got wrong, all of
+# them found by playing it. Three physics constants moved and one level-format *meaning* did:
+# `mover_speed` is now one 16-pixel art pixel per tick (0.0625) so a shelf and its rider step a
+# whole screen pixel per tick at every integer zoom instead of holding still for two frames and
+# jumping one; `shot_speed` is 0.18, faster than `sprint_speed`, so the doc's own "a shot cannot be
+# outrun" is true (it was 0.08, slower than a run) and `shot_range` is 18 so a wall is what stops a
+# bullet rather than an invisible twelve-tile wall in mid-air; and a flyer's `span` now means the
+# distance it *moves* (the authored ends name the box's edges, so the old reading shortened every
+# beat by the box's width — 0.7 tiles, a fifth of a short beat). The ride is also state now rather
+# than a per-frame landing test, and the feet are measured before the shelf's carry instead of after
+# it. A champion replayed against any of that would diverge, so the trio moves: sim 0.13.0. Sensors
+# and fitness are unchanged — none of this is visible in the observation or the score — but the
+# version trio's contract is that a champion records the build it was trained on, and that build is
+# gone.
+# 0.14.0: the elements. Three tiles that change the *body* rather than the terrain, and the only
+# pass so far that added a way for a body to move without pressing jump on ground: water (a body
+# whose centre is in it sinks at `water_sink` and swims up at `water_swim` while jump is held, with
+# a `water_jump_v0` push off the surface, and horizontal speed capped at `water_speed`), vines (a
+# body overlapping one climbs at `vine_climb` and slides at `vine_slide`, with gravity replaced
+# while it is on them), and lava (lethal on contact, and a vent that throws a ball every
+# `lava_period` when it is open to the air). Every one of them is a new physics rule, so every
+# earlier champion would be replayed against a body that cannot swim or climb and a world with no
+# fountains in it; sim 0.14.0, sensors v12 (the patch reads water, lava and vine as their own
+# values) and level format 3 (three new glyphs) move together.
 [workspace.package]
-version = "0.11.0"
+version = "0.14.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"

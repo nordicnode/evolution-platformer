@@ -152,6 +152,19 @@ pub struct Session {
     /// because it is a fact about the *last few frames*, which a stateless view cannot
     /// recover from the sim alone.
     anim: AgentAnim,
+    /// Where the body was at the start of the last simulated tick, and how far the frame is
+    /// between that tick and the next — the two halves of drawing a 60 Hz simulation on a
+    /// display that is not 60 Hz (see [`Session::body_at`]).
+    prev_body: Option<(f32, f32)>,
+    /// The ghost's position at the start of the last tick, for the same reason.
+    prev_ghost: Option<(f32, f32)>,
+    /// `accumulator / TICK`, in `0..1`: how far into the next tick this frame is.
+    render_alpha: f32,
+    /// The simulated clock the animation was last advanced to, in seconds: `frames * TICK` plus the
+    /// fraction of a tick the frame is into. Its *difference* is what the run cycle, the dust and the
+    /// squash are advanced by, so the legs move with the drawn body rather than with the frames that
+    /// happen to carry a tick (see [`Session::advance_actions`]).
+    anim_clock: f32,
     /// The quickest *playthrough* that has touched the flag in this session, if any.
     ///
     /// The player's own record, kept for the reason the run keeps the AI's ([`FastWin`]): a
@@ -172,8 +185,66 @@ impl Session {
             finished_wall: None,
             ghost: None,
             anim: AgentAnim::new(),
+            prev_body: None,
+            prev_ghost: None,
+            render_alpha: 0.0,
+            anim_clock: 0.0,
             best: None,
         }
+    }
+
+    /// Where to **draw** the body this frame: between the last two physics ticks, by however
+    /// much of a tick the frame is into.
+    ///
+    /// This is the whole of the playtest's smoothness. The simulator ticks at 60 Hz no matter
+    /// what the display does, so on a 144 Hz screen two frames in three advance no tick at all
+    /// and the third jumps a whole tick's movement — a 60 Hz stutter on a screen doing twice
+    /// that, which is exactly what "jerky" looked like. Interpolating between the two positions
+    /// the frames are between turns the same ticks into motion at the display's own rate.
+    ///
+    /// Linear rather than eased, on purpose: the physics already integrates acceleration, so
+    /// easing the *render* would double-smooth the run and make a sprint feel like it was on
+    /// ice. What is drawn is where the body was at a time between two states it really was in.
+    pub fn body_at(&self) -> (f32, f32) {
+        let p = self.sim.player();
+        match self.prev_body {
+            Some((px, py)) => (
+                px + (p.x - px) * self.render_alpha,
+                py + (p.y - py) * self.render_alpha,
+            ),
+            None => (p.x, p.y),
+        }
+    }
+
+    /// Where to draw the **camera** this frame: the centre of the body as it is drawn, not as the
+    /// simulator last left it.
+    ///
+    /// The camera has to be in on the interpolation rather than beside it. A camera that follows the
+    /// sim's last tick while the body is drawn *between* two ticks holds the scene still while the
+    /// body advances a third of a tick, then moves the whole scene a tick's travel at once when the
+    /// tick lands — so the body's offset from the centre saws from zero to a full tick's motion and
+    /// snaps back, sixty times a second, under a picture that is otherwise drawing at the display's
+    /// rate. That is the stutter the interpolation was added to remove, still there in the camera.
+    /// Put on the same clock, the body sits at one fixed point on screen and the world scrolls under
+    /// it smoothly; what is left of the loop is the integer pixel the camera is snapped to, which is
+    /// the pixel grid this renderer draws on and not a frame-rate artefact.
+    pub fn camera_centre(&self) -> (f32, f32) {
+        let p = self.sim.player();
+        let (x, y) = self.body_at();
+        (x + p.w * 0.5, y + p.h * 0.5)
+    }
+
+    /// The same for the ghost, so the race is drawn on one clock.
+    pub fn ghost_at(&self) -> Option<(f32, f32)> {
+        let g = self.ghost.as_ref()?;
+        let p = g.runner.sim().player();
+        Some(match self.prev_ghost {
+            Some((px, py)) => (
+                px + (p.x - px) * self.render_alpha,
+                py + (p.y - py) * self.render_alpha,
+            ),
+            None => (p.x, p.y),
+        })
     }
 
     /// Start over on the current level — after dying.
@@ -370,6 +441,14 @@ impl Session {
         let mut stepped = 0u32;
         while self.accumulator >= TICK {
             self.accumulator -= TICK;
+            // Remember where the body (and the ghost) were *before* this tick: the renderer
+            // interpolates between this position and the one the step is about to produce.
+            let p = self.sim.player();
+            self.prev_body = Some((p.x, p.y));
+            if let Some(ghost) = &self.ghost {
+                let g = ghost.runner.sim().player();
+                self.prev_ghost = Some((g.x, g.y));
+            }
             let action = decide(&self.sim);
             self.sim.step(action);
             // The ghost runs on the player's ticks, not on its own clock: one AI
@@ -383,14 +462,28 @@ impl Session {
             }
             stepped += 1;
         }
-        // The animation is advanced by the *simulated* time, not the wall clock: a frame
-        // that ran no ticks must not make the run cycle or the dust timers move, or the
-        // legs would run while the agent stands still on a slow machine.
-        if stepped > 0 {
-            self.anim.advance(&self.sim, stepped as f32 * TICK);
+        // How far this frame sits between the last tick and the next. Always updated, including
+        // on a frame that ran no tick — that is the frame the interpolation exists for.
+        self.render_alpha = (self.accumulator / TICK).clamp(0.0, 1.0);
+        // The animation is advanced by the *simulated* time, not by the ticks this frame happened to
+        // run: the drawn body moves a third of a tick on a frame that ran none, and a run cycle that
+        // only moved on the tick frames would take its steps at 60 Hz under a body gliding at the
+        // display's rate — the legs skating under a smooth sprite, which reads as a jerk however
+        // smooth the position is. The clock is the sim's own (`frames * TICK`) plus the fraction of
+        // the next tick the frame is into, so it is exactly the time the drawn body is at, and it is
+        // still the simulation's time rather than the wall clock's: a stalled frame that ran no ticks
+        // and is still stuck in the same tick advances the animation by the same fraction, never
+        // further than the body moved.
+        let simulated = self.sim.stats().frames as f32 * TICK + self.render_alpha * TICK;
+        let anim_dt = (simulated - self.anim_clock).max(0.0);
+        self.anim_clock = simulated;
+        if anim_dt > 0.0 {
+            self.anim.advance(&self.sim, anim_dt);
             if let Some(ghost) = &mut self.ghost {
-                ghost.anim.advance(ghost.runner.sim(), stepped as f32 * TICK);
+                ghost.anim.advance(ghost.runner.sim(), anim_dt);
             }
+        }
+        if stepped > 0 {
             // And the stopwatch stops on the tick the episode ended on, whatever frame carried it.
             self.note_win();
             // The death pause starts the moment the outcome turns, measured in wall
@@ -1112,5 +1205,117 @@ mod tests {
         assert_eq!(session.frames(), 0);
         assert_eq!(session.ghost_sim().map(|s| s.stats().frames), Some(0));
         assert!(session.has_ghost(), "the race restarts together");
+    }
+
+    /// **The playtest draws a body that moves on every frame, by the same amount.**
+    ///
+    /// The bug this pins is the one a 60 Hz simulation on a 144 Hz screen always has: two frames in
+    /// three run no tick at all, so a view that draws the simulator's last position shows a body that
+    /// stands still, stands still, then jumps a whole tick's travel. That is a 60 Hz stutter under a
+    /// screen drawing three times as often, and it is what "jerky" looks like. Interpolating between
+    /// the two ticks a frame is between makes the step per frame the accumulator's own share of a
+    /// tick — equal on every frame, including the ones no tick landed on.
+    ///
+    /// Measured after the body has reached run speed, so the step is constant in the physics too and
+    /// any variance is the view's.
+    #[test]
+    fn the_drawn_body_advances_on_every_frame_of_a_fast_display() {
+        let level = shipped("l1-flat-run");
+        let mut session = Session::new(&level, 1);
+        let keys = Keys {
+            right: true,
+            ..Keys::default()
+        };
+        // Forty ticks at the simulation's own rate: long enough to be at the speed cap.
+        for _ in 0..40 {
+            session.advance(1.0 / 60.0, keys);
+        }
+        // Then a 144 Hz display, for three quarters of a second of running.
+        let mut steps = Vec::new();
+        let mut ticks = 0;
+        let mut last = session.body_at().0;
+        for _ in 0..120 {
+            let before = session.frames();
+            session.advance(1.0 / 144.0, keys);
+            ticks += session.frames() - before;
+            let x = session.body_at().0;
+            steps.push(x - last);
+            last = x;
+        }
+        assert!(
+            ticks > 40 && ticks < 55,
+            "120 frames at 144 Hz is about fifty ticks, got {ticks}"
+        );
+        let still = steps.iter().filter(|s| **s <= 0.0).count();
+        assert_eq!(
+            still, 0,
+            "{} of {} frames drew the body standing still; the drawn position is the tick's, not \
+             a point between two ticks",
+            still,
+            steps.len()
+        );
+        let mean = steps.iter().sum::<f32>() / steps.len() as f32;
+        let slowest = steps.iter().cloned().fold(f32::INFINITY, f32::min);
+        let fastest = steps.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            (slowest - mean).abs() <= mean * 0.25 && (fastest - mean).abs() <= mean * 0.25,
+            "the step per frame should be the same on every frame: mean {mean:.4}, \
+             min {slowest:.4}, max {fastest:.4}"
+        );
+        // And the camera is on the drawn body, so what actually moves on screen is the world: the
+        // body's centre is the camera centre to within the f32 the lerp is computed in.
+        let (cx, _) = session.camera_centre();
+        assert!(
+            (cx - (session.body_at().0 + session.sim().player().w * 0.5)).abs() < 1e-5,
+            "the camera has to follow the body where it is drawn, not where the last tick left it"
+        );
+    }
+
+    /// **The run cycle advances with the drawn body, not with the frames that carry a tick.**
+    ///
+    /// The second half of the same jerkiness: on a 144 Hz screen two frames in three run no tick, and
+    /// an animator advanced by `ticks * TICK` takes its leg steps on the tick frames only — legs
+    /// stepping at 60 Hz under a body gliding at 144, which reads as a skating sprite however smooth
+    /// the position is. The animation clock is the *simulated* time the frame is at, fractional part
+    /// included, so the cycle moves on the frames the body moves on.
+    ///
+    /// Counted through the drawn sprite rather than through a timer, because the sprite is what a
+    /// player sees: the leg frame has to change on frames that ran no tick at all.
+    #[test]
+    fn the_run_cycle_advances_on_frames_that_run_no_tick() {
+        let level = shipped("l1-flat-run");
+        let mut session = Session::new(&level, 1);
+        let keys = Keys {
+            right: true,
+            ..Keys::default()
+        };
+        for _ in 0..40 {
+            session.advance(1.0 / 60.0, keys);
+        }
+        let mut last_sprite = crate::view::player_sprite(session.sim(), session.anim()).0;
+        let mut changes_without_a_tick = 0;
+        let mut changes = 0;
+        for _ in 0..120 {
+            let before = session.frames();
+            session.advance(1.0 / 144.0, keys);
+            let ran_tick = session.frames() != before;
+            let sprite = crate::view::player_sprite(session.sim(), session.anim()).0;
+            if sprite != last_sprite {
+                changes += 1;
+                if !ran_tick {
+                    changes_without_a_tick += 1;
+                }
+                last_sprite = sprite;
+            }
+        }
+        assert!(
+            changes >= 6,
+            "a 0.40 s run cycle over 0.83 s of running should step several times, got {changes}"
+        );
+        assert!(
+            changes_without_a_tick > 0,
+            "the leg frame changed only on frames that ran a tick, so the animation is running on the \
+             simulation's 60 Hz rather than the display's clock"
+        );
     }
 }

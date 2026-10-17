@@ -48,8 +48,10 @@ use sim::Outcome;
 const PANEL_BG: Color32 = theme::SHELL;
 /// The chart's plot area, cut into that display so the lines read as data.
 const PLOT_BG: Color32 = theme::SCREEN_WELL;
-/// The chart's rules.
+/// The chart's frame and its baseline: the edge of the display, at the control-boundary weight.
 const AXIS: Color32 = theme::SCREEN_EDGE;
+/// The chart's interior rules: a scale, one step quieter than its frame.
+const GRID: Color32 = theme::SCREEN_GRID;
 /// The best-of-generation line: the growth colour, because the max series *is* the run's
 /// growth and the chart's headline series.
 const MAX_LINE: Color32 = theme::GOOD;
@@ -466,14 +468,34 @@ pub struct Keys {
 /// the fix — and it is one function rather than four call sites so the next section gets
 /// the same treatment by existing.
 pub fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(title)
-            .color(theme::ACCENT_INK)
-            .monospace()
-            .strong(),
+    // A ribbon, not a label over a rule: the panel's sections are the *tabs* of a game's menu,
+    // so each one is a bright blue plate with white caps on it, a brown outline and a rounded
+    // corner. The strip takes the panel's whole width, which is what makes a column of them read
+    // as one board of headings rather than as a document with subheads.
+    ui.add_space(10.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let radius = CornerRadius::same(theme::RADIUS);
+    painter.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), radius, theme::OUTLINE);
+    painter.rect_filled(rect, radius, theme::RIBBON);
+    // The lit top edge every candy-coloured plate in this window wears: one pixel of white at
+    // 35%, which is what makes blue read as a *plastic sign* rather than as a flat swatch.
+    painter.rect_filled(
+        Rect::from_min_size(
+            Pos2::new(rect.left() + 8.0, rect.top() + 2.0),
+            Vec2::new((rect.width() - 16.0).max(0.0), 1.0),
+        ),
+        radius,
+        Color32::from_white_alpha(90),
     );
-    ui.separator();
+    let font = FontId::monospace(12.0);
+    let galley = painter.layout_no_wrap(title.to_uppercase(), font, Color32::WHITE);
+    painter.galley(
+        Pos2::new(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5 - 1.0),
+        galley,
+        Color32::WHITE,
+    );
+    ui.add_space(6.0);
 }
 
 /// Small print: a qualifier, a unit, a hint. Dim, so it never competes with a reading.
@@ -797,6 +819,7 @@ pub fn lab_panel(
     let mut actions = Actions::default();
 
     // --- where the run is -------------------------------------------------
+    section(ui, "The run");
     for reading in menu_readings(summary) {
         reading_line(ui, &reading);
     }
@@ -838,7 +861,7 @@ pub fn lab_panel(
     actions.speed = pace_row(ui, atlas, view.speed, "the pace it plays at");
 
     // --- what to do about it ----------------------------------------------
-    ui.add_space(8.0);
+    section(ui, "The controls");
     // The rows all take the panel's own width: a menu is a *column*, and a column of plates that each
     // sized themselves would read as separate buttons that happen to be near each other.
     let width = ui.available_width();
@@ -1695,13 +1718,20 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
         return;
     }
 
-    // The y rule: three lines, and the two numbers the series must be read against.
-    for value in [geometry.hi, (geometry.hi + geometry.lo) * 0.5, geometry.lo] {
+    // The y rule: three lines, and the two numbers the series must be read against. The
+    // **baseline is the frame's weight and the two rules above it are gridlines**: a chart whose
+    // three rules are all the frame's colour has no floor, and one whose floor is a gridline has
+    // no edge. That hierarchy is the whole of the drawing's depth.
+    for (i, value) in [geometry.hi, (geometry.hi + geometry.lo) * 0.5, geometry.lo]
+        .into_iter()
+        .enumerate()
+    {
         let y = plot.bottom() - plot.height() * (value - geometry.lo) / (geometry.hi - geometry.lo);
         let y = y.clamp(plot.top(), plot.bottom());
+        let ink = if i == 2 { AXIS } else { GRID };
         painter.line_segment(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
-            Stroke::new(1.0_f32, AXIS),
+            Stroke::new(1.0_f32, ink),
         );
         painter.text(
             Pos2::new(plot.left() - 6.0, y),
@@ -1710,6 +1740,28 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
             font.clone(),
             SCREEN_TEXT_DIM,
         );
+    }
+
+    // A very quiet wash under the max series: the line says *where* the run has been and the
+    // wash says *how much* of the plot it owns, which is the read a reader takes before reading
+    // any number. Low enough alpha that the gridlines stay visible through it.
+    if geometry.max.len() > 1 {
+        // A quad per segment rather than one polygon: a fitness curve is not convex, and a fan
+        // triangulation of one would paint over itself. Two triangles per point pair is exact
+        // whatever the run's shape does.
+        let tint = MAX_LINE.gamma_multiply(0.10);
+        let mut mesh = egui::Mesh::default();
+        for pair in geometry.max.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let base = mesh.vertices.len() as u32;
+            mesh.colored_vertex(a, tint);
+            mesh.colored_vertex(b, tint);
+            mesh.colored_vertex(Pos2::new(b.x, plot.bottom()), tint);
+            mesh.colored_vertex(Pos2::new(a.x, plot.bottom()), tint);
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
+        }
+        painter.add(mesh);
     }
 
     // Average first, so the max series is never hidden behind it.

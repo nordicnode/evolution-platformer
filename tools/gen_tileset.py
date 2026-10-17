@@ -52,13 +52,28 @@ from art.common import CELL, CHECKER, TRANSPARENT, cell, rgba  # noqa: E402
 # Fifteen rows held two hundred and thirty-three sprites with seven cells to spare, and `ROWS` went
 # to sixteen for the trap tiles rather than to fifteen-and-a-half: the two tiles and their four
 # crack overlays fit either way, and a growable atlas is the point of it being wider than it needs
-# to be. Fourteen rows held two hundred and twenty-three with one cell spare — a full atlas rather
+# to be. Sixteen rows held two hundred and thirty-eight with two cells spare, and `ROWS` went to
+# seventeen for the enemy and platform families (three enemies, their four new frames, a shot, two
+# shelf families): two spare cells is a full atlas, and the next sprite added would have been a
+# generator error instead of a drawing. Fourteen rows held two hundred and twenty-three with one
+# cell spare — a full atlas rather
 # than a growable one — and the window's own tool glyphs (`art/ui.py`) are the family that made it
 # fifteen. They are the first sprites here that the *game* never draws, and they arrived last for
 # the same reason the seams did: a family whose whole purpose is the application's chrome can wait
 # for one that goes in the level.
+#
+# Eighteen now, for the fluids' autotile. A pool used to be four cells per fluid — a body and two
+# surfaces — and the body carried its own depth shading, which is why a two-tile pool drew that
+# shading twice. Splitting it into three interchangeable bodies plus a surface, a bed and two walls
+# is what a solid tile has always been (a mask, a crown and its variants); it is also eight cells
+# per fluid rather than four, and the atlas grew a row to hold them.
+#
+# Twenty now, and it is the last growable step of this kind: a fluid's body became sixteen cells —
+# one picture four tiles square, cut up (`terrain.FLUID_BLOCK`) — so that a pool has no seam at
+# any tile boundary and no visible repeat until four tiles out. That is thirty-two sprites for two
+# fluids, which is the largest family here by a factor of two and the reason for the wide margin.
 COLS = 16
-ROWS = 16
+ROWS = 20
 
 # Read order, so the manifest is stable and the preview is readable: nothing may
 # reorder this except a change to `assets/README.md`, which lists the same names.

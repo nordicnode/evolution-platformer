@@ -6,7 +6,7 @@ Generated art. `tools/gen_tileset.py` rewrites everything in this directory:
 
 | file | what it is |
 |---|---|
-| `tileset.png` | the atlas: 16x16 pixel cells, 16 columns by 16 rows (256x256) |
+| `tileset.png` | the atlas: 16x16 pixel cells, 16 columns by 20 rows (256x320) |
 | `tileset.json` | the manifest the game reads: cell size, grid, and where each named sprite lives |
 | `tileset_preview.png` | an 8x nearest-neighbour upscale on a checked background, for eyeballing |
 
@@ -20,7 +20,13 @@ drift into three palettes. The table below is the manifest in words; it is check
 against the shipped manifest by
 `atlas::tests::the_assets_readme_lists_every_shipped_sprite`, so it cannot go stale
 quietly. Most names are **required** (`crate::atlas::REQUIRED`): the game refuses to
-start without them. The tile variants, the last eight props, every material seam and the
+start without them. The eight element sprites a pool cannot be drawn without (`water`,
+`water_top_a`, `water_top_b`, `lava`, `lava_top_a`, `lava_top_b`, `lava_ball`, `vine`) are required
+for the spike's and the pad's reason: each of those tiles has behaviour the game has no fallback
+picture for, and an invisible pool is a body sinking for no visible reason. The rest of the fluid
+family — the extra body textures, the beds and the walls — is optional on the same terms as the
+tile variants: a tileset without them draws a plain, seamless pool, and the only thing lost is
+the variation and the edges. The tile variants, the last eight props, every material seam and the
 four `cracked_*` overlays are *optional* — a tileset that omits them draws the plainer
 equivalent instead (a hard edge, for a missing seam; a brittle tile as the material it is made
 of, for a missing crack), and the fallbacks are in `crate::view::scenery_sprite`,
@@ -49,12 +55,32 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `wood_1_b`, `wood_1_c` | the timber deck plus wood knots, and plus countersunk iron rivets |
 | `spike` | a lethal non-solid tile: three spikes on a stone base, top row transparent so it never looks like part of the ceiling |
 | `spring` | a spring pad: a brass coil between two steel plates, standing in its cell with the top quarter of the cell left transparent (the launch zone follows that gap, `sim::physics::SPRING_TOP_CLEARANCE`). A body that *lands* on it is thrown upward and keeps the horizontal speed it arrived with |
+| `water_b0`, `water_b1`, `water_b2`, `water_b3`, `water_b4`, `water_b5`, `water_b6`, `water_b7`, `water_b8`, `water_b9`, `water_b10`, `water_b11`, `water_b12`, `water_b13`, `water_b14`, `water_b15` | a pool's body (`Tile::Water`, `~`), drawn as **one picture four tiles square and cut into sixteen cells**: cell `r * 4 + c` of the picture, indexed by the tile's own position modulo four (`crate::view::fluid_body_sprite`). The body has to be seamless — two stacked water cells are one body of water rather than two trays — so the cut is where the *index* changes and not where the picture does, and a pool repeats every four tiles instead of every one |
+| `water` | the plain body: cell 0 of that picture, for a tileset that has no block (the sixteen cells above are optional art) and for the two surfaces, which are a body with a crest drawn over it |
+| `water_top_a`, `water_top_b` | a pool's surface, the crest travelling along a row so a long pool's wave moves. The rows above the crest are transparent and the lit band under it fades back into the body tone, so the surface cell ends where the body cell below it begins. Not solid, and a body whose centre is in the water sinks and has to swim |
+| `water_bed` | a pool's bed, drawn **over** the body cell on the floor (`crate::view::draw_fluid_edges`): a shadow whose ragged top edge thickens downwards. An overlay, so it composes with every one of the sixteen body cells |
+| `water_wall_l`, `water_wall_r` | the rim of a pool that meets **air** at that side: two or three pixels of dark water, uniform down the cell so the edge runs unbroken through a deep pool. The right wall is the left one mirrored, so the two cannot drift apart |
+| `lava_b0`, `lava_b1`, `lava_b2`, `lava_b3`, `lava_b4`, `lava_b5`, `lava_b6`, `lava_b7`, `lava_b8`, `lava_b9`, `lava_b10`, `lava_b11`, `lava_b12`, `lava_b13`, `lava_b14`, `lava_b15` | a lava pool's body (`Tile::Lava`, `L`) in the same sixteen-cell construction, drawn from the molten end of the palette: bright cells are molten, dark ones already cooled. Lethal on contact, and a cell open to the air is a **vent** that throws a ball |
+| `lava` | the plain lava body: cell 0 of the picture, for a tileset without the block |
+| `lava_top_a`, `lava_top_b` | a lava surface: a glowing crust line with two domes that break and re-form, fading into the body by the fourth row for the same reason water's does |
+| `lava_bed` | a lava pool's bed: crusted where it meets the ground, with a few cracks in the crust still glowing — the rock the pool sits on is being cooked |
+| `lava_wall_l`, `lava_wall_r` | the rim of a lava pool against open air: the crust that forms where the melt meets nothing. Another mirrored pair |
+| `lava_ball` | one ball of lava in flight, drawn to fill its cell because the cell *is* its hitbox: the thing that kills a body is the thing the player can see |
+| `vine` | one cell of climbable vine (`Tile::Vine`, `V`): a stem continuous from row 0 to row 15 so a shaft of them reads as one vine, with leaves alternating down it. Not solid; jump climbs it and releasing slides down it |
 | `cracked_ground`, `cracked_sand`, `cracked_brick`, `cracked_wood` | one material's crack, on an otherwise transparent cell, drawn **over** that material's own tile by `crate::view`. The tile it marks is ordinary solid ground until a body stands on it, and then it leaves the level (`sim::physics::CRUMBLE_TICKS`) |
 | `player_idle_a`, `player_idle_b` | the runner at rest, breathing |
 | `player_run_1`, `player_run_2`, `player_run_3`, `player_run_4`, `player_run_5`, `player_run_6` | the six-frame run cycle |
 | `player_jump`, `player_fall`, `player_land`, `player_hurt` | rising, falling, the landing frame, and the pose a dead agent is left in |
 | `walker_a`, `walker_b`, `walker_c`, `walker_d` | the patroller's four-frame walk |
 | `walker_dead` | a stomped walker |
+| `chaser_a`, `chaser_b`, `chaser_c`, `chaser_d` | the chaser's four-frame run: a leaner, red carapace with a forward horn, deliberately not a tint of the walker's art |
+| `chaser_dead` | a stomped chaser |
+| `flyer_a`, `flyer_b` | the flyer's two wing frames, raised and swept: the body hovers and only the wings move |
+| `turret_r` | a turret facing right: a stone plinth, a small dome and an iron barrel with a warm muzzle |
+| `turret_l` | the same turret mirrored. The view mirrors `turret_r` instead of drawing this one, so the two can never drift apart; the sprite is here for tools and for tilesets that prefer the pair |
+| `shot` | a turret's projectile: a hot core with a short tail behind it, so a still frame reads as motion |
+| `oneway_l`, `oneway_m`, `oneway_r` | the one-way platform (`Tile::OneWay`, `=`): a timber shelf across the **top** of its cell, with iron brackets under it, in three pieces so a run of them has cut ends. Ground from above, air from below and from the side |
+| `mover_l`, `mover_m`, `mover_r` | a moving platform (`sim::level::PlatformSpec`): the same shelf with an iron rail on top and a hanging link, drawn in the **top half** of the cell because half a cell is the platform's whole box |
 | `goal_top`, `goal_bottom`, `goal_flag_1`, `goal_flag_2`, `goal_flag_3`, `goal_flag_4` | the flag on its pole, waving through four frames |
 | `spawn_marker` | where the player starts, editor only |
 | `bush_a`, `bush_b` | a leafy mound, two frames of sway |

@@ -27,7 +27,7 @@ use egui::{ColorImage, Context, Pos2, Rect, TextureHandle, TextureOptions};
 /// The material seams (`blend_*`) are optional the same way, and more so than the rest:
 /// a tileset without them draws a hard edge between two materials, which is what every
 /// tileset drew before they existed.
-pub const REQUIRED: [&str; 72] = [
+pub const REQUIRED: [&str; 80] = [
     "empty",
     // The ground: one sprite per 4-bit open-side mask, and the rock the same way for
     // every mask with no sky above it.
@@ -62,6 +62,21 @@ pub const REQUIRED: [&str; 72] = [
     // game has no fallback picture for, exactly as a spike is, so a tileset without it is refused
     // at startup rather than drawn as an empty cell a body bounces off for no visible reason.
     "spring",
+    // The elements: the fluid bodies and their beds, the two animated surfaces each, the ball
+    // a vent throws, and the vine. All required, because each of the three tiles has
+    // *behaviour* the game cannot draw a fallback picture for — an invisible pool is a body
+    // sinking for no visible reason, which is exactly the failure `spring`'s note describes.
+    // The bed is required for a subtler reason: it is the sprite that lets the body be
+    // seamless, so a tileset with the bodies and the surfaces but no beds would draw a pool's
+    // depth cue nowhere at all rather than draw it twice.
+    "water",
+    "water_top_a",
+    "water_top_b",
+    "lava",
+    "lava_top_a",
+    "lava_top_b",
+    "lava_ball",
+    "vine",
     // The player's animation set: two idle frames, a six-frame run, one pose per
     // airborne state, and the pose a dead agent is left in.
     "player_idle_a",

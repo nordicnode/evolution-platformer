@@ -31,7 +31,7 @@
 //! widget in the window keeps: things you press are rounded, things you read are square-ish.
 
 use egui::{
-    Color32, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Response, Sense, Ui,
+    Color32, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Response, Sense, Stroke, Ui,
     Vec2,
 };
 
@@ -200,7 +200,10 @@ pub struct Bevel {
 /// a surface and brightens its type; and a resting one is a card.
 pub fn bevel(state: PlateState, rect: Rect) -> Bevel {
     let pressed = state.pressed && state.enabled;
-    let face = rect.shrink(1.0);
+    // Two pixels of socket, not one: this window's controls are pixel-art buttons, and the
+    // keyline around a pressed tile in the game's own art is two pixels — a one-pixel rim at
+    // forty points is a hairline the eye reads as anti-aliasing rather than as an outline.
+    let face = rect.shrink(2.0);
     // The content is inset far enough that an icon or a word never touches the lip, and the
     // pressed sink is applied *here* rather than to the face: a face that moved would take the
     // socket's lit edge with it, and the two edges are what say which way the plate went.
@@ -216,8 +219,8 @@ pub fn bevel(state: PlateState, rect: Rect) -> Bevel {
     let (fill, light, dark, text) = if !state.enabled {
         (
             theme::CARD_OFF,
-            theme::EDGE,
-            theme::EDGE.gamma_multiply(0.92),
+            theme::CONTROL_EDGE.gamma_multiply(0.55),
+            theme::CONTROL_EDGE,
             theme::TEXT_FAINT,
         )
     } else if state.selected {
@@ -268,9 +271,10 @@ pub fn bevel(state: PlateState, rect: Rect) -> Bevel {
 /// Paint a resolved plate: the socket, the face, then its two edges.
 pub fn paint(painter: &Painter, b: &Bevel) {
     let radius = CornerRadius::same(theme::RADIUS_LG);
-    // The socket first, filled with the plate's *shaded* colour: that ring is the lip the face
-    // sits in, and it is why a resting button already has an outline to press into.
-    painter.rect_filled(b.socket, radius, b.dark);
+    // The socket first, and it is the *outline* rather than the plate's shaded colour: a control
+    // in this window is a printed tile, so it carries the same warm brown boundary as the panels
+    // it stands on, and the face's own lit and shaded edges are drawn inside it.
+    painter.rect_filled(b.socket, radius, theme::OUTLINE);
     painter.rect_filled(b.face, radius, b.fill);
     // The two edges, drawn inside the face and inset from its corners so they do not fight the
     // rounded lip at the ends.
@@ -475,10 +479,12 @@ pub fn menu_row(
 /// one object rather than as a row of plates that happen to be near each other.
 fn paint_well(painter: &Painter, outer: Rect) {
     painter.rect_filled(outer, CornerRadius::same(theme::RADIUS_LG), theme::SUNKEN);
+    // The well holds pressable cells, so its rim is a control boundary rather than a hairline: a
+    // sunk well edged in `EDGE` is a group whose edge the eye has to be told about.
     painter.rect_stroke(
         outer,
         CornerRadius::same(theme::RADIUS_LG),
-        egui::Stroke::new(1.0_f32, theme::EDGE),
+        egui::Stroke::new(1.0_f32, theme::CONTROL_EDGE),
         egui::StrokeKind::Inside,
     );
 }
@@ -570,17 +576,24 @@ pub fn segmented_sized(
     let cells = options.len() as f32;
     let size = Vec2::new(cell_size.x * cells + 8.0, cell_size.y + 8.0);
     let (outer, _) = ui.allocate_exact_size(size, Sense::hover());
+    // **One id space per control, not per panel.** The cells used to be keyed on
+    // `ui.id().with(("segment", i))`, so every segmented control in the same `Ui` reused the same
+    // ids: the shape switch and the turret's direction switch are both in the palette panel, and
+    // egui keys a widget's interaction state by id — two controls sharing one id is two controls
+    // fighting over one hover and one click. Read from the ui's auto-id counter *after* the row's
+    // own allocation, which is what makes this call's base different from the next call's.
+    let base = ui.auto_id_with("segments");
     let painter = ui.painter_at(outer);
     paint_well(&painter, outer);
 
     let mut clicked = None;
-    let mut hit = ui.interact(outer, ui.id().with("segments"), Sense::hover());
+    let mut hit = ui.interact(outer, base, Sense::hover());
     for (i, (icon, label)) in options.iter().enumerate() {
         let cell = Rect::from_min_size(
             Pos2::new(outer.min.x + 4.0 + i as f32 * cell_size.x, outer.min.y + 4.0),
             cell_size,
         );
-        let id = ui.id().with(("segment", i));
+        let id = base.with(("segment", i));
         let response = ui.interact(cell, id, Sense::click());
         let allowed = enabled.get(i).copied().unwrap_or(true);
         let state = PlateState::of(&response, i == selected, allowed);
@@ -739,8 +752,10 @@ const ROW_HEIGHT: f32 = 14.0;
 /// the file behind it without wrapping the whole thing in a second layout.
 pub fn plaque(ui: &mut Ui, title: &str, subtitle: &str) -> Response {
     egui::Frame::new()
-        .fill(theme::PLATE)
+        .fill(theme::ACCENT)
+        .stroke(Stroke::new(3.0_f32, theme::OUTLINE))
         .corner_radius(CornerRadius::same(theme::RADIUS_LG))
+        .shadow(theme::drop_shadow())
         .inner_margin(egui::Margin::symmetric(12, 5))
         .show(ui, |ui| {
             // A *frame* inherits its parent's layout, and a plaque lives on a horizontal bar:
@@ -748,16 +763,19 @@ pub fn plaque(ui: &mut Ui, title: &str, subtitle: &str) -> Response {
             // line, which is a caption rather than a sign and takes a hundred points the dock needs.
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
+                // Brown ink on a coin-gold plate: the sign over the whole window, drawn the way
+                // a game's title plate is. The name leads because it is the document; the file
+                // under it is the small print printed on the same sign.
                 ui.label(
                     egui::RichText::new(title)
-                        .font(FontId::new(theme::HEADING_SIZE, FontFamily::Proportional))
-                        .color(theme::TEXT),
+                        .font(FontId::new(theme::HEADING_SIZE, FontFamily::Monospace))
+                        .color(theme::OUTLINE),
                 );
                 if !subtitle.is_empty() {
                     ui.label(
                         egui::RichText::new(subtitle)
                             .font(FontId::new(theme::SMALL_SIZE, FontFamily::Monospace))
-                            .color(theme::TEXT_DIM),
+                            .color(theme::OUTLINE.gamma_multiply(0.75)),
                     );
                 }
             });

@@ -39,7 +39,9 @@
 
 use std::path::Path;
 
-use egui::{Align2, Color32, Context, FontId, Painter, Pos2, Rect, Vec2};
+use egui::{
+    Align2, Color32, Context, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, Vec2,
+};
 use evo::{ActScratch, ChampionFile, Genome};
 use sim::{AgentAction, Level, Sim, Tile};
 
@@ -48,14 +50,19 @@ use crate::play::{self, Keys};
 use crate::theme;
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 
-/// The words. The title is the window's own title, so the taskbar and the splash agree.
-const TITLE: &str = "EVOLUTION PLATFORMER";
+/// The lockup. Two lines rather than one, because a logo is stacked: nine letters across a
+/// window this wide at a size worth reading draw a banner, and two lines draw a *title*.
+///
+/// The eyebrow is the genre line a box would carry above its name; the subtitle is the hook.
+/// The words are the window's own, so the taskbar and the splash agree.
+const TITLE_LINES: [&str; 2] = ["EVOLUTION", "PLATFORMER"];
+const EYEBROW: &str = "AN ARTIFICIAL-LIFE PLATFORMER";
 const SUBTITLE: &str = "a population learns to beat the level you draw";
-/// The invitation, and the two shortcuts worth learning on the front door. The app's own
-/// bindings, and *honest* ones: the screen dismisses into whichever of these the key
-/// names, so the hint is a doorway rather than a promise the editor would have to keep.
-const HINT: &str = "press any key to build a level";
-const KEYS: &str = "P  play it yourself        E  evolve an AI";
+/// The menu's own help line: how to move between the doors, and how to take one.
+///
+/// "Up / down" rather than arrow glyphs, which the window's font does not have: a hint that
+/// renders as two empty boxes is worse than one that spells the key out.
+const MENU_HINT: &str = "UP / DOWN   SELECT";
 
 /// What a person asked for by dismissing the screen.
 ///
@@ -87,11 +94,10 @@ const TITLE_AT: f32 = 0.30;
 const LETTER_IN: f32 = 0.045;
 const LETTER_FADE: f32 = 0.45;
 const LETTER_RISE: f32 = 10.0;
-/// When the invitation arrives, and how fast it breathes. After the title has finished
-/// assembling: a screen that is still revealing its name while it says "press any key" is
-/// still assembling itself at the moment it invites the viewer to leave.
+/// When the menu arrives. After the title has finished assembling: a screen that is still
+/// revealing its name while it offers its doors is still assembling itself at the moment it
+/// invites the viewer to choose.
 const HINT_AT: f32 = 1.9;
-const HINT_HZ: f32 = 1.3;
 /// How long the finished episode is held before the little run starts over.
 const HOLD: f32 = 1.15;
 /// How long a dismissing event is ignored at the very start.
@@ -104,14 +110,14 @@ const ARMED: f32 = 0.35;
 /// invitation needs a band of its own under the ground rather than the lawn's brown. Pushing
 /// the world up is one number and it is what turns the layer under the ground from a state
 /// the fit happened to land on into a *floor for the text*.
-const RAISED: f32 = 0.075;
+const RAISED: f32 = 0.17;
 /// Where the ground sits in the window when a champion is playing, as a fraction of the
 /// window's height.
 ///
 /// Low enough that the lawn, the props and the agent are in the lower third of a window the
 /// sky and its parallax fill above them, high enough to leave a band of its own under the
 /// ground for the invitation. See [`Splash::target`].
-const GROUND_LINE: f32 = 0.78;
+const GROUND_LINE: f32 = 0.60;
 /// The seed of the splash's episode, so the splash is the same splash every launch.
 const SEED: u64 = 4;
 
@@ -125,46 +131,87 @@ const SEED: u64 = 4;
 /// renamed — the title stopped being a cream of its own and became the accent, because a
 /// screen with one thing on it wants one ink for the thing it is about.
 const TITLE_INK: Color32 = theme::ACCENT;
+/// The top edge of the title's bevel: the gold, lifted towards the sun.
+const TITLE_LIGHT: Color32 = Color32::from_rgb(255, 246, 208);
 const TITLE_SHADE: Color32 = theme::SHELL;
-const SUBTITLE_INK: Color32 = theme::TEXT;
-const HINT_INK: Color32 = theme::ACCENT;
-const RULE_INK: Color32 = theme::GOOD;
-const FOOT_INK: Color32 = theme::TEXT_DIM;
+/// The eyebrow over the title, and the rule under it: the metal, not the sun.
+const EYEBROW_INK: Color32 = theme::GOLD_EDGE;
+/// The tagline is read on the *sky*, so it is the window's dark screen ink rather than its
+/// cream: a pale line over a pale-blue sky was the one piece of type on this screen that had
+/// to be read twice. Dark navy on sky is 8.7:1 and belongs to the same palette.
+const SUBTITLE_INK: Color32 = Color32::from_rgb(24, 34, 46);
+const RULE_INK: Color32 = theme::GOLD_EDGE;
+/// Small print on the stage: the *screen* ink, because the band under the level is dark.
+/// The old footer used the chrome's dim ink and was 1.3:1 on it — a caption nobody could read.
+const FOOT_INK: Color32 = theme::SCREEN_INK_DIM;
+/// The stage: near-black, blue-shifted, so the gold on it reads warm.
+const STAGE_INK: Color32 = Color32::from_rgb(54, 38, 24);
+/// The menu's face: the window's warm white, because the box is a piece of the game's own menu
+/// set on top of the picture rather than a hole cut into it.
+const PANEL_FACE: Color32 = theme::CARD;
 
-/// When the three doors are up: a beat after the invitation starts breathing.
+/// When the menu is up: a beat after the invitation starts breathing.
 ///
-/// They arrive with the caption rather than at the first frame, because a doorway offered
+/// It arrives with the caption rather than at the first frame, because a doorway offered
 /// before the screen has said what it is a doorway *to* is a button nobody reads. A beat
-/// and not a crossfade: a button is a hit target as well as a pixel, and a target that is
+/// and not a crossfade: a row is a hit target as well as a pixel, and a target that is
 /// half transparent on the frame it becomes clickable is a target somebody clicks twice.
 const DOORS_LAG: f32 = 0.25;
-/// The size each door is drawn at. One number for the row, so the placement arithmetic in
-/// [`buttons`] is the same number the buttons are made of.
-const DOOR_SIZE: Vec2 = Vec2::new(112.0, 26.0);
 
-/// The three doors, left to right, with what each one does and the key that also does it.
+/// The panel the menu is drawn in: a framed box in the band under the level.
+///
+/// A fixed width rather than a fraction of the window, because a menu is an *object*: three
+/// lines six hundred points wide on a cinema screen are a toolbar, and the same lines on a
+/// small window are a wall. 520 is wide enough for a cursor, a name, a description and a key
+/// on one line, and narrow enough to read as a box.
+const MENU_W: f32 = 520.0;
+/// One option line's height. A line of a console menu is a line of type with a cursor beside
+/// it, not a card: 40 points is a name, its key and the air a blinking cursor needs.
+const LINE_H: f32 = 40.0;
+/// The panel's padding, and the description strip under the options.
+///
+/// The strip is what a console menu does instead of a sentence on every line: one hint about
+/// the thing the cursor is on, in the bottom of the box.
+const PANEL_PAD: f32 = 14.0;
+const DESC_H: f32 = 34.0;
+/// Padding from the window's bottom edge, for the box, the prompt and the key line.
+const MENU_BOTTOM_PAD: f32 = 96.0;
+
+/// One door: what it is called, what it does, the sentence the box shows while the cursor is
+/// on it, and the key that also takes it.
 ///
 /// Edit first because it is what most launches want — a splash is usually opened on the way
-/// to drawing something — and then the two activities the invitation names, in the order the
-/// plan lists them: play it yourself, then teach the population. The tooltips carry the same
-/// keys [`show`] reads, so a person who would rather use the keyboard can read the key off
-/// the button instead of guessing at it.
-const DOORS: [(&str, Action, &str); 3] = [
-    (
-        "Edit",
-        Action::Edit,
-        "build a level: paint tiles, place the spawn and the flag\nany other key",
-    ),
-    (
-        "Play",
-        Action::Play,
-        "take the keyboard and play the level yourself  (P)",
-    ),
-    (
-        "Evolve",
-        Action::Evolve,
-        "train a population to beat this level  (E)",
-    ),
+/// to drawing something — and then the two activities the plan lists: play it yourself, then
+/// teach the population. The key chips are the same keys [`show`] reads, so a person who
+/// would rather use the keyboard can read the key off the row instead of guessing at it, and
+/// the pictures are the mode switch's own sprites, so the front door and the dock agree
+/// about what the four activities look like.
+struct Door {
+    name: &'static str,
+    action: Action,
+    blurb: &'static str,
+    key: &'static str,
+}
+
+const DOORS: [Door; 3] = [
+    Door {
+        name: "EDIT",
+        action: Action::Edit,
+        blurb: "draw a level, tile by tile",
+        key: "ANY KEY",
+    },
+    Door {
+        name: "PLAY",
+        action: Action::Play,
+        blurb: "take the keyboard and play it",
+        key: "P",
+    },
+    Door {
+        name: "EVOLVE",
+        action: Action::Evolve,
+        blurb: "train a population to beat it",
+        key: "E",
+    },
 ];
 
 /// The splash, and everything it is doing while it is up.
@@ -183,6 +230,13 @@ pub struct Splash {
     clock: f32,
     /// Seconds left of the hold after the episode ends, and then it starts again.
     hold: f32,
+    /// Which door the keyboard is on: an index into [`DOORS`].
+    ///
+    /// One selection with two ways to move it. The pointer sets it on hover, so the gold bar
+    /// is under the cursor, and <up>/<down> set it, so the bar is where the next Enter will
+    /// go. Two cursors that could disagree would be a menu that shows one thing and does
+    /// another.
+    selected: usize,
 }
 
 /// What is running the level in the picture.
@@ -266,6 +320,7 @@ impl Splash {
             policy: Policy::Champion(run),
             clock: 0.0,
             hold: 0.0,
+            selected: 0,
         }
     }
 
@@ -279,6 +334,7 @@ impl Splash {
             policy: Policy::Script,
             clock: 0.0,
             hold: 0.0,
+            selected: 0,
         }
     }
 
@@ -301,7 +357,7 @@ impl Splash {
     /// photograph if they were showing somebody the screen. The episode is advanced as well,
     /// so the runner in that frame is running rather than standing on the spawn tile.
     pub fn skip_opening(&mut self) {
-        let skip = PULLBACK + 0.5;
+        let skip = HINT_AT + 0.9;
         let steps = (skip / sim::DT).ceil() as u32;
         for _ in 0..steps {
             self.advance(sim::DT);
@@ -367,19 +423,23 @@ impl Splash {
     /// Draw the screen, and say which way the viewer asked to go — or `None` if they have not
     /// asked yet.
     ///
-    /// Any key press or any click counts, once the screen has been up for [`ARMED`] seconds:
-    /// a splash is a doorway, and a doorway that argues is a wall. The two keys the invitation
-    /// names enter the activity they name ([`Action::Play`], [`Action::Evolve`]); everything
-    /// else opens the editor. Nothing else about the app runs while this is up — the caller
-    /// returns early — so the key that dismisses the splash cannot also press a button in the
-    /// editor underneath it.
+    /// The picture first, then the stage, then the words and the menu: the level is the screen's
+    /// *subject*, and everything drawn over it is furniture arranged around it.
     ///
-    /// The one press that is not that rule is a press on the three doors drawn in the band
-    /// under the world ([`buttons`]): those are widgets, they answer on the release, and a
-    /// press that took the screen down on its way to them would put the editor under a click
-    /// aimed at Play. So the band's own presses are passed through to the button and every
-    /// other press — the sky, the title, the level — is still "just start".
-    pub fn show(&self, ctx: &Context, atlas: &Atlas, sprites: &Sprites) -> Option<Action> {
+    /// Any key press or any click counts, once the screen has been up for [`ARMED`] seconds: a
+    /// splash is a doorway, and a doorway that argues is a wall. Two keys open the activity they
+    /// name ([`Action::Play`], [`Action::Evolve`]); everything else opens the editor, which is
+    /// what most launches want. **The arrows and enter are the exception**: a menu that shows a
+    /// selection has to be drivable by the keys that move a selection, so up/down move the gold
+    /// bar and enter takes it — and the bar is the same one the pointer sets, so the two ways in
+    /// cannot disagree about which door is chosen.
+    ///
+    /// The one press that is not a decision is a press on the rows themselves ([`menu`]): those
+    /// are widgets, they answer on the release, and a press that took the screen down on its way
+    /// to them would put the editor under a click aimed at Play. So the menu's own presses are
+    /// passed through to the row and every other press — the sky, the title, the level — is still
+    /// "just start".
+    pub fn show(&mut self, ctx: &Context, atlas: &Atlas, sprites: &Sprites) -> Option<Action> {
         let rect = ctx.screen_rect();
         let painter = ctx.layer_painter(egui::LayerId::background());
         let camera = self.camera(rect);
@@ -401,29 +461,38 @@ impl Splash {
             self.session.anim(),
         );
 
-        // Where the world ends. The invitation is placed under it rather than at a fixed
-        // height, because a champion is played on whatever document the window opened on and
-        // a document can be tall enough to reach the band the words want.
-        let world_bottom = sheet
+        // The band under the level's own floor is the stage. Measured from the floor rather
+        // than from a fraction of the window, because a champion is played on whatever level
+        // the window opened on and this is the one line the composition can trust.
+        let floor = sheet
             .camera
-            .to_screen(0.0, self.level.height as f32, rect)
+            .to_screen(0.0, (self.level.height - 1) as f32, rect)
             .y;
-        title(&painter, ctx, rect, self.clock);
-        subtitle(&painter, rect, self.clock);
-        invitation(&painter, rect, self.clock, world_bottom);
-        footer(&painter, rect, self.credit());
+        stage(&painter, rect, floor);
+        lockup(&painter, ctx, rect, self.clock);
 
-        // The doors, over the caption they answer: the invitation asks the question —
-        // "press any key" — and these are the three answers, spelled out. Drawn before the
-        // input is read, because the widget has to exist on the frame the pointer lands on
-        // it for egui to know the press was aimed at it.
-        let band = button_band(rect, world_bottom);
-        let from_doors = buttons(ctx, band, self.clock);
+        let panel = menu_panel(rect);
+        let from_menu = menu(
+            ctx,
+            &painter,
+            rect,
+            panel,
+            &mut self.selected,
+            self.clock,
+        );
+        footer(&painter, rect, self.credit());
 
         if self.clock < ARMED {
             return None;
         }
-        let from_keys = ctx.input(|i| {
+        // What the keyboard asked for this frame: no decision, a new selection, or a door.
+        enum Pressed {
+            None,
+            Move(usize),
+            Go(Action),
+        }
+        let count = DOORS.len();
+        let pressed = ctx.input(|i| {
             for event in &i.events {
                 match event {
                     // A press, not a release: letting go of a key is not a decision.
@@ -432,37 +501,47 @@ impl Splash {
                         pressed: true,
                         ..
                     } => {
-                        return Some(match key {
-                            egui::Key::P => Action::Play,
-                            egui::Key::E => Action::Evolve,
-                            _ => Action::Edit,
-                        });
+                        return match key {
+                            egui::Key::ArrowDown | egui::Key::ArrowRight | egui::Key::Tab => {
+                                Pressed::Move((self.selected + 1) % count)
+                            }
+                            egui::Key::ArrowUp | egui::Key::ArrowLeft => {
+                                Pressed::Move((self.selected + count - 1) % count)
+                            }
+                            egui::Key::Enter | egui::Key::Space => {
+                                Pressed::Go(DOORS[self.selected].action)
+                            }
+                            egui::Key::P => Pressed::Go(Action::Play),
+                            egui::Key::E => Pressed::Go(Action::Evolve),
+                            _ => Pressed::Go(Action::Edit),
+                        };
                     }
-                    // A press *on the doors* is not a decision either, and this is the one
-                    // press the rule below has to step aside for: a button answers on the
-                    // release, so taking the press here would start the editor out from
-                    // under the pointer and the click would arrive somewhere it was not
-                    // aimed. Every other press is "just start": a click on the title, on
-                    // the sky or on the world is the editor.
+                    // A press *on a row* is not a decision either, and this is the one press
+                    // the rule below has to step aside for: a row answers on the release, so
+                    // taking the press here would start the editor out from under the pointer
+                    // and the click would arrive somewhere it was not aimed.
                     egui::Event::PointerButton {
                         pressed: true,
                         pos, ..
-                    } if doors_are_up(self.clock) && band.expand(8.0).contains(*pos) => {
+                    } if menu_is_up(self.clock) && panel.expand(10.0).contains(*pos) => {
                         continue;
                     }
-                    egui::Event::PointerButton { pressed: true, .. } => {
-                        return Some(Action::Edit);
-                    }
+                    egui::Event::PointerButton {
+                        pressed: true, ..
+                    } => return Pressed::Go(Action::Edit),
                     _ => {}
                 }
             }
-            None
+            Pressed::None
         });
-        // A key beats a button in the same frame, which cannot happen for a person and has
-        // to be decided anyway: the keyboard is the faster way out of this screen, and the
-        // button is the pointer's, so the two can only disagree on a frame that delivered
-        // both. `or` rather than precedence by hand: either is a decision to leave.
-        from_keys.or(from_doors)
+        match pressed {
+            Pressed::Move(next) => {
+                self.selected = next;
+                None
+            }
+            Pressed::Go(action) => Some(action),
+            Pressed::None => from_menu,
+        }
     }
 
     /// Where the world is drawn from: close on the runner, easing out to where the run goes.
@@ -680,236 +759,601 @@ fn champion_file(
 ///
 /// A pure function of the clock and the letter's index, so the reveal can be tested without a
 /// screen, and so the last letter's arrival is a fact about the timing constants rather than
-/// something to eyeball.
+/// something to eyeball. The index runs across *both* lines, so the second line assembles
+/// after the first: a title that arrives as one gesture rather than two.
 fn letter_in(clock: f32, index: usize) -> f32 {
     let at = TITLE_AT + index as f32 * LETTER_IN;
     ((clock - at) / LETTER_FADE).clamp(0.0, 1.0)
 }
 
-/// Around the title, in points, as a fraction of the window.
-fn title_size(rect: Rect) -> f32 {
-    (rect.height() * 0.092).clamp(26.0, 64.0)
+/// How many letters the lockup has, spaces included: the reveal's own clock.
+fn title_letters() -> usize {
+    TITLE_LINES.iter().map(|line| line.chars().count()).sum()
 }
 
-/// The line the title sits on, as a fraction of the window's height.
+/// The size of the title: one number for both lines, and the biggest type in the window.
 ///
-/// High enough to be in the sky and clear of the treeline, low enough that the space above
-/// it is a horizon rather than a margin.
-const TITLE_LINE: f32 = 0.275;
+/// Sized from the window's height rather than fixed, because the title *is* the screen's
+/// subject: at 92 points "PLATFORMER" is about 600 wide, which is a logo in the middle of a
+/// 1360-point window rather than a caption over one.
+fn title_size(rect: Rect) -> f32 {
+    (rect.height() * 0.115).clamp(36.0, 96.0)
+}
 
-/// The title, revealed a letter at a time.
+/// The baseline of the lockup's first line, as a fraction of the window's height.
 ///
-/// One `painter.text` per letter rather than one for the line, because the reveal is the
+/// High enough that the sky above it is a horizon rather than a margin, low enough that the
+/// two lines, the rule and the tagline clear the level's floor.
+const TITLE_TOP_LINE: f32 = 0.185;
+/// The vertical rhythm of the lockup: the second line's distance from the first, then the
+/// rule's and the tagline's, as fractions of the title's own size.
+const TITLE_LEAD: f32 = 0.88;
+const RULE_LEAD: f32 = 0.55;
+const SUBTITLE_LEAD: f32 = 0.97;
+
+/// The title, its eyebrow, its rule and the tagline: the whole lockup, revealed in order.
+///
+/// One `painter.text` per letter rather than one per line, because the reveal is the
 /// animation and a galley can only be drawn whole. The advances come from the font
 /// ([`egui::epaint::Fonts::glyph_width`]), so the letters land exactly where a single call
-/// would have put them: this is a line of text that is drawn in pieces, not a hand-laid one.
+/// would have put them, plus the letterspacing that makes type at this size read as a mark
+/// rather than as a line of prose.
 ///
-/// Each letter is drawn twice, a shade under and to the right in the panel's own near-black
-/// and then in the sun's cream. Two calls is the whole of the outline: this is a pixel game,
-/// and a 2px offset shadow is the way a pixel game puts type on a picture.
-fn title(painter: &Painter, ctx: &Context, rect: Rect, clock: f32) {
-    let font = FontId::monospace(title_size(rect));
-    let advances: Vec<f32> = TITLE
-        .chars()
-        .map(|c| ctx.fonts(|f| f.glyph_width(&font, c)))
-        .collect();
-    let width: f32 = advances.iter().sum();
-    let mut x = rect.center().x - width * 0.5;
-    let y = rect.top() + rect.height() * TITLE_LINE;
-    for (index, ch) in TITLE.chars().enumerate() {
-        let arrived = letter_in(clock, index);
-        if arrived > 0.0 {
-            let ink = arrived.powf(0.7);
-            let at = Pos2::new(x, y + (1.0 - arrived) * LETTER_RISE);
-            if ch != ' ' {
-                painter.text(
-                    at + Vec2::new(2.0, 3.0),
-                    Align2::LEFT_CENTER,
-                    ch,
-                    font.clone(),
-                    TITLE_SHADE.gamma_multiply(ink),
-                );
-                painter.text(
-                    at,
-                    Align2::LEFT_CENTER,
-                    ch,
-                    font.clone(),
-                    TITLE_INK.gamma_multiply(ink),
-                );
-            }
-        }
-        x += advances[index];
-    }
-    // And a rule under it, growing from the middle out as the title arrives: the one piece of
-    // decoration on the screen, and it is what stops a line of type over a landscape from
-    // reading as a caption.
-    let grown = ((clock - TITLE_AT) / (TITLE_AT + LETTER_IN * TITLE.len() as f32)).clamp(0.0, 1.0);
-    if grown > 0.0 {
-        let rule = Rect::from_center_size(
-            Pos2::new(rect.center().x, y + title_size(rect) * 0.75),
-            Vec2::new(width * 0.6 * grown, 3.0),
+/// Every letter is drawn four times: a drop shadow, a dark outline in eight directions, the
+/// gold body, and a cream edge lifted a point and a half. Two of those are the whole of the
+/// outline — this is a pixel game, and an offset shadow with a hard outline is the way a
+/// pixel game puts a logo on a picture. The bevel is what stops the gold reading as flat
+/// yellow: the top of every stroke catches the light the sun is drawn with.
+fn lockup(painter: &Painter, ctx: &Context, rect: Rect, clock: f32) {
+    let size = title_size(rect);
+    let centre = rect.center().x;
+    let top = rect.top() + rect.height() * TITLE_TOP_LINE;
+
+    eyebrow(painter, rect, clock);
+
+    // A warm bloom behind the words, so the gold has light behind it rather than sky. Twelve
+    // concentric discs at a few percent each: cheap, and it is the difference between type on
+    // a background and type *in* a scene.
+    let bloom_at = Pos2::new(centre, top + size * 0.55);
+    for step in 0..14 {
+        let t = step as f32 / 13.0;
+        let radius = size * (2.6 - 1.9 * t);
+        let alpha = (3.0 + 2.0 * t) as u8;
+        painter.circle_filled(
+            bloom_at,
+            radius,
+            Color32::from_rgba_unmultiplied(255, 240, 196, alpha),
         );
-        painter.rect_filled(rule, 0.0, RULE_INK.gamma_multiply(grown));
+    }
+
+    let font = FontId::monospace(size);
+    let spacing = size * 0.055;
+    let mut index = 0;
+    for (line, text) in TITLE_LINES.iter().enumerate() {
+        let advances: Vec<f32> = text
+            .chars()
+            .map(|c| ctx.fonts(|f| f.glyph_width(&font, c)))
+            .collect();
+        let width: f32 = advances.iter().sum::<f32>()
+            + spacing * (text.chars().count().saturating_sub(1)) as f32;
+        let y = top + line as f32 * size * TITLE_LEAD;
+        let mut x = centre - width * 0.5;
+        for (char_index, ch) in text.chars().enumerate() {
+            let arrived = letter_in(clock, index);
+            index += 1;
+            if arrived > 0.0 {
+                let ink = arrived.powf(0.7);
+                let at = Pos2::new(x, y + (1.0 - arrived) * LETTER_RISE);
+                if ch != ' ' {
+                    letter(painter, ctx, at, ch, &font, ink);
+                }
+            }
+            x += advances[char_index] + spacing;
+        }
+    }
+
+    // The rule, growing from the middle out as the second line lands, with a gold diamond at
+    // its centre: the one piece of jewellery on the screen, and what stops a stack of type
+    // over a landscape from reading as a caption.
+    // The rule grows from the middle as the title's last letter lands, and the tagline
+    // follows it — timed off the reveal itself rather than off a second guess at it.
+    let settled = TITLE_AT + title_letters() as f32 * LETTER_IN;
+    let grown = ((clock - settled + 0.15) / 0.7).clamp(0.0, 1.0);
+    if grown > 0.0 {
+        let y = top + size * (TITLE_LEAD + RULE_LEAD);
+        let half = size * 2.4 * grown;
+        let gap = 12.0;
+        let stroke = Stroke::new(2.0_f32, RULE_INK.gamma_multiply(grown));
+        painter.line_segment(
+            [Pos2::new(centre - half, y), Pos2::new(centre - gap, y)],
+            stroke,
+        );
+        painter.line_segment(
+            [Pos2::new(centre + gap, y), Pos2::new(centre + half, y)],
+            stroke,
+        );
+        let gem = [
+            Pos2::new(centre, y - 5.0),
+            Pos2::new(centre + 5.0, y),
+            Pos2::new(centre, y + 5.0),
+            Pos2::new(centre - 5.0, y),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            gem.to_vec(),
+            TITLE_INK.gamma_multiply(grown),
+            Stroke::new(1.0_f32, TITLE_LIGHT.gamma_multiply(grown * 0.8)),
+        ));
+    }
+
+    // And the sentence under it, in the sky's own dark ink rather than the window's cream: a
+    // pale line over a pale-blue sky has to be read twice, and dark-on-sky is 8.7:1.
+    let arrived = ((clock - settled - 0.25) / 0.6).clamp(0.0, 1.0);
+    if arrived > 0.0 {
+        painter.text(
+            Pos2::new(centre, top + size * (TITLE_LEAD + SUBTITLE_LEAD)),
+            Align2::CENTER_CENTER,
+            SUBTITLE,
+            FontId::proportional((size * 0.20).clamp(14.0, 19.0)),
+            SUBTITLE_INK.gamma_multiply(arrived),
+        );
     }
 }
 
-/// Whether the doors are on screen at `clock`.
+/// One letter of the title: shadow, outline, gold body, lit edge.
+fn letter(
+    painter: &Painter,
+    ctx: &Context,
+    at: Pos2,
+    ch: char,
+    font: &FontId,
+    ink: f32,
+) {
+    let glyph = |offset: Vec2, colour: Color32| {
+        painter.text(
+            at + offset,
+            Align2::LEFT_CENTER,
+            ch,
+            font.clone(),
+            colour.gamma_multiply(ink),
+        );
+    };
+    // The drop shadow sits low and to the right, the way the sun in this game comes from the
+    // upper left: one offset, so a hundred letters do not each invent their own light.
+    glyph(
+        Vec2::new(4.0, 6.0),
+        Color32::from_rgba_unmultiplied(10, 14, 20, 170),
+    );
+    for dx in [-2.0, 0.0, 2.0] {
+        for dy in [-2.0, 0.0, 2.0] {
+            if dx != 0.0 || dy != 0.0 {
+                glyph(Vec2::new(dx, dy), TITLE_SHADE);
+            }
+        }
+    }
+    glyph(Vec2::ZERO, TITLE_INK);
+    // The lit top edge: the gold, lifted towards the sun. Drawn over the body rather than
+    // under it, so the bevel is on the *inside* of the stroke.
+    glyph(Vec2::new(0.0, -1.5), TITLE_LIGHT.gamma_multiply(0.55));
+    let _ = ctx;
+}
+
+/// The genre line above the title, between two short rules.
+///
+/// Small, letterspaced and gold: it is the part of a box that says what the game *is*, and at
+/// this size the only way it reads is as a label rather than as a sentence.
+fn eyebrow(painter: &Painter, rect: Rect, clock: f32) {
+    let arrived = ((clock - 0.10) / 0.55).clamp(0.0, 1.0);
+    if arrived <= 0.0 {
+        return;
+    }
+    let ink = EYEBROW_INK.gamma_multiply(arrived * 0.9);
+    let font = FontId::monospace((rect.height() * 0.0155).clamp(10.0, 13.0));
+    let spacing = 3.0;
+    let widths: Vec<f32> = EYEBROW
+        .chars()
+        .map(|c| painter.layout_no_wrap(c.to_string(), font.clone(), ink).size().x)
+        .collect();
+    let width: f32 = widths.iter().sum::<f32>() + spacing * (widths.len() - 1) as f32;
+    let y = rect.top() + rect.height() * 0.115;
+    let mut x = rect.center().x - width * 0.5;
+    for (index, ch) in EYEBROW.chars().enumerate() {
+        if ch != ' ' {
+            painter.text(Pos2::new(x, y), Align2::LEFT_CENTER, ch, font.clone(), ink);
+        }
+        x += widths[index] + spacing;
+    }
+    let rule = Stroke::new(1.5_f32, EYEBROW_INK.gamma_multiply(arrived * 0.55));
+    let left = rect.center().x - width * 0.5 - 16.0;
+    let right = rect.center().x + width * 0.5 + 16.0;
+    painter.line_segment([Pos2::new(left - 78.0, y), Pos2::new(left, y)], rule);
+    painter.line_segment([Pos2::new(right, y), Pos2::new(right + 78.0, y)], rule);
+}
+
+/// The stage: the band under the level's floor, darkened to a near-black gradient.
+///
+/// The menu has to be an *object on a picture*, not a caption painted over a lawn. The level's
+/// own under-ground band is already a flat murk, so darkening it costs nothing the scene was
+/// using and buys the contrast the gold needs. It fades in from just above the floor line, so
+/// the grass and the runner stay at full brightness and only the space below them goes down.
+fn stage(painter: &Painter, rect: Rect, floor: f32) {
+    let top = (floor - 30.0).clamp(rect.top(), rect.bottom() - 1.0);
+    let clear = Color32::from_rgba_unmultiplied(STAGE_INK.r(), STAGE_INK.g(), STAGE_INK.b(), 0);
+    let solid = Color32::from_rgba_unmultiplied(STAGE_INK.r(), STAGE_INK.g(), STAGE_INK.b(), 236);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(Pos2::new(rect.left(), top), clear);
+    mesh.colored_vertex(Pos2::new(rect.right(), top), clear);
+    mesh.colored_vertex(Pos2::new(rect.right(), rect.bottom()), solid);
+    mesh.colored_vertex(Pos2::new(rect.left(), rect.bottom()), solid);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+    // A hairline of gold along the bottom of the window, the same lip the dock wears: the
+    // stage is furniture, and the window's furniture has a gold edge.
+    painter.rect_filled(
+        Rect::from_min_size(
+            Pos2::new(rect.left(), rect.bottom() - 3.0),
+            Vec2::new(rect.width(), 3.0),
+        ),
+        CornerRadius::ZERO,
+        theme::GOLD_EDGE.gamma_multiply(0.55),
+    );
+}
+
+/// Whether the menu is on screen at `clock`.
 ///
 /// One function rather than the comparison written twice, because `show` has to answer it
-/// for a reason of its own: a press inside the doors' band belongs to the *button* under the
-/// pointer, and the rule that any press starts the editor has to step aside for it. Two
-/// copies of "when are they up" is how the band ends up swallowing a click on a frame the
-/// buttons are not drawn on.
-fn doors_are_up(clock: f32) -> bool {
+/// for a reason of its own: a press inside the menu belongs to the *row* under the pointer,
+/// and the rule that any press starts the editor has to step aside for it. Two copies of
+/// "when is it up" is how the band ends up swallowing a click on a frame the rows are not
+/// drawn on.
+fn menu_is_up(clock: f32) -> bool {
     clock >= HINT_AT + DOORS_LAG
 }
 
-/// Where the three doors sit: the strip under the world, just above the invitation.
+/// The gap after each glyph of letterspaced type: about a fifth of a capital.
+const SPACING: f32 = 3.0;
+
+/// How far the menu has arrived: 0 not yet, 1 settled.
 ///
-/// The invitation's own rule ([`invitation_line`]), one row higher: under the level rather
-/// than on it, so the doors read over haze instead of over whatever the level's fit happened
-/// to leave down there, and inside the window when the world is tall enough to reach the
-/// bottom of it. A world that *does* reach the bottom — a champion on a long, deep level —
-/// pushes the row down onto the invitation's clamped line, where the buttons still read: a
-/// button is an opaque card with a border, not a line of type, so unlike the caption it does
-/// not need clean haze behind it. The width is capped for the same reason the caption's band
-/// is — three buttons across a very wide window would be a toolbar, and the row has to stay a
-/// cluster.
+/// One progress for the whole panel rather than one per row: a menu is a *box* in every game
+/// that has one, and a box arrives whole.
+fn menu_in(clock: f32) -> f32 {
+    ((clock - HINT_AT - DOORS_LAG) / 0.30).clamp(0.0, 1.0)
+}
+
+/// Where the menu sits: a framed panel in the band under the level.
 ///
-/// A strip and not three rectangles, because the caller needs one rectangle to ask "was that
-/// press aimed at the doors?" — and a press that lands *between* two buttons is aimed at the
-/// doors. Anything narrower is a rule that a mouse has to be pixel-precise to satisfy.
-pub fn button_band(rect: Rect, world_bottom: f32) -> Rect {
-    let line = invitation_line(rect, world_bottom);
-    let height = 34.0;
-    Rect::from_center_size(
-        Pos2::new(rect.center().x, line - height * 1.35),
-        Vec2::new(rect.width().min(560.0), height),
+/// Bottom-anchored, because the window is the thing the menu is *on*: a champion is played on
+/// whatever document was opened, and a level tall enough to reach the panel must not push the
+/// doorway off the screen. The stage behind it is what keeps it readable when it overlaps.
+fn menu_panel(rect: Rect) -> Rect {
+    let height = PANEL_PAD * 2.0 + LINE_H * DOORS.len() as f32 + DESC_H;
+    let top = (rect.bottom() - MENU_BOTTOM_PAD - height).max(rect.top() + 12.0);
+    Rect::from_min_size(
+        Pos2::new(rect.center().x - MENU_W * 0.5, top),
+        Vec2::new(MENU_W, height),
     )
 }
 
-/// Draw the three doors and report the one that was clicked, if any.
+/// The rectangle of one option line, in screen space.
 ///
-/// Real widgets in a real `egui` area rather than three hand-hit-tested rectangles: the
-/// window's own theme styles them ([`crate::theme::apply`] gives every button its resting
-/// fill, its hover ring and its pressed state), so a button on the front door is the same
-/// button as one in a panel — which is the whole point of having a theme. Only the *ink*
-/// differs per door, and it is the palette's own meaning: the editor is plain text, play is
-/// the accent, and evolve is the growth colour, because learning is what it is.
-fn buttons(ctx: &Context, band: Rect, clock: f32) -> Option<Action> {
-    if !doors_are_up(clock) {
+/// The one statement of where a line is, shared by the painter and the hit test — a line
+/// drawn by a layout and clicked by arithmetic is how a menu ends up twenty points off its
+/// own highlight.
+fn line_rect(panel: Rect, index: usize) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(panel.left(), panel.top() + PANEL_PAD + index as f32 * LINE_H),
+        Vec2::new(panel.width(), LINE_H),
+    )
+}
+
+/// Draw the menu, and report the door that was clicked, if any.
+///
+/// Real widgets (`Ui::interact`) for the hit test, hand-painted for the look: the panel is a
+/// dialog box, the options are lines of type with a cursor beside them, and the row under the
+/// pointer is the row the keyboard's arrow keys are on. That is the whole of a console menu —
+/// a frame, a list, one cursor and one blinking prompt — and it is what this screen is: a
+/// game's front door, not an application's launcher.
+fn menu(
+    ctx: &Context,
+    painter: &Painter,
+    rect: Rect,
+    panel: Rect,
+    selected: &mut usize,
+    clock: f32,
+) -> Option<Action> {
+    if !menu_is_up(clock) {
         return None;
     }
     let mut action = None;
-    // The row is *placed* rather than centred by the layout, and the arithmetic is the
-    // reason: `vertical_centered` centres a child whose width it knows, and a horizontal
-    // row's width is only known once it has been laid out — so the row was drawn from the
-    // band's left edge and the band's own centre landed on the third door. Placing the row
-    // by its measured width is exact, and it is what makes "the band's centre is the middle
-    // button's centre" true rather than approximate: the width is the buttons' own size plus
-    // the theme's own spacing, so a change to either moves the row with it.
-    let spacing = ctx.style().spacing.item_spacing.x;
-    let row = DOOR_SIZE.x * DOORS.len() as f32 + spacing * (DOORS.len() - 1) as f32;
-    egui::Area::new(egui::Id::new("splash-doors"))
+    let arrived = menu_in(clock);
+    egui::Area::new(egui::Id::new("splash-menu"))
         .order(egui::Order::Foreground)
-        .fixed_pos(Pos2::new(band.center().x - row * 0.5, band.top()))
+        .fixed_pos(rect.min)
         .interactable(true)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = spacing;
-                for (label, target, about) in DOORS {
-                    let ink = match target {
-                        Action::Edit => theme::TEXT,
-                        Action::Play => theme::ACCENT,
-                        Action::Evolve => theme::GOOD,
-                    };
-                    let button =
-                        egui::Button::new(egui::RichText::new(label).monospace().color(ink))
-                            .min_size(DOOR_SIZE);
-                    if ui.add(button).on_hover_text(about).clicked() {
-                        action = Some(target);
-                    }
+            // The area covers the window rather than the panel, so a line is never clipped by
+            // its own container and the hit test is against the same rectangle the painter
+            // used. It draws nothing itself: the panel is painted on the background layer,
+            // under every panel the window might put up.
+            ui.set_min_size(rect.size());
+            for (index, door) in DOORS.iter().enumerate() {
+                let response = ui.interact(
+                    line_rect(panel, index),
+                    egui::Id::new(("splash-door", index)),
+                    egui::Sense::click(),
+                );
+                if response.hovered() {
+                    *selected = index;
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-            });
+                if response.clicked() {
+                    action = Some(door.action);
+                }
+            }
         });
+    if arrived > 0.0 {
+        paint_menu(painter, panel, *selected, arrived, clock);
+        prompt(painter, rect, clock);
+    }
     action
 }
 
-/// The line under the title: what the window is *for*, in one sentence.
-fn subtitle(painter: &Painter, rect: Rect, clock: f32) {
-    let arrived = ((clock - TITLE_AT - 0.6) / 0.6).clamp(0.0, 1.0);
-    if arrived <= 0.0 {
-        return;
-    }
-    painter.text(
-        Pos2::new(
-            rect.center().x,
-            rect.top() + rect.height() * TITLE_LINE + title_size(rect) * 1.9,
-        ),
-        Align2::CENTER_CENTER,
-        SUBTITLE,
-        FontId::proportional((title_size(rect) * 0.44).clamp(14.0, 24.0)),
-        SUBTITLE_INK.gamma_multiply(arrived),
-    );
-}
-
-/// Where the invitation sits: the band under the ground, and never on the world.
+/// The menu panel and everything in it.
 ///
-/// The composition wants it at a fixed height — seven eighths of the way down, in the layer
-/// under the level — and the only thing that can be wrong with that is the world in the
-/// picture: a champion is played on whatever document the window opened on, and a level
-/// reaching that far down would have the words printed on its own lawn. So the wanted line is
-/// pushed below the world when it has to be, and held inside the window after that.
-fn invitation_line(rect: Rect, world_bottom: f32) -> f32 {
-    let wanted = rect.bottom() - rect.height() * 0.125;
-    wanted.max(world_bottom + 34.0).min(rect.bottom() - 24.0)
-}
+/// A menu plate from a Nintendo game: a warm white card in a thick chocolate outline, a blue
+/// `SELECT` tab on its top edge, a gold band under the cursor and a blinking red pointer. Rounded
+/// corners and a hard drop shadow rather than a flat rectangle — the plate is a physical toy lying
+/// on the picture, which is the whole of the look this window and its title screen share.
+fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clock: f32) {
+    let ink = |colour: Color32| colour.gamma_multiply(arrived);
+    let shift = Vec2::new(0.0, (1.0 - arrived) * 12.0);
+    let panel = panel.translate(shift);
+    let radius = CornerRadius::same(theme::RADIUS_LG);
 
-/// The breathing invitation, and the four keys a person needs to know about.
-fn invitation(painter: &Painter, rect: Rect, clock: f32, world_bottom: f32) {
-    let arrived = ((clock - HINT_AT) / 0.5).clamp(0.0, 1.0);
-    if arrived <= 0.0 {
-        return;
-    }
-    // A breath rather than a blink: two frames of hidden and two of shown reads as a broken
-    // sprite, and this has to survive being looked at for as long as somebody takes to read
-    // the keys under it.
-    let breath = 0.55 + 0.45 * (clock * std::f32::consts::TAU * HINT_HZ).sin();
-    // Under the ground rather than on it: the band below the level is empty haze, and a line
-    // of type there is legible on every window size instead of on the ones where the fit
-    // happened to leave a gap under the lawn.
-    let y = invitation_line(rect, world_bottom);
-    // A soft dark band behind the words, so the invitation reads over any world rather than
-    // only over the ones whose fit happened to leave clean haze under the lawn. It fades in
-    // with the words, so the screen is not born with a bar on it.
-    let band = Rect::from_center_size(
-        Pos2::new(rect.center().x, y + title_size(rect) * 0.22),
-        Vec2::new(
-            rect.width().min(560.0),
-            title_size(rect) * 1.9,
-        ),
+    // The tab: a blue ribbon on the box's top edge, the way a menu screen labels itself. It is
+    // drawn first so the box's outline closes over its bottom and the tab reads as stuck *onto*
+    // the plate rather than as a second panel floating above it.
+    let tab_w = 196.0;
+    let tab = Rect::from_min_size(
+        Pos2::new(panel.center().x - tab_w * 0.5, panel.top() - 26.0),
+        Vec2::new(tab_w, 36.0),
     );
     painter.rect_filled(
-        band,
-        10.0,
-        Color32::from_black_alpha((110.0 * arrived) as u8),
+        tab.translate(Vec2::new(0.0, 2.0)),
+        CornerRadius::same(8),
+        ink(Color32::from_rgba_unmultiplied(74, 52, 32, 110)),
     );
-    painter.text(
-        Pos2::new(rect.center().x, y),
-        Align2::CENTER_CENTER,
-        HINT,
-        FontId::monospace((title_size(rect) * 0.44).clamp(16.0, 28.0)),
-        HINT_INK.gamma_multiply(arrived * breath),
+    painter.rect_filled(tab, CornerRadius::same(8), ink(theme::RIBBON));
+    painter.rect_stroke(
+        tab,
+        CornerRadius::same(8),
+        Stroke::new(2.5_f32, ink(theme::OUTLINE)),
+        egui::StrokeKind::Inside,
     );
-    painter.text(
+    let tab_font = FontId::monospace(12.0);
+    let tab_text = "SELECT";
+    let tab_text_w = spaced_width(painter, tab_text, &tab_font);
+    spaced(
+        painter,
         Pos2::new(
-            rect.center().x,
-            (y + title_size(rect) * 0.95).min(rect.bottom() - 30.0),
+            tab.center().x - tab_text_w * 0.5,
+            panel.top() - 8.0,
         ),
+        tab_text,
+        tab_font,
+        ink(Color32::WHITE),
+        2.5,
+    );
+
+    // The box: a warm white plate with a soft brown shadow, a coin-gold hairline inside and a
+    // thick chocolate outline on it. Three rings, and none of them black: this is the same plate
+    // the window's own panels are cut from, which is what makes the title screen and the editor
+    // look like two rooms of one house.
+    painter.rect_filled(
+        panel.translate(Vec2::new(0.0, 5.0)),
+        radius,
+        ink(Color32::from_rgba_unmultiplied(74, 52, 32, 110)),
+    );
+    painter.rect_filled(panel, radius, ink(PANEL_FACE));
+    painter.rect_stroke(
+        panel.shrink(5.0),
+        CornerRadius::same(theme::RADIUS),
+        Stroke::new(1.5_f32, ink(theme::GOLD_EDGE.gamma_multiply(0.8))),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_stroke(
+        panel,
+        radius,
+        Stroke::new(3.0_f32, ink(theme::OUTLINE)),
+        egui::StrokeKind::Inside,
+    );
+
+    // The options. The cursor blinks on the *frame's* clock, a hard on-and-off rather than a
+    // fade: every game that ever had a menu blinked its cursor, and a breath reads as a glow
+    // rather than as an invitation to press something.
+    let blink = (clock * 2.2).fract() < 0.62;
+    for (index, door) in DOORS.iter().enumerate() {
+        let line = line_rect(panel, index);
+        let chosen = index == selected;
+        if chosen {
+            // The chosen line is a coin-gold bar with the window's own rounded corner — the
+            // same gold a selected tool wears, so "this is the one that is on" is one idea in
+            // both rooms.
+            let band = line.shrink2(Vec2::new(6.0, 3.0));
+            painter.rect_filled(
+                band.translate(Vec2::new(0.0, 2.0)),
+                CornerRadius::same(theme::RADIUS),
+                ink(theme::GOLD_EDGE.gamma_multiply(0.55)),
+            );
+            painter.rect_filled(band, CornerRadius::same(theme::RADIUS), ink(theme::ACCENT));
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(band.left() + 8.0, band.top() + 2.0),
+                    Vec2::new((band.width() - 16.0).max(0.0), 1.0),
+                ),
+                CornerRadius::same(theme::RADIUS),
+                ink(Color32::from_white_alpha(110)),
+            );
+        }
+        let name_ink = if chosen {
+            theme::OUTLINE
+        } else {
+            theme::OUTLINE.gamma_multiply(0.82)
+        };
+        let key_ink = theme::TEXT_DIM;
+        // The cursor: the runner's own red, pointing at the line, blinking.
+        if chosen && blink {
+            let cursor = cursor_points(Pos2::new(panel.left() + 24.0, line.center().y));
+            painter.add(egui::Shape::convex_polygon(
+                cursor.to_vec(),
+                ink(theme::RUN),
+                Stroke::NONE,
+            ));
+        }
+        spaced_shadowed(
+            painter,
+            Pos2::new(panel.left() + 48.0, line.center().y),
+            door.name,
+            FontId::monospace(21.0),
+            ink(name_ink),
+            ink(Color32::from_white_alpha(0)),
+            2.0,
+        );
+        let key_font = FontId::monospace(11.0);
+        let galley = painter.layout_no_wrap(door.key.to_string(), key_font, ink(key_ink));
+        painter.galley(
+            Pos2::new(
+                panel.right() - 20.0 - galley.size().x,
+                line.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            ink(key_ink),
+        );
+    }
+
+    // The description strip: one sentence about the highlighted door, the way a console menu
+    // explains the file under the cursor rather than putting a sentence on every line.
+    let top = panel.top() + PANEL_PAD + LINE_H * DOORS.len() as f32;
+    painter.rect_filled(
+        Rect::from_min_size(
+            Pos2::new(panel.left() + 14.0, top + 6.0),
+            Vec2::new(panel.width() - 28.0, 1.0),
+        ),
+        CornerRadius::ZERO,
+        ink(theme::EDGE),
+    );
+    painter.text(
+        Pos2::new(panel.left() + 24.0, top + 6.0 + DESC_H * 0.5),
+        Align2::LEFT_CENTER,
+        DOORS[selected].blurb,
+        FontId::proportional(13.0),
+        ink(theme::TEXT_DIM),
+    );
+}
+
+/// How wide a letterspaced run is: the sum of its glyphs plus the gaps between them.
+fn spaced_width(painter: &Painter, text: &str, font: &FontId) -> f32 {
+    let widths: Vec<f32> = text
+        .chars()
+        .map(|c| {
+            painter
+                .layout_no_wrap(c.to_string(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
+        .collect();
+    widths.iter().sum::<f32>() + SPACING * (widths.len().saturating_sub(1)) as f32
+}
+
+/// Letterspaced type drawn from a left-centre anchor, one glyph at a time.
+///
+/// The window's fonts are proportional-ish at this size, so letterspacing has to be applied by
+/// hand: a run of characters is laid out with a fixed gap after each, which is what makes a
+/// menu's capitals read as a *sign* rather than as a sentence.
+fn spaced(
+    painter: &Painter,
+    at: Pos2,
+    text: &str,
+    font: FontId,
+    colour: Color32,
+    spacing: f32,
+) -> f32 {
+    let mut x = at.x;
+    for c in text.chars() {
+        let galley = painter.layout_no_wrap(c.to_string(), font.clone(), colour);
+        let advance = galley.size().x;
+        if c != ' ' {
+            painter.galley(Pos2::new(x, at.y - galley.size().y * 0.5), galley, colour);
+        }
+        x += advance + spacing;
+    }
+    x - at.x - spacing
+}
+
+/// The cursor: a solid pixel triangle pointing at the chosen line.
+fn cursor_points(at: Pos2) -> [Pos2; 3] {
+    [
+        Pos2::new(at.x - 5.0, at.y - 6.0),
+        Pos2::new(at.x + 5.0, at.y),
+        Pos2::new(at.x - 5.0, at.y + 6.0),
+    ]
+}
+
+/// Letterspaced text with a one-pixel drop shadow: a menu line's own type.
+fn spaced_shadowed(
+    painter: &Painter,
+    at: Pos2,
+    text: &str,
+    font: FontId,
+    colour: Color32,
+    shadow: Color32,
+    spacing: f32,
+) {
+    spaced(
+        painter,
+        at + Vec2::new(2.0, 2.0),
+        text,
+        font.clone(),
+        shadow,
+        spacing,
+    );
+    spaced(painter, at, text, font, colour, spacing);
+}
+
+/// The blinking invitation under the box, and the keys that move the cursor.
+///
+/// "PRESS ENTER" rather than "press any key": the screen has a cursor now, so the honest
+/// invitation is the key that takes it. Any *other* key still leaves for the editor, which is
+/// what the Edit line's own `ANY KEY` chip says.
+fn prompt(painter: &Painter, rect: Rect, clock: f32) {
+    let arrived = ((clock - HINT_AT - DOORS_LAG - 0.15) / 0.45).clamp(0.0, 1.0);
+    if arrived <= 0.0 {
+        return;
+    }
+    let blink = (clock * 1.5).fract() < 0.66;
+    if blink {
+        let font = FontId::monospace(14.0);
+        let text = "PRESS ENTER TO START";
+        let width = spaced_width(painter, text, &font);
+        // Gold on a brown shadow, the way a game's score line is printed over the picture: the
+        // shadow is the outline's own colour, so the words belong to the same sign as the box.
+        spaced_shadowed(
+            painter,
+            Pos2::new(rect.center().x - width * 0.5, rect.bottom() - 62.0),
+            text,
+            font,
+            theme::ACCENT.gamma_multiply(arrived),
+            theme::OUTLINE.gamma_multiply(arrived),
+            SPACING,
+        );
+    }
+    painter.text(
+        Pos2::new(rect.center().x, rect.bottom() - 42.0),
         Align2::CENTER_CENTER,
-        KEYS,
-        FontId::monospace((title_size(rect) * 0.30).clamp(12.0, 17.0)),
-        FOOT_INK.gamma_multiply(arrived * 0.9),
+        MENU_HINT,
+        FontId::monospace(10.0),
+        Color32::from_rgb(222, 204, 172).gamma_multiply(arrived),
     );
 }
 
@@ -917,25 +1361,25 @@ fn invitation(painter: &Painter, rect: Rect, clock: f32, world_bottom: f32) {
 fn footer(painter: &Painter, rect: Rect, credit: Option<&str>) {
     let font = FontId::monospace(11.0);
     painter.text(
-        Pos2::new(rect.left() + 12.0, rect.bottom() - 10.0),
+        Pos2::new(rect.left() + 14.0, rect.bottom() - 11.0),
         Align2::LEFT_BOTTOM,
         format!("evo-app {}", env!("CARGO_PKG_VERSION")),
         font.clone(),
         FOOT_INK,
     );
     // The credit is the one line down here worth reading, so it is the one line down here
-    // that is not grey: the warm cream of the title, held back far enough to stay a caption.
+    // that is not grey: the title's gold, held back far enough to stay a caption.
     if let Some(credit) = credit {
         painter.text(
-            Pos2::new(rect.center().x, rect.bottom() - 10.0),
+            Pos2::new(rect.center().x, rect.bottom() - 11.0),
             Align2::CENTER_BOTTOM,
             credit,
             font.clone(),
-            TITLE_INK.gamma_multiply(0.72),
+            theme::ACCENT.gamma_multiply(0.85),
         );
     }
     painter.text(
-        Pos2::new(rect.right() - 12.0, rect.bottom() - 10.0),
+        Pos2::new(rect.right() - 14.0, rect.bottom() - 11.0),
         Align2::RIGHT_BOTTOM,
         "edit · play · evolve · replay",
         font,
@@ -962,7 +1406,7 @@ mod tests {
     /// are two calls rather than one.
     fn frame(
         ctx: &Context,
-        splash: &Splash,
+        splash: &mut Splash,
         atlas: &Atlas,
         sprites: &Sprites,
         rect: Rect,
@@ -1014,13 +1458,10 @@ mod tests {
         splash
     }
 
-    /// The band the doors occupy, for a splash at its armed clock.
-    fn band_of(splash: &Splash, rect: Rect) -> Rect {
-        let world_bottom = splash
-            .camera(rect)
-            .to_screen(0.0, splash.level.height as f32, rect)
-            .y;
-        button_band(rect, world_bottom)
+    /// The menu box, for a splash at its armed clock: the one statement of where the box is,
+    /// shared with the painter (`menu_panel`).
+    fn band_of(_splash: &Splash, rect: Rect) -> Rect {
+        menu_panel(rect)
     }
 
     /// A click on a door enters the activity it names, and the press that starts the click
@@ -1034,12 +1475,11 @@ mod tests {
     #[test]
     fn a_click_on_a_door_enters_it_and_the_press_does_not_leave_first() {
         let (ctx, atlas, sprites, rect) = screen();
-        let splash = armed();
-        let band = band_of(&splash, rect);
-        // The middle door is Play, and the row is centred in the band, so the band's own
-        // centre is the middle button's centre: three doors of one width, the middle one
-        // exactly in the middle.
-        let pos = band.center();
+        let mut splash = armed();
+        let panel = band_of(&splash, rect);
+        // The middle line is Play: three lines of one height, so the second one is the middle
+        // of the box.
+        let pos = line_rect(panel, 1).center();
 
         // Two frames with no events first, and the count is not padding. An `egui::Area`
         // registers itself in the layer order on the frame it is first laid out and is only
@@ -1051,15 +1491,21 @@ mod tests {
         // a window that has drawn the screen twice, which is every frame a person can click
         // on: the doors are up for a quarter second before the invitation is drawn, and the
         // first of those is the only one an area cannot be clicked on.
-        assert_eq!(frame(&ctx, &splash, &atlas, &sprites, rect, Vec::new()), None);
-        assert_eq!(frame(&ctx, &splash, &atlas, &sprites, rect, Vec::new()), None);
         assert_eq!(
-            frame(&ctx, &splash, &atlas, &sprites, rect, at(pos, true)),
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+            None
+        );
+        assert_eq!(
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+            None
+        );
+        assert_eq!(
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, at(pos, true)),
             None,
             "the press on a door left for the editor instead of reaching the button"
         );
         assert_eq!(
-            frame(&ctx, &splash, &atlas, &sprites, rect, at(pos, false)),
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, at(pos, false)),
             Some(Action::Play),
             "the release on the Play door did not enter the playtest"
         );
@@ -1072,27 +1518,28 @@ mod tests {
     #[test]
     fn a_press_away_from_the_doors_still_opens_the_editor() {
         let (ctx, atlas, sprites, rect) = screen();
-        let splash = armed();
+        let mut splash = armed();
         let far = Pos2::new(rect.center().x, rect.top() + 40.0);
         assert!(far.y < band_of(&splash, rect).top());
         assert_eq!(
-            frame(&ctx, &splash, &atlas, &sprites, rect, at(far, true)),
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, at(far, true)),
             Some(Action::Edit),
             "a click on the sky stopped being a way out of the screen"
         );
     }
 
-    /// The doors are up only once the invitation has been, and they sit under the world.
+    /// The box arrives only once the invitation has been, and it sits under the world.
     ///
-    /// Both halves are geometry, and both are the kind a screenshot catches late: a row of
-    /// buttons over the level's lawn, or a row that appears before the caption that explains
-    /// it. The band is placed off the world's own bottom edge, so a level that reaches further
-    /// down pushes the doors up with it.
+    /// Both halves are geometry, and both are the kind a screenshot catches late: a menu drawn
+    /// over the level's lawn, or a box that appears before the caption that explains it. The
+    /// box is anchored to the window's bottom edge — a menu is a thing you *open into*, not a
+    /// caption that follows the terrain — so a level tall enough to reach it must not push the
+    /// doorways off the screen.
     #[test]
-    fn the_doors_arrive_with_the_caption_and_sit_under_the_world() {
-        assert!(!doors_are_up(0.0));
-        assert!(!doors_are_up(HINT_AT));
-        assert!(doors_are_up(HINT_AT + DOORS_LAG + 0.01));
+    fn the_menu_arrives_with_the_caption_and_sits_under_the_world() {
+        assert!(!menu_is_up(0.0));
+        assert!(!menu_is_up(HINT_AT));
+        assert!(menu_is_up(HINT_AT + DOORS_LAG + 0.01));
 
         let (_, _, _, rect) = screen();
         let splash = armed();
@@ -1100,21 +1547,22 @@ mod tests {
             .camera(rect)
             .to_screen(0.0, splash.level.height as f32, rect)
             .y;
-        let band = button_band(rect, world_bottom);
+        let panel = menu_panel(rect);
         assert!(
-            band.top() > world_bottom,
-            "the doors are drawn over the level: band {band:?} against world bottom {world_bottom}"
+            panel.top() > world_bottom,
+            "the menu is drawn over the level: box {panel:?} against world bottom {world_bottom}"
         );
+        // The prompt and the key line live under the box, and the box leaves them their band.
         assert!(
-            band.bottom() < invitation_line(rect, world_bottom),
-            "the doors are standing on the caption under them"
+            panel.bottom() <= rect.bottom() - 70.0,
+            "the box is standing on the prompt under it: {panel:?}"
         );
-        assert!(band.bottom() <= rect.bottom(), "the doors fall off the window");
+        assert!(panel.bottom() <= rect.bottom(), "the box falls off the window");
 
-        // A world that reaches the bottom of the window still leaves the doors inside it,
-        // because the invitation's line is clamped there and the band hangs off it.
-        let tall = button_band(rect, rect.bottom() + 200.0);
-        assert!(tall.bottom() <= rect.bottom() && tall.top() >= rect.top());
+        // A short window still holds the whole box: the top is clamped into the frame.
+        let small = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 240.0));
+        let panel = menu_panel(small);
+        assert!(panel.top() >= small.top() && panel.bottom() <= small.bottom());
     }
 
     /// The path of a shipped level, as the window would be given it.
@@ -1277,14 +1725,14 @@ mod tests {
     /// reveal that takes longer than a person waits is a title nobody reads.
     #[test]
     fn the_title_arrives_before_the_invitation() {
-        let last = TITLE.chars().count() - 1;
+        let last = title_letters() - 1;
         assert_eq!(
             letter_in(0.0, 0),
             0.0,
             "the title is up before the clock is"
         );
         assert!(letter_in(0.0, last) == 0.0);
-        for index in 0..TITLE.chars().count() {
+        for index in 0..title_letters() {
             assert!(
                 letter_in(TITLE_AT + index as f32 * LETTER_IN - 0.01, index) == 0.0,
                 "letter {index} arrives early"
@@ -1610,8 +2058,8 @@ mod tests {
             GROUND_LINE
         );
         assert!(
-            invitation_line(rect, floor) > floor,
-            "the invitation is drawn on the ground it is meant to be under"
+            menu_panel(rect).top() > floor,
+            "the menu box is drawn on the ground it is meant to be under"
         );
 
         // And it tracks: two seconds of running carries the camera with the agent.
@@ -1626,35 +2074,32 @@ mod tests {
         );
     }
 
-    /// The invitation is drawn under the world it is over, whatever the world is.
+    /// The prompt and the key line have their own band under the box, whatever the window.
     ///
     /// The screen plays whatever level the window opened on when that level has a champion, so
-    /// the words cannot be placed as a fraction of the window and trusted: a level tall enough
-    /// to reach the band would have "press any key" printed on its own lawn. The rule is the
-    /// wanted line, pushed below the world when the world takes it, and held inside the window
-    /// after that.
+    /// the words cannot be placed as a fraction of the world and trusted: a level tall enough to
+    /// reach the band would have the prompt printed on its own lawn. The box is anchored to the
+    /// window's bottom edge and the prompt to the box, which is what keeps the two readable on
+    /// every level the screen can be opened on.
     #[test]
-    fn the_invitation_is_drawn_under_the_world_it_is_over() {
+    fn the_prompt_sits_under_the_menu_box() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
-        let wanted = rect.bottom() - rect.height() * 0.125;
+        let panel = menu_panel(rect);
+        assert!(panel.top() >= rect.top(), "the box starts above the window");
+        // The blinking prompt is at `rect.bottom() - 62`, the key line at `- 42`.
+        assert!(
+            panel.bottom() < rect.bottom() - 62.0,
+            "the prompt is drawn on the box"
+        );
+        assert!(panel.bottom() < rect.bottom() - 42.0);
+        // And the box is bottom-anchored: a taller window moves it, it does not stretch it.
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 1100.0));
         assert_eq!(
-            invitation_line(rect, 500.0),
-            wanted,
-            "the usual case is untouched"
+            menu_panel(tall).height(),
+            menu_panel(rect).height(),
+            "the box changed shape with the window"
         );
-        assert!(
-            invitation_line(rect, wanted - 10.0) > wanted,
-            "the world pushes it down"
-        );
-        assert!(
-            invitation_line(rect, 900.0) <= rect.bottom() - 24.0,
-            "a world that reaches the bottom cannot push the words out of the window"
-        );
-        // And the splash's own level leaves it exactly where the composition wants it.
-        let splash = Splash::scripted();
-        let camera = splash.camera(rect);
-        let bottom = camera.to_screen(0.0, splash.level.height as f32, rect).y;
-        assert_eq!(invitation_line(rect, bottom), wanted);
+        assert!(menu_panel(tall).bottom() > panel.bottom());
     }
 
     /// The screen draws the world and the words, and both of them change with the clock.
@@ -1675,12 +2120,14 @@ mod tests {
         // them is what makes this a test of the reveal: the footer and the four keys are on
         // the screen from the first frame, and a count of every glyph in the window would be
         // a count of those.
-        let line = Rect::from_center_size(
-            Pos2::new(rect.center().x, rect.top() + rect.height() * TITLE_LINE),
-            Vec2::new(rect.width(), 90.0),
+        // The lockup's own band: the eyebrow, both title lines and the tagline under them,
+        // and nothing the footer or the menu contributes.
+        let line = Rect::from_min_size(
+            Pos2::new(rect.left(), rect.height() * 0.08),
+            Vec2::new(rect.width(), rect.height() * 0.32),
         );
         let counts = |clock: f32| -> (usize, usize, usize) {
-            let splash = {
+            let mut splash = {
                 let mut splash = Splash::scripted();
                 while splash.clock() < clock {
                     splash.advance(sim::DT);
@@ -1729,7 +2176,7 @@ mod tests {
             (world, words, title)
         };
 
-        let letters = TITLE.chars().filter(|c| *c != ' ').count();
+        let letters = title_letters();
         let (world, words, title) = counts(2.4);
         assert!(
             world > 40,

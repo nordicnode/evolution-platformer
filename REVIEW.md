@@ -1795,6 +1795,108 @@ of the claim: **memory is not a better policy, it is a longer one, and it pays e
 that need a horizon.** It is still not the default; the first thing to reach for on a level with a
 wait in it, yes.
 
+### Content: enemies and objects, and the level that keeps them
+
+The pack could teach a jump, a sprint, a wall climb, a pad and a crumbling bridge, and every threat in
+it was the same threat: a walker pacing a ledge. So the world grew five things at once — a chaser, a
+flyer, a turret with a shot, a one-way platform tile and a moving platform — and the pass's design rule
+was that each would **fit a rule the sim already had** rather than add a mode, because the observation
+is the expensive surface and a new mode is a new thing it has to distinguish.
+
+| thing | the rule it fits | the one thing that is new |
+|---|---|---|
+| one-way platform (`=`) | solid ground | `is_solid` and `is_opaque` disagree, for the first time in the pack |
+| chaser | `Walker` + `WalkerMode::Chase`, same stomp and contact | it reads the player's x, and stops at a ledge rather than turning |
+| flyer | a gravity-free patrol between authored ends | height stops being safety; the stomp rule moves one row up |
+| turret | a stationary **solid** box: a lid to stand on and a wall to bump, never stomped or lethal to touch | a hazard that *moves*: `Shot`s on `turret_period`, bounded by walls and `shot_range` |
+| moving platform | the one-way rule stated as a box, carrying its rider | its position is a pure function of the frame count, so no phase is hashed; its travel is clamped to the clear part of its path |
+
+**Where the cost landed: the version trio.** The workspace is **0.12.1**, sensors **v11** (same 100
+inputs — the nearest-threat triple now searches flyers and live shots too, and a mover is drawn into the
+patch as one-way ground), fitness untouched at **v8**, and the level format **v2**. The format bump is
+an *additive* one and the reader accepts `1..=2`: every v1 file is a strict subset, so the shipped pack
+did not need migrating. That is not the usual arrangement — the trap pass refused the older version —
+and it is justified only because v2 adds glyphs and optional entity fields and changes no existing
+meaning.
+
+**The demo level is in the pack**: `levels/l10-the-hunt.json`, 60×15, all five mechanics and no
+patrols. `reach` says beatable (4 platforms, all reachable) and `render` shows `F`, `h`, `T`, `MMM`
+and `=` on one screen. Its slider crosses a five-tile pit that a sprint jump also clears, and that is a
+rule rather than a coincidence: **the oracle does not model movers**, so a level whose only route is a
+moving platform reads as unbeatable. The alternative — refusing to answer for any level with a lift —
+would make them unverifiable, and the sentence an author can act on is the shorter one.
+
+**The mover needed a second pass, and that is the finding of this section.** Playing it found four
+bugs the tests had not: the rider was carried *after* its own tick (gravity and the landing snap fought
+once per frame), the landing test was a position rather than a **crossing** (a body three tiles above a
+shelf was teleported onto it), the shelf had no terrain clamp (it slid through walls), and the renderer
+drew it in whole tile cells (smooth physics, a stutter on screen). All four are fixed in **0.12.1**,
+with three new integration tests — no teleport from above, a rider never pushed into a wall, a shelf
+stopping at the first wall — and two smaller corrections: the flyer's beat is centred on the cell and
+defaults to eight tiles instead of four, and the turret's palette icon follows its firing direction.
+The version moved again rather than reusing 0.12.0 because a champion records the sim version and the
+mover's behaviour changed; nothing had been trained on the first build, which is the only reason this
+was cheap.
+
+**0.13.0 is the same pass played again, and that is the finding.** The 0.12.1 build was opened, played,
+and reported with the same three sentences as before — plus a fourth about the projectiles — because
+"the bug is fixed" and "the thing feels right" are two different passes, and the first one had shipped
+on the strength of the first. Four second-pass defects, each of them a fix that was true but not
+sufficient:
+
+| what was reported | what 0.12.1 had already fixed | what was still wrong |
+|---|---|---|
+| the platform is janky | it was drawn at its continuous position, not in a tile cell | the pieces were cut at the *level's* tile boundaries (so a fractional shelf squeezed its cut ends and swapped which piece was which), and 0.02 tiles/tick is half a screen pixel per tick — a speed no integer zoom can draw smoothly |
+| movement on it is janky | the rider was carried before its own tick | the feet were sampled *after* the carry, so a lift's own motion counted as the body crossing the deck, and the ride was re-derived every frame rather than kept |
+| the flyer's flight path is tiny | the beat is centred on the cell | the ends name the box's *edges*, so every beat was short by the box's width — a fifth of a four-tile beat — and the default was eight |
+| the turret icon is the wrong way | the palette asked the brush for an icon that follows `turret_dir` | that icon came from a *second atlas cell* while the canvas mirrored the first; two pictures, free to drift. And every segmented control in the palette shared one widget id, so the shape switch and the direction switch fought over one click |
+| the projectiles barely move | — | `shot_speed` was 0.08, slower than a run and slower than a sprint, against a doc claiming it could not be outrun; the range was 12 tiles, so a shot died in mid-air; and the art (a cell with a tail in it) was squeezed into the hitbox as an `actor`, which is a two-pixel dot above the row it kills in |
+
+The fixes are numbers rather than special cases: `mover_speed` is **1/16** (one art
+pixel a tick, derived so the shelf and its rider land on the pixel grid at any zoom), `shot_speed` is
+**0.18** (above `sprint_speed`, so the dodge is a jump) with `shot_range` **18** and a wall as the real
+stop, and a flyer's `span` now means the distance it **moves**. `view::mover_pieces` is one layout
+function with a test that pins rigidity at a fractional x, `view::turret_picture` is one picture for
+the palette, the ghost and the canvas, and a shot is drawn from the art's own core anchored on the
+hitbox with a muzzle flash read off the turret's cooldown. The ride is state (`Sim::riding`) rather
+than a per-frame landing test, and the feet are measured before the shelf moves them.
+
+The **sim version** moved to **0.13.0** — the physics constants changed, so a champion from 0.12.x is
+refused rather than replayed against a different game. Sensors and fitness are unchanged, because none
+of this is visible in the observation or the score. No champion existed on the 0.12 builds, so nothing
+was lost — the same reason 0.12.1 was cheap — and the demo level was re-checked on the new numbers: at
+pop 40, 60 generations, seed 1, `--stop-on-win`, `l10-the-hunt` won at **generation 12 in 9.67 s (580
+frames)**, slower than the 6.3-6.5 s of the 0.12 build and still a win. Whether the faster bullet is the
+right *difficulty* rather than merely survivable is open, and no seed besides 1 has been run.
+
+**What is measured:** 626 tests green, and the level is learnable rather than merely reachable. At
+**pop 40, 60 generations, seeds 1-4**, `l10-the-hunt` was solved on **4 of 4** seeds — first wins at
+generations 8, 12, 25 and 26 — with the best agent finishing in **6.3-6.5 s (374-387 frames)**, and
+`replay` reproduces the last one bit for bit (`stomps 2, jumps 5, checkpoints 3`). That is evidence of
+the one thing the oracle cannot say: the first pit is twelve tiles wide, which no jump clears, so a
+policy that reaches the flag has necessarily gone **up through the one-way shelf and along it** — and
+it has stomped two of the new enemies on the way. On the fixed build the same protocol solved **2 of 2
+seeds** (first wins at 33 and 7, bests 6.15 s and 6.87 s), so the fixes did not make the level
+unwinnable and the wider flyer beat did not make it a wall. Two of the new tests are the ones a *document*
+operation needs: the editor's Mirror keeps every new entity and turns the two things that face — a
+turret's firing direction and a flyer's beat (a slider still slides right; the level flipped, not the
+clock) — and a resize **drops** the entities the new grid cannot hold instead of leaving them outside
+it, where `validate` would refuse the document and the level would stop being saveable. The rest are
+ten sim integration tests in
+`crates/sim/tests/entities.rs` (both halves of the one-way rule; a chaser that closes distance and one
+that stops at the edge; a flyer that turns at both ends of its span; a turret's direction, its shot and
+the shot's kill; a rider carried; a field-for-field round trip of every new entity; the sensors' view of
+a flyer and of the shelf; the oracle standing on a shelf), three editor tests (every new brush places,
+can be picked and can be erased; the placement rules refuse what the loader refuses; a pick adopts the
+facing and the shape), and the pack round trip with `l10` in it.
+
+**What is not measured, and is the next pass's work:** no champion has been trained on any of it. The
+five mechanics are correct as physics, visible in the observation, and placeable in the editor; whether
+a population *learns* to jump up through a shelf rather than onto it, or to time a turret's period
+against its own run, is a training run each — and `l10-the-hunt` is the fixture those runs want. The
+flyer's eight-tile span and the turret's 120-tick period are authored numbers with an argument behind
+them (legible at `run_speed`, about one jump's airtime) and no sweep.
+
 ### The trial rule: what it bought, and where it bought nothing
 
 Item 3 (2.5) was wired this pass: three patrol phases where a level has walkers, one where it does

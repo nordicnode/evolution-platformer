@@ -132,6 +132,14 @@ pub enum Brush {
     Spike,
     /// A spring pad: not solid, and it throws a body that lands on it upward.
     Spring,
+    /// A one-way platform: ground from above, air from below and from the side.
+    OneWay,
+    /// Water: not solid, and a body in it sinks and has to swim.
+    Water,
+    /// Lava: not solid, lethal, and a vent when it is open to the air.
+    Lava,
+    /// A vine: not solid, and a body climbs it.
+    Vine,
     /// Clears terrain.
     Empty,
     /// Moves the spawn point.
@@ -140,6 +148,14 @@ pub enum Brush {
     Goal,
     /// Places a patrolling walker.
     Walker,
+    /// Places a chaser: a walker that hunts the body instead of patrolling a ledge.
+    Chaser,
+    /// Places a flyer: an enemy that holds a height and beats across it.
+    Flyer,
+    /// Places a turret: a fixed enemy that fires along its own row.
+    Turret,
+    /// Places a moving platform: a shelf that slides on a fixed cycle and carries a body.
+    Platform,
     /// Places a piece of scenery (a bush, tree, rock, flower...): decoration the physics
     /// never sees. Which sprite is decided by [`Editor::scene_sprite`], because there are
     /// two dozen of them and two dozen palette buttons would be two dozen brushes.
@@ -221,7 +237,7 @@ impl Brush {
     /// Material, then *what that material's brittle self is*, all the way down: a person painting a
     /// bridge reaches for `cracked` in the same glance they found `ground` in, which a row that
     /// grouped all four brittle cells together would not give them.
-    pub const ALL: [Brush; 16] = [
+    pub const ALL: [Brush; 24] = [
         Brush::Solid,
         Brush::Cracked,
         Brush::Sand,
@@ -230,13 +246,21 @@ impl Brush {
         Brush::CrackedBrick,
         Brush::Plank,
         Brush::CrackedPlank,
+        Brush::OneWay,
         Brush::Spike,
         Brush::Spring,
+        Brush::Water,
+        Brush::Lava,
+        Brush::Vine,
         Brush::Scenery,
         Brush::Empty,
         Brush::Spawn,
         Brush::Goal,
         Brush::Walker,
+        Brush::Chaser,
+        Brush::Flyer,
+        Brush::Turret,
+        Brush::Platform,
         Brush::Erase,
     ];
 
@@ -282,13 +306,21 @@ impl Brush {
             Brush::CrackedBrick => "cracked_brick",
             Brush::Plank => "wood_1",
             Brush::CrackedPlank => "cracked_wood",
+            Brush::OneWay => "oneway_m",
             Brush::Spike => "spike",
             Brush::Spring => "spring",
+            Brush::Water => "water",
+            Brush::Lava => "lava",
+            Brush::Vine => "vine",
             Brush::Scenery => "bush_c",
             Brush::Empty => "empty",
             Brush::Spawn => "spawn_marker",
             Brush::Goal => "goal_top",
             Brush::Walker => "walker_a",
+            Brush::Chaser => "chaser_a",
+            Brush::Flyer => "flyer_a",
+            Brush::Turret => "turret_r",
+            Brush::Platform => "mover_m",
             Brush::Erase => "walker_dead",
         }
     }
@@ -303,13 +335,21 @@ impl Brush {
             Brush::CrackedBrick => "cracked brick",
             Brush::Plank => "timber",
             Brush::CrackedPlank => "cracked timber",
+            Brush::OneWay => "one-way",
             Brush::Spike => "spikes",
             Brush::Spring => "spring",
+            Brush::Water => "water",
+            Brush::Lava => "lava",
+            Brush::Vine => "vine",
             Brush::Scenery => "scenery",
             Brush::Empty => "clear",
             Brush::Spawn => "spawn",
             Brush::Goal => "goal",
             Brush::Walker => "walker",
+            Brush::Chaser => "chaser",
+            Brush::Flyer => "flyer",
+            Brush::Turret => "turret",
+            Brush::Platform => "move platform",
             Brush::Erase => "erase",
         }
     }
@@ -326,9 +366,17 @@ impl Brush {
             Brush::CrackedBrick => "Cracked brick: masonry that gives way underfoot.",
             Brush::Plank => "Timber: solid tile, same physics, drawn as milled decking.",
             Brush::CrackedPlank => "Cracked timber: decking that gives way underfoot.",
+            Brush::OneWay => "One-way platform: ground from above, air from below and from \
+                the side. A body jumps up through it and lands on top of it.",
             Brush::Spike => "Spike: not solid, lethal on contact.",
             Brush::Spring => "Spring: not solid. A body that lands on it is thrown upward, \
                 keeping the speed it arrived with.",
+            Brush::Water => "Water: not solid. A body in it sinks slowly; hold jump to swim \
+                up, and press jump at the surface to push off it.",
+            Brush::Lava => "Lava: not solid, lethal on contact. A lava cell open to the air \
+                spits a ball upward on its own rhythm.",
+            Brush::Vine => "Vine: not solid. A body overlapping it climbs while jump is held \
+                and slides down when it is released.",
             Brush::Scenery => "Scenery: a bush, tree, rock... decoration the physics ignores.\n\
                 Pick which one in the row under the palette.",
             Brush::Empty => "Empty space: clears a tile.",
@@ -336,6 +384,15 @@ impl Brush {
             Brush::Goal => "The flag the population has to reach.\n\
                 A level has one: placing it moves it.",
             Brush::Walker => "A patrol enemy. Stompable from above.",
+            Brush::Chaser => "A chaser: walks towards the player and stops at a ledge rather \
+                than falling off it. Stompable, but it will not walk into a pit to reach you.",
+            Brush::Flyer => "A flyer: holds its height and beats left and right across the \
+                span it was placed with. Height is not safety any more.",
+            Brush::Turret => "A turret: fires a shot along its own row on a fixed cycle, in \
+                the direction it is placed facing. Solid: stand on its lid or bump its side, \
+                but the box itself never kills and cannot be stomped away.",
+            Brush::Platform => "A moving platform: slides right (or up, with the axis toggle) \
+                on a fixed cycle and carries whatever stands on it.",
             Brush::Erase => "Removes the entity under the cursor, then the tile.",
         }
     }
@@ -349,6 +406,28 @@ pub struct Editor {
     pub brush: Option<Brush>,
     /// Which sprite the scenery brush places, chosen in the palette row under the brushes.
     pub scene_sprite: &'static str,
+    /// Which way a turret is placed: `+1` right, `-1` left.
+    ///
+    /// The direction *is* the placement, the way a one-way platform's whole meaning is which
+    /// side is up: a turret facing the wrong way is a different level. Held here rather than
+    /// asked per click because placing a row of them facing the same way is one decision.
+    pub turret_dir: i8,
+    /// How many tiles a flyer's beat spans, centred on the click.
+    ///
+    /// The loader's own default ([`sim::level::DEFAULT_FLYER_SPAN`]), not a second literal: a
+    /// flyer placed in the window and a flyer written by hand in a level file are the same
+    /// creature, and the number that says how far it beats should not depend on who wrote the
+    /// level. The span is **tiles of travel** — see [`Level::add_flyer_tile`].
+    pub enemy_span: i32,
+    /// How far a moving platform travels, and how many tiles wide it is.
+    ///
+    /// Separate from [`Self::enemy_span`] because they are different numbers with different
+    /// sensible defaults: a shelf is two to four tiles long and slides three or four, where a
+    /// flyer wants a long beat. One shared field meant changing one silently changed the other.
+    pub platform_span: i32,
+    pub platform_tiles: i32,
+    /// Whether the platform brush places a lift (up) rather than a slider (right).
+    pub platform_vertical: bool,
     /// How a drag lays tiles down: freehand, a rectangle or a line.
     pub shape: Shape,
     /// Whether the *next* stroke is forced to a straight line whatever [`Self::shape`] says.
@@ -392,6 +471,11 @@ impl Editor {
             path,
             brush: Some(Brush::Solid),
             scene_sprite: SCENERY_SPRITES[0],
+            turret_dir: 1,
+            enemy_span: sim::level::DEFAULT_FLYER_SPAN,
+            platform_span: sim::level::DEFAULT_PLATFORM_SPAN,
+            platform_tiles: sim::level::DEFAULT_PLATFORM_TILES,
+            platform_vertical: false,
             shape: Shape::Free,
             line: false,
             shape_anchor: None,
@@ -479,6 +563,12 @@ impl Editor {
         match brush {
             Brush::Spawn => self.level.spawn_stands_on_ground(tx, ty),
             Brush::Walker => self.level.walker_stands_on_ground(tx, ty),
+            Brush::Chaser => self.level.chaser_placeable(tx, ty),
+            Brush::Flyer => self.level.flyer_placeable(tx, ty),
+            Brush::Turret => self.level.turret_placeable(tx, ty),
+            Brush::Platform => self
+                .level
+                .platform_placeable(tx, ty, self.platform_tiles),
             Brush::Scenery => self.level.scenery_placeable(self.scene_sprite, tx, ty),
             Brush::Goal => self.level.goal_placeable(tx, ty),
             _ => true,
@@ -618,6 +708,7 @@ impl Editor {
     fn paint_one(&mut self, brush: Brush, tx: i32, ty: i32) -> bool {
         match brush {
             Brush::Solid => self.level.set_tile(tx, ty, Tile::Solid),
+            Brush::OneWay => self.level.set_tile(tx, ty, Tile::OneWay),
             Brush::Cracked => self.level.set_tile(tx, ty, Tile::Cracked),
             Brush::Sand => self.level.set_tile(tx, ty, Tile::Sand),
             Brush::CrackedSand => self.level.set_tile(tx, ty, Tile::CrackedSand),
@@ -627,6 +718,9 @@ impl Editor {
             Brush::CrackedPlank => self.level.set_tile(tx, ty, Tile::CrackedPlank),
             Brush::Spike => self.level.set_tile(tx, ty, Tile::Spike),
             Brush::Spring => self.level.set_tile(tx, ty, Tile::Spring),
+            Brush::Water => self.level.set_tile(tx, ty, Tile::Water),
+            Brush::Lava => self.level.set_tile(tx, ty, Tile::Lava),
+            Brush::Vine => self.level.set_tile(tx, ty, Tile::Vine),
             Brush::Empty => self.level.set_tile(tx, ty, Tile::Empty),
             Brush::Spawn => {
                 if self.level.spawn_tile() == (tx, ty) {
@@ -674,6 +768,43 @@ impl Editor {
                 }
                 self.level.add_walker_tile(tx, ty)
             }
+            Brush::Chaser => {
+                if !self.can_place(Brush::Chaser, tx, ty) {
+                    self.message = "a chaser needs ground under it".to_string();
+                    return false;
+                }
+                self.level.add_chaser_tile(tx, ty)
+            }
+            Brush::Flyer => {
+                if !self.can_place(Brush::Flyer, tx, ty) {
+                    self.message = "a flyer needs an empty cell".to_string();
+                    return false;
+                }
+                self.level.add_flyer_tile(tx, ty, self.enemy_span)
+            }
+            Brush::Turret => {
+                if !self.can_place(Brush::Turret, tx, ty) {
+                    self.message = "a turret needs ground under it".to_string();
+                    return false;
+                }
+                self.level.add_turret_tile(tx, ty, self.turret_dir)
+            }
+            Brush::Platform => {
+                if !self.can_place(Brush::Platform, tx, ty) {
+                    self.message = format!(
+                        "a platform {} tiles wide does not fit here",
+                        self.platform_tiles
+                    );
+                    return false;
+                }
+                self.level.add_platform_tile(
+                    tx,
+                    ty,
+                    self.platform_tiles,
+                    self.platform_span,
+                    self.platform_vertical,
+                )
+            }
             Brush::Scenery => {
                 if !self.can_place(Brush::Scenery, tx, ty) {
                     self.message = "scenery needs an empty cell (and a tree needs room above)"
@@ -689,7 +820,9 @@ impl Editor {
                 if self.level.remove_scenery_at(tx, ty) {
                     return true;
                 }
-                if self.level.remove_walker_at(tx, ty) {
+                // One call for every enemy and mover: the eraser should not have to know how
+                // many kinds there are to remove the one under the pointer.
+                if self.level.remove_enemy_at(tx, ty) {
                     return true;
                 }
                 if self.level.remove_goal_at(tx, ty) {
@@ -740,8 +873,46 @@ impl Editor {
             .iter()
             .find(|s| (s.x, s.y) == (tx, ty));
 
-        if self.level.walker_tiles().contains(&(tx, ty)) {
-            self.brush = Some(Brush::Walker);
+        // Every enemy and mover is one question — "what is standing in this cell?" — so the
+        // eyedropper asks it once and then *learns* the thing it found: a turret brings its
+        // firing direction, a platform its width and travel. Picking a piece you liked and
+        // then having to set its two numbers by hand would be the pick doing half its job.
+        match self.level.enemy_at(tx, ty) {
+            Some("turret") => {
+                // The level's own tile list is the one address book for a spec: the index it
+                // reports is the index into the spec vector, so the two cannot drift apart.
+                if let Some(i) = self.level.turret_tiles().iter().position(|p| *p == (tx, ty)) {
+                    if let Some(t) = self.level.turrets.get(i) {
+                        self.turret_dir = t.dir;
+                    }
+                }
+                self.brush = Some(Brush::Turret);
+            }
+            Some("flyer") => {
+                if let Some(i) = self.level.flyer_tiles().iter().position(|p| *p == (tx, ty)) {
+                    if let Some(f) = self.level.flyers.get(i) {
+                        self.enemy_span = f.span().round().max(1.0) as i32;
+                    }
+                }
+                self.brush = Some(Brush::Flyer);
+            }
+            Some("platform") => {
+                if let Some(i) = self.level.platform_tiles().iter().position(|p| *p == (tx, ty)) {
+                    if let Some(p) = self.level.platforms.get(i) {
+                        self.platform_tiles = p.rect.w.round().max(1.0) as i32;
+                        self.platform_span = p.span.round().max(1.0) as i32;
+                        self.platform_vertical = p.vertical;
+                    }
+                }
+                self.brush = Some(Brush::Platform);
+            }
+            Some("chaser") => self.brush = Some(Brush::Chaser),
+            Some("walker") => self.brush = Some(Brush::Walker),
+            _ => {}
+        }
+        if self.level.enemy_at(tx, ty).is_some() {
+            // Nothing else in this cell is worth picking: the terrain under an enemy is what
+            // the enemy is standing on, and the next click is about the enemy.
         } else if let Some(scenery) = scenery {
             // The sprite's own name, when the palette knows it: the scenery row is a curated list,
             // so a prop that is on the level but not in the list would silently pick the *first*
@@ -768,8 +939,12 @@ impl Editor {
                 Some(Tile::CrackedBrick) => self.brush = Some(Brush::CrackedBrick),
                 Some(Tile::Plank) => self.brush = Some(Brush::Plank),
                 Some(Tile::CrackedPlank) => self.brush = Some(Brush::CrackedPlank),
+                Some(Tile::OneWay) => self.brush = Some(Brush::OneWay),
                 Some(Tile::Spike) => self.brush = Some(Brush::Spike),
                 Some(Tile::Spring) => self.brush = Some(Brush::Spring),
+                Some(Tile::Water) => self.brush = Some(Brush::Water),
+                Some(Tile::Lava) => self.brush = Some(Brush::Lava),
+                Some(Tile::Vine) => self.brush = Some(Brush::Vine),
                 // Air is a brush like any other — the clear one — and the flag's own tile is air
                 // with an entity on it, which the branch above caught.
                 Some(Tile::Empty | Tile::Goal) => self.brush = Some(Brush::Empty),
@@ -837,6 +1012,12 @@ impl Editor {
         }
         if report.spawn_moved {
             parts.push("spawn moved".to_string());
+        }
+        if report.dropped_enemies > 0 {
+            parts.push(format!("{} enemy(s) fell off the map", report.dropped_enemies));
+        }
+        if report.dropped_platforms > 0 {
+            parts.push(format!("{} platform(s) fell off the map", report.dropped_platforms));
         }
         if report.dropped_scenery > 0 {
             parts.push(format!("{} scenery dropped", report.dropped_scenery));
@@ -1824,5 +2005,162 @@ mod tests {
 
         assert!(ed.undo());
         assert_eq!(ed.level.name, "test-level", "undo takes the name back");
+    }
+
+    /// **Every new brush places its thing, the document accepts it, and the eraser takes it
+    /// back.**
+    ///
+    /// The loop is the point: one test that walks the whole new palette is what catches a
+    /// brush wired to the wrong writer, which is a mistake the type checker cannot see and
+    /// which the palette would happily paint.
+    #[test]
+    fn the_new_brushes_place_and_erase_their_own_entities() {
+        let mut ed = doc();
+        // A floor at row 9 to stand the ground-lovers on.
+        for tx in 0..40 {
+            ed.level.set_tile(tx, 9, Tile::Solid);
+        }
+
+        for (brush, tile) in [
+            (Brush::OneWay, (3, 7)),
+            (Brush::Chaser, (5, 8)),
+            (Brush::Flyer, (7, 6)),
+            (Brush::Turret, (9, 8)),
+            (Brush::Platform, (11, 6)),
+        ] {
+            ed.brush = Some(brush);
+            ed.begin_stroke();
+            assert!(ed.paint(tile.0, tile.1), "{} was refused", brush.label());
+            ed.end_stroke();
+            let kind = ed.level.enemy_at(tile.0, tile.1);
+            if brush == Brush::OneWay {
+                assert_eq!(ed.level.tile(tile.0, tile.1), Some(Tile::OneWay));
+            } else {
+                assert_eq!(
+                    kind,
+                    Some(match brush {
+                        Brush::Chaser => "chaser",
+                        Brush::Flyer => "flyer",
+                        Brush::Turret => "turret",
+                        _ => "platform",
+                    }),
+                    "{} did not land where it was clicked",
+                    brush.label()
+                );
+            }
+
+            // The eyedropper knows the piece it just placed. It reports "no change" when the
+            // brush is already the same one, so step away first.
+            ed.brush = Some(Brush::Erase);
+            assert!(ed.pick_at(tile.0, tile.1), "{} is not pickable", brush.label());
+            assert_eq!(ed.brush, Some(brush));
+
+            // And the eraser takes it back, leaving nothing of the entity behind.
+            ed.brush = Some(Brush::Erase);
+            ed.begin_stroke();
+            assert!(ed.paint(tile.0, tile.1), "{} is not erasable", brush.label());
+            ed.end_stroke();
+            if brush == Brush::OneWay {
+                assert_ne!(ed.level.tile(tile.0, tile.1), Some(Tile::OneWay));
+            } else {
+                assert_eq!(ed.level.enemy_at(tile.0, tile.1), None);
+            }
+        }
+
+        // The whole level still writes: the new entities are part of a document the loader
+        // accepts, not something only the editor knows about.
+        assert!(ed.level.to_json_pretty().is_ok());
+    }
+
+    /// **The placement rules refuse what the file would refuse.**
+    ///
+    /// A flyer in a wall is scenery in a wall; a turret or a chaser in mid-air falls on the
+    /// first tick; a platform that runs off the right edge has half a shelf.
+    #[test]
+    fn the_new_placements_refuse_cells_that_would_not_survive_the_loader() {
+        let mut ed = doc();
+        for tx in 0..40 {
+            ed.level.set_tile(tx, 9, Tile::Solid);
+        }
+        // A pile of terrain to refuse.
+        ed.level.set_tile(20, 8, Tile::Solid);
+        ed.level.set_tile(21, 8, Tile::Solid);
+
+        assert!(!ed.can_place(Brush::Flyer, 20, 8), "a flyer inside a wall");
+        assert!(!ed.can_place(Brush::Chaser, 22, 6), "a chaser in mid-air");
+        assert!(!ed.can_place(Brush::Turret, 22, 6), "a turret in mid-air");
+        assert!(ed.can_place(Brush::Chaser, 22, 8), "on the floor it is fine");
+
+        // A three-wide shelf does not fit in the last two columns.
+        ed.platform_tiles = 3;
+        assert!(!ed.can_place(Brush::Platform, 38, 6), "off the right edge");
+        assert!(ed.can_place(Brush::Platform, 32, 6));
+
+        // Each refusal is also refused by the writer, so the ghost and the click agree.
+        ed.brush = Some(Brush::Flyer);
+        ed.begin_stroke();
+        assert!(!ed.paint(20, 8));
+        ed.end_stroke();
+    }
+
+    /// **The turret's brush picture is the canvas's picture.**
+    ///
+    /// [`crate::view::turret_picture`] is the one rule for both directions, and the brush's own
+    /// base sprite has to be the sprite that rule mirrors — otherwise the palette cell and the
+    /// turret drawn on the canvas would be two pieces of art, and a direction setting could
+    /// change one without the other. That is the bug this pins: the window promised a right-facing
+    /// turret while the brush placed a left-facing one.
+    #[test]
+    fn the_turret_brush_names_the_sprite_the_canvas_mirrors() {
+        assert_eq!(
+            crate::view::turret_picture(1),
+            (Brush::Turret.sprite(), false)
+        );
+        assert_eq!(
+            crate::view::turret_picture(-1),
+            (Brush::Turret.sprite(), true)
+        );
+    }
+
+    /// The turret's direction and the platform's shape are properties of the *brush*, and a
+    /// pick adopts them: placing a second turret should fire the way the first one did.
+    #[test]
+    fn the_brush_learns_the_turret_and_platform_it_picked() {
+        let mut ed = doc();
+        for tx in 0..40 {
+            ed.level.set_tile(tx, 9, Tile::Solid);
+        }
+        ed.turret_dir = -1;
+        ed.brush = Some(Brush::Turret);
+        ed.begin_stroke();
+        assert!(ed.paint(6, 8));
+        ed.end_stroke();
+        assert_eq!(ed.level.turrets[0].dir, -1);
+
+        ed.turret_dir = 1;
+        ed.brush = Some(Brush::Erase);
+        assert!(ed.pick_at(6, 8));
+        assert_eq!(ed.turret_dir, -1, "the pick adopts the facing it found");
+
+        ed.platform_tiles = 4;
+        ed.platform_span = 6;
+        ed.platform_vertical = true;
+        ed.brush = Some(Brush::Platform);
+        ed.begin_stroke();
+        assert!(ed.paint(12, 6));
+        ed.end_stroke();
+        let p = ed.level.platforms[0];
+        assert_eq!(p.rect.w, 4.0);
+        assert_eq!(p.span, 6.0);
+        assert!(p.vertical);
+
+        ed.platform_tiles = 1;
+        ed.platform_span = 1;
+        ed.platform_vertical = false;
+        ed.brush = Some(Brush::Erase);
+        assert!(ed.pick_at(12, 6));
+        assert_eq!(ed.platform_tiles, 4, "the pick adopts the width");
+        assert_eq!(ed.platform_span, 6, "and the travel");
+        assert!(ed.platform_vertical, "and the axis");
     }
 }

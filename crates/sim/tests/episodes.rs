@@ -122,7 +122,24 @@ fn golden_state_hash_after_ten_thousand_frames() {
     // itself is bit-identical — but a hash that says "the same state" for a level that has lost a
     // bridge and one that never had one would be the wrong hash, which is the whole reason the
     // two are in there.
-    const GOLDEN_LONG_RUNWAY_HASH: u64 = 1_557_231_695_008_748_248;
+    //
+    // Re-recorded for 0.12.0: the state now covers flyers, turrets, the shots they fire and
+    // the moving platforms' own boxes, and the *count* of each is folded in even when it is
+    // zero — a level that has gained a flyer must not hash like one that never had one. This
+    // runway has none of them, so the trajectory is unchanged and only the hash stream grew.
+    //
+    // Re-recorded for 0.14.0, and again for the *hash* rather than the trajectory: the body
+    // carries `in_water` and `on_vine` now, and both are folded into `state_hash`. This runway
+    // has no water, no lava and no vine, so the body is never in either medium and the episode is
+    // bit-identical — but a hash that said "the same state" for a body swimming in a pool and one
+    // standing on a ledge would be the wrong hash, which is why the two are in there.
+    //
+    // Re-recorded once more inside 0.14.0, for the same reason and with the same check: the body
+    // carries an in-progress pull-up now (`mantle`), which is folded into the hash, and this runway
+    // has no vine to pull up over. The constant above was reproduced *exactly* with the mantle's
+    // bytes taken back out of the stream before this one was recorded, so the episode is still
+    // bit-identical and only the hash grew.
+    const GOLDEN_LONG_RUNWAY_HASH: u64 = 10_818_682_214_639_513_976;
 
     let level = common::long_runway();
     let mut sim = sim::Sim::new(&level, SEED);

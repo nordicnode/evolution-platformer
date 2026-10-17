@@ -25,7 +25,7 @@ use sim::AgentAction;
 /// column 2 and the flag at column 56. It is here in the table with the rest because everything the
 /// pack asserts about a level (its size, its one flag, its round trip, its mirror) has to hold for
 /// it too.
-const SHIPPED: [(&str, i32, i32, usize); 10] = [
+const SHIPPED: [(&str, i32, i32, usize); 12] = [
     ("l1-flat-run", 60, 15, 0),
     ("l2-first-gap", 60, 15, 0),
     ("l3-gauntlet", 60, 15, 1),
@@ -36,6 +36,17 @@ const SHIPPED: [(&str, i32, i32, usize); 10] = [
     ("l7-wall-school", 60, 15, 0),
     ("l8-long-jump", 60, 15, 1),
     ("l9-wait-and-climb", 60, 15, 1),
+    // The demo for the enemies-and-objects pass: a one-way shelf, a flyer, a chaser, a
+    // turret and a moving platform in one level. The walker count is the *patrols* the level
+    // file lists, and this one has none: its chaser is a `chaser` entity, and the sim appends
+    // chasers to its walker vector only once an episode starts.
+    ("l10-the-hunt", 60, 15, 0),
+    // The demo for the elements pass, and the first level in the pack with a tile that is not
+    // ground in it: a lava pool that throws, a water basin two deep that has to be swum out of,
+    // and a vine down the far wall of the plateau's pit. All three are on the route a body
+    // walks; the pit's vine is one of *two* ways out of it, which is what keeps the level
+    // reachable to an oracle that cannot climb (`sim::reach`).
+    ("l11-the-elements", 72, 18, 0),
 ];
 
 #[test]
@@ -333,11 +344,29 @@ fn malformed_levels_are_refused() {
         "the control case must parse, or the assertions below are vacuous"
     );
 
-    let bad_version = common::fixture_src("bad-version", &rows, (1, 0), &goal, 2);
+    // A version this build has never seen. Every older version is accepted on purpose (each
+    // one is a strict subset of this one), so the refusal case is the *next* version rather
+    // than the last one.
+    let bad_version = common::fixture_src(
+        "bad-version",
+        &rows,
+        (1, 0),
+        &goal,
+        sim::level::LEVEL_FORMAT_VERSION + 1,
+    );
     assert!(
         sim::Level::from_json_str(&bad_version).is_err(),
-        "level_format_version 2 must be refused, not guessed at"
+        "a format version this build does not know must be refused, not guessed at"
     );
+
+    for old in 1..sim::level::LEVEL_FORMAT_VERSION {
+        let old_version = common::fixture_src("old-version", &rows, (1, 0), &goal, old);
+        assert!(
+            sim::Level::from_json_str(&old_version).is_ok(),
+            "a v{old} file is a subset of v{} and must still load",
+            sim::level::LEVEL_FORMAT_VERSION
+        );
+    }
 
     // Row 1 declares one column where the level says four.
     let short_row = common::fixture_src("short-row", &["....", "#"], (1, 0), &goal, 1);

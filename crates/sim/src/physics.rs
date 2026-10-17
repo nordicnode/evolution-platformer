@@ -185,6 +185,139 @@ pub struct Physics {
     pub walker_spawn_jitter: f32,
     /// How far above a walker's top the player's previous bottom must be to stomp.
     pub enemy_stomp_tol: f32,
+    /// A flyer's box.
+    pub flyer_w: f32,
+    pub flyer_h: f32,
+    /// A flyer's patrol speed, tiles/tick.
+    ///
+    /// **Slower than a walker's**, and the difference is the decision rather than the feel. A
+    /// walker crosses the floor a body runs along, so its speed sets how long a wait is; a flyer
+    /// crosses the row a jump is *made* in, so its speed sets the width of the window a jump has
+    /// to be timed in. At walker speed a flyer's window is a coin flip; at three quarters of it, a
+    /// body that watches the row can still commit.
+    pub flyer_speed: f32,
+    /// A turret's box.
+    pub turret_w: f32,
+    pub turret_h: f32,
+    /// Ticks between a turret's shots.
+    pub turret_period: u32,
+    /// A shot's box.
+    pub shot_w: f32,
+    pub shot_h: f32,
+    /// A shot's speed along its row, tiles/tick.
+    ///
+    /// **Faster than a sprint**, which is the strongest promise the mechanic can make: no body,
+    /// at any gear, outruns a bullet. The dodge is therefore always a *vertical* one — jump over
+    /// the row, or be somewhere else when it arrives — which is the decision a turret exists to
+    /// add. At 0.18 tiles/tick a shot crosses a ten-tile ledge in a second, so the body has to
+    /// read the turret rather than react to the bullet.
+    ///
+    /// It used to be 0.08, and that number was the bug: slower than `run_speed` (0.10), so the
+    /// doc's own sentence was false and a player could simply walk away from a shot. A projectile
+    /// nobody has to dodge is a decoration that occasionally kills someone standing still.
+    pub shot_speed: f32,
+    /// How far a shot travels before it fizzles, in tiles.
+    ///
+    /// **A wall ends a shot; this is the backstop for a row that has none.** Eighteen tiles is a
+    /// third of a sixty-tile level: long enough that a turret's row is dangerous along its whole
+    /// length — the ledge, the pit beside it, the air over both — and short enough that a shot
+    /// fired across an open map still ends inside the level rather than sweeping the ground the
+    /// body starts on. That last half is a level-design rule as much as a physics one, and the
+    /// demo level relies on it: its turret fires across a ledge and a five-tile pit and dies over
+    /// the pit.
+    pub shot_range: f32,
+    /// A moving platform's thickness, and the speed it slides at.
+    pub platform_h: f32,
+    /// A moving platform's speed, in tiles per tick.
+    ///
+    /// **One 16-pixel art pixel per tick**, which is why the number is 0.0625 and not a round
+    /// 0.05. The renderer draws at a whole-number points-per-tile scale (`Camera::scale`), so a
+    /// shelf moving 1/16 of a tile per tick moves exactly `scale` screen pixels per tick at every
+    /// zoom — it and the body riding it step every frame instead of holding still for two frames
+    /// and then jumping one. That is the whole difference between a platform that slides and one
+    /// that stutters, and the reason the speed is derived from the art's own tile rather than
+    /// picked by feel. It is also a pace a person reads as a platform: 62% of a run, four tiles in
+    /// about a second, slow enough to step onto and quick enough to wait for.
+    ///
+    /// It used to be 0.02 (half a screen pixel per tick at the usual zoom), which is the one speed
+    /// at which no zoom can draw the motion smoothly.
+    pub mover_speed: f32,
+
+    // ---- the elements: water, lava, vines ----------------------------
+    /// Downward speed a body in water drifts at when it is not swimming, tiles/tick.
+    ///
+    /// 1.2 tiles a second. Slow enough that a pool is a place to think for a moment rather than
+    /// a pit, fast enough that a body which ignores the water ends up on its bottom — which is
+    /// the pressure the mechanic applies: swimming is a cost measured in ticks.
+    pub water_sink: f32,
+    /// Upward speed a swimming body rises at while jump is held, tiles/tick.
+    ///
+    /// 4.2 tiles a second, roughly half a run. A body can get out of anything given time, and
+    /// the time is what a pool charges for.
+    pub water_swim: f32,
+    /// How fast a body's vertical speed drifts to the water's own rate, tiles/tick².
+    ///
+    /// The water does not snap the body to its rate: a body that falls in is caught over a few
+    /// ticks, which is what makes the entry read as a body entering water rather than as a body
+    /// hitting a floor.
+    pub water_accel: f32,
+    /// The fastest a body descends at the moment it enters water, tiles/tick.
+    ///
+    /// A cap rather than a deceleration, because a body arriving at [`Physics::max_fall`]
+    /// (0.75) would otherwise carry most of a fall's speed through the first half second and be
+    /// on the bottom of a two-tile pool before the water had caught it. Water takes the fall out
+    /// of an arrival in one tick — that is what water is for — and `water_accel` does the rest.
+    pub water_entry: f32,
+    /// Horizontal speed cap in water, tiles/tick. Half a run.
+    pub water_speed: f32,
+    /// Upward velocity of a **push off the surface**, tiles/tick.
+    ///
+    /// Pressing jump with the body near the surface is not a stroke, it is a leap: the body
+    /// leaves the water with this and is ballistic from there, which is the only way a pool with
+    /// a lip taller than a stroke can be left at all. `v0²/(2g)` is 2.5 tiles — the height of lip
+    /// a pool may have and still be escapable — and a level author reads it off
+    /// [`Physics::water_breach_height`] rather than deriving it twice.
+    ///
+    /// **Equal to `jump_v0`, and that is the design.** The first version gave 1.6 tiles, on the
+    /// theory that water should be weaker than ground. It is not weaker, it is *slippery*: a
+    /// breach has no ground to stand on, so its whole horizontal budget is the airtime above the
+    /// lip, and 1.6 tiles left a body with a window about eight ticks long to drift a quarter of a
+    /// tile out of the pool — a move that measured as impossible in `a_swimmer_leaves_a_pool_over_its_lip`
+    /// rather than merely hard. The surface push is a jump: one height, one ladder, one number.
+    pub water_jump_v0: f32,
+    /// How far below the surface a press still counts as a push off it, in tiles.
+    ///
+    /// Without the band a swimmer would have to press on the one tick its feet were inside the
+    /// tolerance of the surface, and with a band the size of the body it could breach from the
+    /// bottom of a puddle. Three quarters of a tile is "at the surface" as a person means it.
+    pub water_surface_reach: f32,
+    /// Upward speed while climbing a vine, tiles/tick.
+    pub vine_climb: f32,
+    /// Downward speed while hanging on a vine without climbing, tiles/tick.
+    ///
+    /// Slower than the wall slide (0.06): a vine is a controlled descent, and the point of the
+    /// tile is that going *down* it is a move rather than a fall.
+    pub vine_slide: f32,
+    /// Ticks between one lava vent's balls.
+    pub lava_period: u32,
+    /// Upward velocity a lava ball leaves its vent with, tiles/tick.
+    ///
+    /// Equal to [`Physics::jump_v0`], so a ball rises exactly as high as a jump: 2.5 tiles, which
+    /// is a little over the two-row clearance a body needs to walk under one and a little under
+    /// the three-tile step a body might try to hide on. The number is shared deliberately — the
+    /// fountain and the jump ladder are the same geometry, so a level can be read.
+    pub lava_v0: f32,
+    /// Lateral drift of a lava ball, tiles/tick, sign alternating by vent index.
+    ///
+    /// Without it every ball falls back into the vent that threw it and the hazard is a column;
+    /// with it a pool throws a curtain that lands a tile or two apart, which is what makes a row
+    /// of vents a rhythm rather than a set of independent poles.
+    pub lava_drift: f32,
+    /// A lava ball's box.
+    pub lava_w: f32,
+    pub lava_h: f32,
+    /// Ticks a lava ball lives for at most, after which it burns out wherever it is.
+    pub lava_ticks: u32,
 }
 
 pub const PHYSICS: Physics = Physics {
@@ -217,6 +350,52 @@ pub const PHYSICS: Physics = Physics {
     stomp_bounce: 0.85,
     enemy_stomp_tol: 0.20,
     walker_spawn_jitter: 0.20,
+    flyer_w: 0.70,
+    flyer_h: 0.70,
+    flyer_speed: 0.03,
+    turret_w: 0.80,
+    turret_h: 0.80,
+    // Two seconds: long enough that a turret's row is a rhythm to read rather than a wall, and
+    // short enough that crossing it is a decision on every attempt.
+    turret_period: 120,
+    shot_w: 0.30,
+    shot_h: 0.30,
+    // Faster than `sprint_speed` (0.15): a bullet cannot be outrun, only dodged.
+    shot_speed: 0.18,
+    shot_range: 18.0,
+    platform_h: 0.50,
+    // One art pixel a tick (see `mover_speed`): 0.0625 = 1/16, and the value is derived rather
+    // than tuned so that the shelf and its rider land on the pixel grid at any integer zoom.
+    mover_speed: 0.0625,
+    // 0.02 is 1.2 tiles a second: a body that stops swimming is at the bottom in about two
+    // seconds in a deep pool, and never feels yanked in a shallow one.
+    water_sink: 0.02,
+    // 0.07 is 4.2 tiles/s up, which is 3.5x the sink rate: swimming wins, slowly.
+    water_swim: 0.07,
+    water_accel: 0.02,
+    // A quarter of `max_fall`, and half of it again above the sink rate: the water takes a
+    // terminal fall out of a body in one tick without ever pulling a swimmer down.
+    water_entry: 0.10,
+    // Half a run. A pool is crossed at half the pace of the floor beside it, and that is the
+    // route's cost.
+    water_speed: 0.06,
+    // 1.6 tiles of breach: enough to leave a pool whose lip is a tile above the water, not
+    // enough to leave a shaft. `water_breach_height` is this number's height.
+    water_jump_v0: 0.25,
+    water_surface_reach: 0.75,
+    // Slower than a run (0.10): a vine is a route, not a lift.
+    vine_climb: 0.06,
+    vine_slide: 0.03,
+    // Two and a half seconds between one vent's balls: the fountain is a rhythm to read, and
+    // 150 ticks is 37.5 decision blocks, so no two visits to a vent see the same phase twice.
+    lava_period: 150,
+    lava_v0: 0.25,
+    lava_drift: 0.015,
+    lava_w: 0.30,
+    lava_h: 0.30,
+    // A ball's arc is ~40 ticks; 150 is the backstop for a vent that has been buried by a
+    // bridge since it fired.
+    lava_ticks: 150,
 };
 
 impl Default for Physics {
@@ -226,6 +405,33 @@ impl Default for Physics {
 }
 
 impl Physics {
+    /// How high a push off the water's surface carries a body: `v0²/(2g)`.
+    ///
+    /// The one number a level author needs to decide whether a pool can be left: a lip taller
+    /// than this is a pool a body cannot get out of, however long it swims.
+    pub fn water_breach_height(&self) -> f32 {
+        self.water_jump_v0 * self.water_jump_v0 / (2.0 * self.gravity)
+    }
+
+    /// How high a lava ball rises above its vent: `v0²/(2g)`, the same ladder as a jump.
+    pub fn lava_height(&self) -> f32 {
+        self.lava_v0 * self.lava_v0 / (2.0 * self.gravity)
+    }
+
+    /// Ticks a lava ball spends in the air: `2·v0/g`.
+    pub fn lava_air_time_ticks(&self) -> f32 {
+        2.0 * self.lava_v0 / self.gravity
+    }
+
+    /// Does a shot outrun a body moving at `speed`? The mechanic's promise, as a question.
+    ///
+    /// A method rather than a comparison at the call site because the claim is part of what a shot
+    /// *is*: a projectile a gear can leave behind is not a threat, it is a decoration that
+    /// occasionally hits somebody standing still.
+    pub fn shot_outruns(&self, speed: f32) -> bool {
+        self.shot_speed > speed
+    }
+
     /// Peak height of a fully held jump: `v0²/(2g)`.
     pub fn max_jump_height(&self) -> f32 {
         self.jump_v0 * self.jump_v0 / (2.0 * self.gravity)
@@ -510,6 +716,10 @@ pub struct TickContact {
     pub hit_wall: bool,
     pub hit_ceiling: bool,
     pub touched_spike: bool,
+    /// The body overlapped a lava cell. Its own flag rather than folded into `touched_spike`,
+    /// because the two hazards answer different boxes and a reader of this report should not
+    /// have to know which one killed it.
+    pub touched_lava: bool,
 }
 
 /// Bottom edge of an entity occupying tile row `ty`, in world units.
@@ -691,6 +901,91 @@ pub struct PlayerState {
     wall_dir: i8,
     /// Remaining ticks of post-wall-jump horizontal lockout.
     wall_lock: u32,
+    /// The body's centre was in water this tick, so it is swimming rather than falling.
+    ///
+    /// Read by the window (the swim pose, the surface line's own animation) and by nothing in
+    /// the physics: the medium is a function of position, recomputed at the top of every tick.
+    /// It is a field because "what is the body in" is a question the *outside* asks, and one
+    /// place to ask it is worth more than a second implementation of the rule.
+    pub in_water: bool,
+    /// The body was airborne and overlapping a vine this tick, so it is climbing.
+    pub on_vine: bool,
+    /// A pull-up in progress: the body has climbed a vine to the block it hangs from and is
+    /// hauling itself over that block's lip.
+    mantle: Option<Mantle>,
+}
+
+/// One scripted pull-up over a vine's own block.
+///
+/// A vine that hangs from a **ledge** is a route: the body climbs it and the oracle can leave the
+/// vine sideways onto the ledge beside it. A vine that hangs from a *block* — a one-tile-thick
+/// ceiling with air above it — is a dead end under the old rules: the body climbs until its head
+/// meets the underside and then has nowhere to go, because the only way on is *over* the block it
+/// is holding. That is the move this models: hold the climb at the top and the body hauls itself
+/// up onto the block, centred on the vine's column.
+///
+/// Scripted rather than physical, for the same reason a spring's throw is: it is a traversal the
+/// body cannot express with air control, and a script that is the same every time is what makes it
+/// replayable, sweepable by the oracle and cheap to render. Collisions are ignored for its ten
+/// ticks — the body is going *through* the corner it is climbing over — and it ends standing.
+/// Ticks a pull-up takes: ten at 60 Hz is a sixth of a second. Long enough to read as a haul
+/// over a lip, short enough that the game does not feel like it took the stick away.
+pub const MANTLE_TICKS: u32 = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mantle {
+    from_x: f32,
+    from_y: f32,
+    to_x: f32,
+    to_y: f32,
+    done: u32,
+    total: u32,
+}
+
+/// What a body is moving through, as the physics asks it once a tick.
+///
+/// One enum rather than two booleans at the call sites: the three media are exclusive, and a
+/// body that is both in water and touching a vine (a flooded shaft with a vine in it) has to
+/// resolve to one of them. Water wins, because it is the medium that changes the *body*, and
+/// the swim is the move a body in a flooded shaft needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Medium {
+    Air,
+    /// The body's centre is in water: it sinks, swims, and is dragged.
+    Water,
+    Vine,
+}
+
+/// The block a vine hangs from, when a body can stand on top of it: the anchor row, given a column
+/// and a row of that column's vine.
+///
+/// **One statement of "is this vine a way over its own block",** shared by the sim and the oracle
+/// for the reason the landing boxes are shared: a pull-up the physics performs but the sweep never
+/// tries is a route the game has and the oracle denies, and that is exactly the false negative that
+/// made every vine under a lid read as a dead end. A vine that hangs from a *ledge* (air above its
+/// top cell) has no answer here — it is left sideways, not climbed over — and neither does a
+/// two-tile-thick block, because there is no room above its anchor for a body to stand in.
+///
+/// `head` may be any row of the vine; the run is walked up to its top before the anchor is read.
+pub fn vine_mantle_anchor(level: &Level, ph: &Physics, col: i32, head: i32) -> Option<i32> {
+    if !level.is_vine(col, head) {
+        return None;
+    }
+    // The top of the run this vine is, and the block above it.
+    let mut top = head;
+    while top > 0 && level.is_vine(col, top - 1) {
+        top -= 1;
+    }
+    let anchor = top - 1;
+    if !level.is_solid(col, anchor) {
+        return None;
+    }
+    // Room to stand: every row the body would occupy above the anchor has to be free.
+    let first = (anchor as f32 - ph.player_h).floor() as i32;
+    if (first..anchor).any(|row| level.is_opaque(col, row)) {
+        return None;
+    }
+    Some(anchor)
 }
 
 impl PlayerState {
@@ -720,11 +1015,85 @@ impl PlayerState {
             speed_cap: ph.run_speed,
             wall_dir: 0,
             wall_lock: 0,
+            in_water: false,
+            on_vine: false,
+            mantle: None,
         }
+    }
+
+    /// True while a pull-up is in progress. The window draws it as a climb — the rising pose, since
+    /// the script moves the body upward rather than its velocity — and the simulator ignores input
+    /// until it ends.
+    pub fn mantling(&self) -> bool {
+        self.mantle.is_some()
+    }
+
+    /// Advance a pull-up one tick. Returns what contact the tick made (a mantle presses nothing
+    /// and blocks nothing), or `None` when no mantle is running.
+    ///
+    /// The curve is a smoothstep on both axes, so the body leaves the vine slowly, crosses the
+    /// lip quickly and settles onto the block rather than snapping there — which is the whole
+    /// difference between a move and a teleport.
+    fn advance_mantle(&mut self) -> Option<TickContact> {
+        let mantle = self.mantle.as_mut()?;
+        mantle.done += 1;
+        let t = (mantle.done as f32 / mantle.total as f32).clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        self.x = mantle.from_x + (mantle.to_x - mantle.from_x) * eased;
+        self.y = mantle.from_y + (mantle.to_y - mantle.from_y) * eased;
+        self.vx = 0.0;
+        self.vy = 0.0;
+        let finished = mantle.done >= mantle.total;
+        let (to_y, to_x) = (mantle.to_y, mantle.to_x);
+        if finished {
+            // Placed rather than eased into place: the last tick of a smoothstep is within a
+            // hundredth of the target, and a body that ends a move a hundredth of a tile off a
+            // surface is a body the next tick has to catch.
+            self.x = to_x;
+            self.y = to_y;
+            self.mantle = None;
+            self.grounded = true;
+            self.coyote_ticks = 0;
+            // The climb button is still held: spend the cut and keep the press *held*, so the
+            // tick after the pull-up does not launch a jump nobody asked for.
+            self.jump_cut_applied = true;
+            self.jump_hold_ticks = 0;
+            self.jump_buffer = 0;
+        }
+        self.in_water = false;
+        self.on_vine = false;
+        // The last tick of a pull-up is a landing: the body leaves the vine and puts its weight on
+        // the block. Reported through the same channel every other touchdown uses, because the
+        // oracle's scripts end their trajectory on a landed contact and a mantle that reported
+        // nothing would look like a body that climbed onto a block and then stood there forever
+        // (see `reach::simulate_vine_climb_with`).
+        Some(TickContact {
+            landed: finished,
+            ..TickContact::default()
+        })
     }
 
     pub fn aabb(&self) -> Rect {
         Rect::new(self.x, self.y, self.w, self.h)
+    }
+
+    /// Put the body down on a surface the tile grid does not hold: a moving platform's top.
+    ///
+    /// One method rather than a write to six fields from the sim, because "standing on
+    /// something" is exactly the state [`PlayerState`] owns: the body is placed, its fall is
+    /// stopped, and the one-shot jump cut is cleared so the next press is a fresh jump rather
+    /// than the tail of the last one.
+    pub fn land_on(&mut self, top: f32) {
+        self.y = top - self.h;
+        self.vy = 0.0;
+        self.grounded = true;
+        self.jump_cut_applied = false;
+    }
+
+    /// Move the body with the surface under it — a platform's own motion, not the body's.
+    pub fn carry(&mut self, dx: f32, dy: f32) {
+        self.x += dx;
+        self.y += dy;
     }
 
     /// Advance one tick: intent, gravity, then per-axis AABB resolution.
@@ -735,6 +1104,34 @@ impl PlayerState {
         action: AgentAction,
     ) -> TickContact {
         let mut contact = TickContact::default();
+
+        // ---- a pull-up owns the body until it ends -----------------------
+        //
+        // Checked before anything else, because a mantle is a script rather than a body: the
+        // input for its ten ticks is the climb that started it, collisions do not apply (the body
+        // is climbing over a corner), and the medium it is in is decided by the script.
+        if let Some(done) = self.advance_mantle() {
+            self.jump_held = action.wants_jump();
+            return done;
+        }
+
+        // ---- what is the body in? ---------------------------------------
+        //
+        // Asked once, from the body's **centre**, before anything moves: water is decided by
+        // the centre so the surface is a line and not a band of half-states, and a vine is
+        // decided by the box so a climber's whole body is on the thing it is holding. A vine
+        // only counts once the body is off the ground — a body standing at the foot of one is
+        // standing on the floor, with its jump intact, and grabs the vine on the way up.
+        let (cx, cy) = self.aabb().center();
+        let medium = if level.is_water(cx.floor() as i32, cy.floor() as i32) {
+            Medium::Water
+        } else if !self.grounded && self.overlaps_vine(level) {
+            Medium::Vine
+        } else {
+            Medium::Air
+        };
+        let in_air_medium = matches!(medium, Medium::Air);
+        let in_water = matches!(medium, Medium::Water);
 
         // ---- jump: edge-triggered, buffered, then cut once ---------------
         //
@@ -759,7 +1156,66 @@ impl PlayerState {
             self.jump_buffer = ph.jump_buffer_ticks;
         }
         let clinging = self.clinging();
-        if self.jump_buffer > 0 {
+
+        // ---- the vine's own block -----------------------------------------
+        //
+        // A vine that hangs from a *ledge* is left sideways (the climb's exit), but a vine that
+        // hangs from a **block** with air above it has no sideways exit at all: the body climbs
+        // until its head meets the block's underside. Holding the climb there is the pull-up —
+        // the body hauls itself over that block's lip and stands on top. It is triggered from the
+        // medium rather than from a new button because the climb already is the button: the one
+        // press that gets a body up a vine is the one that finishes it.
+        if matches!(medium, Medium::Vine) && want_jump {
+            if let Some((to_x, to_y)) = self.vine_ledge(level, ph) {
+                self.mantle = Some(Mantle {
+                    from_x: self.x,
+                    from_y: self.y,
+                    to_x,
+                    to_y,
+                    done: 0,
+                    total: MANTLE_TICKS,
+                });
+                self.jump_buffer = 0;
+                self.jump_held = true;
+                self.vx = 0.0;
+                self.vy = 0.0;
+                self.on_vine = true;
+                return contact;
+            }
+        }
+        // ---- the water's surface is a launch pad -------------------------
+        //
+        // A fresh press at the top of a pool is not a stroke, it is a **push off the water**:
+        // the body leaves with `water_jump_v0` and is ballistic from there. It is the only move
+        // that gets a body out of a pool with a lip, so it is the mechanic's own exit rather
+        // than a flourish.
+        //
+        // The test is "the body is **at** a surface", not "in water", and it has to be: a
+        // swimmer at the surface **bobs**, with its centre in the air and its legs in the water,
+        // so a rule keyed on submersion could only be taken on the tick the centre happened to
+        // be below the line — which is not a thing a person or a policy can aim at.
+        // `water_surface_at` therefore looks for water under the body's columns within
+        // `water_surface_reach` of its feet, which is "at the surface" as a player means it.
+        //
+        // A grounded body is excluded: standing on a ledge above a pool must not quietly
+        // downgrade a jump to a push.
+        if !self.grounded && self.jump_buffer > 0 && self.water_surface_at(level, ph).is_some() {
+            self.breach(ph);
+            contact.jumped = true;
+        }
+        match medium {
+            // What is left for a press in water is a stroke, which the vertical pass below
+            // applies for as long as the button is held.
+            Medium::Water => {
+                self.jump_buffer = self.jump_buffer.saturating_sub(1);
+            }
+            // A vine is climbed, not jumped: there is no ground behind the press, and a
+            // buffered ground jump carried onto one would fire the moment the body reached
+            // the top of the vine and turned a climb into a launch.
+            Medium::Vine => self.jump_buffer = 0,
+            Medium::Air => {}
+        }
+        if in_air_medium && self.jump_buffer > 0 {
             if self.can_jump() {
                 self.vy = -ph.jump_v0;
                 self.grounded = false;
@@ -825,7 +1281,11 @@ impl PlayerState {
                 ph.run_accel
             };
             self.vx += input * accel * scale;
-            self.vx = self.vx.clamp(-self.speed_cap, self.speed_cap);
+            // Water drags: the cap is the water's, not the body's gear, so a pool is crossed
+            // at half a run whatever the body was doing when it went in. Sprinting through
+            // water is not a thing, and the clamp is what says so.
+            let cap = if in_water { ph.water_speed } else { self.speed_cap };
+            self.vx = self.vx.clamp(-cap, cap);
         } else {
             // Brake is the one neutral action that is *not* a coast, and it decelerates in
             // the air as well as on the ground: see `Physics::brake_friction` for why the
@@ -850,7 +1310,9 @@ impl PlayerState {
         if self.vx > 0.0 {
             let col = tile_span(self.x, self.w).1;
             for ty in ty0..=ty1 {
-                if level.is_solid(col, ty) {
+                // `is_opaque`, not `is_solid`: a one-way shelf is ground from above and air
+                // from the side, so a body walking into its edge walks past it.
+                if level.is_opaque(col, ty) {
                     self.x = col as f32 - self.w;
                     self.vx = 0.0;
                     contact.hit_wall = true;
@@ -860,7 +1322,7 @@ impl PlayerState {
         } else if self.vx < 0.0 {
             let col = tile_span(self.x, self.w).0;
             for ty in ty0..=ty1 {
-                if level.is_solid(col, ty) {
+                if level.is_opaque(col, ty) {
                     self.x = (col + 1) as f32;
                     self.vx = 0.0;
                     contact.hit_wall = true;
@@ -869,13 +1331,53 @@ impl PlayerState {
             }
         }
 
-        // ---- gravity, wall slide, move y, resolve y ----------------------
-        self.vy = (self.vy + ph.gravity).min(ph.max_fall);
-        // Pressing into a wall turns a fall into a slow slide. `wall_dir != 0` after the
-        // jump block means this tick did *not* launch off the wall (a wall jump clears it),
-        // so a jump out of a slide is never slowed by the slide it just left.
-        if clinging && self.wall_dir != 0 && self.vy > ph.wall_slide_fall {
-            self.vy = ph.wall_slide_fall;
+        // ---- vertical: gravity, or the medium's own pull, then move y -----
+        //
+        // One match rather than three ifs, because the media are exclusive and a body that is
+        // in water must not also be wall-sliding: a swimmer pressing into a pool wall would
+        // otherwise be held at the wall slide's 0.06 by a rule about walls it is not on.
+        match medium {
+            Medium::Water => {
+                // A body already rising faster than a stroke is **ballistic**: that is the
+                // breach jump, and letting gravity have it is what makes the leap out of a
+                // pool the height `water_breach_height` promises instead of a stroke. Inside
+                // the water, the body's vertical speed drifts to the water's own rate — the
+                // sink when the button is up, the swim when it is down.
+                if self.vy < -ph.water_swim {
+                    self.vy = (self.vy + ph.gravity).min(ph.max_fall);
+                } else {
+                    // The fall the body arrived with is taken out of it at the surface line,
+                    // in one tick, and `water_accel` does the rest. A body that has just
+                    // splashed in is caught here, not by the sink rate alone.
+                    self.vy = self.vy.min(ph.water_entry);
+                    let target = if want_jump {
+                        -ph.water_swim
+                    } else {
+                        ph.water_sink
+                    };
+                    self.vy += (target - self.vy).clamp(-ph.water_accel, ph.water_accel);
+                }
+            }
+            // A vine replaces gravity outright: the body hangs where it is when the button is
+            // up, and rises when it is held. Snapping rather than accelerating is the grab —
+            // arriving at a vine at speed catches the body on the first tick, which is the
+            // difference between a vine and a ladder-shaped suggestion.
+            Medium::Vine => {
+                self.vy = if want_jump {
+                    -ph.vine_climb
+                } else {
+                    ph.vine_slide
+                };
+            }
+            Medium::Air => {
+                self.vy = (self.vy + ph.gravity).min(ph.max_fall);
+                // Pressing into a wall turns a fall into a slow slide. `wall_dir != 0` after the
+                // jump block means this tick did *not* launch off the wall (a wall jump clears
+                // it), so a jump out of a slide is never slowed by the slide it just left.
+                if clinging && self.wall_dir != 0 && self.vy > ph.wall_slide_fall {
+                    self.vy = ph.wall_slide_fall;
+                }
+            }
         }
         self.y += self.vy;
         let (tx0, tx1) = tile_span(self.x, self.w);
@@ -895,7 +1397,8 @@ impl PlayerState {
         } else if self.vy < 0.0 {
             let row = tile_span(self.y, self.h).0;
             for tx in tx0..=tx1 {
-                if level.is_solid(tx, row) {
+                // Rising through a one-way shelf is the move the tile exists for.
+                if level.is_opaque(tx, row) {
                     self.y = (row + 1) as f32;
                     self.vy = 0.0;
                     contact.hit_ceiling = true;
@@ -918,6 +1421,14 @@ impl PlayerState {
                 if level.is_spike(tx, ty) && body.overlaps(&spike_lethal_box(tx, ty)) {
                     contact.touched_spike = true;
                     break 'hazards;
+                }
+                // Lava is the *cell*, not a drawing inside it: the pool fills its tile and
+                // there is no transparent band at the top for a body to stand in, so the
+                // whole cell is the hazard and the art fills the whole cell.
+                if level.is_lava(tx, ty)
+                    && body.overlaps(&Rect::new(tx as f32, ty as f32, 1.0, 1.0))
+                {
+                    contact.touched_lava = true;
                 }
             }
         }
@@ -948,7 +1459,94 @@ impl PlayerState {
         }
 
         self.jump_held = want_jump;
+        self.in_water = in_water;
+        self.on_vine = matches!(medium, Medium::Vine);
         contact
+    }
+
+    /// A push off the water's surface: the body leaves the water at
+    /// [`Physics::water_jump_v0`], ballistic from there.
+    ///
+    /// Written as its own method, beside [`PlayerState::bounce`] and for the same reason: the
+    /// jump's bookkeeping is five fields, and a second place that sets four of them is a place
+    /// where the fifth is wrong.
+    ///
+    /// **It spends the jump cut, and that is the whole difference between a push and a jump.**
+    /// The cut exists to let a player shorten an ascent by letting go; a swimmer *must* let go to
+    /// steer, because the button is also the only horizontal input in the water. With the cut
+    /// live, every breach that was steered anywhere lost 55% of its height — measured: a 2.5-tile
+    /// push peaked 0.9 tiles in and could not clear a one-tile lip, which made the pool's own exit
+    /// unreachable exactly when it was being used. So the water gives a fixed launch, like a
+    /// spring pad gives a fixed throw: the level's number, not the button's.
+    fn breach(&mut self, ph: &Physics) {
+        self.vy = -ph.water_jump_v0;
+        self.grounded = false;
+        self.coyote_ticks = 0;
+        self.jump_cut_applied = true;
+        self.jump_hold_ticks = 0;
+        self.jump_buffer = 0;
+    }
+
+    /// The top of the water surface the body is **at**, if any: under its columns and within
+    /// [`Physics::water_surface_reach`] of its feet.
+    ///
+    /// Scanned down from the feet rather than up from them, because the question is "is there
+    /// water just below me" — the bobbing swimmer's case — and bounded by the reach, so a body
+    /// standing on a ledge a tile above a pool is not at the pool's surface.
+    fn water_surface_at(&self, level: &Level, ph: &Physics) -> Option<f32> {
+        let (tx0, tx1) = tile_span(self.x, self.w);
+        let feet = self.y + self.h;
+        let first = feet.floor() as i32;
+        let last = (feet + ph.water_surface_reach).floor() as i32;
+        for tx in tx0..=tx1 {
+            for ty in first..=last {
+                if let Some(top) = level.water_top(tx, ty) {
+                    if feet <= top + ph.water_surface_reach {
+                        return Some(top);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Where a pull-up would put the body, if one is available **right now**.
+    ///
+    /// Available means all of: the body is on a vine; the cell above that vine's run is solid (the
+    /// block the vine hangs from); the body's head is against that block's underside; and the cell
+    /// above the block is free for the body to stand in. The target is the top of that block,
+    /// centred on the vine's column, so the body ends the move standing on the thing it climbed.
+    ///
+    /// A two-tile-thick block has no answer here and that is correct: there is no room above its
+    /// anchor for a body to stand in, so the vine hanging under it is a dead end rather than a
+    /// route, and pretending otherwise would put the body inside a wall.
+    fn vine_ledge(&self, level: &Level, ph: &Physics) -> Option<(f32, f32)> {
+        let (tx0, tx1) = tile_span(self.x, self.w);
+        let head = row_span(self.y, self.h).0;
+        for col in tx0..=tx1 {
+            let Some(anchor) = vine_mantle_anchor(level, ph, col, head) else {
+                continue;
+            };
+            // Pressed against the underside: the head is at the block's bottom edge, within a
+            // third of a tile. Without this a body part-way up the vine would be teleported by
+            // pressing climb, which is not the move.
+            let underside = (anchor + 1) as f32;
+            if self.y < underside - 0.05 || self.y > underside + 0.35 {
+                continue;
+            }
+            return Some((
+                col as f32 + (1.0 - self.w) * 0.5,
+                anchor as f32 - self.h,
+            ));
+        }
+        None
+    }
+
+/// Does the body's box overlap a vine cell?
+fn overlaps_vine(&self, level: &Level) -> bool {
+        let (tx0, tx1) = tile_span(self.x, self.w);
+        let (ty0, ty1) = row_span(self.y, self.h);
+        (ty0..=ty1).any(|ty| (tx0..=tx1).any(|tx| level.is_vine(tx, ty)))
     }
 
     /// True when a jump would currently be accepted.
@@ -1018,8 +1616,36 @@ impl PlayerState {
         h.u8(self.jump_held as u8);
         h.f32(self.speed_cap);
         h.i8(self.wall_dir);
+        match &self.mantle {
+            None => h.u8(0),
+            Some(m) => {
+                h.u8(1);
+                h.u32(m.done);
+                h.f32(m.to_x);
+                h.f32(m.to_y);
+            }
+        }
         h.u32(self.wall_lock);
+        h.u8(self.in_water as u8);
+        h.u8(self.on_vine as u8);
     }
+}
+
+/// What a walker's brain does.
+///
+/// Two behaviours, one body: a patrol walks its platform and turns at the edges, and a chaser
+/// heads for the player and turns only at walls. The distinction is deliberately a *mode* rather
+/// than a second struct, because everything the two share — the box, the stomp, the sensor
+/// slots, the art — is everything that makes a walker cheap to place, and only the one line that
+/// picks a direction is different.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkerMode {
+    /// Walk the platform: turn at an edge or a wall.
+    Patrol,
+    /// Head for the body: turn at a wall only. A chaser that walked off a ledge would kill
+    /// itself on the first pit, so it stops at one — which is what makes baiting it to an edge
+    /// a legitimate answer rather than a bug report.
+    Chase,
 }
 
 /// A patrolling walker. Turns at platform edges and walls; never leaves its tile
@@ -1037,6 +1663,8 @@ pub struct Walker {
     pub dir: i8,
     pub alive: bool,
     pub grounded: bool,
+    /// Whether it patrols or hunts. Static for the episode: it is level data, not state.
+    pub mode: WalkerMode,
 }
 
 impl Walker {
@@ -1054,6 +1682,7 @@ impl Walker {
             dir: 1,
             alive: true,
             grounded: false,
+            mode: WalkerMode::Patrol,
         }
     }
 
@@ -1098,6 +1727,19 @@ impl Walker {
             dir,
             alive: true,
             grounded: false,
+            mode: WalkerMode::Patrol,
+        }
+    }
+
+    /// A chaser at its authored position.
+    ///
+    /// No spawn draw: a chaser's direction is decided by where the body is, so there is no
+    /// phase to randomise. That also keeps a chaser level's randomness exactly where a walker
+    /// level's is — the patrols' own draw — instead of adding a second source.
+    pub fn chaser(id: u32, rect: Rect, ph: &Physics) -> Walker {
+        Walker {
+            mode: WalkerMode::Chase,
+            ..Walker::new(id, rect, ph)
         }
     }
 
@@ -1107,6 +1749,15 @@ impl Walker {
 
     /// One tick of patrol. Deterministic and input-free.
     pub fn tick(&mut self, level: &Level, ph: &Physics) {
+        self.tick_against(level, None, ph);
+    }
+
+    /// One tick, with the body a chaser hunts.
+    ///
+    /// `target_x` is the player's left edge. It is ignored by a patrol, and a chaser without
+    /// one keeps walking the way it was — which is what the patrol arm asserts, and what makes
+    /// [`Walker::tick`] still a complete description of a walker-only level.
+    pub fn tick_against(&mut self, level: &Level, target_x: Option<f32>, ph: &Physics) {
         if !self.alive {
             return;
         }
@@ -1139,6 +1790,13 @@ impl Walker {
             return;
         }
 
+        if self.mode == WalkerMode::Chase {
+            if let Some(tx) = target_x {
+                // The body's *left edge* against the walker's own: the two boxes are the same
+                // width, so this is a centre-to-centre comparison without the half-width terms.
+                self.dir = if tx < self.x { -1 } else { 1 };
+            }
+        }
         let dir = self.dir as f32;
         let nx = self.x + ph.walker_speed * dir;
         let (by0, by1) = row_span(self.y, self.h);
@@ -1149,15 +1807,26 @@ impl Walker {
             nx - 0.01
         };
         let lead_col = lead.floor() as i32;
-        let wall_ahead = (by0..=by1).any(|ty| level.is_solid(lead_col, ty));
+        // Walls are `is_opaque`, not `is_solid`: a one-way shelf is not a wall, and a walker
+        // meeting the edge of a bridge should walk onto it the same way the player does. Its
+        // *floor* probe stays `is_solid`, because standing on the shelf is the whole point.
+        let wall_ahead = (by0..=by1).any(|ty| level.is_opaque(lead_col, ty));
 
         // Floor probe just below the front foot.
         let foot_row = (self.y + self.h + 0.05).floor() as i32;
         let floor_ahead = level.is_solid(lead_col, foot_row);
-
-        if wall_ahead || !floor_ahead {
+        if wall_ahead {
             self.dir = -self.dir;
             self.vx = 0.0;
+        } else if !floor_ahead {
+            // A patrol turns around at a ledge; a chaser simply **stops**, and the difference
+            // is the whole character of the two enemies. Turning away from the body would not
+            // be hunting; stepping off would solve the level's problem for the player, which
+            // is why baiting one to an edge is a legitimate answer rather than an exploit.
+            self.vx = 0.0;
+            if self.mode == WalkerMode::Patrol {
+                self.dir = -self.dir;
+            }
         } else {
             self.x = nx;
             self.vx = ph.walker_speed * dir;
@@ -1174,6 +1843,438 @@ impl Walker {
         h.u8(self.alive as u8);
         h.u8(self.grounded as u8);
     }
+}
+
+/// A flyer: an enemy that ignores gravity and patrols a horizontal band.
+///
+/// It is the pack's first air enemy, and the whole of what it means as a decision is that the
+/// row a jump passes through can be occupied. It bounces off the ends of its authored span and
+/// off any wall it meets, keeps its own row, and can be stomped exactly as a walker can — the
+/// stomp is what keeps it a hazard rather than a wall, because a body that comes down on one
+/// is still a body that chose to jump.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Flyer {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// `+1` right, `-1` left.
+    pub dir: i8,
+    pub alive: bool,
+    /// The two ends of its beat, in world x.
+    pub min_x: f32,
+    pub max_x: f32,
+}
+
+impl Flyer {
+    /// A flyer at the middle of its beat, facing right. Tooling's deterministic pose.
+    pub fn new(id: u32, spec: crate::level::FlyerSpec, ph: &Physics) -> Flyer {
+        Flyer {
+            id,
+            x: spec.rect.x,
+            y: spec.rect.y,
+            w: ph.flyer_w,
+            h: ph.flyer_h,
+            dir: 1,
+            alive: true,
+            min_x: spec.min_x,
+            max_x: spec.max_x,
+        }
+    }
+
+    /// Spawn with an episode phase.
+    ///
+    /// **Drawn after every walker's draw**, in the same RNG stream, on purpose: a level with
+    /// flyers and no walkers consumes one draw per flyer and nothing else, while a level with
+    /// only walkers consumes exactly what it always did. That is what keeps every recorded
+    /// walker episode in the pack bit-identical after this pass.
+    pub fn spawn_spread(
+        id: u32,
+        spec: crate::level::FlyerSpec,
+        ph: &Physics,
+        rng: &mut crate::rng::Rng,
+    ) -> Flyer {
+        let mut flyer = Flyer::new(id, spec, ph);
+        flyer.dir = if crate::rng::next_f32(rng) < 0.5 { -1 } else { 1 };
+        let span = (flyer.max_x - flyer.min_x).max(0.0);
+        let phase = crate::rng::next_f32(rng) * span;
+        flyer.x = (flyer.min_x + phase).min(flyer.max_x);
+        flyer
+    }
+
+    pub fn aabb(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+
+    /// One tick of patrol: no gravity, no floor, only its beat and any wall in its row.
+    pub fn tick(&mut self, level: &Level, ph: &Physics) {
+        if !self.alive {
+            return;
+        }
+        let nx = self.x + ph.flyer_speed * self.dir as f32;
+        let lead = if self.dir > 0 {
+            nx + self.w + 0.01
+        } else {
+            nx - 0.01
+        };
+        let lead_col = lead.floor() as i32;
+        let (ty0, ty1) = row_span(self.y, self.h);
+        let wall = (ty0..=ty1).any(|ty| level.is_opaque(lead_col, ty));
+        if wall || nx < self.min_x || nx + self.w > self.max_x {
+            self.dir = -self.dir;
+        } else {
+            self.x = nx;
+        }
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.u32(self.id);
+        h.f32(self.x);
+        h.f32(self.y);
+        h.i8(self.dir);
+        h.u8(self.alive as u8);
+    }
+}
+
+/// A turret: a fixed enemy that fires along the row it stands on.
+///
+/// Its cooldown is the whole of its state. The first shot is staggered by its index rather than
+/// fired on frame zero, because two turrets placed side by side should make a rhythm and not one
+/// louder beat — and the stagger is derived from the index, so it is deterministic and costs no
+/// RNG draw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Turret {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// `+1` fires right, `-1` fires left.
+    pub dir: i8,
+    pub alive: bool,
+    /// Ticks until the next shot.
+    pub cooldown: u32,
+}
+
+impl Turret {
+    pub fn new(id: u32, spec: crate::level::TurretSpec, ph: &Physics) -> Turret {
+        let period = ph.turret_period.max(1);
+        Turret {
+            id,
+            x: spec.rect.x,
+            y: spec.rect.y,
+            w: ph.turret_w,
+            h: ph.turret_h,
+            dir: spec.dir,
+            alive: true,
+            cooldown: (id.wrapping_mul(37) % period).max(1),
+        }
+    }
+
+    pub fn aabb(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+
+    /// One tick. Returns whether this is the tick a shot leaves the muzzle.
+    pub fn tick(&mut self, ph: &Physics) -> bool {
+        if !self.alive {
+            return false;
+        }
+        self.cooldown = self.cooldown.saturating_sub(1);
+        if self.cooldown == 0 {
+            self.cooldown = ph.turret_period.max(1);
+            return true;
+        }
+        false
+    }
+
+    /// The muzzle: just outside the turret's own box, so a shot never hits its owner.
+    pub fn muzzle_x(&self) -> f32 {
+        if self.dir > 0 {
+            self.x + self.w + 0.02
+        } else {
+            self.x - 0.02
+        }
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.u32(self.id);
+        h.u8(self.alive as u8);
+        h.u32(self.cooldown);
+    }
+}
+
+/// A shot in flight: a box that travels along one row until a wall or its range stops it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shot {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub vx: f32,
+    /// Tiles travelled so far, which is what bounds it.
+    pub travelled: f32,
+    pub alive: bool,
+}
+
+impl Shot {
+    pub fn from_turret(t: &Turret, ph: &Physics) -> Shot {
+        Shot {
+            x: if t.dir > 0 { t.muzzle_x() } else { t.muzzle_x() - ph.shot_w },
+            y: t.y + (t.h - ph.shot_h) * 0.5,
+            w: ph.shot_w,
+            h: ph.shot_h,
+            vx: ph.shot_speed * t.dir as f32,
+            travelled: 0.0,
+            alive: true,
+        }
+    }
+
+    pub fn aabb(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+
+    pub fn tick(&mut self, level: &Level, ph: &Physics) {
+        if !self.alive {
+            return;
+        }
+        self.x += self.vx;
+        self.travelled += self.vx.abs();
+        // Three things end a shot, in the order that makes each one tell: the wall it reaches
+        // this tick, the level's edge (so a shot fired out of an open map does not live forever
+        // off-screen), and the authored range (the backstop for a row with no wall in it).
+        //
+        // The lead probe is the edge of the box *in the direction of travel*, not the box's
+        // centre: a bullet stops when its nose touches the masonry, which is also where the body
+        // stops. The box test that follows is for the one case the lead misses — a shot that
+        // spawns already inside a wall (a turret authored hard against one), which would
+        // otherwise fly out of the far side of the tile.
+        let lead = if self.vx > 0.0 {
+            self.x + self.w + 0.01
+        } else {
+            self.x - 0.01
+        };
+        let (ty0, ty1) = row_span(self.y, self.h);
+        let (bx0, bx1) = tile_span(self.x, self.w);
+        let hit = (ty0..=ty1).any(|ty| level.is_opaque(lead.floor() as i32, ty))
+            || (ty0..=ty1).any(|ty| (bx0..=bx1).any(|tx| level.is_opaque(tx, ty)));
+        let gone = self.x + self.w < 0.0 || self.x > level.width as f32;
+        if hit || gone || self.travelled > ph.shot_range {
+            self.alive = false;
+        }
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.f32(self.x);
+        h.f32(self.y);
+        h.f32(self.vx);
+        h.f32(self.travelled);
+        h.u8(self.alive as u8);
+    }
+}
+
+/// A ball of lava, thrown up out of a vent and pulled back down by gravity.
+///
+/// The pack's second projectile and deliberately the opposite of the first: a [`Shot`] is
+/// horizontal, fast, and ends at a wall, while a lava ball is vertical, slow, and ends where it
+/// started. One is a row made dangerous; this is a *column* made dangerous, which is what a pool
+/// needs — the ball is what makes the air above a lava cell a place a body has to time.
+///
+/// **Its whole arc is gravity**, so the geometry is the jump ladder's: `v0²/(2g)` up, `2·v0/g`
+/// of airtime, and its horizontal drift is the only authored part. The ball dies when its centre
+/// enters a solid cell, re-enters lava (the splash), leaves the level, or outlives
+/// [`Physics::lava_ticks`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LavaBall {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub alive: bool,
+    /// Ticks in flight, which bounds the one case the world does not: a ball in a shaft it can
+    /// never leave.
+    pub ticks: u32,
+}
+
+impl LavaBall {
+    /// A ball leaving `vent` (a lava cell), with the lateral drift its index gives it.
+    ///
+    /// The ball starts *sitting on the vent's surface*, centred, so the first tick is already
+    /// an arc rather than a ball inside the pool it came from.
+    pub fn spawn(vent: (i32, i32), index: usize, ph: &Physics) -> LavaBall {
+        let drift = if index % 2 == 0 {
+            ph.lava_drift
+        } else {
+            -ph.lava_drift
+        };
+        LavaBall {
+            x: vent.0 as f32 + 0.5 - ph.lava_w * 0.5,
+            y: vent.1 as f32 - ph.lava_h,
+            w: ph.lava_w,
+            h: ph.lava_h,
+            vx: drift,
+            vy: -ph.lava_v0,
+            alive: true,
+            ticks: 0,
+        }
+    }
+
+    /// Does vent `index` fire on physics tick `tick`?
+    ///
+    /// One period, one phase per vent. The stride is coprime with the period, so a run of vents
+    /// fires in a rolling order rather than as a volley — which is the difference between a
+    /// hazard a body can read and a wall of fire that only a lucky frame crosses.
+    pub fn fires(index: usize, tick: u32, ph: &Physics) -> bool {
+        let period = ph.lava_period.max(1);
+        tick % period == (index as u32 * 37) % period
+    }
+
+    pub fn aabb(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+
+    /// One tick: gravity, then the world.
+    ///
+    /// Tested against the **centre** rather than the box, which is the difference between a ball
+    /// and a body: a ball that clips a ledge corner with its edge is a ball passing it, and a
+    /// 0.3-tile ball whose box stopped at every corner would read as a thing bouncing off
+    /// nothing. The box is what kills a body; the centre is what the ball is.
+    pub fn tick(&mut self, level: &Level, ph: &Physics) {
+        if !self.alive {
+            return;
+        }
+        self.ticks += 1;
+        self.vy = (self.vy + ph.gravity).min(ph.max_fall);
+        self.x += self.vx;
+        self.y += self.vy;
+        let (cx, cy) = self.aabb().center();
+        let cell = level.get(cx.floor() as i32, cy.floor() as i32);
+        if cell.is_solid() || cell.is_lava() || self.y > level.height as f32 {
+            self.alive = false;
+        }
+        if self.ticks >= ph.lava_ticks {
+            self.alive = false;
+        }
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.f32(self.x);
+        h.f32(self.y);
+        h.f32(self.vx);
+        h.f32(self.vy);
+        h.u8(self.alive as u8);
+        h.u32(self.ticks);
+    }
+}
+
+/// A platform that slides along one axis on a fixed cycle, carrying whatever stands on it.
+///
+/// **Its position is a function of the frame count, not of accumulated state.** That is the
+/// design decision that makes a moving platform affordable: two runs of one seed agree without
+/// the sim having to hash a phase, a platform's motion cannot drift from float accumulation,
+/// and a replay at any frame can be asked where the shelf was without replaying to it. What
+/// *does* need state is the body riding it, and that lives in the player, not here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mover {
+    pub id: u32,
+    /// The box at the low end of its travel.
+    pub home: Rect,
+    /// How far it was authored to travel, in tiles.
+    pub span: f32,
+    /// True for a lift (rises), false for a slider (moves right).
+    pub vertical: bool,
+    /// How much of `span` is actually **clear of terrain**: the shelf stops at the first wall
+    /// or ceiling on its path and turns there.
+    ///
+    /// This is the half of a mover that the level format cannot state and the editor cannot
+    /// preview, because it is a fact about the *neighbourhood* of the box rather than about
+    /// the box. It is computed once, when the episode is built, from the same `is_opaque`
+    /// test the player's own collision uses, so a slider that was authored through a wall
+    /// is a shelf that stops at it instead of a box that passes through it — and a lift that
+    /// was authored into a ceiling stops under it rather than carrying its rider into it.
+    pub limit: f32,
+}
+
+impl Mover {
+    /// The box at `tick`, in a triangle wave over the **clear** part of its travel.
+    pub fn rect_at(&self, tick: u32, ph: &Physics) -> Rect {
+        let span = self.limit.clamp(0.0, self.span.max(0.0));
+        let speed = ph.mover_speed.max(1e-6);
+        let half = span / speed;
+        let phase = tick as f32 % (2.0 * half).max(1.0);
+        let travelled = if phase <= half {
+            phase * speed
+        } else {
+            (span - (phase - half) * speed).max(0.0)
+        };
+        let mut rect = self.home;
+        if self.vertical {
+            rect.y -= travelled;
+        } else {
+            rect.x += travelled;
+        }
+        rect
+    }
+
+    /// Where it moved between `tick - 1` and `tick`, which is what a rider is carried by.
+    pub fn delta_at(&self, tick: u32, ph: &Physics) -> (f32, f32) {
+        if tick == 0 {
+            return (0.0, 0.0);
+        }
+        let now = self.rect_at(tick, ph);
+        let before = self.rect_at(tick - 1, ph);
+        (now.x - before.x, now.y - before.y)
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.u32(self.id);
+        h.f32(self.home.x);
+        h.f32(self.home.y);
+        h.f32(self.span);
+        h.u8(self.vertical as u8);
+    }
+}
+
+/// How far a platform can travel from `home` before it would overlap terrain.
+///
+/// Walks the path in small steps and stops at the last clear position. A quarter of a tile
+/// is fine: a box is at least half a tile thick, so nothing can slip between two samples, and
+/// a travel of sixteen tiles is sixty-four tests once per episode rather than per frame.
+///
+/// The consequence an author can rely on: **a mover never passes through a wall or a
+/// ceiling, and never needs a wall on the far end of its travel** — it simply turns early.
+pub fn clear_travel(home: Rect, span: f32, vertical: bool, level: &Level) -> f32 {
+    let span = span.max(0.0);
+    let step = 0.25_f32;
+    let mut clear = 0.0;
+    let mut travelled = 0.0;
+    while travelled < span {
+        travelled = (travelled + step).min(span);
+        let mut probe = home;
+        if vertical {
+            probe.y -= travelled;
+        } else {
+            probe.x += travelled;
+        }
+        if rect_hits_opaque(level, probe) {
+            break;
+        }
+        clear = travelled;
+    }
+    clear
+}
+
+/// Does a world-space box overlap any tile that blocks movement from the side?
+///
+/// `is_opaque`, not `is_solid`: a one-way shelf is not a wall, so a platform may slide
+/// through one — the same rule a body follows.
+pub(crate) fn rect_hits_opaque(level: &Level, rect: Rect) -> bool {
+    let (x0, x1) = tile_span(rect.x, rect.w);
+    let (y0, y1) = row_span(rect.y, rect.h);
+    (y0..=y1).any(|ty| (x0..=x1).any(|tx| level.is_opaque(tx, ty)))
 }
 
 #[cfg(test)]
@@ -1309,6 +2410,46 @@ mod tests {
             PHYSICS.discrete_max_jump_height(),
             heights[4]
         );
+    }
+
+    /// **A platform moves one art pixel a tick.**
+    ///
+    /// The renderer's scale is a whole number of points per 16-pixel tile (`view::Camera::scale`),
+    /// so a speed of 1/16 tile per tick is exactly `scale` screen pixels per tick at *every* zoom:
+    /// the shelf and the body riding it advance together on the pixel grid instead of stepping one
+    /// pixel every other frame. That is the whole reason the number is what it is, so the relation
+    /// is pinned here rather than left as a comment beside a literal — 0.02 was the speed at which
+    /// no zoom could draw the motion smoothly.
+    #[test]
+    fn a_platform_moves_one_art_pixel_a_tick() {
+        let pixels = PHYSICS.mover_speed * 16.0;
+        assert!(
+            (pixels - 1.0).abs() < 1e-6,
+            "a shelf should move one 16-pixel art pixel a tick, moves {pixels}"
+        );
+        // And a shelf is neither a lift that throws you nor a wait that tests the player: a
+        // four-tile slide takes 64 ticks, about a second.
+        assert!((4.0 / PHYSICS.mover_speed - 64.0).abs() < 1e-3);
+    }
+
+    /// **A shot cannot be outrun, so its dodge is vertical.**
+    ///
+    /// The doc on `shot_speed` made this claim for two releases while the number was slower than a
+    /// run — a promise the physics did not keep, and one a player discovers by simply walking away
+    /// from a bullet. The two relations are the mechanic: above the fastest gear the body has, and
+    /// below the terminal fall so the shot is still a thing the eye can track.
+    #[test]
+    fn a_shot_is_faster_than_a_sprint() {
+        for gear in [PHYSICS.run_speed, PHYSICS.sprint_speed] {
+            assert!(
+                PHYSICS.shot_outruns(gear),
+                "a shot at {} is outrun by a body at {gear}",
+                PHYSICS.shot_speed
+            );
+        }
+        // And a shelf is slower than a shot, which is what makes the turret's row a deadline
+        // rather than a wall: the ride across it is what the bullet is timed against.
+        assert!(PHYSICS.shot_outruns(PHYSICS.mover_speed));
     }
 
     #[test]

@@ -30,7 +30,7 @@ numbered findings, the verification detail and the deferred work are in
 | **M4** editor + content | pixel renderer, generated art, drag-and-drop editor with a browsable level shelf and a whole-document mirror, playtest, the two **trap tiles** (brittle ground and spring pads), and the whole watch mode inside the window. Not yet: a curated starter pack |
 | **M5** web/release | not started — except its stall chain, which was done early |
 
-Version trio: **sim 0.11.0 / sensors v9 / fitness v8**. Every champion file records all
+Version trio: **sim 0.13.0 / sensors v11 / fitness v8**, on **level format v2**. Every champion file records all
 three and is *refused* rather than replayed against different physics or a different
 objective. What each version changed, and why, is in
 [FINDINGS.md](FINDINGS.md#the-version-trio).
@@ -47,13 +47,14 @@ thing at stake is whether the artifact on disk still counts.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 563 tests
+cargo test --workspace                 # 626 tests
 cargo build --release
 
 # The game: draw a level, drag tiles out of a palette, play it yourself.
 python3 tools/gen_tileset.py           # only if you change the art
 cargo run --release -p app             # title screen, then l1-flat-run.json
-#   any key or click leaves the title screen for the editor
+#   the title screen is a menu: up/down choose, Enter starts the chosen one,
+#   P and E jump straight to the playtest and the run, any other key is Edit
 #   drag a palette item onto the level to place it; click to paint
 #   right-drag erases, middle-drag (or alt-drag) pans, wheel zooms
 #   ctrl+click takes the brush from the tile under the pointer; shift-drag draws a line
@@ -211,6 +212,8 @@ a frame count.
 | `l7-wall-school` | the same move with nothing else in it, for when the ascent is too much |
 | `l8-long-jump` | sprint, and the only gap a running jump cannot clear |
 | `l9-wait-and-climb` | a *chain*: a spike, a pit, a timed patrol, a hazard patch, a step, a wall climb, a ledge gap, a spike and a climb, with the spawn at column 2 and the flag at column 56 |
+| `l10-the-hunt` | the enemies-and-objects demo: a one-way shelf over the first pit with a flyer above it, a chaser and a turret on the middle ledge, and a moving platform over the last pit |
+| `l11-the-elements` | the elements demo: a lava pool that throws a ball across the jump you have to make, a two-deep water basin that has to be swum out of, and a vine down the far wall of a pit cut into the plateau |
 
 The generation each level falls at, per seed, is measured in
 [FINDINGS.md](FINDINGS.md#difficulty-the-generation-the-population-first-wins) — nine
@@ -227,6 +230,71 @@ demo — the only way to its flag is a cracked span over a spiked pit, with a ho
 middle of the deck to take on the fly — and it is the level whose learning measurement is
 in [FINDINGS.md](FINDINGS.md#the-trap-crossing-does-a-population-learn-the-crumbling-bridge).
 
+### Enemies and objects
+
+Five things in a level are alive or move on their own, and each is one decision rather than one mode:
+
+| on screen | what it is |
+|---|---|
+| a red hunter | a **chaser**. Walks towards the player and **stops at a ledge** instead of falling in; stompable. Placed with the *chaser* brush (`h` in the terminal renderer) |
+| a bat | a **flyer**. Ignores gravity and beats between the two ends of a span you set (**twelve tiles by default**), so height stops being safety; stompable. Brush *flyer*, and the `beat` box sets the span — **in tiles of travel**, so a twelve-tile beat moves the flyer twelve tiles |
+| a barrel on a plinth | a **turret**. Fires a shot along its own row on a fixed cycle, in the direction you place it. It is **solid furniture, not an enemy**: a body stands on its lid, is stopped by its sides, and cannot destroy it by stomping — the shot is the hazard. The shot is **faster than a sprint** (nothing outruns it; the dodge is a jump) and travels until a **wall** stops it, up to eighteen tiles. Brush *turret*, with a fire-left/fire-right switch that the palette's own icon follows |
+| a plank shelf | a **one-way platform** (`=`). **Ground from above, air from below and from the side**: a body jumps up through it and lands on top. Brush *one-way* |
+| an iron-railed shelf | a **moving platform**. Slides (or lifts) on a fixed cycle at **one art pixel a tick** and **carries** whatever stands on it, stopping at the first wall on its path. Its whole travel is drawn as a **dashed guide** — a ghost box at the far end and the swept band between — in Edit, Play and Evolve, so the span is visible instead of guessed. Brush *move platform*, with `width`, `travel` and a slide/lift switch |
+
+The editor's eyedropper learns what it picks: click a turret and the brush adopts its facing, click a
+platform and it adopts the width, travel and axis.
+
+### The elements
+
+Three tiles that change the **body** rather than the terrain, and the only ones a body can be
+*inside* without dying:
+
+| on screen | what it is |
+|---|---|
+| a pool | **water** (`~`). A body whose centre is in it **sinks** at `water_sink` (0.02 tiles/tick, 1.2 tiles a second) whatever its gear, and its horizontal speed is capped at `water_speed` (half a run). Holding jump **swims** up at `water_swim`; a fresh press at the surface is a **push off it** at `water_jump_v0` — the same 2.5 tiles as a jump, and the only way out of a pool whose lip is above the water. A body falling in has the fall taken out of it at the surface line, so a terminal-speed drop into a pool is an arrival rather than a splat |
+| a lava pool | **lava** (`L`). Not solid, **lethal on contact** like a spike, and — when the cell above is open — a **vent**: it throws a ball every `lava_period` (150 ticks, 2.5 s), out of phase with its neighbours, that rises `v0²/(2g)` = 2.5 tiles and falls back. The ball is lethal too, and the pool is full, so the hazard is the cell rather than a drawn box |
+| a hanging stem | a **vine** (`V`). Not solid. A body overlapping one is **on it**: gravity is replaced by the vine's own rate, so holding jump **climbs** at `vine_climb` and releasing **slides down** at `vine_slide` — slower than a wall slide, because going down a vine is a move rather than a fall. A vine only counts once the body is airborne, so a body standing at the foot of one keeps its jump. A vine that hangs beside a ledge is left by pressing the side at its top; a vine that hangs under a **one-tile-thick block** has no sideways exit, so holding climb when the head meets the block's underside **hauls the body up over it** (`MANTLE_TICKS`, a hand-over-hand pull-up that ends standing on the block) |
+
+**A fluid is drawn the way the ground is, in pieces.** A solid tile is a mask, a crown and its
+variants; a pool is a body texture, a surface, a bed and two edges, and its neighbours decide
+which of those a cell gets:
+
+| piece | picked by |
+|---|---|
+| the **body** | the cell's own position modulo four, in both axes, into one picture four tiles square (`crate::view::fluid_body_sprite`) |
+| the **surface** (`*_top_a`, `*_top_b`) | nothing above it is the same fluid. Two frames, phased by column, so a long pool's wave travels |
+| the **bed** (`*_bed`) | nothing below it is the same fluid. An overlay drawn over the body cell, so it composes with all sixteen body cells |
+| a **wall** (`*_wall_l`, `*_wall_r`) | the cell beside it is neither the same fluid nor solid — the pool's edge against open air |
+
+The body being **four tiles square** is the part that replaces a per-cell variant, and it is
+worth one paragraph because the obvious answer is wrong. A fluid body is seamless — two stacked
+cells are one body of water — so a single cell is the same picture everywhere in a pool and the
+wide pool shows its own repeat. Giving cells different variants (the ground's `_b`/`_c` trick)
+just moves the seam to the cell boundary, where two different textures meet in a line. One
+picture cut into sixteen cells has neither problem: no seam at the cuts, because the picture is
+continuous across them, and a repeat four tiles out instead of every tile. The same reasoning
+is why there is no depth gradient inside the body and no per-cell tint: both are a *value per
+cell*, and a value per cell draws the grid. Depth is the bed's job, and the waterline is the
+surface's.
+
+All of it is **required** art up to the plain body and the two surfaces (an invisible pool is a
+body sinking for no visible reason); the sixteen block cells, the beds and the walls are optional,
+and a tileset without them draws a plain, seamless pool.
+
+**A pool and a vine are edges in the route graph, not decoration.** `sim::reach` sweeps them as
+canonical scripts over the real stepper — a swim in from the bank (`simulate_swim`), and a vine
+grab, climb and exit (`simulate_vine_climb`) — so a basin that has to be swum up, a vine left
+sideways onto a ledge, and a vine pulled up over the block it hangs from all answer as
+reachable, and `evo::route_play` walks each of them through the real episode loop. What the
+oracle still does not model is a **mover**, which is a fact about an episode rather than about
+the terrain.
+
+**A level that *needs* a moving platform reads as unbeatable to the oracle**, and that is a rule rather
+than a bug: a route is a statement about the terrain, and a mover's position is a fact about the
+episode. Treat a mover as a shortcut or as decoration, never as the only way across. The demo level
+obeys it — its slider spans a pit a sprint jump also clears.
+
 A level's route graph and the oracle's verdict are derived from its terrain, so both are kept
 beside the level as `<level>.json.routes` and reused by the next process that opens it — the window
 and every `train-cli` command ask the same two questions of the same level, and the answers are
@@ -242,7 +310,7 @@ Human-writable ASCII grid plus an entity list:
 ```jsonc
 {
   "format": "evo-platformer-level",
-  "level_format_version": 1,
+  "level_format_version": 3,
   "name": "L2-first-gap",
   "width": 60, "height": 15,
   "spawn": {"x": 2, "y": 12},
@@ -252,6 +320,10 @@ Human-writable ASCII grid plus an entity list:
   ],
   "entities": [
     {"type": "walker", "x": 30, "y": 12},
+    {"type": "chaser", "x": 26, "y": 12},
+    {"type": "flyer", "x": 15, "y": 8, "span": 12},
+    {"type": "turret", "x": 31, "y": 12, "dir": -1},
+    {"type": "platform", "x": 35, "y": 12, "tiles": 3, "span": 4, "axis": "x"},
     {"type": "goal", "x": 57, "y": 12}
   ]
 }
@@ -259,7 +331,8 @@ Human-writable ASCII grid plus an entity list:
 
 Tiles: `.` empty, `#` solid, `S`/`B`/`W` sand, brick and timber (all solid exactly as
 `#`, and a different material for the *view* only), `^` spike (lethal, not solid), `G`
-goal (normalized into a goal entity at load time).
+goal (normalized into a goal entity at load time), and the elements: `~` water, `L` lava,
+`V` vine (none solid; see [the elements](#the-elements)).
 
 **The two tiles that do something** are written as a material's lowercase self and as the
 spike inverted, so the alphabet carries the rule:
@@ -273,6 +346,31 @@ A cracked tile is drawn as the material it is made of plus a crack, so the level
 says which material is about to give way; a pad is drawn whole, like a spike. Both are
 *behaviour*, not material, which is why they are the two things `render` and the editor's
 palette show as their own cells.
+
+**The one-way platform** is `=`, and it is the third behaviour tile:
+
+| Tile | Glyph | What it does |
+|---|---|---|
+| one-way platform | `=` | **ground from above, air from below and from the side.** A body lands on it and jumps up through it. The first tile whose `is_solid` (the surface question, asked by the landing probes, the walkers' floor probe, the route graph and the sensors' patch) and `is_opaque` (the wall and ceiling question, asked by the player's x resolution and the ceiling test) disagree — that disagreement *is* the tile |
+
+**Entity types, in full.** Every kind is anchored on the bottom edge of its row, and only the
+fields its kind needs are written:
+
+| `type` | fields | what it is |
+|---|---|---|
+| `goal` | `x`, `y` | the flag. Exactly one per level |
+| `walker` | `x`, `y` | a patrol: turns at a ledge or a wall |
+| `chaser` | `x`, `y` | a patrol's body that **hunts**: heads for the player and stops at a ledge |
+| `flyer` | `x`, `y`, `span` | an enemy that ignores gravity and beats `span` tiles **of travel**, centred on `x` |
+| `turret` | `x`, `y`, `dir` | a fixed enemy that fires along its row; `dir` is `1` (right, the default) or `-1` |
+| `platform` | `x`, `y`, `tiles`, `span`, `axis` | a moving platform: `tiles` wide, travelling `span` tiles, `axis` `"x"` (slide, the default) or `"y"` (lift) |
+| `scenery` | `x`, `y`, `sprite` | a decorative prop the physics never sees |
+
+**Each version reads every earlier one.** The version says which alphabet a file is written
+in, and each bump so far only *added* — v2 a glyph, four entity kinds and an optional set of
+entity fields whose absence means "none"; v3 three more glyphs — so an older file means
+exactly what it always did and the reader accepts `1..=3`. The writer always emits 3, and a
+hypothetical v4 is refused rather than guessed at.
 
 **A level has exactly one flag**, declared as a `goal` entity or as a `G` tile; a file
 with two, or with none, is refused at load with the reason. The editor keeps the same
@@ -321,6 +419,11 @@ never tuned separately:
 | `sprint_speed` | 0.15 tiles/tick (9 tiles/s), ramped at 0.005/tick² from `run_speed` |
 | `max_fall` | 0.75 tiles/tick |
 | jump height | `v0²/(2g)` = 2.50 tiles continuous, **2.375 measured** |
+| `water_sink` / `water_swim` | 0.02 down / 0.07 up, tiles/tick |
+| `water_jump_v0` | 0.25 tiles/tick — a push off the surface: **2.50 tiles**, the same as a jump |
+| `water_speed` | 0.06 tiles/tick, the horizontal cap in water |
+| `vine_climb` / `vine_slide` | 0.06 up / 0.03 down, tiles/tick |
+| `lava_v0` / `lava_period` | 0.25 tiles/tick (**2.50 tiles** high) / 150 ticks between a vent's balls |
 | spring height | `spring_v0²/(2g)` = **4.90 tiles** — two jumps and a bit, and the pad's launch zone is as tall as `max_fall` so no fall can tunnel through it |
 | air time | `2·v0/g` = 40 ticks |
 | spring air time | `2·spring_v0/g` = **56 ticks** |

@@ -176,3 +176,47 @@ fn a_replay_is_deterministic() {
         assert_eq!(a.outcome, b.outcome, "{slug}: two replays ended differently");
     }
 }
+
+/// The `sim` element tests' vine-block fixture, in the level format: a vine hanging from the middle
+/// of a one-tile-thick block, with the flag beside it on top. The only way to the flag is over the
+/// block the vine hangs from, so a replay that wins this has pulled up.
+fn vine_block() -> Level {
+    let rows = [
+        "..............",
+        "..............",
+        "....######....",
+        "......V.......",
+        "......V.......",
+        "......V.......",
+        "......V.......",
+        "..............",
+        "##############",
+        "##############",
+    ];
+    let tiles = rows
+        .iter()
+        .map(|r| format!("\"{r}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let src = format!(
+        "{{\"format\":\"evo-platformer-level\",\"level_format_version\":1,\
+         \"name\":\"vine-block\",\"width\":{},\"height\":{},\
+         \"spawn\":{{\"x\":6,\"y\":7}},\"tiles\":[{tiles}],\
+         \"entities\":[{{\"type\":\"goal\",\"x\":10,\"y\":1}}]}}",
+        rows[0].len(),
+        rows.len()
+    );
+    Level::from_json_str(&src).expect("vine-block parses")
+}
+
+/// **A vine over the block it hangs from is a route a replay can walk.**
+///
+/// The oracle answering "reachable" is only half the claim: the plan has to be *executable*, and this
+/// presses it through the real episode loop. The up-exit is the interesting part — the replay holds
+/// the climb with no direction, and the physics' pull-up is what puts the body on the block — so a
+/// plan that only worked as arithmetic would fail here.
+#[test]
+fn the_replay_pulls_up_over_the_block_a_vine_hangs_from() {
+    let play = replay(&vine_block(), 3, &EvalConfig::default());
+    assert!(play.won(), "{}", play.trace.join("\n"));
+}

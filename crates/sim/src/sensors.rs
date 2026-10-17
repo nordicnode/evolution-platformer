@@ -43,8 +43,8 @@
 //! patched in place: index 83 keeps its slot but changes meaning (`gap_ahead` as read by a
 //! rightward body) and index 94 is new, which re-scores every champion ever trained.
 
-use crate::level::{Level, Tile};
-use crate::physics::{AgentAction, Physics, PlayerState, Walker};
+use crate::level::{Level, Rect, Tile};
+use crate::physics::{AgentAction, Flyer, LavaBall, Physics, PlayerState, Shot, Walker};
 
 /// Sensor layout version. Bump on *any* change below (§8).
 ///
@@ -143,7 +143,32 @@ use crate::physics::{AgentAction, Physics, PlayerState, Walker};
 /// the one that misses eighteen solves none of them. It does not make a clone *play* at the shipped
 /// four-tick cadence — that is `evo::imitate`'s own finding, and it is about the cadence rather than
 /// about the vector — but it is what makes the demonstrated press a function a fit can reach.
-pub const VERSION: u32 = 10;
+///
+/// **v11 makes three slots mean more without making the vector wider.** The nearest-threat
+/// triple (indices 81, 82 and 95) now answers about flyers and shots as well as walkers — the
+/// nearest of the three wins, ties keeping the earlier kind — and the patch gained
+/// [`ENC_ONEWAY`] for the one-way tile and for a moving platform's own cells. Both are
+/// *readings* of existing slots rather than new inputs, which is the version number's job: a
+/// pack level with none of the new kinds observes the identical vector it did at v10, and a
+/// champion trained on one is refused rather than quietly played against a changed reading.
+/// **v12 gives the patch the elements**, in three values of its own and no new slots: water is
+/// air that pulls a body down, a vine is air a body can hold, and lava is a cell that kills.
+///
+/// All three are *readings* rather than inputs, which is the cheap kind of sensor change — the
+/// vector is still [`N_INPUTS`] wide and not one index moved — but none of them can be folded
+/// into [`ENC_SOLID`] or [`ENC_EMPTY`] without lying about the world in the expensive way v9
+/// describes. Air with a vine in it is a route; air over water is a slow sink a body must swim
+/// out of; and a cell that ends the episode must not look like a place to stand.
+///
+/// The one deliberate economy is that **lava is encoded exactly as a spike is** ([`ENC_LAVA`] is
+/// [`ENC_SPIKE`]): the two are the same decision — do not go in — and giving them different
+/// numbers would ask a network to learn a distinction the action set cannot express. Water and
+/// vine *are* distinct, because their decisions are: at water the press is the answer, at a vine
+/// the press is the climb.
+///
+/// v11 read the twin triple and the patch's one-way value for the new kinds; v12 is the same
+/// shape of change for the tiles themselves.
+pub const VERSION: u32 = 12;
 
 /// Tiles per side of the local patch (`9×9 = 81` inputs).
 pub const PATCH_RADIUS: i32 = 4;
@@ -206,6 +231,15 @@ pub const ENC_ENEMY: f32 = -1.0;
 /// has no reason to learn a mapping that puts it on the bright side of air.
 pub const ENC_SPRING: f32 = 0.5;
 
+/// A one-way platform, or a moving one: **ground that lets a body through from below.**
+///
+/// A value of its own rather than [`ENC_SOLID`], because the two states ask for different
+/// actions: a solid cell four above the body is a ceiling to stop jumping into, and a shelf in
+/// the same place is a route to jump through and land on. Encoding it as solid would teach a
+/// policy to refuse exactly the move the tile exists to reward, and encoding it as air would
+/// hide the landing. It sits between air and ground, which is what it is.
+pub const ENC_ONEWAY: f32 = 0.75;
+
 /// A cracked tile: ground, and ground that is about to stop being ground.
 ///
 /// Negative and *between* air and a spike — the ordering is the design. A cracked tile is a
@@ -214,6 +248,30 @@ pub const ENC_SPRING: f32 = 0.5;
 /// as ordered learns one axis rather than three unrelated labels. Like every value in the patch
 /// it says what the cell *is*, never what to do about it.
 pub const ENC_CRUMBLE: f32 = -0.25;
+
+/// A water cell: **air that pulls a body down**.
+///
+/// Just below [`ENC_EMPTY`] and just above a cracked tile, which is the ordering of the trouble
+/// they are: a body can cross water at any speed it can swim, so it is not an obstacle, but it is
+/// the only cell in the game a body has to *press a button* to get out of. A value of its own
+/// rather than `ENC_EMPTY` because a policy that reads water as air learns to fall into pools and
+/// never to swim — the water's whole lesson is "hold jump".
+pub const ENC_WATER: f32 = -0.1;
+
+/// A lava cell: **death**, encoded exactly as a spike is.
+///
+/// The same number on purpose. A spike and a lava cell are the same decision (do not be here),
+/// the action set has no way to treat them differently, and two adjacent values would ask a fit
+/// to separate two things whose correct answer is identical.
+pub const ENC_LAVA: f32 = ENC_SPIKE;
+
+/// A vine: **air a body can hold on to**.
+///
+/// Positive but below a spring (0.5) and a shelf (0.75): the ordering is "how much good this does
+/// a body that is in it", and a vine is good only while the button is down. A climber's cue is
+/// the cell itself; the value says "this is not a hole", which is the one thing air would say
+/// wrong.
+pub const ENC_VINE: f32 = 0.25;
 
 /// The plan's sensor table omits tiles for spikes, which would leave the single
 /// most common hazard invisible to the agent. Spikes therefore get
@@ -232,6 +290,11 @@ fn encode_tile(t: Tile) -> f32 {
         Tile::Cracked | Tile::CrackedSand | Tile::CrackedBrick | Tile::CrackedPlank => ENC_CRUMBLE,
         Tile::Spike => ENC_SPIKE,
         Tile::Spring => ENC_SPRING,
+        // Ground that is also a doorway: see [`ENC_ONEWAY`].
+        Tile::OneWay => ENC_ONEWAY,
+        Tile::Water => ENC_WATER,
+        Tile::Lava => ENC_LAVA,
+        Tile::Vine => ENC_VINE,
         Tile::Empty | Tile::Goal => ENC_EMPTY,
     }
 }
@@ -302,6 +365,48 @@ pub fn observe_from_stand(
     ph: &Physics,
     current_stand: Option<usize>,
 ) -> [f32; N_INPUTS] {
+    observe_scene(
+        level,
+        player,
+        &Scene {
+            walkers,
+            flyers: &[],
+            shots: &[],
+            lava_balls: &[],
+            movers: &[],
+        },
+        ph,
+        current_stand,
+    )
+}
+
+/// Everything in a frame that is not terrain, as the observation sees it.
+///
+/// A bundle rather than five arguments: the three threat kinds share one vector (the nearest
+/// of *any* of them is what the enemy slots describe), and the movers share the patch's
+/// encoding because a platform is ground that happens to move. Keeping this a struct is what
+/// lets [`observe_from_stand`] remain the walker-only entry point every existing caller and
+/// test already uses.
+pub struct Scene<'a> {
+    pub walkers: &'a [Walker],
+    pub flyers: &'a [Flyer],
+    pub shots: &'a [Shot],
+    /// Lava balls in flight: the pools' vertical threats, and the reason the triple reads a
+    /// fourth kind. A ball is in the air a body has to jump through, exactly as a flyer is.
+    pub lava_balls: &'a [LavaBall],
+    /// Moving platforms, as the boxes they occupy this frame.
+    pub movers: &'a [Rect],
+}
+
+/// Build the observation vector from a whole frame.
+pub fn observe_scene(
+    level: &Level,
+    player: &PlayerState,
+    scene: &Scene<'_>,
+    ph: &Physics,
+    current_stand: Option<usize>,
+) -> [f32; N_INPUTS] {
+    let walkers = scene.walkers;
     let mut out = [0.0f32; N_INPUTS];
     let (cx, cy) = player.aabb().center();
     let ctx = cx.floor() as i32;
@@ -317,23 +422,63 @@ pub fn observe_from_stand(
     }
     debug_assert_eq!(i, 81);
 
+    // A moving platform is drawn into the patch as what it is — ground from above — rather
+    // than as a hole, so an agent can plan a landing on a shelf it can see coming.
+    for m in scene.movers {
+        let (c0, c1) = (
+            m.x.floor() as i32 - ctx,
+            (m.x + m.w - 0.001).floor() as i32 - ctx,
+        );
+        let r = m.y.floor() as i32 - cty;
+        if !(-PATCH_RADIUS..=PATCH_RADIUS).contains(&r) {
+            continue;
+        }
+        for c in c0.max(-PATCH_RADIUS)..=c1.min(PATCH_RADIUS) {
+            let idx = ((r + PATCH_RADIUS) * (2 * PATCH_RADIUS + 1) + (c + PATCH_RADIUS)) as usize;
+            if out[idx] == ENC_EMPTY {
+                out[idx] = ENC_ONEWAY;
+            }
+        }
+    }
+
     // ---- nearest live enemy (within ENEMY_VIEW_DISTANCE) ---------------
     // Ties break on walker index, so the observation is order-stable. Walkers beyond
     // ENEMY_VIEW_DISTANCE on both axes are out of sight and leave the slots at (0, 0),
     // preventing a distant walker from feeding a constant phantom threat from spawn.
     let mut best: Option<(f32, f32, i8)> = None;
     let mut best_d2 = f32::INFINITY;
-    for w in walkers.iter().filter(|w| w.alive) {
-        let (wx, wy) = w.aabb(ph).center();
-        let (dx, dy) = (wx - cx, wy - cy);
+    // One vector for every threat, nearest wins. Ties keep the earlier kind, which is why the
+    // order is walkers, then flyers, then shots: the three the pack has had longest come first,
+    // so a level with none of the new kinds observes exactly what it observed before.
+    let consider = |bx: f32, by: f32, dir: i8, best: &mut Option<(f32, f32, i8)>, best_d2: &mut f32| {
+        let (dx, dy) = (bx - cx, by - cy);
         if dx.abs() > ENEMY_VIEW_DISTANCE || dy.abs() > ENEMY_VIEW_DISTANCE {
-            continue;
+            return;
         }
         let d2 = dx * dx + dy * dy;
-        if d2 < best_d2 {
-            best_d2 = d2;
-            best = Some((dx, dy, w.dir));
+        if d2 < *best_d2 {
+            *best_d2 = d2;
+            *best = Some((dx, dy, dir));
         }
+    };
+    for w in walkers.iter().filter(|w| w.alive) {
+        let (wx, wy) = w.aabb(ph).center();
+        consider(wx, wy, w.dir, &mut best, &mut best_d2);
+    }
+    for f in scene.flyers.iter().filter(|f| f.alive) {
+        let (fx, fy) = f.aabb().center();
+        consider(fx, fy, f.dir, &mut best, &mut best_d2);
+    }
+    for s in scene.shots.iter().filter(|s| s.alive) {
+        let (sx, sy) = s.aabb().center();
+        consider(sx, sy, if s.vx < 0.0 { -1 } else { 1 }, &mut best, &mut best_d2);
+    }
+    // A lava ball, last for the same reason: the three kinds the pack has had longest keep
+    // their tie-break. Its heading is its lateral drift, which is the only horizontal motion
+    // it has — the arc itself is vertical and the two slots above already say where it is.
+    for b in scene.lava_balls.iter().filter(|b| b.alive) {
+        let (bx, by) = b.aabb().center();
+        consider(bx, by, if b.vx < 0.0 { -1 } else { 1 }, &mut best, &mut best_d2);
     }
     if let Some((dx, dy, dir)) = best {
         out[81] = (dx / ENEMY_VIEW_DISTANCE).clamp(-1.0, 1.0);

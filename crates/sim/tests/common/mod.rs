@@ -81,7 +81,21 @@ pub fn fixture<S: AsRef<str>>(
             assert!(
                 matches!(
                     ch,
-                    '.' | '#' | 'S' | 'B' | 'W' | '^' | 'G' | 'd' | 's' | 'b' | 'w' | 'v'
+                    '.' | '#'
+                        | 'S'
+                        | 'B'
+                        | 'W'
+                        | '^'
+                        | 'G'
+                        | 'd'
+                        | 's'
+                        | 'b'
+                        | 'w'
+                        | 'v'
+                        | '~'
+                        | 'L'
+                        | 'V'
+                        | '='
                 ),
                 "fixture {name} row {i} column {c} has illegal glyph {ch:?}"
             );

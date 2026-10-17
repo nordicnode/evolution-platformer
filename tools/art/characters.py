@@ -47,6 +47,24 @@ from .common import (
     POLE_DARK,
     POLE_LIGHT,
     POLE_SHADE,
+    MASONRY_DARK,
+    MASONRY_LIGHT,
+    MASONRY_MID,
+    BRICK_DARK,
+    BRICK_LIGHT,
+    BRICK_MID,
+    BRICK_TOP,
+    CRYSTAL,
+    CRYSTAL_LIGHT,
+    IRON_BOLT,
+    IRON_FRAME,
+    IRON_LIGHT,
+    LANTERN_GLOW,
+    LANTERN_WARM,
+    SPARK,
+    STONE,
+    STONE_DARK,
+    STONE_MID,
     STONE_LIGHT,
     WALKER_BODY,
     WALKER_DARK,
@@ -264,6 +282,193 @@ def _walker(bob: int, feet: tuple[tuple[int, int], tuple[int, int]], dead: bool 
     return _bump(img, PLAYER_OUTLINE)
 
 
+# --- the chaser -------------------------------------------------------------
+
+
+def _chaser(
+    bob: int,
+    feet: tuple[tuple[int, int], tuple[int, int]],
+    dead: bool = False,
+) -> Image.Image:
+    """A hunter: the patroller's construction, in red and leaning forward.
+
+    A chaser has to be readable as *a different enemy* at a glance, because what it asks
+    of a player is different: a patroller is a rhythm to time and a chaser is a decision
+    to make once. The silhouette says it — lower, narrower, and with a horn pushed out
+    ahead of the body — and the red carapace says it in one colour, which is the only
+    signal that survives being seen for four frames at the speed this thing moves.
+
+    Drawn with the walker's feet convention (row 15 is the ground) so the view can draw
+    either of them at a physics box without knowing which one it is.
+    """
+    img = cell()
+    px = img.load()
+    if dead:
+        _box(px, 2, 12, 13, 15, BRICK_LIGHT)
+        _box(px, 2, 13, 13, 15, BRICK_MID)
+        _box(px, 3, 14, 12, 15, BRICK_DARK)
+        for x, y in ((4, 12), (5, 12), (10, 12), (11, 12)):
+            _put(px, x, y, BRICK_DARK)
+        return img
+
+    top = 7 + bob
+    bottom = 13 + bob
+    # The back is a step higher than the head: a body already leaning into the run.
+    _box(px, 2, top + 1, 4, top + 1, BRICK_TOP)
+    _box(px, 2, top + 2, 4, bottom - 1, BRICK_LIGHT)
+    _box(px, 4, top, 10, bottom, BRICK_LIGHT)
+    _box(px, 4, top, 10, top, BRICK_TOP)
+    _box(px, 4, bottom, 10, bottom, BRICK_DARK)
+    _box(px, 10, top, 10, bottom, BRICK_DARK)
+    _box(px, 4, bottom - 1, 9, bottom - 1, BRICK_MID)
+
+    # The horn: two pixels of forward intent, and the only part of it that is not the body.
+    _put(px, 11, top + 1, BRICK_TOP)
+    _box(px, 11, top + 2, 12, top + 2, BRICK_TOP)
+    _box(px, 11, top + 3, 12, top + 3, BRICK_LIGHT)
+
+    # A narrowed, forward-set eye. Narrower than the walker's cyclops on purpose: it is the
+    # one feature that reads as "looking at you" rather than "out in front of itself".
+    _box(px, 7, top + 2, 10, top + 2, BRICK_DARK)
+    _box(px, 8, top + 3, 10, top + 4, LANTERN_GLOW)
+    _box(px, 9, top + 3, 10, top + 4, BRICK_DARK)
+    _put(px, 8, top + 3, POLE_LIGHT)
+
+    for x, y in feet:
+        _box(px, x, y, x + 1, y, BRICK_DARK)
+        _box(px, x, y - 1, x + 1, y - 1, BRICK_LIGHT)
+    return _bump(img, PLAYER_OUTLINE)
+
+
+# --- the flyer --------------------------------------------------------------
+
+
+def _flyer(wing: int) -> Image.Image:
+    """A flyer, mid-cell, with its wings at `wing` (0 raised, 1 swept down).
+
+    No feet on row 15 and no shadow under it, because a flyer is the first enemy that is
+    *not standing on something*: anything that planted it on the ground would undo the
+    one thing it adds. The body is deliberately small and the wings deliberately wide, so
+    the cell it occupies in the air is legible from the cell it does not.
+
+    Two frames is all a patrol needs — a body that hovers while its wings beat is a body
+    you can tell is alive — and the pair loops at the sim's own cadence in the view.
+    """
+    img = cell()
+    px = img.load()
+    top = 6
+    bottom = 11
+    _box(px, 5, top, 10, bottom, MASONRY_MID)
+    _box(px, 5, top, 10, top, MASONRY_LIGHT)
+    _box(px, 5, bottom, 10, bottom, MASONRY_DARK)
+    _box(px, 9, top, 10, bottom, MASONRY_DARK)
+    # Two eyes and a short muzzle: a small face is what makes a small body read as a creature.
+    _put(px, 6, top + 1, CRYSTAL_LIGHT)
+    _put(px, 8, top + 1, CRYSTAL_LIGHT)
+    _put(px, 6, top + 2, CRYSTAL)
+    _put(px, 8, top + 2, CRYSTAL)
+    _box(px, 6, top + 4, 9, top + 4, MASONRY_DARK)
+    # A pair of small claws under the body, folded: a flyer with nothing below the waist reads
+    # as a floating helmet rather than as an animal.
+    _put(px, 6, bottom + 1, MASONRY_DARK)
+    _put(px, 9, bottom + 1, MASONRY_DARK)
+
+    # Wings: filled blades rather than lines, because a one-pixel arc next to an outlined body
+    # disappears into its own rim and reads as an antenna. Each blade is three rows thick at the
+    # shoulder, tapering to one at the tip, and lit along its leading edge.
+    # Wings: filled blades running *outwards* more than upwards, five pixels wide, because a
+    # narrow diagonal beside an outlined body disappears into its own rim and reads as a horn.
+    # The raised frame keeps the blade's leading edge level with the shoulders and lifts only
+    # the outer third; the swept frame drops it below the belly. That difference is the beat.
+    if wing == 0:
+        for side in (-1, 1):
+            for step in range(4):
+                x = 5 + side * (2 + step)
+                rise = 0 if step < 2 else step
+                y = top - rise
+                for row in range(3):
+                    _put(
+                        px,
+                        x,
+                        y + row,
+                        MASONRY_LIGHT if row == 0 else (MASONRY_MID if row == 1 else MASONRY_DARK),
+                    )
+    else:
+        for side in (-1, 1):
+            for step in range(4):
+                x = 5 + side * (2 + step)
+                drop = 2 if step < 2 else step + 1
+                y = top + 3 + drop
+                for row in range(3):
+                    _put(
+                        px,
+                        x,
+                        y - row,
+                        MASONRY_DARK if row == 0 else (MASONRY_MID if row == 1 else MASONRY_LIGHT),
+                    )
+    return _bump(img, PLAYER_OUTLINE)
+
+
+# --- the turret -------------------------------------------------------------
+
+
+def _turret_facing() -> Image.Image:
+    """A turret whose barrel points right; the left-facing sprite is this one flipped."""
+    img = cell()
+    px = img.load()
+    # The base: a light stone plinth, planted on row 15 like every other standing thing. Stone
+    # rather than the dark iron of the barrel, so the muzzle is the brightest thing on the sprite
+    # and the eye goes where the danger comes out.
+    _box(px, 4, 12, 11, 15, STONE_MID)
+    _box(px, 4, 12, 11, 12, STONE_LIGHT)
+    _box(px, 4, 15, 11, 15, STONE_DARK)
+    _box(px, 3, 14, 12, 15, STONE_DARK)
+    for x in (5, 10):
+        _put(px, x, 13, IRON_BOLT)
+
+    # The dome: small, so the barrel is the thing the silhouette is made of. A dome as wide as
+    # the base turns the whole sprite into a mushroom and the muzzle gets lost in it.
+    _box(px, 5, 9, 9, 12, STONE)
+    _box(px, 5, 9, 9, 9, STONE_LIGHT)
+    _box(px, 5, 12, 9, 12, STONE_DARK)
+    _box(px, 9, 9, 9, 12, STONE_DARK)
+    _put(px, 6, 10, LANTERN_GLOW)
+
+    # The barrel: an iron tube that clears the dome by half a cell, with a warm muzzle at the
+    # business end. It is what makes the sprite point, which is the one thing a turret has to do.
+    _box(px, 9, 10, 15, 11, IRON_FRAME)
+    _box(px, 9, 10, 15, 10, IRON_LIGHT)
+    _box(px, 9, 11, 15, 11, IRON_BOLT)
+    _box(px, 13, 10, 15, 11, LANTERN_WARM)
+    _put(px, 15, 10, LANTERN_GLOW)
+    _put(px, 15, 11, LANTERN_GLOW)
+    return _bump(img, PLAYER_OUTLINE)
+
+
+# --- the shot ---------------------------------------------------------------
+
+
+def shot() -> Image.Image:
+    """A turret's shot: a hot core with a short trail behind it, travelling right.
+
+    The trail is what says *which way it is going* on a sprite that is a circle of light in a
+    level where everything else is made of edges: the core is bright and round, and the tail
+    fades back to the left so a still frame still reads as motion.
+    """
+    img = cell()
+    px = img.load()
+    for x in range(2, 9):
+        alpha = 40 + x * 12
+        px[x, 7] = (255, 214, 120, alpha)
+        px[x, 8] = (255, 214, 120, alpha)
+    _box(px, 9, 6, 11, 9, LANTERN_WARM)
+    _box(px, 10, 5, 12, 10, LANTERN_WARM)
+    _box(px, 9, 6, 11, 9, LANTERN_GLOW)
+    _box(px, 10, 6, 11, 8, SPARK)
+    _put(px, 11, 7, SPARK)
+    return img
+
+
 # --- the goal ---------------------------------------------------------------
 
 
@@ -386,6 +591,16 @@ def sprites() -> list[tuple[str, Image.Image]]:
         ("walker_c", _walker(0, ((3, 14), (9, 15)))),
         ("walker_d", _walker(1, ((5, 15), (10, 15)))),
         ("walker_dead", _walker(0, (), dead=True)),
+        ("chaser_a", _chaser(0, ((2, 15), (7, 15)))),
+        ("chaser_b", _chaser(1, ((3, 15), (8, 15)))),
+        ("chaser_c", _chaser(0, ((2, 14), (8, 15)))),
+        ("chaser_d", _chaser(1, ((4, 15), (9, 15)))),
+        ("chaser_dead", _chaser(0, (), dead=True)),
+        ("flyer_a", _flyer(0)),
+        ("flyer_b", _flyer(1)),
+        ("turret_r", _turret_facing()),
+        ("turret_l", _turret_facing().transpose(Image.FLIP_LEFT_RIGHT)),
+        ("shot", shot()),
         ("goal_top", goal_top()),
         ("goal_bottom", goal_bottom()),
     ]

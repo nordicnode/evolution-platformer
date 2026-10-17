@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use egui::{Color32, Mesh, Painter, Pos2, Rect, TextureId, Vec2};
+use egui::{Color32, CornerRadius, Mesh, Painter, Pos2, Rect, Stroke, TextureId, Vec2};
 use sim::reach::ReachReport;
 use sim::{Level, Outcome, Sim, Tile, Walker};
 
@@ -511,12 +511,7 @@ impl<'a> Sheet<'a> {
     /// exact: an agent facing the way it is travelling is worth a second set of sprites
     /// to a hand-drawn game, and worth nothing at all to a texture sampler.
     pub fn image_facing(&self, rect: Rect, uv: Rect, flip: bool, tint: Color32) {
-        let uv = if flip {
-            Rect::from_min_max(Pos2::new(uv.max.x, uv.min.y), Pos2::new(uv.min.x, uv.max.y))
-        } else {
-            uv
-        };
-        self.painter.image(self.texture, rect, uv, tint);
+        self.painter.image(self.texture, rect, facing(uv, flip), tint);
     }
 
     /// Draw an agent sprite in a physics box, keeping the *sprite's* proportions.
@@ -2267,6 +2262,53 @@ const FLAG_HZ: f32 = 3.0;
 /// the view is a pure function of it: two draws at the same clock draw the same picture,
 /// which is what makes this testable at all. `reach` is the validation overlay; pass
 /// `None` for a plain view.
+/// The level's own chasers, flyers, turrets and movers — what a document says is *there*,
+/// rather than where anything has walked to.
+///
+/// The editor needs this: a level with no simulation in it still has to show the enemies
+/// its author placed, at the tiles they placed them on. Each one is drawn at its authored
+/// box with the same sprite function the live view uses, so a chaser on the canvas and a
+/// chaser in a run are the same creature in the same pose.
+fn draw_level_entities(sheet: Sheet<'_>, level: &Level, clock: f32) {
+    for m in &level.platforms {
+        draw_mover(sheet, m.rect);
+    }
+    for c in &level.chasers {
+        sheet.actor(
+            c.x,
+            c.y,
+            c.w,
+            c.h,
+            sheet.sprites.get(chaser_frame(clock)),
+            false,
+            Color32::WHITE,
+        );
+    }
+    for f in &level.flyers {
+        sheet.actor(
+            f.rect.x,
+            f.rect.y,
+            f.rect.w,
+            f.rect.h,
+            sheet.sprites.get(flyer_frame(clock)),
+            false,
+            Color32::WHITE,
+        );
+    }
+    for t in &level.turrets {
+        let (name, flip) = turret_picture(t.dir);
+        sheet.actor(
+            t.rect.x,
+            t.rect.y,
+            t.rect.w,
+            t.rect.h,
+            sheet.sprites.get(name),
+            flip,
+            Color32::WHITE,
+        );
+    }
+}
+
 pub fn draw_level(
     sheet: Sheet<'_>,
     level: &Level,
@@ -2276,6 +2318,14 @@ pub fn draw_level(
 ) {
     let painter = sheet.painter;
     let (tx0, tx1, ty0, ty1) = sheet.camera.visible_tiles(level, sheet.viewport);
+
+    // Under everything: where each moving platform can travel. A shelf's motion is the one
+    // thing about it a person cannot see from a single frame — the authored span is invisible
+    // in the file and the platform's own art shows only where it is *now* — so the far end of
+    // its clear travel is drawn as a ghost, with the swept band between the two ends dashed.
+    // The guide is under the terrain on purpose: a platform never travels through a wall, so a
+    // dashed line hidden behind ground is a line the platform will not take.
+    draw_platform_travels(sheet, level);
 
     // Scenery first, and in the cell the prop itself names: the open tile above the ground
     // it stands on ([`Prop`]). Drawn in the ground's *own* cell — which is where this used
@@ -2328,6 +2378,58 @@ pub fn draw_level(
                 Some(Tile::Spring) => {
                     sheet.image(rect, sheet.sprites.get("spring"));
                 }
+                // A one-way shelf: a thin deck along the top of the cell, so what a body
+                // stands on is where the art says the ground is. Three pieces, chosen by
+                // whether the run continues either side, so a bridge of them has cut ends.
+                Some(Tile::OneWay) => {
+                    sheet.image(rect, sheet.sprites.get(oneway_part(level, tx, ty)));
+                }
+                // ---- the elements: water, lava, vine ---------------------
+                //
+                // None of the three is a *material*, so none is autotiled the way the ground
+                // is: what a fluid needs from its neighbours is one fact — whether the cell
+                // above holds the same fluid — because that is what tells a surface from a
+                // body, and the surface is the only part of a pool that has a line to draw.
+                // The surface's two frames are phased by column, so a long pool's crest
+                // travels along it instead of the whole row blinking in place.
+                // A body cell is seamless in every direction, so two stacked cells are one
+                // body of water; the cells a pool *ends* in get their own picture, and the
+                // body is varied by a hash so a deep pool is not the same picture repeated.
+                // That is the fluid's whole autotile, and it is deliberately not a 16-mask
+                // like the ground's: a fluid has no silhouette of its own (the basin is its
+                // silhouette), so the only things a neighbour can change are whether this
+                // cell is the top, the bottom, or the edge.
+                Some(Tile::Water) => {
+                    let body = if level.tile(tx, ty - 1) == Some(Tile::Water) {
+                        fluid_body_sprite(sheet.sprites, Tile::Water, tx, ty)
+                    } else {
+                        sheet.sprites.get(water_surface_frame(clock, tx))
+                    };
+                    sheet.image(rect, body);
+                    draw_fluid_edges(sheet, level, tx, ty, rect, Tile::Water);
+                }
+                Some(Tile::Lava) => {
+                    // "Open" is the vent rule the sim fires by, asked the same way here: a
+                    // lava cell under a ceiling is not a surface, so it is drawn as the body
+                    // it is and the row above it is somebody else's problem.
+                    let above = level.tile(tx, ty - 1);
+                    let open = !matches!(
+                        above,
+                        Some(t) if t.is_solid() || t.is_lava() || t.is_water()
+                    );
+                    let body = if open {
+                        sheet.sprites.get(lava_surface_frame(clock, tx))
+                    } else {
+                        fluid_body_sprite(sheet.sprites, Tile::Lava, tx, ty)
+                    };
+                    sheet.image(rect, body);
+                    draw_fluid_edges(sheet, level, tx, ty, rect, Tile::Lava);
+                }
+                // A vine is one cell of stem, drawn to meet the cells above and below it, so a
+                // shaft of them reads as one vine rather than as a stack of cuttings.
+                Some(Tile::Vine) => {
+                    sheet.image(rect, sheet.sprites.get("vine"));
+                }
                 Some(Tile::Empty) | Some(Tile::Goal) | None => {}
             }
             if opts.grid {
@@ -2374,6 +2476,7 @@ pub fn draw_level(
     // frame comes from the same `walker_sprite` the live lanes use, so the creature on the
     // editor's canvas and the creature patrolling a run are the same one.
     if opts.entities {
+        draw_level_entities(sheet, level, clock);
         for walker in &level.walkers {
             // A placement faces right, which is what the loader gives the walker it
             // builds from this tile: an authored level has no direction to draw.
@@ -2454,6 +2557,323 @@ pub fn draw_level(
     }
 }
 
+/// Which of a water surface's two frames a column shows at `clock`.
+///
+/// The phase carries along the row (`- tx * 0.10`) so a long pool's surface travels rather
+/// than blinking in place: one frame is a crest, the next a trough, and a wave that sweeps a
+/// pool is the cheapest way to say "this is a liquid" without a shader.
+fn water_surface_frame(clock: f32, tx: i32) -> &'static str {
+    let phase = (clock * 2.2 - tx as f32 * 0.10).rem_euclid(2.0);
+    if phase < 1.0 {
+        "water_top_a"
+    } else {
+        "water_top_b"
+    }
+}
+
+/// The same idea for a lava surface, slower and with a wider phase step.
+///
+/// Slower because lava is viscous and a bubbling pool should not shimmer like a lake, and a
+/// wider step because a lava surface's *bulges* are what move: two frames a whole column apart
+/// read as a crust breaking rather than as a wave.
+fn lava_surface_frame(clock: f32, tx: i32) -> &'static str {
+    let phase = (clock * 1.1 - tx as f32 * 0.35).rem_euclid(2.0);
+    if phase < 1.0 {
+        "lava_top_a"
+    } else {
+        "lava_top_b"
+    }
+}
+
+/// How many cells across and down a fluid's body texture is, in tiles.
+///
+/// The art (`tools/art/terrain.py::FLUID_BLOCK`) draws one picture this many cells square and
+/// the renderer indexes it by the cell's own position, so the two numbers are one decision and
+/// must agree. A test pins them together against the shipped atlas.
+const FLUID_BLOCK: i32 = 4;
+
+/// The sixteen cells of water's body texture, row-major.
+///
+/// Spelled out rather than formatted: a name built with `format!` would allocate once per
+/// fluid cell per frame, and this pass runs over every tile of every level every frame.
+const WATER_BODIES: [&str; 16] = [
+    "water_b0", "water_b1", "water_b2", "water_b3", "water_b4", "water_b5", "water_b6",
+    "water_b7", "water_b8", "water_b9", "water_b10", "water_b11", "water_b12", "water_b13",
+    "water_b14", "water_b15",
+];
+const LAVA_BODIES: [&str; 16] = [
+    "lava_b0", "lava_b1", "lava_b2", "lava_b3", "lava_b4", "lava_b5", "lava_b6", "lava_b7",
+    "lava_b8", "lava_b9", "lava_b10", "lava_b11", "lava_b12", "lava_b13", "lava_b14",
+    "lava_b15",
+];
+
+/// A fluid body cell's texture: which cell of the fluid's block this tile falls on.
+///
+/// The body is seamless, which is what makes a deep pool one body of water — and which also
+/// means every cell of it is the *same picture* unless something varies it. A per-cell variant
+/// (the ground's `_b`/`_c` trick) does not work here: two different textures meeting at a cell
+/// boundary draw a line there, and a pool has a boundary at every tile. So the body is one
+/// picture four cells square and this picks the cell by position, exactly as a texture atlas is
+/// sampled — no seam at any of the cuts, because the picture is continuous across them, and a
+/// repeat every four tiles instead of every one.
+///
+/// Optional art: a tileset without the block draws every body cell as the plain `water`/`lava`,
+/// which is the block's own cell 0.
+fn fluid_body_sprite(sprites: &Sprites, fluid: Tile, tx: i32, ty: i32) -> Rect {
+    let (plain, block) = match fluid {
+        Tile::Water => ("water", &WATER_BODIES),
+        _ => ("lava", &LAVA_BODIES),
+    };
+    let index = (ty.rem_euclid(FLUID_BLOCK) * FLUID_BLOCK + tx.rem_euclid(FLUID_BLOCK)) as usize;
+    sprites.first_of(&[block[index], plain])
+}
+
+/// The two things a fluid cell's *neighbours* decide, drawn over its base sprite.
+///
+/// This is the fluid's autotile, and it is deliberately not a 16-mask like the ground's. A
+/// fluid has no silhouette of its own — the basin it is cut into is its silhouette — so the only
+/// questions a neighbour can answer are "is this the bed?" and "does the pool meet air here?".
+/// Both answers are overlays, so they compose with all three body textures and with the surface:
+/// one picture per question instead of one per combination. Contrast `draw_seams`, which is the
+/// same idea one level up, between materials rather than within one.
+fn draw_fluid_edges(
+    sheet: Sheet<'_>,
+    level: &Level,
+    tx: i32,
+    ty: i32,
+    rect: egui::Rect,
+    fluid: Tile,
+) {
+    let (bed, wall_l, wall_r) = match fluid {
+        Tile::Water => ("water_bed", "water_wall_l", "water_wall_r"),
+        _ => ("lava_bed", "lava_wall_l", "lava_wall_r"),
+    };
+    // The bed, unless there is more of the same fluid under this cell. Drawn on the surface
+    // cell too: a pool one tile deep is all bed.
+    if level.tile(tx, ty + 1) != Some(fluid) {
+        if let Some(sprite) = sheet.sprites.try_get(bed) {
+            sheet.image(rect, sprite);
+        }
+    }
+    // A rim only where the pool faces open air. Against ground the terrain draws its own edge
+    // and is the silhouette; a second line just inside it would be a line where there is no
+    // edge at all.
+    for (neighbour, name) in [(tx - 1, wall_l), (tx + 1, wall_r)] {
+        let tile = level.tile(neighbour, ty);
+        let open = tile != Some(fluid) && !matches!(tile, Some(t) if t.is_solid());
+        if open {
+            if let Some(sprite) = sheet.sprites.try_get(name) {
+                sheet.image(rect, sprite);
+            }
+        }
+    }
+}
+
+/// Which piece of a one-way shelf tile `(tx, ty)` is: a cut end when the run stops here,
+/// and the plain middle when it continues or when the shelf is one tile long.
+///
+/// A pure function of the level's neighbours, like `ground_mask`: the art is chosen by the
+/// shape of the run and nothing else, so two shelves of the same length always look alike.
+fn oneway_part(level: &Level, tx: i32, ty: i32) -> &'static str {
+    let left = level.tile(tx - 1, ty) == Some(Tile::OneWay);
+    let right = level.tile(tx + 1, ty) == Some(Tile::OneWay);
+    match (left, right) {
+        (false, true) => "oneway_l",
+        (true, false) => "oneway_r",
+        _ => "oneway_m",
+    }
+}
+
+/// The colour of a platform's travel guide: a warm, pale gold, because it is a hint rather
+/// than a thing in the level and has to read over sky, hills and soil alike.
+const TRAVEL_LINE: Color32 = Color32::from_rgba_premultiplied(190, 173, 125, 190);
+/// The ghost box at the far end of that travel, filled rather than outlined, so it reads as
+/// "a shelf could be here" instead of "a shelf is here".
+const TRAVEL_GHOST: Color32 = Color32::from_rgba_premultiplied(26, 25, 22, 26);
+/// Dash length and gap, in screen points. Short enough that the guide never competes with a
+/// solid edge, long enough to survive the zoom range a person actually plays at.
+const TRAVEL_DASH: (f32, f32) = (5.0, 4.0);
+
+/// The two boxes a moving platform's travel is drawn between: the box where it rests, and the
+/// box at the far end of the part of its span that is **clear of terrain**.
+///
+/// The far end is [`sim::physics::clear_travel`], not the authored `span`, on purpose: a shelf
+/// written through a wall turns at the wall, and a guide that promised the authored span would
+/// be promising a route the sim refuses. The editor, the playtest and the evolve view all draw
+/// the same answer because it is the same function the episode builds from.
+pub(crate) fn mover_travel(
+    spec: &sim::PlatformSpec,
+    level: &Level,
+) -> (sim::Rect, sim::Rect) {
+    let clear = sim::physics::clear_travel(spec.rect, spec.span, spec.vertical, level);
+    let mut far = spec.rect;
+    if spec.vertical {
+        far.y -= clear;
+    } else {
+        far.x += clear;
+    }
+    (spec.rect, far)
+}
+
+/// Draw the travel of every moving platform in the level: the box it will reach, the swept
+/// band between here and there, and a dashed outline around both.
+fn draw_platform_travels(sheet: Sheet<'_>, level: &Level) {
+    let painter = sheet.painter;
+    for spec in &level.platforms {
+        let (home, far) = mover_travel(spec, level);
+        // The band the shelf's box sweeps out. Built from min/max rather than from two union
+        // calls so a lift (which moves *up*, so `far.y < home.y`) and a slider go through the
+        // same arithmetic.
+        let min_x = home.x.min(far.x);
+        let min_y = home.y.min(far.y);
+        let max_x = home.x.max(far.x) + home.w;
+        let max_y = home.y.max(far.y) + home.h;
+        let band = sheet.world(min_x, min_y, max_x - min_x, max_y - min_y);
+        // The far box first, under the band's outline: the ghost is the destination, and the
+        // eye should find it before it follows the dashes back.
+        let ghost = sheet.world(far.x, far.y, far.w, far.h);
+        painter.rect_filled(ghost, CornerRadius::same(2), TRAVEL_GHOST);
+        dashed_outline(painter, ghost, Stroke::new(1.5_f32, TRAVEL_LINE));
+        dashed_outline(painter, band, Stroke::new(1.0_f32, TRAVEL_LINE));
+    }
+}
+
+/// Outline a screen rectangle with dashes: four sides, no corners left open.
+fn dashed_outline(painter: &Painter, rect: Rect, stroke: Stroke) {
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    for pair in corners.windows(2) {
+        painter.extend(egui::Shape::dashed_line(
+            pair,
+            stroke,
+            TRAVEL_DASH.0,
+            TRAVEL_DASH.1,
+        ));
+    }
+}
+
+/// Draw a moving platform as the shelf it is: an iron rail over timber, one piece per tile
+/// of its width, with the ends cut.
+///
+/// It takes the *box*, not the spec, so the editor can draw the authored position and the
+/// live view can draw the position the sim says it is at this frame: one drawing, two
+/// callers, and no chance of the editor and the game disagreeing about what a mover looks
+/// like.
+fn draw_mover(sheet: Sheet<'_>, rect: sim::Rect) {
+    // **Drawn where it is, not in the tile cell it is over.** The first version snapped the
+    // shelf to whole tiles (`sheet.tile(...)`), so a platform sliding at two hundredths of a
+    // tile per tick held still for fifty frames and then jumped a whole cell: the motion was
+    // smooth in the physics and a series of hops on screen. The art is a whole cell whose
+    // shelf sits in its top rows, so a cell-sized box with its **top edge on the deck** puts
+    // the visible rail exactly on the collision surface, at any sub-tile position.
+    //
+    // **Drawn rigid, not cut at the tile boundaries.** The second version cut each column where
+    // the *level's* grid fell (`next = (x.floor() + 1.0).min(end)`), which is continuous
+    // arithmetic and a rigid-looking result only while the shelf sits exactly on a boundary: at
+    // a fractional x the first column is a fraction of a cell wide and the last is the sliver
+    // left over — so the shelf's two cut ends squeezed and stretched as it slid, and every time
+    // it crossed a tile boundary the *pattern* of pieces shifted by a whole cell. Both are
+    // motion artifacts in a thing whose whole job is to look like one solid object moving.
+    //
+    // A shelf is `w` whole tiles wide, so it is drawn as `w` whole cells at `rect.x + i`: every
+    // piece is exactly one cell, the ends stay cut ends, and since all of them share the same
+    // fractional part, `Camera::world_rect`'s origin rounding moves them *together*. That is
+    // what "rigid" means here, and it is what makes the shelf and the body standing on it move
+    // in step on the pixel grid.
+    for (piece, x) in mover_pieces(rect) {
+        sheet.image(
+            sheet.world(x, rect.y, 1.0, 1.0),
+            sheet.sprites.get(piece),
+        );
+    }
+}
+
+/// The cells a shelf is drawn from, left to right: a cut end, middles, and a cut end.
+///
+/// A pure function of the box so the *layout* can be pinned by a test — the interesting half of
+/// the drawing is that every piece is exactly one cell and they are exactly one cell apart, which
+/// a painter cannot be asked about and a screenshot cannot measure.
+fn mover_pieces(rect: sim::Rect) -> impl Iterator<Item = (&'static str, f32)> {
+    let pieces = rect.w.round().max(1.0) as i32;
+    (0..pieces).map(move |i| {
+        let piece = match (i == 0, i == pieces - 1) {
+            (true, true) => "mover_m",
+            (true, false) => "mover_l",
+            (false, true) => "mover_r",
+            _ => "mover_m",
+        };
+        (piece, rect.x + i as f32)
+    })
+}
+
+/// Ticks a turret's muzzle stays lit after it fires.
+const MUZZLE_TICKS: u32 = 3;
+/// The muzzle flash's size, in tiles: a puff just outside the barrel.
+const MUZZLE_FLASH: f32 = 0.45;
+
+/// How big one shot's *cell* is drawn, in tiles.
+///
+/// The art is a 16-pixel cell with a hot core at its right and a fading tail behind it
+/// (`tools/art/characters.py::shot`), so the cell has to be drawn big enough for the tail to be a
+/// tail — a bullet whose whole picture is squeezed into its 0.3-tile hitbox is a two-pixel dot.
+/// 0.9 puts the core at about a fifth of a tile and the tail half a tile behind it.
+const SHOT_DRAW_TILES: f32 = 0.9;
+
+/// Where the bullet's core sits inside that cell, as a fraction of the cell.
+///
+/// The centre of the hot box in the art: pixels 9..12 across and 5..10 down, of sixteen. This is
+/// the point the drawing is *anchored* on the hitbox, so the thing that kills you is the bright
+/// part of the picture exactly rather than roughly.
+const SHOT_CORE: (f32, f32) = (10.5 / 16.0, 7.5 / 16.0);
+
+/// Draw a shot in the sprite's own proportions, anchored on the hitbox and facing its travel.
+///
+/// It used to be an `actor`: a square sprite centred on the box and 30% taller than it, which for
+/// a 0.3-tile box threw the art's proportions away (the tail was squashed into the same cell as
+/// the core) and stood the picture *above* the row it kills in. A projectile is the one sprite in
+/// the game whose picture and hitbox have to be the same fact, so it is drawn from the art's own
+/// geometry: the core lands on the box, the tail trails behind it, and the mirror follows `vx`.
+fn draw_shot(sheet: Sheet<'_>, shot: &sim::Shot, tint: Color32) {
+    sheet.image_facing(
+        shot_rect(sheet.camera, sheet.viewport, shot),
+        sheet.sprites.get("shot"),
+        shot.vx < 0.0,
+        tint,
+    );
+}
+
+/// The screen rectangle one shot's cell is drawn in: the art's core on the hitbox.
+///
+/// Split out because "the bright part of the picture is where the bullet kills you" is a claim
+/// about arithmetic, and the one place it can be checked without a painter is here.
+fn shot_rect(camera: &Camera, viewport: Rect, shot: &sim::Shot) -> Rect {
+    let centre_x = shot.x + shot.w * 0.5;
+    let centre_y = shot.y + shot.h * 0.5;
+    let left = centre_x - SHOT_CORE.0 * SHOT_DRAW_TILES;
+    let top = centre_y - SHOT_CORE.1 * SHOT_DRAW_TILES;
+    camera.world_rect(left, top, SHOT_DRAW_TILES, SHOT_DRAW_TILES, viewport)
+}
+
+/// Draw a lava ball **at the size of its own hitbox**.
+///
+/// The art is a ball that fills its cell, so the cell and the box are the same rectangle: the
+/// thing that kills a body is the thing the player is looking at, which is the rule the spike's
+/// kill zone and the shot's core are both built on. That is also why the ball's box is chunkier
+/// than a bullet's 0.3 tiles — a 0.3-tile ball is five pixels at the usual zoom, and a hazard
+/// nobody can see is a hazard that reads as an unfair death.
+fn draw_lava_ball(sheet: Sheet<'_>, ball: &sim::LavaBall, tint: Color32) {
+    sheet.image_tinted(
+        sheet.world(ball.x, ball.y, ball.w, ball.h),
+        sheet.sprites.get("lava_ball"),
+        tint,
+    );
+}
+
 /// Validation overlay (§9): where the spawn can and cannot get to.
 pub fn draw_reach_overlay(sheet: Sheet<'_>, level: &Level, report: &ReachReport) {
     let painter = sheet.painter;
@@ -2504,8 +2924,31 @@ pub fn draw_reach_overlay(sheet: Sheet<'_>, level: &Level, report: &ReachReport)
 
 /// Draw a live episode: the level, and every agent in it with the pose its state implies.
 pub fn draw_sim(sheet: Sheet<'_>, sim: &Sim, opts: RenderOpts, clock: f32, anim: &AgentAnim) {
+    draw_sim_at(sheet, sim, opts, clock, anim, None);
+}
+
+/// [`draw_sim`] with the body's **drawn** position given by the caller.
+///
+/// The simulator advances in whole ticks; a display does not. Drawing the body at its last tick's
+/// position is what made the playtest look jerky: at 144 Hz most frames run no tick at all and the
+/// ones that do jump a whole tick's worth of movement, so the runner stutters at 60 Hz on a screen
+/// that is doing twice that. `at` is the interpolated position between the last two ticks —
+/// supplied by the session, which is the only thing that knows how far into the next tick the
+/// frame is — and `None` means "draw the simulation's own position", which is what the evolution
+/// and replay views do (they animate at speeds the eye reads as motion already).
+///
+/// Only the body moves: the walkers and the terrain are drawn where they are, because a body is
+/// the one thing on screen the viewer is tracking frame by frame.
+pub fn draw_sim_at(
+    sheet: Sheet<'_>,
+    sim: &Sim,
+    opts: RenderOpts,
+    clock: f32,
+    anim: &AgentAnim,
+    at: Option<(f32, f32)>,
+) {
     draw_level(sheet, sim.level(), opts, None, clock);
-    draw_agents(sheet, sim, clock, Color32::WHITE, anim, true);
+    draw_agents_at(sheet, sim, clock, Color32::WHITE, anim, true, at);
 }
 
 /// `sim`'s full running speed in tiles per tick.
@@ -2539,6 +2982,10 @@ const RUN_FRAMES: [&str; 6] = [
 ];
 /// The four frames of a walker's march.
 const WALKER_FRAMES: [&str; 4] = ["walker_a", "walker_b", "walker_c", "walker_d"];
+/// The four frames of a chaser's run. Its own family rather than a tint of the walker's:
+/// two enemies that look alike are two enemies a player cannot tell apart at speed, which
+/// is the one thing the second enemy has to be.
+const CHASER_FRAMES: [&str; 4] = ["chaser_a", "chaser_b", "chaser_c", "chaser_d"];
 
 /// What a single frame of a live episode cannot tell you about an agent.
 ///
@@ -2848,7 +3295,10 @@ pub fn player_sprite(sim: &Sim, anim: &AgentAnim) -> (&'static str, bool) {
     let p = sim.player();
     let flip = anim.facing_left;
     if !p.grounded {
-        if p.vy < 0.0 {
+        // A pull-up has no velocity of its own — the script moves the body, not the body's `vy` — so
+        // it would otherwise fall through to the falling pose while it is going *up* over a lip. The
+        // jump sprite is the one that reads as "arms working", which is what the move is.
+        if p.vy < 0.0 || p.mantling() {
             ("player_jump", flip)
         } else {
             ("player_fall", flip)
@@ -2874,13 +3324,73 @@ pub fn walker_frame(clock: f32) -> &'static str {
     WALKER_FRAMES[frame]
 }
 
+/// Which frame of a chaser's run is showing. Same cadence as the march, because the two
+/// enemies walk at the same speed and a different cadence would read as a different gait.
+pub fn chaser_frame(clock: f32) -> &'static str {
+    let frame = ((clock * 6.0) as i64).rem_euclid(CHASER_FRAMES.len() as i64) as usize;
+    CHASER_FRAMES[frame]
+}
+
 /// The walker's sprite for this frame: the march mirrored when it heads left, and the
 /// flattened pose once it has been stomped.
+///
+/// A chaser is a [`Walker`] with a different [`WalkerMode`](sim::WalkerMode) — the sim keeps
+/// them in one vector on purpose, so the same contact and stomp rules apply — and this is the
+/// one place that has to know the difference, because it is the only place that draws it.
 pub fn walker_sprite(walker: &Walker, clock: f32) -> (&'static str, bool) {
     if !walker.alive {
-        return ("walker_dead", false);
+        return match walker.mode {
+            sim::WalkerMode::Chase => ("chaser_dead", false),
+            sim::WalkerMode::Patrol => ("walker_dead", false),
+        };
     }
-    (walker_frame(clock), walker.dir < 0)
+    match walker.mode {
+        sim::WalkerMode::Chase => (chaser_frame(clock), walker.dir < 0),
+        sim::WalkerMode::Patrol => (walker_frame(clock), walker.dir < 0),
+    }
+}
+
+/// Which of a flyer's two wing frames is showing: a slow beat, because a flyer hovers.
+pub fn flyer_frame(clock: f32) -> &'static str {
+    if ((clock * 3.0) as i64).rem_euclid(2) == 0 {
+        "flyer_a"
+    } else {
+        "flyer_b"
+    }
+}
+
+/// The turret's picture, as `(sprite, mirrored)`.
+///
+/// One drawing, two directions: the same rule the player's own body follows, so a left-facing
+/// turret is the right-facing one seen in a mirror rather than a second piece of art that can
+/// drift from it.
+///
+/// **The whole window asks this one function**, and that is the point of it existing. The canvas,
+/// the editor's placed turret, the palette cell and the brush's ghost used to reach the picture by
+/// three different routes — one of them a second atlas cell named `turret_l` — and the moment two
+/// of them disagree the palette promises a turret the level will not get. `dir` is the value the
+/// brush will place, so the answer for `-1` is the canvas's own answer for a turret it drew firing
+/// left, by construction rather than by keeping two numbers in two files in step.
+pub fn turret_picture(dir: i8) -> (&'static str, bool) {
+    ("turret_r", dir < 0)
+}
+
+/// The turret's sprite, mirrored when it fires left.
+pub fn turret_sprite(turret: &sim::Turret) -> (&'static str, bool) {
+    turret_picture(turret.dir)
+}
+
+/// The atlas rectangle of a sprite, mirrored left-to-right when `flip` is set.
+///
+/// The same corner swap [`Sheet::image_facing`] does, exposed for the two places that paint a
+/// sprite without a [`Sheet`] — the palette and the brush's ghost — so the direction rule is one
+/// function rather than one function and two copies of a uv swap.
+pub fn facing(uv: Rect, flip: bool) -> Rect {
+    if flip {
+        Rect::from_min_max(Pos2::new(uv.max.x, uv.min.y), Pos2::new(uv.min.x, uv.max.y))
+    } else {
+        uv
+    }
 }
 
 /// Draw just an episode's agents — the player and every walker — leaving the terrain
@@ -2903,7 +3413,99 @@ pub fn draw_agents(
     anim: &AgentAnim,
     effects: bool,
 ) {
+    draw_agents_at(sheet, sim, clock, tint, anim, effects, None);
+}
+
+/// [`draw_agents`] with the body drawn at `at` rather than at its last tick's position.
+pub fn draw_agents_at(
+    sheet: Sheet<'_>,
+    sim: &Sim,
+    clock: f32,
+    tint: Color32,
+    anim: &AgentAnim,
+    effects: bool,
+    at: Option<(f32, f32)>,
+) {
     let sprites = sheet.sprites;
+
+    // The movers go under everything that stands on them: a shelf drawn over the body it is
+    // carrying would look like the body falling through the floor.
+    for shelf in sim.platforms() {
+        draw_mover(sheet, shelf);
+    }
+
+    // Flyers next, then turrets, then the walkers: the aerial threat is behind everything
+    // that is on the ground, so a body on a shelf is never hidden by a wing.
+    for flyer in sim.flyers() {
+        if !flyer.alive {
+            continue;
+        }
+        sheet.actor(
+            flyer.x,
+            flyer.y,
+            flyer.w,
+            flyer.h,
+            sprites.get(flyer_frame(clock)),
+            flyer.dir < 0,
+            tint,
+        );
+    }
+    for turret in sim.turrets() {
+        if !turret.alive {
+            continue;
+        }
+        let (name, flip) = turret_sprite(turret);
+        sheet.actor(
+            turret.x,
+            turret.y,
+            turret.w,
+            turret.h,
+            sprites.get(name),
+            flip,
+            tint,
+        );
+    }
+    // A turret that has *just* fired flashes at the muzzle.
+    //
+    // The shot itself is a fast, small thing: at 0.18 tiles a tick it crosses a ten-tile ledge in
+    // under a second, and the warning a person actually needs is the *firing*, not the bullet. The
+    // flash is read off the turret's own cooldown — `period - cooldown` is how many ticks ago it
+    // fired — so the renderer needs no extra state to know it, and the same number the sim uses to
+    // decide when the next shot leaves is the one that decides how long the light stays up.
+    let period = sim::PHYSICS.turret_period.max(1);
+    for turret in sim.turrets().iter().filter(|t| t.alive) {
+        let since = period.saturating_sub(turret.cooldown);
+        if since > MUZZLE_TICKS {
+            continue;
+        }
+        let age = since as f32 / (MUZZLE_TICKS as f32 + 1.0);
+        let x = if turret.dir > 0 {
+            turret.muzzle_x()
+        } else {
+            turret.muzzle_x() - MUZZLE_FLASH
+        };
+        let y = turret.y + (turret.h - MUZZLE_FLASH) * 0.5;
+        let rect = sheet.world(x, y, MUZZLE_FLASH, MUZZLE_FLASH);
+        sheet.painter.circle_filled(
+            rect.center(),
+            rect.width() * (1.0 + age * 0.6),
+            Color32::from_rgba_unmultiplied(255, 214, 120, (210.0 * (1.0 - age)) as u8),
+        );
+    }
+
+    // The shots go over the enemies and under the player: a bullet in flight is the one
+    // thing in the frame the player has to see, and the body that has to dodge it is what
+    // the eye should be drawn to next.
+    for s in sim.shots().iter().filter(|s| s.alive) {
+        draw_shot(sheet, s, tint);
+    }
+
+    // The pools' own projectiles, drawn with the shots: a body that dies to a ball should have
+    // been able to see the ball, so it goes in the same pass and at the same weight as the
+    // bullet it sits beside in the threat vector.
+    for b in sim.lava_balls().iter().filter(|b| b.alive) {
+        draw_lava_ball(sheet, b, tint);
+    }
 
     for walker in sim.walkers() {
         let (name, flip) = walker_sprite(walker, clock);
@@ -2969,7 +3571,7 @@ pub fn draw_agents(
     }
 
     let p = sim.player();
-    draw_agent_body(sheet, sim, tint, anim);
+    draw_agent_body_at(sheet, sim, tint, anim, at);
 
     if effects {
         match sim.outcome() {
@@ -3012,11 +3614,23 @@ pub fn draw_agents(
 /// of the episode the viewer is actually watching are already drawn. The dust and the
 /// death burst belong to that same one agent, so they are not here either.
 pub fn draw_agent_body(sheet: Sheet<'_>, sim: &Sim, tint: Color32, anim: &AgentAnim) {
+    draw_agent_body_at(sheet, sim, tint, anim, None);
+}
+
+/// [`draw_agent_body`] with the drawn position given by the caller (see [`draw_sim_at`]).
+pub fn draw_agent_body_at(
+    sheet: Sheet<'_>,
+    sim: &Sim,
+    tint: Color32,
+    anim: &AgentAnim,
+    at: Option<(f32, f32)>,
+) {
     let (name, flip) = player_sprite(sim, anim);
     let p = sim.player();
+    let (x, y) = at.unwrap_or((p.x, p.y));
     sheet.actor_squashed(
-        p.x,
-        p.y,
+        x,
+        y,
         p.w,
         p.h,
         anim.squash_x,
@@ -3106,6 +3720,15 @@ pub fn draw_lane_tag(sheet: Sheet<'_>, sim: &Sim, colour: Color32) {
     let bar = Rect::from_min_size(
         Pos2::new(feet.left(), feet.top()),
         Vec2::new(feet.width(), (sheet.camera.zoom * 0.12).clamp(1.5, 4.0)),
+    );
+    // **The tag sits on whatever the body is standing on**, and eight pastel lane colours do not
+    // all read on pale sand or on a dark pit. A dark halo under the bar — one pixel on each side,
+    // at the window's own shell colour — is what keeps the tag a tag on every surface instead of
+    // eight colours that each work on one tile. Painted first, so the colour keeps its own edge.
+    sheet.painter.rect_filled(
+        bar.expand(1.0),
+        egui::CornerRadius::ZERO,
+        Color32::from_rgba_premultiplied(12, 16, 24, 150),
     );
     sheet
         .painter
@@ -3204,6 +3827,240 @@ mod tests {
     use egui::{Pos2, Rect, Vec2};
     use render::trace::{ChampionTrace, TracePoint};
     use sim::AgentAction;
+
+    /// **A moving shelf is drawn as one rigid object.**
+    ///
+    /// Every piece is exactly one cell wide and exactly one cell from the next, whatever
+    /// fractional position the shelf is at — which is the whole of what "rigid" means and the
+    /// whole of the difference between a platform that slides and one that squashes its cut ends
+    /// a pixel at a time. The old layout cut each column where the *level's* grid fell, so at a
+    /// fractional x the first piece was a fraction of a cell and the last was the sliver left
+    /// over; a screenshot cannot see that, and this can.
+    #[test]
+    fn the_shelf_is_drawn_as_one_rigid_run() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let camera = Camera {
+            centre: Vec2::new(20.0, 7.0),
+            zoom: 26.0,
+        };
+        let scale = camera.scale();
+
+        for x in [35.0, 35.02, 35.25, 35.5, 35.75, 35.99, 36.0, 36.31] {
+            let rect = sim::Rect::new(x, 12.5, 3.0, 0.5);
+            let pieces: Vec<(&str, f32)> = mover_pieces(rect).collect();
+            assert_eq!(pieces.len(), 3, "a three-tile shelf is three cells at x={x}");
+            assert_eq!(pieces[0].0, "mover_l");
+            assert_eq!(pieces[2].0, "mover_r");
+
+            let mut previous: Option<Rect> = None;
+            for (piece, px) in pieces {
+                let cell = camera.world_rect(px, rect.y, 1.0, 1.0, viewport);
+                assert_eq!(
+                    cell.width(),
+                    scale,
+                    "piece {piece} at x={x} is {:.2} points wide, not one whole cell",
+                    cell.width()
+                );
+                if let Some(before) = previous {
+                    assert_eq!(
+                        cell.min.x,
+                        before.max.x,
+                        "a seam between two pieces at x={x}: {} then {}",
+                        before.max.x,
+                        cell.min.x
+                    );
+                    assert_eq!(cell.min.y, before.min.y, "the shelf is not level at x={x}");
+                }
+                previous = Some(cell);
+            }
+            // And the run really is where the box says it is, to within the one pixel the
+            // renderer's own snapping can move it by.
+            let drawn = camera.world_rect(rect.x, rect.y, rect.w, 1.0, viewport);
+            let first = camera.world_rect(x, rect.y, 1.0, 1.0, viewport);
+            assert!(
+                (first.min.x - drawn.min.x).abs() <= 1.0,
+                "the first piece at {:.3} is {} away from the box's left edge",
+                first.min.x - drawn.min.x,
+                1.0
+            );
+        }
+    }
+
+    /// **A platform's travel guide ends where the shelf can actually get to.**
+    ///
+    /// The guide exists so a person can read a mover's span — invisible in the level file and
+    /// in the shelf's own picture — while drawing or playing. Its far end has to be the clear
+    /// part of the travel rather than the authored number: a shelf placed through a wall turns
+    /// at the wall, and a guide that promised the rest would be promising a route the sim
+    /// refuses. Both axes are checked, because a lift's far box moves in y.
+    #[test]
+    fn a_platforms_travel_guide_ends_where_the_shelf_can_reach() {
+        let mut level = Level::starter("travel-guide", 30, 10);
+        assert!(level.add_platform_tile(4, 6, 3, 4, false));
+        let spec = level.platforms[0];
+
+        let (home, far) = mover_travel(&spec, &level);
+        assert_eq!(home, spec.rect, "the near end is the box as authored");
+        assert_eq!(far.y, home.y, "a slider stays in its row");
+        assert!((far.x - (home.x + 4.0)).abs() < 1e-4, "a clear span is drawn whole");
+
+        // A wall in the shelf's row stops it — and the guide with it.
+        let mut walled = level.clone();
+        assert!(walled.set_tile(8, 6, Tile::Solid));
+        let (_, stopped) = mover_travel(&spec, &walled);
+        assert!(
+            stopped.x + stopped.w <= 8.0 + 1e-3,
+            "the guide must not run into the wall: shelf right {} at wall column 8",
+            stopped.x + stopped.w
+        );
+        assert!(
+            stopped.x > home.x,
+            "and the shelf still gets some of its travel before the wall"
+        );
+
+        // A lift moves up, so the far box is above the near one by its clear travel.
+        let mut lift = Level::starter("travel-lift", 30, 10);
+        assert!(lift.add_platform_tile(4, 6, 3, 3, true));
+        let lift_spec = lift.platforms[0];
+        let (lift_home, lift_far) = mover_travel(&lift_spec, &lift);
+        assert!((lift_far.y - (lift_home.y - 3.0)).abs() < 1e-4);
+        assert_eq!(lift_far.x, lift_home.x);
+    }
+
+    /// **A live shot reaches the frame, and it is the art's own core that is drawn.**
+    ///
+    /// The arithmetic above is only worth anything if the call site uses it, so this runs the
+    /// real `draw_sim` over a real sim with a bullet in flight and collects the sprite quads the
+    /// frame is made of. A turret that fired into nothing would pass every physics test in the
+    /// crate and still be the picture of an empty row.
+    #[test]
+    fn a_live_shot_is_drawn_where_it_kills() {
+        let ctx = egui::Context::default();
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
+        let mut level = Level::starter("shot-frame", 40, 5);
+        assert!(level.add_turret_tile(2, 3, 1));
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let camera = Camera::fit(&level, viewport, 24.0);
+
+        let mut sim = Sim::new(&level, 3);
+        for _ in 0..40 {
+            sim.step(AgentAction::Walk);
+        }
+        let shot = sim
+            .shots()
+            .iter()
+            .find(|s| s.alive)
+            .copied()
+            .expect("the turret should have a shot in the air by frame forty");
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::default())
+                    .show(ctx, |ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let painter = ui.painter_at(rect);
+                        let sheet = Sheet::new(&painter, &atlas, &sprites, &camera, rect);
+                        draw_sim(sheet, &sim, RenderOpts::playing(), 0.0, &AgentAnim::new());
+                    });
+            },
+        );
+
+        let wanted = atlas.uv("shot").expect("the shot sprite is in the atlas");
+        // The four corners of the shot's cell, so a mirrored quad counts too: a quad is the
+        // sprite when its uv corners are the cell's, whatever order the tessellator put them in.
+        let corners = [
+            wanted.min,
+            Pos2::new(wanted.max.x, wanted.min.y),
+            wanted.max,
+            Pos2::new(wanted.min.x, wanted.max.y),
+        ];
+        let texture = atlas.texture_id();
+        let mut drawn = 0;
+        for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+            let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
+                continue;
+            };
+            if mesh.texture_id != texture {
+                continue;
+            }
+            for chunk in mesh.vertices.chunks(4) {
+                if chunk.len() < 4 {
+                    continue;
+                }
+                if corners.iter().all(|c| chunk.iter().any(|v| v.uv == *c)) {
+                    drawn += 1;
+                }
+            }
+        }
+        assert!(drawn >= 1, "the shot is not in the frame");
+        let expected = shot_rect(&camera, viewport, &shot);
+        assert!(
+            expected.width() > 0.0 && expected.width().is_finite(),
+            "the shot's cell is degenerate: {expected:?}"
+        );
+    }
+
+    /// **A shot is drawn around its hitbox, at the size its art was drawn for.**
+    ///
+    /// The two ways a projectile's picture goes wrong are both arithmetic: drawn as an `actor` it
+    /// is a square 30% taller than the box and standing on the box's floor (so a small bullet
+    /// floats above the row it kills in), and drawn into the hitbox itself the 16-pixel cell with
+    /// its baked tail is squeezed to two pixels (so the bullet is a dot). The core of the art has
+    /// to land on the box, and the cell has to be big enough for the tail to be a tail.
+    #[test]
+    fn a_shot_is_drawn_around_its_hitbox() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let camera = Camera {
+            centre: Vec2::new(20.0, 7.0),
+            zoom: 26.0,
+        };
+        let shot = sim::Shot {
+            x: 10.0,
+            y: 4.2,
+            w: 0.30,
+            h: 0.30,
+            vx: -0.18,
+            travelled: 3.0,
+            alive: true,
+        };
+        let cell = shot_rect(&camera, viewport, &shot);
+        let box_centre = camera.to_screen(shot.x + shot.w * 0.5, shot.y + shot.h * 0.5, viewport);
+        let core = cell.min + Vec2::new(SHOT_CORE.0 * cell.width(), SHOT_CORE.1 * cell.height());
+        assert!(
+            (core - box_centre).length() <= 1.5,
+            "the art's core is {:.2} points from the hitbox centre",
+            (core - box_centre).length()
+        );
+        assert!(
+            cell.width() >= camera.scale() * 0.8,
+            "a shot should be drawn big enough to read, got {:.1} points at {} a tile",
+            cell.width(),
+            camera.scale()
+        );
+    }
+
+    /// **The turret's picture has exactly one rule, and it is a mirror.**
+    ///
+    /// The palette, the drop ghost and the canvas all ask `turret_picture`, so "the turret fires
+    /// left" has one answer everywhere in the window. `facing` is the uv swap that answer needs in
+    /// the two places that paint without a `Sheet`, so it is pinned to the same corners.
+    #[test]
+    fn the_turret_picture_is_the_right_facing_sprite_mirrored() {
+        assert_eq!(turret_picture(1), ("turret_r", false));
+        assert_eq!(turret_picture(-1), ("turret_r", true));
+        let uv = Rect::from_min_max(Pos2::new(0.25, 0.5), Pos2::new(0.5, 0.75));
+        assert_eq!(facing(uv, false), uv);
+        assert_eq!(
+            facing(uv, true),
+            Rect::from_min_max(Pos2::new(0.5, 0.5), Pos2::new(0.25, 0.75))
+        );
+    }
 
     fn assets_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets")
@@ -5550,6 +6407,50 @@ mod tests {
         );
     }
 
+    /// The fluid body block: the renderer's idea of how big it is and the art's must agree.
+    ///
+    /// `FLUID_BLOCK` is the one number two languages share — the cells are generated by
+    /// `tools/art/terrain.py::FLUID_BLOCK` — and the failure if they disagree is not a crash but
+    /// a pool that repeats every tile again, which is the exact bug the block exists to remove.
+    /// So the shipped atlas must have all sixteen cells, and a tile's cell must be its position
+    /// modulo four in **both** axes.
+    #[test]
+    fn fluid_bodies_tile_as_one_four_by_four_picture() {
+        let atlas = atlas();
+        let sprites = Sprites::load(&atlas).unwrap();
+        for block in [&WATER_BODIES, &LAVA_BODIES] {
+            for name in block {
+                assert!(
+                    sprites.try_get(name).is_some(),
+                    "{name} is in the fluid block but not in the shipped atlas"
+                );
+            }
+        }
+        for ty in -3..6 {
+            for tx in -3..6 {
+                let here = fluid_body_sprite(&sprites, Tile::Water, tx, ty);
+                let across = fluid_body_sprite(&sprites, Tile::Water, tx + FLUID_BLOCK, ty);
+                let down = fluid_body_sprite(&sprites, Tile::Water, tx, ty - FLUID_BLOCK);
+                assert_eq!(here, across, "the block must wrap at {FLUID_BLOCK} across ({tx}, {ty})");
+                assert_eq!(here, down, "the block must wrap at {FLUID_BLOCK} down ({tx}, {ty})");
+            }
+        }
+        // And the cells are sixteen different pictures, not one pasted sixteen times: an index
+        // over a block of identical copies is a pool that still repeats every tile.
+        let mut distinct: Vec<Rect> = Vec::new();
+        for name in WATER_BODIES.iter().chain(LAVA_BODIES.iter()) {
+            let rect = sprites.get(name);
+            if !distinct.contains(&rect) {
+                distinct.push(rect);
+            }
+        }
+        assert_eq!(
+            distinct.len(),
+            WATER_BODIES.len() + LAVA_BODIES.len(),
+            "every block cell must be its own picture"
+        );
+    }
+
     /// A vine hangs from a platform's underside and nowhere else: not under the world's own
     /// edge, not in a cell that is not empty, and never on every column of an overhang at
     /// once — a vine per column is a curtain, not vegetation.
@@ -5613,6 +6514,51 @@ mod tests {
             hanging.len() < 18,
             "all {} columns of the overhang have a vine: that is a curtain",
             hanging.len()
+        );
+    }
+
+    /// **A pull-up is drawn as a climb, not as a fall.**
+    ///
+    /// The renderer has one pose for an airborne body that is not rising, and it is the *falling* one
+    /// — but a body being hauled over a lip by its own arms is neither falling nor, in velocity,
+    /// rising: the script moves its position and leaves `vy` at zero. Without the mantle in the pose
+    /// test the move reads as the body dropping upward. This drives a real pull-up and checks the
+    /// sprite on the ticks it is running.
+    #[test]
+    fn a_pull_up_is_drawn_as_a_climb_rather_than_a_fall() {
+        // A starter level, with a one-tile block planted above the spawn and a vine under it: the
+        // geometry the pull-up exists for.
+        let mut level = Level::starter("mantle-probe", 20, 10);
+        for ty in 5..9 {
+            assert!(level.set_tile(1, ty, Tile::Vine), "the test laid its own vine");
+        }
+        assert!(level.set_tile(1, 4, Tile::Solid), "and the block above it");
+        let mut sim = Sim::new(&level, 3);
+        let mut anim = AgentAnim::new();
+        let mut mantling = 0;
+        for _ in 0..200 {
+            if sim.outcome().is_finished() {
+                break;
+            }
+            sim.step(AgentAction::JumpInPlace);
+            anim.advance(&sim, sim::DT);
+            if sim.player().mantling() {
+                mantling += 1;
+                assert_eq!(
+                    player_sprite(&sim, &anim).0,
+                    "player_jump",
+                    "a body hauling itself over a lip is climbing, not falling"
+                );
+            }
+        }
+        assert_eq!(
+            mantling,
+            sim::physics::MANTLE_TICKS as i32,
+            "the climb holds the rising pose for the whole script"
+        );
+        assert!(
+            sim.player().grounded,
+            "and the script ends standing on the block"
         );
     }
 

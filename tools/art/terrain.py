@@ -48,11 +48,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 
 from PIL import Image
 
 from .common import (
     BRICK,
+    LAVA,
+    LAVA_CRUST,
+    LAVA_DEEP,
+    LAVA_GLOW,
+    LAVA_HOT,
+    LAVA_MID,
+    TRANSPARENT,
+    VINE,
+    VINE_DARK,
+    VINE_LIGHT,
+    VINE_STEM,
+    WATER,
+    WATER_DEEP,
+    WATER_FOAM,
+    WATER_LIGHT,
+    WATER_MID,
     BRICK_DARK,
     BRICK_DEEP,
     BRICK_LIGHT,
@@ -1002,6 +1019,466 @@ def spikes() -> Image.Image:
     return img
 
 
+def oneway(part: str) -> Image.Image:
+    """A one-way platform: a timber shelf across the **top** of its cell.
+
+    The height is the whole point. A one-way platform is ground from above and air from
+    below, so the art has to be a thin thing at the top of the tile a body stands on, and
+    not a block that fills the cell: a full cell would look like a wall the body walks
+    *through*, which is exactly the bug the tile exists to avoid looking like.
+
+    Three pieces (left end, middle, right end) so a run of them reads as one continuous
+    deck with a cut end, rather than as a row of separate tiles with a seam between each
+    pair. The brackets underneath are what say "shelf" instead of "floor tile that happens
+    to be short": they are the only part of the drawing that hangs into the air.
+    """
+    img = cell()
+    px = img.load()
+    left = 0 if part != "l" else 1
+    right = 15 if part != "r" else 14
+
+    for x in range(left, right + 1):
+        px[x, 0] = WOOD_TOP if h(x, 0, 311) < 0.8 else WOOD_LIGHT
+        px[x, 1] = WOOD
+        px[x, 2] = WOOD_DARK
+    # The cut end: a darker column where the deck stops, so the two ends of a run are
+    # visible from the side a body arrives from.
+    if part == "l":
+        for y in range(0, 3):
+            px[0, y] = WOOD_DARK
+    if part == "r":
+        for y in range(0, 3):
+            px[15, y] = WOOD_DARK
+
+    # Brackets: iron, two cells in from each end that is not a cut end.
+    for x in ((2, 3) if part != "r" else () ):
+        for y in range(3, 6):
+            px[x, y] = IRON_BOLT
+        px[x, 3] = IRON_LIGHT
+    for x in ((12, 13) if part != "l" else ()):
+        for y in range(3, 6):
+            px[x, y] = IRON_BOLT
+        px[x, 3] = IRON_LIGHT
+
+    # A warm rivet at each bracket's foot reads as a thing that is *hung* rather than set.
+    for x in ((2, 13) if part == "m" else ()):
+        px[x, 5] = LANTERN_WARM
+    return img
+
+
+def mover(part: str) -> Image.Image:
+    """A moving platform: an iron-railed shelf, drawn in the **top half** of its cell.
+
+    Half a cell is the platform's whole physics box ([`sim::physics::platform_h`]), so the
+    art is confined to rows 0..7: the rows below it are the air the shelf slides through,
+    and a drawing that filled the cell would look like a wall that moves.
+
+    The rail is what distinguishes it from the static one-way deck at a glance. The two
+    are the same shape of thing on purpose — both are ground from above and air from
+    below — and what separates them is that one is bolted to nothing and slides.
+    """
+    img = cell()
+    px = img.load()
+    left = 1 if part == "l" else 0
+    right = 14 if part == "r" else 15
+
+    for x in range(left, right + 1):
+        px[x, 0] = IRON_LIGHT
+        px[x, 1] = IRON_BOLT
+        px[x, 2] = WOOD_TOP
+        px[x, 3] = WOOD
+        px[x, 4] = WOOD_DARK
+    for x in range(left, right + 1, 3):
+        px[x, 1] = IRON_FRAME
+    if part != "l":
+        px[0, 2] = IRON_FRAME
+    if part != "r":
+        px[15, 2] = IRON_FRAME
+
+    # The chain: two links hanging off the underside, at the middle only, because a lift
+    # that is drawn hanging everywhere is a lift that is not moving.
+    if part == "m":
+        for y in (6, 7):
+            px[7, y] = IRON_BOLT
+            px[8, y] = IRON_FRAME
+    return img
+
+
+#: The water surface's crest height, column by column, for the two frames.
+#: A table rather than a sine so the wave is a drawing rather than a maths problem:
+#: the second frame is the first rotated by eight columns, which is what makes a crest
+#: appear to travel along a long pool instead of the whole surface bobbing in place.
+WATER_CREST = [1, 1, 2, 2, 3, 2, 1, 1, 1, 2, 3, 3, 2, 1, 1, 1]
+
+
+def _blob(x: int, y: int, period: int, seed: int, wrap: int = 0) -> float:
+    """Smooth value noise in [0, 1): a hash at every `period` pixels, curved in between.
+
+    [`h`] on its own is white noise, so hashing one lattice point per three pixels is not a
+    blob — it is a three-pixel checkerboard, and a body made of those stacks into a visible
+    grid of identical squares. Interpolating between the lattice points with a smoothstep is
+    what turns the same hash into patches with a shape and no lattice to see.
+
+    `wrap` is how many lattice steps make a period, so the field joins up with itself after
+    `wrap * period` pixels. A fluid's body is a *texture the level tiles*, and a texture that
+    does not join up draws a seam every time it repeats — which is the whole reason the
+    argument exists.
+    """
+    fx, fy = x / period, y / period
+    x0, y0 = int(fx), int(fy)
+    tx, ty = fx - x0, fy - y0
+    tx = tx * tx * (3 - 2 * tx)
+    ty = ty * ty * (3 - 2 * ty)
+
+    def at(ix: int, iy: int) -> float:
+        if wrap:
+            ix %= wrap
+            iy %= wrap
+        return h(ix, iy, seed)
+
+    top = at(x0, y0) * (1 - tx) + at(x0 + 1, y0) * tx
+    bottom = at(x0, y0 + 1) * (1 - tx) + at(x0 + 1, y0 + 1) * tx
+    return top * (1 - ty) + bottom * ty
+
+
+#: How many cells across and down a fluid's body texture is drawn as.
+#:
+#: **One is not enough, and a variant per cell is not the answer.** A fluid's body has to be
+#: seamless — two stacked cells are one body of water — so a single seamless cell is the *same
+#: picture* in every cell of a pool, and that repeat is what the eye picks out of a wide pool. A
+#: per-cell variant (the ground's `_b`/`_c` trick) moves the problem instead of solving it: two
+#: different textures meeting at a cell boundary draw a line there. So the fluid is drawn as one
+#: picture `FLUID_BLOCK` cells square, cut into cells and indexed by the cell's own position
+#: modulo `FLUID_BLOCK` (`crate::view::fluid_body_sprite`): there is no seam at any cut, because
+#: the picture is continuous across them, and the repeat is four tiles instead of one.
+FLUID_BLOCK = 4
+
+
+def _fluid_texture(
+    base,
+    shade,
+    light,
+    deep,
+    seed: int,
+    shade_at: float = 0.44,
+    light_at: float = 0.64,
+    glints: int = 14,
+) -> Image.Image:
+    """One fluid's body, `FLUID_BLOCK` cells square, drawn as a single continuous picture.
+
+    **No row may depend on its height, and no cell may carry structure of its own**: this
+    picture is cut into cells and tiled by the renderer, so a gradient or a bright edge in it
+    would be drawn once per cell — a band straight across the middle of a pool, which is the
+    bug this family was reshaped to remove. Depth, heat and shape all belong to the cells a
+    pool *ends* in ([`water_top`], [`water_bed`], [`lava_top`], [`lava_bed`]), which occur
+    exactly once per column.
+
+    Three noise scales: two octaves of [`_blob`] give the fluid currents of its own at a
+    distance, the per-pixel grain breaks the patches up so the body is a fluid rather than a
+    set of clouds, and the short glints are the only thing in here with a direction — a short
+    horizontal glint is a highlight, while a long one would be a line.
+    """
+    size = FLUID_BLOCK * 16
+    img = Image.new("RGBA", (size, size), TRANSPARENT)
+    px = img.load()
+    for y in range(size):
+        for x in range(size):
+            patch = 0.65 * _blob(x, y, 8, seed, size // 8) + 0.35 * _blob(
+                x, y, 4, seed + 3, size // 4
+            )
+            grain = h(x, y, seed + 7)
+            tone = base
+            if patch < shade_at:
+                tone = shade
+            elif patch > light_at:
+                tone = light
+            if grain < 0.07:
+                tone = deep
+            elif grain > 0.985:
+                # Rare on purpose: a bright pixel every few of them is confetti, and the
+                # patch scale above is where the light belongs.
+                tone = light
+            px[x, y] = tone
+    for index in range(glints):
+        gx = int(h(index, 1, seed + 11) * (size - 4)) + 1
+        gy = int(h(index, 2, seed + 12) * (size - 1))
+        for step in range(2 + int(h(index, 3, seed + 13) * 2)):
+            px[min(gx + step, size - 1), gy] = light
+    return img
+
+
+def _fluid_cells(texture: Image.Image) -> list[Image.Image]:
+    """A fluid picture cut into cells, row-major: cell `(r, c)` is `r * FLUID_BLOCK + c`."""
+    return [
+        texture.crop((c * 16, r * 16, c * 16 + 16, r * 16 + 16))
+        for r in range(FLUID_BLOCK)
+        for c in range(FLUID_BLOCK)
+    ]
+
+
+@lru_cache(maxsize=None)
+def water_cells() -> list[Image.Image]:
+    """Water's sixteen body cells. **Copy one before drawing on it.**"""
+    # The bright end is rare, and the *glints* are where the light is: a body built mostly of
+    # highlights reads as foam, and foam is the one thing a pool is not made of.
+    return _fluid_cells(
+        _fluid_texture(
+            WATER, WATER_MID, WATER_LIGHT, WATER_DEEP, 311, shade_at=0.42, light_at=0.86
+        )
+    )
+
+
+@lru_cache(maxsize=None)
+def lava_cells() -> list[Image.Image]:
+    """Lava's sixteen body cells. **Copy one before drawing on it.**"""
+    # Molten, and drawn from the molten end of the palette: the *body* of a lava pool is the hot
+    # part, and the crust is what cools against the air and the ground — which is what the
+    # surface, the bed and the walls are for. A body built from the crust end instead reads as
+    # rusty soil, which is what the first version of this drawing did.
+    # The shade is the rarest of the three tones on purpose: `LAVA_MID` against `LAVA` is a big
+    # step, and a third of a pool in it reads as a leopard skin rather than as molten rock. The
+    # dark end is left to the bed, the walls and the single-pixel crust specks.
+    return _fluid_cells(
+        _fluid_texture(
+            LAVA, LAVA_MID, LAVA_HOT, LAVA_DEEP, 331, shade_at=0.26, light_at=0.86
+        )
+    )
+
+
+def water() -> Image.Image:
+    """The **plain** body of a pool: cell 0 of water's texture.
+
+    Opaque, unlike a spike or a pad, because it is not an object standing in a cell — it is the
+    *cell*. A pool's silhouette is the ground it is cut into, which the autotiled terrain draws;
+    what the fluid owns is its texture, its surface ([`water_top`]), its bed ([`water_bed`]) and
+    its edges ([`_fluid_wall`]).
+
+    This plain cell has two callers: a tileset that has none of the sixteen block cells (they
+    are optional art), and the surfaces, which are a body with a crest drawn over it.
+    """
+    return water_cells()[0].copy()
+
+
+def water_bed() -> Image.Image:
+    """A pool's bed: the body, settling into the floor, drawn **over** the body cell.
+
+    An overlay rather than a whole cell, and that is the mechanic the terrain has had all
+    along: the bed is a *drawing on top of* a body tile, so it composes with all three body
+    textures instead of existing three times over, and the renderer draws it only where the
+    tile below is not water (`crate::view::draw_fluid_edges`).
+
+    The rows above it are transparent, and the shading's top edge is ragged — coverage by
+    row is a *density* (18%, 50%, 85%, all of it) rather than a band, so a pool settles into
+    its floor instead of ending on a ruled line.
+    """
+    img = cell()
+    px = img.load()
+    for x in range(16):
+        for y in range(12, 16):
+            if h(x, y, 361) > (0.18, 0.5, 0.85, 1.0)[y - 12]:
+                continue
+            if y == 12:
+                px[x, y] = (*WATER_MID, 200)
+            elif y == 13:
+                px[x, y] = (*WATER_MID, 255)
+            elif y == 14:
+                px[x, y] = (*(WATER_MID if h(x, y, 362) < 0.7 else WATER), 255)
+            else:
+                px[x, y] = (*(WATER_DEEP if h(x, y, 362) < 0.7 else WATER_MID), 255)
+    return img
+
+
+def water_top(frame: int) -> Image.Image:
+    """The surface of a pool: a crest line with foam, over a body of water.
+
+    The rows above the crest stay **transparent**, because the cell above a surface is air —
+    a filled top row would put the waterline at the top of the tile no matter where the wave
+    was drawn, which is the same mistake the spike's top row exists to avoid.
+    """
+    img = water()
+    px = img.load()
+    shift = 0 if frame == 0 else 8
+    for x in range(16):
+        crest = WATER_CREST[(x + shift) % 16]
+        for y in range(crest):
+            px[x, y] = TRANSPARENT
+        px[x, crest] = WATER_FOAM
+        if crest > 0 and h(x, crest, 319) < 0.22:
+            px[x, crest - 1] = WATER_FOAM
+        # The lit band under the crest **fades back into the body within four rows**, so the
+        # surface cell's own bottom is indistinguishable from the body cell under it. A
+        # surface that ended in its own colours would draw a line under itself — the stripe
+        # the body is built to avoid, moved one cell up.
+        if crest + 1 < 16:
+            px[x, crest + 1] = WATER_LIGHT
+        for step, chance, seed in ((2, 0.6, 320), (3, 0.25, 321)):
+            if crest + step < 16 and h(x, crest + step, seed) < chance:
+                px[x, crest + step] = WATER_LIGHT
+    return img
+
+
+def lava() -> Image.Image:
+    """The **plain** body of a lava pool: cell 0 of lava's texture.
+
+    The same construction as [`water`] and for the same reason, with the opposite heat: the
+    bright cells are the ones hot enough to glow, the dark ones are crust already cooled. A pool
+    that read as a flat orange rectangle would be a tint; a pool with a crust is a material —
+    and the crust belongs to [`lava_bed`], drawn once against the rock, rather than to every
+    body cell, where a two-tile pool would stack two of them.
+    """
+    return lava_cells()[0].copy()
+
+
+def lava_bed() -> Image.Image:
+    """The bed of a lava pool: cooled rock, crusted where it meets the ground.
+
+    The same overlay as [`water_bed`] — transparent above, all of it at the bottom, ragged in
+    between — with one difference that is the whole character of the material: a few cracks
+    in the crust still glow. The pool is hot enough that the rock it sits on is *cooking*,
+    and a bed that was uniformly dark would say the bottom of a lava pool is cold.
+    """
+    img = cell()
+    px = img.load()
+    for x in range(16):
+        for y in range(12, 16):
+            if h(x, y, 371) > (0.2, 0.55, 0.85, 1.0)[y - 12]:
+                continue
+            crust = LAVA_CRUST if h(x, y, 372) < 0.7 else LAVA_DEEP
+            if y == 15 and h(x, y, 373) > 0.88:
+                crust = LAVA_MID
+            px[x, y] = (*crust, 255 if y > 12 else 200)
+    return img
+
+
+def _fluid_wall(edge, shade, seed: int) -> Image.Image:
+    """One side of a pool: a rim, drawn over the body cells of the pool's edge column.
+
+    Uniform down the cell and **with no row structure at all**, for the reason the body has
+    none: an edge runs the whole height of a pool, so its rim has to be one continuous line
+    through every cell it crosses. Its top rows do not fade — a fade would put a gap in the
+    line every sixteenth pixel — and the two or three pixels of overflow above a surface
+    cell's crest read as the waterline climbing the wall, which is what a waterline does.
+
+    Left only: the right wall is this picture mirrored, so the two cannot drift apart the way
+    the turret's two directions did before they were one drawing (`crate::view`).
+    """
+    img = cell()
+    px = img.load()
+    for y in range(16):
+        px[0, y] = (*edge, 255)
+        if h(1, y, seed) < 0.75:
+            px[1, y] = (*shade, 200)
+        if h(2, y, seed + 1) < 0.3:
+            px[2, y] = (*shade, 120)
+    return img
+
+
+def water_wall_l() -> Image.Image:
+    """Water's rim against open air: dark, wet, and two or three pixels deep."""
+    return _fluid_wall(WATER_DEEP, WATER_MID, 391)
+
+
+def water_wall_r() -> Image.Image:
+    return water_wall_l().transpose(Image.FLIP_LEFT_RIGHT)
+
+
+def lava_wall_l() -> Image.Image:
+    """Lava's rim against open air: the crust that forms where the melt meets nothing."""
+    return _fluid_wall(LAVA_CRUST, LAVA_DEEP, 392)
+
+
+def lava_wall_r() -> Image.Image:
+    return lava_wall_l().transpose(Image.FLIP_LEFT_RIGHT)
+
+
+def lava_top(frame: int) -> Image.Image:
+    """A lava surface: a glowing crust line with two domes that break and re-form.
+
+    The domes are why there are two frames: a pool that only changed colour would read as a
+    light, and what a vent does is *bulge* just before it throws. Nothing here is the ball
+    itself — the ball is a sprite of its own (`lava_ball`), thrown into the air above this
+    line — but a surface that domes says the pool is doing something.
+    """
+    img = lava()
+    px = img.load()
+    # The hot rows fade into the body tone by the fourth row, for the reason `water_top`
+    # gives: the cell below a surface is a body cell, and a surface that ended in its own
+    # colours would draw a line under itself. The top row is the crust line itself — a
+    # molten pool has a cooled skin, so the brightest line of the whole pool is the one the
+    # body *does not* have.
+    for x in range(16):
+        px[x, 0] = LAVA_GLOW if h(x, 0, 341) < 0.25 else LAVA_HOT
+        px[x, 1] = LAVA
+        if h(x, 2, 342) < 0.55:
+            px[x, 2] = LAVA
+        if h(x, 3, 343) < 0.55:
+            px[x, 3] = LAVA
+    domes = (4, 11) if frame == 0 else (7, 13)
+    for cx in domes:
+        for dx in (-1, 0, 1):
+            px[cx + dx, 0] = LAVA_GLOW
+            px[cx + dx, 1] = LAVA_HOT
+        px[cx, 2] = LAVA_HOT
+    return img
+
+
+def lava_ball() -> Image.Image:
+    """A ball of lava in flight: a glowing core inside a cooling shell.
+
+    Drawn **to fill its cell**, because the game draws this cell at the ball's own hitbox
+    (`crate::view::draw_lava_ball`): the thing that kills a body has to be the thing the
+    player can see, so the picture and the box are the same rectangle by construction
+    rather than by a size constant that could drift from it.
+    """
+    img = cell()
+    px = img.load()
+    for y in range(16):
+        for x in range(16):
+            d2 = (x + 0.5 - 8.0) ** 2 + (y + 0.5 - 8.0) ** 2
+            if d2 > 46:
+                continue
+            if d2 > 36:
+                px[x, y] = LAVA_DEEP
+            elif d2 > 22:
+                px[x, y] = LAVA
+            elif d2 > 10:
+                px[x, y] = LAVA_HOT
+            else:
+                px[x, y] = LAVA_GLOW
+    # Two sparks off the top, so a still frame of the ball reads as *thrown*.
+    px[6, 1] = LAVA_HOT
+    px[10, 1] = LAVA
+    return img
+
+
+def vine() -> Image.Image:
+    """A vine: a stem through the whole cell with leaves either side.
+
+    **The stem is continuous from row 0 to row 15 and does not wander**, because a vine is
+    the one tile in the level that is *stacked*: any sway in the stem is a kink at every
+    tile boundary, so a shaft of ten of these reads as ten cuttings. The leaves alternate
+    sides down the cell, which is where the organic shape comes from instead.
+
+    The stem bottom is a darker knot, which is what a vine's own weight does to it.
+    """
+    img = cell()
+    px = img.load()
+    for y in range(16):
+        px[7, y] = VINE_STEM
+        px[8, y] = VINE
+        px[9, y] = VINE_DARK
+    for index, y in enumerate((2, 6, 10, 13)):
+        right = index % 2 == 0
+        bx = 10 if right else 6
+        step = 1 if right else -1
+        px[bx, y] = VINE_LIGHT
+        px[bx + step, y] = VINE
+        px[bx + step, y + 1] = VINE_DARK
+        px[bx, y + 1] = VINE
+    px[8, 15] = VINE_DARK
+    return img
+
+
 def sprites() -> list[tuple[str, Image.Image]]:
     """Every terrain sprite, in the order the manifest lists them."""
     out: list[tuple[str, Image.Image]] = []
@@ -1043,11 +1520,48 @@ def sprites() -> list[tuple[str, Image.Image]]:
 
     out.append(("spike", spikes()))
 
+    # The one-way shelf and the moving platform: one family of three each, because both
+    # are a run of tiles and both need their two ends drawn.
+    for part in ("l", "m", "r"):
+        out.append((f"oneway_{part}", oneway(part)))
+    for part in ("l", "m", "r"):
+        out.append((f"mover_{part}", mover(part)))
+
     # The trap tiles, next to the spike because they are the same *kind* of thing: a tile the
     # physics has an opinion about, drawn as an object rather than as a material. The four cracks
     # go last of the group because the renderer draws them *over* the tile beneath, which is also
     # where they sit in a level.
     out.append(("spring", spring()))
+
+    # The elements. Water and lava are a seamless body, a bed, and two surface frames each;
+    # the ball and the vine are one cell each. They sit beside the spike and the pad because
+    # they are the same *kind* of thing — a tile the physics has an opinion about rather than
+    # a material. The bed is the sprite that lets the body be seamless: a pool's depth cue was
+    # in the body once, and a two-tile pool drew it twice, which is the band this family was
+    # reshaped to remove (`_fluid_texture`).
+    # Bodies first, then the three cells a pool *ends* in. A fluid's autotile is built out of
+    # those pieces rather than out of masks, the way a solid tile is: the body is seamless and
+    # indexed by position (sixteen cells of one picture, `FLUID_BLOCK` square), and the
+    # surface, the bed and the two walls are overlays or replacements that compose with
+    # whichever body cell the position happened to pick. The plain `water`/`lava` cell is the
+    # body's cell 0, and doubles as the fallback for a tileset that has no block.
+    for name, cells in (("water", water_cells), ("lava", lava_cells)):
+        for index, sprite in enumerate(cells()):
+            out.append((f"{name}_b{index}", sprite))
+    out.append(("water", water()))
+    out.append(("water_top_a", water_top(0)))
+    out.append(("water_top_b", water_top(1)))
+    out.append(("water_bed", water_bed()))
+    out.append(("water_wall_l", water_wall_l()))
+    out.append(("water_wall_r", water_wall_r()))
+    out.append(("lava", lava()))
+    out.append(("lava_top_a", lava_top(0)))
+    out.append(("lava_top_b", lava_top(1)))
+    out.append(("lava_bed", lava_bed()))
+    out.append(("lava_wall_l", lava_wall_l()))
+    out.append(("lava_wall_r", lava_wall_r()))
+    out.append(("lava_ball", lava_ball()))
+    out.append(("vine", vine()))
     out.append(("cracked_ground", crack_overlay("ground")))
     out.append(("cracked_sand", crack_overlay("sand")))
     out.append(("cracked_brick", crack_overlay("brick")))

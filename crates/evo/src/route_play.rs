@@ -71,8 +71,9 @@
 
 use sim::physics::AgentAction;
 use sim::reach::{
-    climb_action, extract_platforms, simulate_jump_at, trajectory_action, GoalRoutes, JumpHold,
-    LaunchSpeed, Platform, RouteMove, Takeoff,
+    climb_action, extract_platforms, simulate_jump_at, simulate_swim, simulate_vine_climb,
+    swim_action, trajectory_action, vine_action, vine_run, GoalRoutes, JumpHold, LaunchSpeed,
+    Platform, RouteMove, Takeoff,
 };
 use sim::{spawn_route_stand, Level, Outcome, Rect, Sim, PHYSICS};
 
@@ -178,7 +179,10 @@ impl Plan {
     fn holds_jump(self) -> bool {
         match self.move_ {
             RouteMove::Jump(t) => t.hold != JumpHold::None,
-            RouteMove::Climb { .. } => true,
+            // A vine's "hold" is its whole climb and a dive is a jump; the field only seeds
+            // `Active::hovering`, which the swim and vine scripts do not read.
+            RouteMove::Climb { .. } | RouteMove::Vine { .. } => true,
+            RouteMove::Swim { dive, .. } => dive,
         }
     }
 
@@ -190,6 +194,9 @@ impl Plan {
             // A climb starts flush against its wall from a standstill: the rhythm is swept from rest,
             // and a body still sliding past the wall is a different climb.
             RouteMove::Climb { .. } => 0.0,
+            // A swim and a vine are entered from the aim at whatever speed the approach built:
+            // both scripts take the body over from there, and a pool's own drag is the cap.
+            RouteMove::Swim { .. } | RouteMove::Vine { .. } => 0.0,
         }
     }
 
@@ -204,6 +211,8 @@ impl Plan {
         match self.move_ {
             RouteMove::Jump(t) => trajectory_action(&t, self.holds_jump(), 0, ph),
             RouteMove::Climb { dir } => climb_action(dir, 0, ph),
+            RouteMove::Swim { dir, dive } => swim_action(dir, dive, false, 0),
+            RouteMove::Vine { .. } => AgentAction::JumpInPlace,
         }
     }
 }
@@ -221,6 +230,11 @@ struct Active {
     airborne: bool,
     /// `hops_closed` when the attempt started, so a landing can say whether it bought anything.
     hops_at_start: u32,
+    /// The vine's top row, for a vine climb's exit timing — a property of the level, read once
+    /// when the plan is pressed.
+    vine_top: Option<i32>,
+    /// A vine climb has reached its exit and is pressing off it.
+    exiting: bool,
 }
 
 /// Which stand the body is standing on, if it is standing on one.
@@ -313,6 +327,17 @@ fn press_lands(
             launch_vx: vx,
         },
         RouteMove::Climb { .. } => return true,
+        // A swim and a vine are asked the same question the jumps are: does the script, run from
+        // *here*, reach the stand the graph promised? A pool's far bank and a vine's top ledge are
+        // ordinary landings, so the check is the oracle's own simulator rather than a special case.
+        RouteMove::Swim { dir, dive } => {
+            let traj = simulate_swim(level, platforms, x, surface_row, dir, dive);
+            return traj.landed_at.and_then(|(c, r)| routes.zone_at(c, r)) == plan.to;
+        }
+        RouteMove::Vine { exit } => {
+            let traj = simulate_vine_climb(level, platforms, x, surface_row, exit);
+            return traj.landed_at.and_then(|(c, r)| routes.zone_at(c, r)) == plan.to;
+        }
     };
     let traj = simulate_jump_at(level, platforms, x, surface_row, &takeoff);
     if traj.hit_spike || traj.fell_out {
@@ -373,6 +398,16 @@ fn match_speed(vx: f32, desired: f32, plan: Plan) -> AgentAction {
                     AgentAction::Retreat
                 }
             }
+            // The swim and the vine take over from the aim: what they need of the approach is
+            // only that the body *is* there, not how fast it is going.
+            RouteMove::Swim { dir, .. } => {
+                if dir.sign() > 0.0 {
+                    AgentAction::Run
+                } else {
+                    AgentAction::Retreat
+                }
+            }
+            RouteMove::Vine { .. } => AgentAction::Walk,
         }
     }
 }
@@ -524,6 +559,9 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                 }
                 active = None;
             } else {
+                let on_vine = sim.player().on_vine;
+                let in_water = sim.player().in_water;
+                let feet = sim.player().y + sim.player().h;
                 held = match a.plan.move_ {
                     RouteMove::Jump(t) => {
                         if a.hovering && vy >= 0.0 {
@@ -532,6 +570,14 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                         trajectory_action(&t, a.hovering, a.ticks, ph)
                     }
                     RouteMove::Climb { dir } => climb_action(dir, a.ticks, ph),
+                    RouteMove::Swim { dir, dive } => swim_action(dir, dive, in_water, a.ticks),
+                    RouteMove::Vine { exit } => vine_action(
+                        exit,
+                        on_vine,
+                        feet,
+                        a.vine_top.unwrap_or(0),
+                        &mut a.exiting,
+                    ),
                 };
                 a.ticks += 1;
             }
@@ -558,12 +604,21 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                 // hand clears the hop from where the body is. Both have to agree.
                 let row = routes.zone_bounds(p.stand).0;
                 if due && press_lands(level, &platforms, routes, p, x, row, vx) {
+                    let vine_top = match p.move_ {
+                        RouteMove::Vine { .. } => {
+                            let col = Level::tile_x(x + sim.player().w * 0.5);
+                            vine_run(level, col, row, ph).map(|(_, top)| top)
+                        }
+                        _ => None,
+                    };
                     active = Some(Active {
                         plan: p,
                         ticks: 0,
                         hovering: p.holds_jump(),
                         airborne: false,
                         hops_at_start: hops_closed,
+                        vine_top,
+                        exiting: false,
                     });
                     pending = None;
                     blocked_blocks = 0;

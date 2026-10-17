@@ -60,6 +60,14 @@ pub const DEATH_WINDOW: u32 = 25;
 pub const DEFAULT_BEST_LANES: usize = 4;
 pub const DEFAULT_RANDOM_LANES: usize = 4;
 
+/// Whether the worker prints the cost of each part of a generation to stderr.
+///
+/// Set `LAB_PROFILE=1` to profile a run without a profiler: the writes are stderr-only and only
+/// on this env var's value, so a normal run pays one `env::var_os` per generation.
+fn profiling() -> bool {
+    std::env::var_os("LAB_PROFILE").is_some()
+}
+
 /// A file-name-safe version of a level name.
 ///
 /// The level's *name*, not its file's: a level drawn in the editor has no file until it
@@ -103,9 +111,18 @@ pub fn slug(name: &str) -> String {
 /// the first generation: a fraction of a second at the default pop size, against the generations it
 /// saves.
 fn warm_seed_from_route(level: &Level, cfg: &GaConfig) -> Option<(Vec<Genome>, String)> {
+    let started = Instant::now();
     let eval = cfg.eval_config();
     let imit = ImitateConfig::default();
     let (play, report) = from_route(level, cfg.master_seed, &eval, cfg.shape.clone(), &imit).ok()?;
+    if profiling() {
+        eprintln!(
+            "lab warm route+clone {:?} ({} decisions, {:.0}% agreement)",
+            started.elapsed(),
+            play.decisions.len(),
+            report.agreement * 100.0
+        );
+    }
     let mut rng = sim::rng::rng_from_seed(cfg.master_seed ^ 0x2E5E_ED2E_5EED_2E5E);
     let warm = (cfg.pop_size / 4).max(1);
     let pop = warm_population(
@@ -561,11 +578,42 @@ pub struct Generator {
     /// allows one step per *stall spell* rather than one per run, and never two in the
     /// same spell.
     detour_best: f32,
+    /// The practice detour currently running, if any. See [`Detour`].
+    detour: Option<Detour>,
     traces: TraceLog,
     history: Vec<HistoryPoint>,
     deaths: Vec<(f32, f32, u32)>,
     best_k: usize,
     random_k: usize,
+}
+
+/// One practice detour, running on a thread of its own.
+///
+/// **Why a thread.** A detour is forty generations on an easier level, plus the sweep that
+/// derives that level, plus two file writes — measured at **1.73 s** on `scratch-tower` against
+/// a 20-50 ms median generation. Run between two generations it was a visible freeze: the
+/// window animates the generation it holds for 0.6-5 s, and a detour longer than the animation
+/// leaves the viewer on a still frame with nothing arriving. The lookahead in `evolve_step`
+/// covers one generation of slack; a detour is forty.
+///
+/// So the detour takes a clone of the trainer and works on it. Generations keep arriving from
+/// the run's own population meanwhile, and the practised population is adopted the generation
+/// after the thread finishes — through [`Trainer::adopt`], which exists for exactly this (a
+/// curriculum step hands a population back into a run that owns the history and the ids).
+///
+/// The cost is that the detour's starting point is the stalled population as it was, not as it
+/// would have been after forty more stuck generations — which is a *better* starting point for
+/// the thing the detour is for.
+struct Detour {
+    handle: std::thread::JoinHandle<DetourDone>,
+}
+
+/// What a detour thread hands back.
+struct DetourDone {
+    /// The practised population, or `None` when there was nowhere to practise from.
+    genomes: Option<Vec<Genome>>,
+    /// The note the panel shows. One line per stall spell, exactly as the inline step's was.
+    note: String,
 }
 
 impl Generator {
@@ -619,6 +667,7 @@ impl Generator {
             origin,
             curriculum: None,
             detour_best: f32::NEG_INFINITY,
+            detour: None,
             traces: TraceLog::new(),
             history: Vec::new(),
             deaths: Vec::new(),
@@ -646,6 +695,12 @@ impl Generator {
     #[cfg(test)]
     pub fn level(&self) -> &Level {
         &self.level
+    }
+
+    /// Is a practice detour running on its own thread right now?
+    #[cfg(test)]
+    pub fn detour_in_flight(&self) -> bool {
+        self.detour.is_some()
     }
 
     /// Start over — on the same level after an edit, or on a different one entirely —
@@ -690,6 +745,12 @@ impl Generator {
         self.plan.resume = None;
         self.origin = None;
         self.curriculum = None;
+        // A detour belongs to the run that was stuck, not to the fresh population. It is
+        // detached rather than waited for on purpose: a restart that blocked a second and a
+        // half on a thread nobody will read would be the freeze this thread exists to remove.
+        // Its only side effects are the checkpoint and practice level it writes, which a
+        // restart is about to overwrite anyway.
+        self.detour = None;
     }
 
     /// The viewer's live mutation-rate slider: applied from the next generation on, so a
@@ -699,14 +760,174 @@ impl Generator {
     }
 
     /// Evaluate one generation and package everything the window needs to draw it.
+    /// Append one line to the run's curriculum note. Every step keeps its line: a run that
+    /// practised its way past three spots says so three times, not once.
+    fn push_note(&mut self, note: String) {
+        self.curriculum = Some(match self.curriculum.take() {
+            Some(prev) => format!("{prev}\n{note}"),
+            None => note,
+        });
+    }
+
+    /// Start the stall's practice detour on its own thread. See [`Detour`].
+    ///
+    /// The population is snapshotted, and the arm closes (`detour_best`) before the thread
+    /// starts, so a run that stalls again while the detour is in flight neither starts a second
+    /// one nor re-reports the same spell.
+    fn begin_detour(&mut self, label: String, best: f32) {
+        self.detour_best = best;
+        let mut trainer = self.trainer.clone();
+        let main = self.level.clone();
+        let authored = self.plan.curriculum.clone();
+        let path = self
+            .out_dir
+            .join(format!("{}.population.json", slug(&self.level.name)));
+        let rate = self.cfg.mutation_rate;
+        let main_name = self.level.name.clone();
+        let spawned = thread::Builder::new()
+            .name("practice".into())
+            .spawn(move || {
+                let started = Instant::now();
+                // The authored easier level is the run's first choice (§12 M5). Without one
+                // the run practises *where it is stuck* instead (finding 50): its own level
+                // from the furthest stand its best genome has made. Both are decided here
+                // rather than on the worker: deriving the level is a sweep, and a sweep is
+                // the cost this thread exists to keep off the packet path.
+                let plan = match authored {
+                    Some(c) => Some((c.level, c.generations, false)),
+                    None => match practice_level_for_stall(&trainer, &main) {
+                        Ok(level) => Some((level, DEFAULT_CURRICULUM_GENERATIONS, true)),
+                        Err(reason) => {
+                            return DetourDone {
+                                genomes: None,
+                                note: format!(
+                                    "curriculum: {reason}; the run stays where it is ({label})"
+                                ),
+                            }
+                        }
+                    },
+                };
+                let Some((easier, generations, derived)) = plan else {
+                    return DetourDone {
+                        genomes: None,
+                        note: format!("curriculum: nowhere to practise ({label})"),
+                    };
+                };
+                // The practice detour keeps the main level in its judgement, so what it
+                // learns comes back able to reach the spot it left.
+                let step = if derived {
+                    practice_step(
+                        &mut trainer,
+                        &main,
+                        &easier,
+                        generations,
+                        &path,
+                        rate,
+                        &label,
+                    )
+                } else {
+                    curriculum_step(
+                        &mut trainer,
+                        &main,
+                        &easier,
+                        generations,
+                        &path,
+                        rate,
+                        &label,
+                    )
+                };
+                let done = match step {
+                    Ok(step) => {
+                        let mut note = step.note(&main_name);
+                        if derived {
+                            // The detour's landscape is written beside the checkpoint so it
+                            // can be opened and played; a failed write is part of the note,
+                            // not a lost detour.
+                            if let Err(err) = save_practice_level(&easier, &path) {
+                                note.push_str(&format!(" (practice level not written: {err})"));
+                            }
+                        }
+                        DetourDone {
+                            genomes: Some(trainer.genomes),
+                            note,
+                        }
+                    }
+                    // A step that cannot run is not a reason to lose the run: the stall
+                    // line still says the search has stopped, which is the honest thing to
+                    // leave on screen.
+                    Err(err) => DetourDone {
+                        genomes: None,
+                        note: format!("curriculum step failed: {err}"),
+                    },
+                };
+                if profiling() {
+                    eprintln!(
+                        "lab detour {:?} off the packet path ({})",
+                        started.elapsed(),
+                        label
+                    );
+                }
+                done
+            });
+        match spawned {
+            Ok(handle) => self.detour = Some(Detour { handle }),
+            Err(err) => self.push_note(format!(
+                "curriculum step failed: cannot start the practice thread: {err}"
+            )),
+        }
+    }
+
+    /// Adopt a finished detour. Never blocks: a running one is left alone.
+    fn poll_detour(&mut self) {
+        self.settle_detour(false);
+    }
+
+    /// Adopt the detour, waiting for it if `wait` — the end of a capped run, where the note
+    /// is the last thing the run has to say and no generation is waiting behind this one.
+    fn settle_detour(&mut self, wait: bool) {
+        let Some(detour) = &self.detour else {
+            return;
+        };
+        if !wait && !detour.handle.is_finished() {
+            return;
+        }
+        let detour = self.detour.take().expect("checked just above");
+        match detour.handle.join() {
+            Ok(done) => {
+                let DetourDone { genomes, note } = done;
+                self.push_note(note);
+                if let Some(genomes) = genomes {
+                    if let Err(err) = self.trainer.adopt(genomes) {
+                        self.push_note(format!("curriculum step failed: {err}"));
+                    }
+                }
+            }
+            Err(_) => self.push_note(
+                "curriculum step failed: the practice thread panicked".to_string(),
+            ),
+        }
+    }
+
     pub fn next_packet(&mut self) -> Packet {
+        let t_packet = Instant::now();
+        // A detour that finished since the last generation is adopted *here*, on the
+        // worker, so the population the next generation breeds from is the practised one.
+        self.poll_detour();
         // The population snapshot is taken before breeding, so these are the exact
         // genomes (with the exact ids) the report describes.
         self.trainer.config.mutation_rate = self.cfg.mutation_rate;
+        let t = Instant::now();
         let (report, population) = self.trainer.step_verbose(&self.level);
+        if profiling() {
+            eprintln!("lab step_verbose {:?}", t.elapsed());
+        }
+        let t = Instant::now();
         let showcase = self
             .trainer
             .showcase(&report, &population, self.best_k, self.random_k);
+        if profiling() {
+            eprintln!("lab showcase {:?}", t.elapsed());
+        }
 
         // Labels count within each group rather than using `lane.rank`: the trainer
         // numbers random lanes `best_k + n`, so a rank would name the first outsider
@@ -746,6 +967,7 @@ impl Generator {
         // worth of allocation per generation (~1.2 MB at pop 200) for a vector that is then the
         // only owner of the same data. The `report.results` are borrowed-into by clone instead,
         // because the report itself is still needed for the history and the deaths below.
+        let t = Instant::now();
         let agents: Vec<Agent> = population
             .into_iter()
             .zip(report.results.iter())
@@ -754,6 +976,9 @@ impl Generator {
                 result: result.clone(),
             })
             .collect();
+        if profiling() {
+            eprintln!("lab agents {:?}", t.elapsed());
+        }
 
         // Record the champion's route when it is an improvement (§10 Tier 2.7). Asked
         // *before* paying: the recording costs one extra episode, and a stalled run —
@@ -800,98 +1025,30 @@ impl Generator {
         // derived practice re-arms on every *new* stall spell — a practice run has to
         // work through a spot, keep the gain, and meet the next spot — and never twice
         // within one, so a detour that learns nothing cannot loop (finding 50).
-        let armed = match &self.plan.curriculum {
-            Some(_) => self.curriculum.is_none(),
-            None => report.max_fitness > self.detour_best,
-        };
+        let armed = self.detour.is_none()
+            && match &self.plan.curriculum {
+                Some(_) => self.curriculum.is_none(),
+                None => report.max_fitness > self.detour_best,
+            };
         if armed {
             if let Some(stall) = fitness_stall(&self.history) {
-                // The authored easier level is the run's first choice (§12 M5). Without
-                // one the run practises *where it is stuck* instead (finding 50): its own
-                // level from the furthest stand its best genome has made, so every episode
-                // of the detour is the next move instead of the whole chain. The plan's
-                // `Curriculum` carries its own detour length; the derived one takes the
-                // constant both front-ends share.
-                let plan = match self.plan.curriculum.clone() {
-                    Some(c) => Some((c.level, c.generations, false)),
-                    None => match practice_level_for_stall(&self.trainer, &self.level) {
-                        Ok(p) => Some((p, DEFAULT_CURRICULUM_GENERATIONS, true)),
-                        Err(reason) => {
-                            // Nowhere to practise from joins the note the panel shows:
-                            // the stall line says the search stopped, this says why it
-                            // is not stepping back. Once per stall spell — the arm
-                            // closes until the run finds something better.
-                            self.detour_best = report.max_fitness;
-                            let taken = format!(
-                                "curriculum: {reason}; the run stays where it is ({})",
-                                stall.label()
-                            );
-                            self.curriculum = Some(match self.curriculum.take() {
-                                Some(prev) => format!("{prev}\n{taken}"),
-                                None => taken,
-                            });
-                            None
-                        }
-                    },
-                };
-                if let Some((easier, generations, derived)) = plan {
-                    let path = self
-                        .out_dir
-                        .join(format!("{}.population.json", slug(&self.level.name)));
-                    // The practice detour keeps the main level in its judgement, so
-                    // what it learns comes back able to reach the spot it left.
-                    let step = if derived {
-                        practice_step(
-                            &mut self.trainer,
-                            &self.level,
-                            &easier,
-                            generations,
-                            &path,
-                            self.cfg.mutation_rate,
-                            &stall.label(),
-                        )
-                    } else {
-                        curriculum_step(
-                            &mut self.trainer,
-                            &self.level,
-                            &easier,
-                            generations,
-                            &path,
-                            self.cfg.mutation_rate,
-                            &stall.label(),
-                        )
-                    };
-                    self.detour_best = report.max_fitness;
-                    let taken = match step {
-                        Ok(step) => {
-                            let mut note = step.note(&self.level.name);
-                            if derived {
-                                // The detour's landscape is written beside the
-                                // checkpoint so it can be opened and played; a failed
-                                // write is part of the note, not a lost detour.
-                                if let Err(err) = save_practice_level(&easier, &path) {
-                                    note.push_str(&format!(
-                                        " (practice level not written: {err})"
-                                    ));
-                                }
-                            }
-                            note
-                        }
-                        // A step that cannot run is not a reason to lose the run: the
-                        // stall line still says the search has stopped, which is the
-                        // honest thing to leave on screen.
-                        Err(err) => format!("curriculum step failed: {err}"),
-                    };
-                    // Every step keeps its line: a run that practised its way past
-                    // three spots says so three times, not once.
-                    self.curriculum = Some(match self.curriculum.take() {
-                        Some(prev) => format!("{prev}\n{taken}"),
-                        None => taken,
-                    });
-                }
+                self.begin_detour(stall.label(), report.max_fitness);
             }
         }
 
+        // A capped run must not lose the detour it started: the note, the checkpoint and the
+        // practice level are the run's last artifacts, and an abandoned thread would leave the
+        // window with a curve that has no explanation of where it went. Waiting is bounded by
+        // one detour and happens at the end of the run, which is the one place a stall costs
+        // nobody a frame.
+        let finished = self.plan.cap.is_some_and(|t| run >= t);
+        if finished {
+            self.settle_detour(true);
+        }
+
+        if profiling() {
+            eprintln!("lab packet total {:?} (generation {})", t_packet.elapsed(), report.generation);
+        }
         Packet {
             generation: report.generation,
             max_fitness: report.max_fitness,
@@ -919,9 +1076,9 @@ impl Generator {
             best: self.trainer.best_ever().cloned(),
             target: self.plan.cap,
             level_name: self.level.name.clone(),
-            level_hash: self.level.content_hash_string(),
+            level_hash: self.level.scene_hash_string(),
             curriculum: self.curriculum.clone(),
-            finished: self.plan.cap.is_some_and(|t| run >= t),
+            finished,
         }
     }
 }
@@ -1235,7 +1392,7 @@ impl Lab {
             worker: Some(worker),
             eval: cfg.eval_config(),
             level: level.clone(),
-            level_hash: level.content_hash_string(),
+            level_hash: level.scene_hash_string(),
             level_name: level.name.clone(),
             pop_size: cfg.pop_size,
             asked: true,
@@ -1306,12 +1463,14 @@ impl Lab {
 
     /// Was this run started on the level as it stands now?
     ///
-    /// The hash covers the grid, the spawn and every entity box, so this answers
-    /// "the same level" rather than "the same file name": an edit that matters to the
-    /// physics is an edit that makes the run's numbers a claim about a level nobody can
-    /// see any more.
+    /// The hash covers the grid, the spawn and every entity box — walkers, chasers, flyers,
+    /// turrets and movers ([`Level::scene_hash`]) — so this answers "the same level" rather
+    /// than "the same file name": an edit that matters to the physics is an edit that makes
+    /// the run's numbers a claim about a level nobody can see any more. A chaser placed after
+    /// the run started is exactly such an edit, and leaving it out of the hash is what let the
+    /// evolve view keep drawing a copy of the level the creature had been added to.
     pub fn trained_on(&self, level: &Level) -> bool {
-        self.level_hash == level.content_hash_string()
+        self.level_hash == level.scene_hash_string()
     }
 
     /// Take the generation that is ready, if any, and start animating it.
@@ -1375,7 +1534,7 @@ impl Lab {
     /// Start a fresh run — a new population — on `level`.
     pub fn restart(&mut self, level: &Level, seed: u64) {
         self.level = level.clone();
-        self.level_hash = level.content_hash_string();
+        self.level_hash = level.scene_hash_string();
         self.level_name = level.name.clone();
         self.config.master_seed = seed;
         let mut state = self.hub.state.lock().unwrap();
@@ -1984,6 +2143,42 @@ mod tests {
         assert_eq!(first.packet().level_name, shipped("l3-gauntlet").name);
     }
 
+    /// **A chaser placed after a run started makes the run stale.**
+    ///
+    /// The regression this pins: the run's identity was the terrain hash, which leaves out
+    /// chasers, flyers, turrets and movers. Placing one changed the document but not the hash,
+    /// so the window decided the run was still on "the same level" and kept drawing its own
+    /// stale copy — a chaser visible in Edit and Play and missing in Evolve, which is the one
+    /// view that draws a copy instead of the document.
+    #[test]
+    fn an_entity_placed_after_a_run_starts_makes_its_level_stale() {
+        let level = shipped("l1-flat-run");
+        let lab = Lab::start(
+            &level,
+            tiny_config(),
+            1,
+            1,
+            RunPlan {
+                cap: Some(1),
+                ..RunPlan::default()
+            },
+            scratch("lab-stale-entity"),
+        )
+        .expect("thread starts");
+        assert!(lab.trained_on(&level), "the run starts on the document");
+
+        let mut edited = level.clone();
+        edited.chasers.push(sim::Rect::new(4.0, 8.0, 0.8, 0.8));
+        assert!(
+            edited.content_hash() == level.content_hash(),
+            "a chaser does not change the terrain hash, which champions are keyed on"
+        );
+        assert!(
+            !lab.trained_on(&edited),
+            "but it does change the run's level, so the evolve view must restart on it"
+        );
+    }
+
     /// The window's one write to disk, driven end to end: a real run's best-ever genome
     /// goes out as a champion file and comes back as one this build will replay.
     #[test]
@@ -2127,6 +2322,52 @@ mod tests {
         assert_eq!(last.generation, 59, "a capped run still runs to its cap");
         assert_eq!(last.history.last().map(|p| p.generation), Some(59));
         assert_eq!(last.level_name, shipped("l5-tightrope").name);
+    }
+
+    /// **A stall's detour is handed off, so the generation it fires on is not forty
+    /// generations long.**
+    ///
+    /// The freeze this pins: the practice detour used to run between two generations, so the
+    /// packet that carried it took 1.73 s on `scratch-tower` against a 20-50 ms median, and the
+    /// window — which only animates what the worker hands it — sat on a still frame for the
+    /// difference. The packet now returns at its usual cost with the detour on a thread, and the
+    /// next generation arrives while that thread is still working.
+    #[test]
+    fn a_stall_hands_its_practice_detour_to_another_thread() {
+        let mut generator = generator_with(
+            "l5-tightrope",
+            stalling_config(),
+            RunPlan {
+                cap: Some(60),
+                ..RunPlan::default()
+            },
+            "practice-thread",
+        );
+        let mut stall_packet = None;
+        let mut afterwards = None;
+        for _ in 0..60 {
+            let packet = generator.next_packet();
+            if fitness_stall(&packet.history).is_some() {
+                if stall_packet.is_none() {
+                    stall_packet = Some((packet.generation, generator.detour_in_flight()));
+                } else if let Some((at, _)) = stall_packet {
+                    if packet.generation > at {
+                        afterwards = Some(packet.generation);
+                        break;
+                    }
+                }
+            }
+        }
+        let (at, in_flight) = stall_packet.expect("the run has to stall for this to say anything");
+        assert!(
+            in_flight,
+            "the detour has to be on another thread the moment the stall's packet is returned: \
+             inline it is the 1.7 s freeze this test exists for"
+        );
+        assert!(
+            afterwards.is_some_and(|g| g > at),
+            "the generation after the stall must arrive without waiting for the detour"
+        );
     }
 
     /// A run without an easier level never steps back, however long it sits still: the
@@ -2389,6 +2630,42 @@ mod tests {
             "nothing to declare about a population nobody handed over"
         );
         assert_eq!(generator.next_packet().generation, 0);
+    }
+
+    /// Print what each part of a generation costs, on a run big enough to see the hitches in.
+    ///
+    /// Ignored because it is an instrument, not an assertion: it trains for real and prints to
+    /// stderr. Run it with
+    /// `cargo test -p app --release --lib profile_generations -- --ignored --nocapture` and read
+    /// the `lab ...` lines. It exists because "the UI freezes" is not a bug report a profiler can
+    /// take: the phases that can stall a frame are named here, so the next measurement says which.
+    #[test]
+    #[ignore]
+    fn profile_generations() {
+        let level = shipped("scratch-tower");
+        let cfg = GaConfig {
+            pop_size: 200,
+            ..GaConfig::default()
+        };
+        let started = Instant::now();
+        let mut generator = Generator::new(
+            level,
+            cfg,
+            DEFAULT_BEST_LANES,
+            DEFAULT_RANDOM_LANES,
+            RunPlan::default(),
+            scratch("profile"),
+        )
+        .expect("a fresh generator starts");
+        eprintln!("lab Generator::new (warm start) {:?}", started.elapsed());
+        for _ in 0..120 {
+            let packet = generator.next_packet();
+            eprintln!(
+                "lab gen {} max {:.0}",
+                packet.generation,
+                packet.history.last().map(|h| h.max_fitness).unwrap_or(0.0)
+            );
+        }
     }
 
     #[test]

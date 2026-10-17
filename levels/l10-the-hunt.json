@@ -1,0 +1,60 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 2,
+  "name": "L10-the-hunt",
+  "width": 60,
+  "height": 15,
+  "spawn": {
+    "x": 2,
+    "y": 12
+  },
+  "tiles": [
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............................................................",
+    "............=======.........................................",
+    "............................................................",
+    "##########............##############.....###################",
+    "##########............##############.....###################"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 57,
+      "y": 12
+    },
+    {
+      "type": "chaser",
+      "x": 26,
+      "y": 12
+    },
+    {
+      "type": "turret",
+      "x": 31,
+      "y": 12,
+      "dir": -1
+    },
+    {
+      "type": "flyer",
+      "x": 15,
+      "y": 8,
+      "span": 12
+    },
+    {
+      "type": "platform",
+      "x": 35,
+      "y": 12,
+      "tiles": 3,
+      "span": 4
+    }
+  ],
+  "_notes": "The demo level for the enemies-and-objects pass, and the one the pack keeps as a reference for what each new thing is for. **A one-way shelf** (row 11, columns 12-18) is the only way across the first pit: it is ground from above and air from below, so the jump up through it and the landing on top are one move. **A flyer** (row 8, a twelve-tile beat over the whole first pit) makes the crossing a timing problem rather than a jump. **A chaser** (column 26) hunts along the middle ledge and stops at its edge instead of falling in. **A turret** (column 31, facing left) makes that ledge's row dangerous on a clock, so the answer is a route that spends as little time on it as possible. **A moving platform** (columns 35-37, sliding four tiles right) is the shortcut across the last five-tile pit, which a sprint jump also clears: the oracle does not model a mover, so a level that needed one would read unbeatable, and the demo has to be beatable without it."
+}

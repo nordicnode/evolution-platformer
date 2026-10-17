@@ -28,7 +28,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::level::{Level, Rect};
-use crate::physics::{AgentAction, Physics, PlayerState, TickContact, PHYSICS};
+use crate::physics::{
+    vine_mantle_anchor, AgentAction, Physics, PlayerState, TickContact, PHYSICS,
+};
 
 /// How long a single canonical jump trajectory may run.
 pub const MAX_TRAJECTORY_TICKS: u32 = 240;
@@ -40,6 +42,28 @@ pub const MAX_TRAJECTORY_TICKS: u32 = 240;
 /// 150 ticks, and the cap is four times that so a tall shaft is not called unclimbable
 /// because the oracle gave up early.
 pub const MAX_CLIMB_TICKS: u32 = 600;
+
+/// How long a canonical swim may run: twenty seconds of water time.
+///
+/// A swim is the slowest move in the game — the water caps a body at
+/// [`Physics::water_speed`] (0.06 tiles a tick) — so the jump-sized budget of
+/// [`MAX_TRAJECTORY_TICKS`] covers only fourteen tiles of pool, and a level with a forty-tile
+/// lake was reported unreachable for no reason but the cap. Twenty seconds is 72 tiles at the
+/// swim cap, which is longer than any shipped level, and it costs the sweep nothing on a
+/// level with no water in it: the script is only run from a platform beside a pool.
+pub const MAX_SWIM_TICKS: u32 = 1200;
+
+/// Ticks one swim stroke is held, and how many of them release the jump.
+///
+/// A body swims while the button is down and sinks slowly while it is up, and a *fresh*
+/// press at the surface is what breaches the pool's lip (see `PlayerState::breach`). A
+/// swimmer therefore has to let go now and then — that is what mashing jump does — so the
+/// script pulses: five ticks held, one released. The release is the shortest one that a
+/// fresh press can follow, and five held ticks still move the body at the swim rate, so the
+/// crossing loses about an eighth of a tile to each stroke and nothing else.
+pub const SWIM_STROKE_TICKS: u32 = 6;
+/// Ticks of a swim stroke during which the jump is held (`SWIM_STROKE_TICKS - 1`).
+const SWIM_HOLD_TICKS: u32 = SWIM_STROKE_TICKS - 1;
 
 /// Which abilities the oracle is allowed to use.
 ///
@@ -61,6 +85,22 @@ pub struct ReachOptions {
     /// unreachable — which is how the shape the owner reported is pinned as a *pad* level rather
     /// than merely a beatable one.
     pub spring: bool,
+    /// Whether a body may swim across a pool.
+    ///
+    /// Water is not an obstacle, it is a medium: a body that walks in is caught by it, crosses
+    /// at [`Physics::water_speed`] and breaches out of the far lip. A level whose only route is
+    /// a wide pool was reported unreachable while the game crossed it without a jump, because a
+    /// canonical *jump* falls through water and the oracle had no other move to try. Off, that
+    /// level reads unreachable again — which is how the crossing is pinned as a swim rather than
+    /// as a jump that happens to land.
+    pub swim: bool,
+    /// Whether a body may climb a vine.
+    ///
+    /// The vine is the one route in the game that needs no jump at all: a body that overlaps a
+    /// vine while airborne and holds jump goes up it. With the move switched off, a level whose
+    /// only way up is a hanging vine is unreachable — which is what the oracle used to answer
+    /// about every one of them, and why no route graph could point a population at a vine.
+    pub vine: bool,
 }
 
 impl Default for ReachOptions {
@@ -69,6 +109,8 @@ impl Default for ReachOptions {
             sprint: true,
             wall_climb: true,
             spring: true,
+            swim: true,
+            vine: true,
         }
     }
 }
@@ -112,7 +154,30 @@ impl Default for ReachOptions {
 /// expensive to find: a v3 sidecar survived the first change, so the same terrain answered with two
 /// different routes under one version — green on the machine holding the cache, red in CI, which
 /// rebuilds the graph from the terrain.
-pub const MOVE_SET_VERSION: u32 = 4;
+/// v5: the oracle learned the game's two **media** — a swim across a pool and a climb up a
+/// vine. Both are canonical scripts over the real stepper, like the wall climb, and both add
+/// moves the jump sweep could not express: water is not solid, so a jump into it never lands,
+/// and a vine is not a wall, so a climb finds nothing to press against. Every cached verdict and
+/// route graph from v4 is a miss rather than a stale answer about terrain the game crosses.
+/// v6: a **jump that catches a vine is no longer a jump**. The ballistic sweep used to hold the
+/// jump button through a vine in its flight path and record the climb as a jump edge, which handed
+/// the route graph a plan ("jump from three tiles to the left") whose landing only replays if the
+/// body happens to grab the vine on the way. A vine move owns that landing; the jump sweep gives it
+/// up. No script changed, but which plan an edge stores did — the same kind of change as v4, and
+/// the same reason the cache keys on this constant rather than on the sim version.
+/// v7: **a vine's own block is a route.** Holding the climb at the top of a vine whose run ends
+/// under a one-tile-thick block now hauls the body onto that block — the physics' pull-up — so
+/// the sweep's vine edges can land on a stand *above* the vine instead of only beside it. The
+/// move set changed rather than the terrain: an old answer that called a vine under a lid a dead
+/// end is a stale answer about a move the game now has, which is exactly what this constant is
+/// for.
+/// v8: **the flag's own stand is a stand a body can reach the flag from.** The graph took the
+/// topmost stand sharing the flag's *column* as the flag's ground, which was true of every flag
+/// standing on a floor and false of one near the top of a level: the floor seven tiles below
+/// shares the column, so a body under a vine was told it was already home and the route walked it
+/// to the flag's x instead of up the vine. No canonical move changed; the graph's own answer did,
+/// and a cached route is an answer about exactly that, so the stamp moves with it.
+pub const MOVE_SET_VERSION: u32 = 8;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -348,6 +413,10 @@ pub struct MoveEdge {
     pub jump: CulpritJump,
     /// The side the wall is on, when this move is a canonical climb rather than one jump.
     pub climb: Option<TakeoffDir>,
+    /// The direction of travel and whether the entry was a dive, when this move is a swim.
+    pub swim: Option<(TakeoffDir, bool)>,
+    /// The exit side, when this move is a vine climb.
+    pub vine: Option<TakeoffDir>,
 }
 
 /// A single canonical jump at a single spot: enough to name the culprit in the
@@ -629,6 +698,23 @@ fn simulate_jump_with(
         if let Some(end) = trajectory_terminal(level, &player, &contact, t + 1) {
             return end;
         }
+        // **A jump that catches a vine is not a jump.** The sim will happily hold the button
+        // through a vine in the flight path and climb it — true of the game, and it is why a vine
+        // in a jump's arc used to appear as a jump edge. But a route plan has to name the move the
+        // body makes: a jump at a take-off a tile to the left of the vine cannot be replayed by
+        // standing under the vine, and a plan that says "jump" while the body climbs is a plan the
+        // replay can only stumble into. The vine script ([`simulate_vine_climb`]) owns that move,
+        // so the ballistic sweep gives its landing up to it.
+        if player.on_vine {
+            return Trajectory {
+                landed_on: None,
+                landed_at: None,
+                touched_goal: false,
+                hit_spike: false,
+                fell_out: false,
+                ticks: t + 1,
+            };
+        }
         if contact.landed && airborne && !launched {
             // Landing back on the take-off platform with no forward progress is
             // not an edge; it is reported as "landed here" and filtered by BFS.
@@ -698,8 +784,13 @@ fn hazard_start(level: &Level, player: &PlayerState) -> Option<Trajectory> {
     // only in that band is a legal take-off. Asking the oracle a *stricter* question than
     // the game asks would be the false negative the sweep exists to avoid.
     let inside = (hy0..=hy1).any(|ty| {
-        (hx0..=hx1)
-            .any(|tx| level.is_spike(tx, ty) && body.overlaps(&crate::physics::spike_lethal_box(tx, ty)))
+        (hx0..=hx1).any(|tx| {
+            (level.is_spike(tx, ty)
+                && body.overlaps(&crate::physics::spike_lethal_box(tx, ty)))
+                // Lava is the whole cell, so the sweep asks the same question the sim does.
+                || (level.is_lava(tx, ty)
+                    && body.overlaps(&crate::level::Rect::new(tx as f32, ty as f32, 1.0, 1.0)))
+        })
     });
     inside.then_some(Trajectory {
         landed_on: None,
@@ -722,7 +813,7 @@ fn trajectory_terminal(
     contact: &crate::physics::TickContact,
     ticks: u32,
 ) -> Option<Trajectory> {
-    if contact.touched_spike {
+    if contact.touched_spike || contact.touched_lava {
         return Some(Trajectory {
             landed_on: None,
             landed_at: None,
@@ -883,6 +974,342 @@ pub fn climb_action(dir: TakeoffDir, t: u32, ph: &Physics) -> AgentAction {
         script.jump
     } else {
         script.press
+    }
+}
+
+/// The arm for a direction and a jump, as every canonical script names one.
+///
+/// One function so the swim, the vine and the jump sweep cannot disagree about which action
+/// "right, holding jump" is — the pick is the same one [`trajectory_action`] makes, and a gear
+/// added to [`AgentAction`] has one place to be read.
+fn arm(dir: TakeoffDir, jump: bool) -> AgentAction {
+    match (dir, jump) {
+        (TakeoffDir::Right, true) => AgentAction::SprintJump,
+        (TakeoffDir::Right, false) => AgentAction::Sprint,
+        (TakeoffDir::Left, true) => AgentAction::RetreatSprintJump,
+        (TakeoffDir::Left, false) => AgentAction::RetreatSprint,
+        (TakeoffDir::Still, true) => AgentAction::JumpInPlace,
+        (TakeoffDir::Still, false) => AgentAction::Walk,
+    }
+}
+
+/// Where a body can **enter the water** from `p`: a take-off position, and the side the pool
+/// is on.
+///
+/// Only the platform's two ends are swept — water is something a body walks, falls or dives
+/// *off* an edge into — and the test is the body's leading edge: a pool one column past the
+/// ledge is a walk-off, a pool four columns past it is a dive, and a pool further than that is
+/// not this level's crossing (a jump over it is the jump sweep's). The scan looks a few rows
+/// down as well as across, because a canal is usually *below* the bank it is entered from.
+fn swim_starts(level: &Level, p: &Platform) -> Vec<(f32, TakeoffDir)> {
+    let mut out = Vec::new();
+    for (col, dir) in [(p.x1, TakeoffDir::Right), (p.x0, TakeoffDir::Left)] {
+        for &offset in &TAKEOFF_OFFSETS {
+            let x = col as f32 + offset;
+            if !takeoff_fits(level, x, p.surface_row, &PHYSICS) {
+                continue;
+            }
+            let lead = match dir {
+                TakeoffDir::Right => x + PHYSICS.player_w,
+                TakeoffDir::Left => x,
+                TakeoffDir::Still => continue,
+            };
+            if water_ahead(level, lead, p.surface_row, dir) {
+                out.push((x, dir));
+            }
+        }
+    }
+    out
+}
+
+/// Is there water at or below the body's leading edge, within a walk or a dive of it?
+///
+/// Four columns: a running jump reaches four tiles, and a body that leaves the bank with the
+/// direction held is a body that will be over the pool. Three rows down: a canal under a raised
+/// bank is still the pool the body falls into.
+fn water_ahead(level: &Level, lead_x: f32, surface_row: i32, dir: TakeoffDir) -> bool {
+    let sign = dir.sign() as i32;
+    let col = lead_x.floor() as i32;
+    (0..=4).any(|step| {
+        (-1..=3).any(|dy| level.is_water(col + sign * step, surface_row + dy))
+    })
+}
+
+/// The tick-by-tick action of a canonical **swim**, as both the oracle and a replayed route
+/// issue it.
+///
+/// An approach while the body is in the air, then a stroke pulse once it is in the water: the
+/// button held for [`SWIM_HOLD_TICKS`] of every [`SWIM_STROKE_TICKS`] so a fresh press reaches
+/// the surface now and then (a held press is never a new one, and only a new one breaches a
+/// pool's lip). `dive` is whether the entry was a jump — which is the whole difference between
+/// walking into a canal and throwing the body across the gap before it.
+pub fn swim_action(dir: TakeoffDir, dive: bool, in_water: bool, t: u32) -> AgentAction {
+    let jump = if in_water {
+        t % SWIM_STROKE_TICKS < SWIM_HOLD_TICKS
+    } else {
+        dive
+    };
+    // **A run, never a sprint.** The sprint arms exist to build a take-off speed; a swimmer's
+    // gear does not matter to the water (it clamps the body to `water_speed`), and on the release
+    // tick — the one tick a stroke spends at the surface — a sprint arm would accelerate the
+    // body *out* of the pool's cap and skate it across the remaining tiles at sprint speed. That
+    // is not a stroke, it is a boat, and it crossed a pool in the test's `a_swim` fixture that a
+    // swim should take twice as long over.
+    match (dir, jump) {
+        (TakeoffDir::Left, true) => AgentAction::RetreatJump,
+        (TakeoffDir::Left, false) => AgentAction::Retreat,
+        (TakeoffDir::Still, true) => AgentAction::JumpInPlace,
+        (TakeoffDir::Still, false) => AgentAction::Walk,
+        (TakeoffDir::Right, true) => AgentAction::RunJump,
+        (TakeoffDir::Right, false) => AgentAction::Run,
+    }
+}
+
+/// Simulate one canonical swim with the real physics stepper.
+pub fn simulate_swim(
+    level: &Level,
+    platforms: &[Platform],
+    takeoff_x: f32,
+    surface_row: i32,
+    dir: TakeoffDir,
+    dive: bool,
+) -> Trajectory {
+    simulate_swim_with(
+        level,
+        platforms,
+        takeoff_x,
+        surface_row,
+        dir,
+        dive,
+        ReachOptions::default(),
+    )
+}
+
+/// [`simulate_swim`] with the oracle's abilities in the caller's hands.
+///
+/// The body starts standing at the lip with the run speed the platform's runway allows, so a
+/// dive that needs a run-up has it and a pool beside a two-tile ledge is entered at a walk. From
+/// there the script is [`swim_action`]'s, and every tick is the sim's own — water drag, the sink,
+/// the stroke, the breach and the force of the pool's far wall are all the game's, not a second
+/// statement of them. The trajectory ends where any other does: on a platform, at the flag, on a
+/// hazard, in the void, or at [`MAX_SWIM_TICKS`].
+fn simulate_swim_with(
+    level: &Level,
+    platforms: &[Platform],
+    takeoff_x: f32,
+    surface_row: i32,
+    dir: TakeoffDir,
+    dive: bool,
+    options: ReachOptions,
+) -> Trajectory {
+    let ph = &PHYSICS;
+    let mut player = PlayerState::spawn(level, ph);
+    player.w = ph.player_w;
+    player.h = ph.player_h;
+    player.x = takeoff_x;
+    player.y = surface_row as f32 - ph.player_h;
+    // The body leaves the bank with the speed it could have built behind it: the swim itself is
+    // capped at the water's rate, but the dive across a gap is a jump and needs the run-up.
+    player.vx = dir.sign() * LaunchSpeed::Run.achievable(ph, 4.0);
+    player.set_speed_cap(player.vx.abs().max(ph.run_speed));
+    player.vy = 0.0;
+    player.grounded = true;
+    if let Some(death) = hazard_start(level, &player) {
+        return death;
+    }
+
+    let mut airborne = false;
+    let mut entered_water = false;
+    for t in 0..MAX_SWIM_TICKS {
+        let action = swim_action(dir, dive, player.in_water, t);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        if player.in_water {
+            entered_water = true;
+        }
+        if !player.grounded {
+            airborne = true;
+        }
+        if let Some(end) = trajectory_terminal(level, &player, &contact, t + 1) {
+            return end;
+        }
+        // Only a landing **after the water** is this move's landing. A body that walks off the
+        // lip and touches down again on the bank — or jumps clean over the pool — is not a swim,
+        // and the jump sweep already has that edge; counting it here would credit the water for a
+        // crossing that never got wet.
+        if contact.landed && airborne && !launched && entered_water {
+            return landed_trajectory(level, platforms, &player, t + 1);
+        }
+    }
+    Trajectory {
+        landed_on: None,
+        landed_at: None,
+        touched_goal: false,
+        hit_spike: false,
+        fell_out: false,
+        ticks: MAX_SWIM_TICKS,
+    }
+}
+
+/// The contiguous run of vine cells a body standing on `p` can reach from `(col, surface_row)`:
+/// `(bottom, top)` rows, when there is one.
+///
+/// The lowest cell has to be within a standing jump of the body's head — the body jumps from
+/// rest and grabs the first vine it overlaps on the way up — and the run is the **contiguous**
+/// shaft above it, because a body hanging on a vine does not pass a gap: it leaves the vine, and
+/// the climb is over.
+pub fn vine_run(level: &Level, col: i32, surface_row: i32, ph: &Physics) -> Option<(i32, i32)> {
+    let reach = (ph.player_h + ph.discrete_max_jump_height()).ceil() as i32 + 1;
+    for dy in 1..=reach {
+        let row = surface_row - dy;
+        if !level.is_vine(col, row) {
+            continue;
+        }
+        let mut top = row;
+        while top > 0 && level.is_vine(col, top - 1) {
+            top -= 1;
+        }
+        return Some((row, top));
+    }
+    None
+}
+
+/// Where a body can **grab a vine** from `p`: a take-off position under a reachable vine, and the
+/// top of that vine's run (what the exit is timed against).
+fn vine_starts(level: &Level, p: &Platform) -> Vec<f32> {
+    let mut out = Vec::new();
+    for col in p.x0..=p.x1 {
+        let x = col as f32 + (1.0 - PHYSICS.player_w) * 0.5;
+        if !takeoff_fits(level, x, p.surface_row, &PHYSICS) {
+            continue;
+        }
+        if let Some((_, top)) = vine_run(level, col, p.surface_row, &PHYSICS) {
+            // Water wins the medium, so a vine in a flooded shaft is not a climb the game has.
+            let flooded = (top..=p.surface_row).any(|row| level.is_water(col, row));
+            if !flooded {
+                out.push(x);
+            }
+        }
+    }
+    out
+}
+
+/// The tick-by-tick action of a canonical **vine climb**, as both the oracle and a replayed
+/// route issue it.
+///
+/// Three phases, and the middle one is the whole mechanic: jump to reach the vine, hold jump
+/// with **no direction** so the body climbs it (a direction would walk the body off the vine),
+/// and press the exit side once its feet are level with the vine's top — which is the height of
+/// the ledge the vine hangs beside. State rather than a tick count, because a replayed body does
+/// not stand on exactly the swept pixel.
+///
+/// `exit` is [`TakeoffDir::Still`] for a vine that hangs under a **block** rather than beside a
+/// ledge: there is nothing to press off, so the arm never changes — the climb is held to the top
+/// and the physics' own pull-up carries the body over the block ([`vine_mantle_anchor`]). The
+/// script is still the same three phases read as two, which is why this is one function.
+///
+/// `feet` is the body's bottom edge; `on_vine` is the sim's own reading of the medium.
+pub fn vine_action(
+    exit: TakeoffDir,
+    on_vine: bool,
+    feet: f32,
+    top_row: i32,
+    exiting: &mut bool,
+) -> AgentAction {
+    if *exiting {
+        return arm(exit, true);
+    }
+    if on_vine && feet <= top_row as f32 + 0.9 {
+        *exiting = true;
+        return arm(exit, true);
+    }
+    // Climb straight up, with the jump held. On the way up from the ground this is also the
+    // jump that catches the vine, which is why there is no separate grab phase.
+    AgentAction::JumpInPlace
+}
+
+/// Simulate one canonical vine climb with the real physics stepper.
+///
+/// `exit` is the side the body leaves toward, or [`TakeoffDir::Still`] for the pull-up over the
+/// block the vine hangs from — see [`vine_action`] and [`vine_mantle_anchor`].
+pub fn simulate_vine_climb(
+    level: &Level,
+    platforms: &[Platform],
+    start_x: f32,
+    surface_row: i32,
+    exit: TakeoffDir,
+) -> Trajectory {
+    simulate_vine_climb_with(
+        level,
+        platforms,
+        start_x,
+        surface_row,
+        exit,
+        ReachOptions::default(),
+    )
+}
+
+/// [`simulate_vine_climb`] with the oracle's abilities in the caller's hands.
+fn simulate_vine_climb_with(
+    level: &Level,
+    platforms: &[Platform],
+    start_x: f32,
+    surface_row: i32,
+    exit: TakeoffDir,
+    options: ReachOptions,
+) -> Trajectory {
+    let ph = &PHYSICS;
+    // The vine's top is a property of the level, so the caller names the position and this
+    // function reads the run — one implementation of "where does this climb end" for the
+    // sweep, the replay and the press check.
+    let col = Level::tile_x(start_x + ph.player_w * 0.5);
+    let top_row = match vine_run(level, col, surface_row, ph) {
+        Some((_, top)) => top,
+        // Nothing to grab: the move is a jump that lands where it started, which the graph
+        // drops. Reporting it as a death would blame the level for the sweep's mistake.
+        None => {
+            return Trajectory {
+                landed_on: None,
+                landed_at: None,
+                touched_goal: false,
+                hit_spike: false,
+                fell_out: false,
+                ticks: 0,
+            }
+        }
+    };
+    let mut player = PlayerState::spawn(level, ph);
+    player.w = ph.player_w;
+    player.h = ph.player_h;
+    player.x = start_x;
+    player.y = surface_row as f32 - ph.player_h;
+    player.grounded = true;
+    if let Some(death) = hazard_start(level, &player) {
+        return death;
+    }
+
+    let mut airborne = false;
+    let mut exiting = false;
+    for t in 0..MAX_CLIMB_TICKS {
+        let feet = player.y + player.h;
+        let action = vine_action(exit, player.on_vine, feet, top_row, &mut exiting);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        if !player.grounded {
+            airborne = true;
+        }
+        if let Some(end) = trajectory_terminal(level, &player, &contact, t + 1) {
+            return end;
+        }
+        if contact.landed && airborne && !launched {
+            return landed_trajectory(level, platforms, &player, t + 1);
+        }
+    }
+    Trajectory {
+        landed_on: None,
+        landed_at: None,
+        touched_goal: false,
+        hit_spike: false,
+        fell_out: false,
+        ticks: MAX_CLIMB_TICKS,
     }
 }
 
@@ -1090,7 +1517,106 @@ fn edges_from_all_with(
                         to: traj.landed_on.filter(|q| *q != p.id),
                     },
                     climb: Some(dir),
+                    swim: None,
+                    vine: None,
                 });
+            }
+        }
+        // The two media. Both are swept from a platform's own ends only — water is entered off
+        // an edge and a vine is grabbed from under it — so the cost is a handful of scripts per
+        // platform rather than the jump sweep's whole grid.
+        if options.swim {
+            for (start_x, dir) in swim_starts(level, p) {
+                for dive in [false, true] {
+                    let traj = simulate_swim_with(
+                        level,
+                        landing,
+                        start_x,
+                        p.surface_row,
+                        dir,
+                        dive,
+                        *options,
+                    );
+                    edges.push(MoveEdge {
+                        traj,
+                        jump: CulpritJump {
+                            from: p.id,
+                            takeoff_x: start_x.floor() as i32,
+                            takeoff_offset: start_x.fract(),
+                            dir,
+                            hold: if dive { JumpHold::Full } else { JumpHold::None },
+                            speed: LaunchSpeed::Run,
+                            to: traj.landed_on.filter(|q| *q != p.id),
+                        },
+                        climb: None,
+                        swim: Some((dir, dive)),
+                        vine: None,
+                    });
+                }
+            }
+        }
+        if options.vine {
+            for start_x in vine_starts(level, p) {
+                for exit in [TakeoffDir::Left, TakeoffDir::Right] {
+                    let traj = simulate_vine_climb_with(
+                        level,
+                        landing,
+                        start_x,
+                        p.surface_row,
+                        exit,
+                        *options,
+                    );
+                    edges.push(MoveEdge {
+                        traj,
+                        jump: CulpritJump {
+                            from: p.id,
+                            takeoff_x: start_x.floor() as i32,
+                            takeoff_offset: start_x.fract(),
+                            dir: exit,
+                            hold: JumpHold::Full,
+                            speed: LaunchSpeed::Rest,
+                            to: traj.landed_on.filter(|q| *q != p.id),
+                        },
+                        climb: None,
+                        swim: None,
+                        vine: Some(exit),
+                    });
+                }
+                // The third way out of a vine: **over the block it hangs from.** A vine beside a
+                // ledge is left sideways (the two moves above); a vine whose run ends under a
+                // one-tile lid has no sideways exit at all, and the pull-up is the only way on.
+                // Swept from the same take-off only when the geometry answers yes, so the graph is
+                // not given a climb that ends nowhere on every ordinary vine.
+                let col = Level::tile_x(start_x + PHYSICS.player_w * 0.5);
+                let mantle = vine_run(level, col, p.surface_row, &PHYSICS)
+                    .and_then(|(_, top)| vine_mantle_anchor(level, &PHYSICS, col, top));
+                if mantle.is_some() {
+                    let traj = simulate_vine_climb_with(
+                        level,
+                        landing,
+                        start_x,
+                        p.surface_row,
+                        TakeoffDir::Still,
+                        *options,
+                    );
+                    edges.push(MoveEdge {
+                        traj,
+                        jump: CulpritJump {
+                            from: p.id,
+                            takeoff_x: start_x.floor() as i32,
+                            takeoff_offset: start_x.fract(),
+                            // Straight up, with nothing pressed sideways: the climb is the arm and
+                            // the pull-up at its top is the move.
+                            dir: TakeoffDir::Still,
+                            hold: JumpHold::Full,
+                            speed: LaunchSpeed::Rest,
+                            to: traj.landed_on.filter(|q| *q != p.id),
+                        },
+                        climb: None,
+                        swim: None,
+                        vine: Some(TakeoffDir::Still),
+                    });
+                }
             }
         }
         out.push(edges);
@@ -1153,6 +1679,8 @@ fn edges_at_column(
                             to: traj.landed_on.filter(|q| *q != p.id),
                         },
                         climb: None,
+                        swim: None,
+                        vine: None,
                     });
                 }
             }
@@ -1174,6 +1702,8 @@ fn edges_at_column(
                         to: traj.landed_on.filter(|q| *q != p.id),
                     },
                     climb: None,
+                    swim: None,
+                    vine: None,
                 });
             }
         }
@@ -1348,10 +1878,23 @@ fn diagnose(
         })
         .collect();
 
+    // The next surface may be **above** the reachable one rather than beside it, and a level
+    // whose route climbs is exactly the level a "gap to the right" reading misdescribes. So a
+    // platform qualifies when it is not reached, not below the frontier, and either starts past
+    // the frontier's right edge or rises above it; the pick is the nearest on both axes.
     let target = platforms
         .iter()
-        .filter(|p| p.surface_row <= from.surface_row && p.x0 > from.x1)
-        .min_by_key(|p| p.x0 - from.x1);
+        .filter(|p| p.id != from.id && !reached[p.id])
+        .filter(|p| {
+            p.surface_row <= from.surface_row
+                && (p.x0 > from.x1 || p.surface_row < from.surface_row)
+        })
+        .min_by_key(|p| {
+            (
+                (p.x0 - from.x1).max(0),
+                (from.surface_row - p.surface_row).abs(),
+            )
+        });
 
     let message = match target {
         Some(t) => {
@@ -1489,6 +2032,14 @@ pub enum RouteMove {
     Jump(Takeoff),
     /// Climb the wall on this side, from the take-off position.
     Climb { dir: TakeoffDir },
+    /// Swim this way from the take-off position; `dive` is a jump into the pool rather than a
+    /// walk off the lip.
+    Swim { dir: TakeoffDir, dive: bool },
+/// Grab the vine overhead and climb it, leaving toward `exit`.
+///
+/// [`TakeoffDir::Still`] is the third exit: a vine that hangs from a **block** with air above it is
+/// climbed straight up and pulled over, and the body ends on the block rather than beside it.
+Vine { exit: TakeoffDir },
 }
 
 impl RouteEdge {
@@ -1501,6 +2052,12 @@ impl RouteEdge {
     fn demand(&self) -> (u8, u8) {
         match self.plan {
             RouteMove::Climb { .. } => (3, 3),
+            // A vine is a climb: many presses, and only worth taking when nothing simpler
+            // reaches the same ledge.
+            RouteMove::Vine { .. } => (3, 2),
+            // A swim is a walk that happens to be wet: it asks for no jump (a dive asks for one
+            // and is still a single press), and its price is time rather than demand.
+            RouteMove::Swim { dive, .. } => (0, u8::from(dive)),
             RouteMove::Jump(t) => {
                 let speed = match t.speed {
                     LaunchSpeed::Rest => 0,
@@ -1530,19 +2087,19 @@ impl RouteEdge {
         let Some((col, _)) = self.landed_at else {
             return 0;
         };
-        match self.plan {
-            RouteMove::Jump(Takeoff {
-                dir: TakeoffDir::Left,
-                ..
-            }) => landing.2 - col,
+        let dir = match self.plan {
+            RouteMove::Jump(Takeoff { dir, .. }) => dir,
+            RouteMove::Swim { dir, .. } => dir,
+            RouteMove::Vine { exit } => exit,
+            RouteMove::Climb { .. } => TakeoffDir::Still,
+        };
+        match dir {
+            TakeoffDir::Left => landing.2 - col,
             // A climb arrives at the wall's top and a still jump comes down where it left: neither
-            // crosses anything, so neither has a margin to speak of.
-            RouteMove::Jump(Takeoff {
-                dir: TakeoffDir::Still,
-                ..
-            })
-            | RouteMove::Climb { .. } => 0,
-            RouteMove::Jump(_) => col - landing.1,
+            // crosses anything, so neither has a margin to speak of. A vine's landing *is* a
+            // crossing (off the vine, onto the ledge), so it keeps its margin.
+            TakeoffDir::Still => 0,
+            TakeoffDir::Right => col - landing.1,
         }
     }
 }
@@ -1764,9 +2321,11 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
                 touches_flag: traj.touched_goal,
                 takeoff_x: jump.takeoff_x as f32 + jump.takeoff_offset,
                 surface_row: stands[i].0,
-                plan: match edge_move.climb {
-                    Some(dir) => RouteMove::Climb { dir },
-                    None => RouteMove::Jump(Takeoff::with_runway(
+                plan: match (edge_move.climb, edge_move.swim, edge_move.vine) {
+                    (Some(dir), _, _) => RouteMove::Climb { dir },
+                    (_, Some((dir, dive)), _) => RouteMove::Swim { dir, dive },
+                    (_, _, Some(exit)) => RouteMove::Vine { exit },
+                    _ => RouteMove::Jump(Takeoff::with_runway(
                         jump.dir,
                         jump.hold,
                         jump.speed,
@@ -1806,7 +2365,16 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
         stands
             .iter()
             .enumerate()
-            .filter(|(_, &(r, x0, x1))| r as f32 >= g.y && col >= x0 && col <= x1)
+            // The flag's column, **and a surface a body standing there can reach it from.** The
+            // column test alone was wrong for a flag near the top of a level: the ground seven
+            // tiles below it shares the column, so it was taken as the flag's own stand, and the
+            // route graph then answered "you are already home" to a body standing under a vine it
+            // had to climb. A flag whose ground is out of standing reach is not that stand's goal —
+            // the move that wins is the *crossing* that touches it in flight (`touches_flag`), and
+            // it keeps its own hop count.
+            .filter(|(_, &(r, x0, x1))| {
+                col >= x0 && col <= x1 && g.y + g.h >= r as f32 - PHYSICS.player_h
+            })
             .min_by_key(|(_, &(r, _, _))| r)
             .map(|(i, _)| i)
     });
@@ -2355,6 +2923,21 @@ mod tests {
                             edge.surface_row,
                             dir,
                         ),
+                        RouteMove::Swim { dir, dive } => simulate_swim(
+                            &lv,
+                            &platforms,
+                            edge.takeoff_x,
+                            edge.surface_row,
+                            dir,
+                            dive,
+                        ),
+                        RouteMove::Vine { exit } => simulate_vine_climb(
+                            &lv,
+                            &platforms,
+                            edge.takeoff_x,
+                            edge.surface_row,
+                            exit,
+                        ),
                     };
                     let landed = traj
                         .landed_at
@@ -2577,6 +3160,130 @@ mod tests {
             Some(top),
             "the tower must be out of reach of a ground jump, or it is not a climb: {jump:?}"
         );
+    }
+
+    // A pool eight tiles wide between two banks at the same height and **six tiles deep**. No
+    // jump crosses eight tiles, and the depth is the point: a jump that falls in needs 300 ticks
+    // to reach the floor (a 0.02-tile sink), which is past MAX_TRAJECTORY_TICKS, so the jump
+    // sweep cannot discover the crossing by accident — the pool is a route only if a body
+    // swims it at the surface and breaches out of the far lip.
+    const POOL: &[&str] = &[
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "######~~~~~~~~######",
+        "######~~~~~~~~######",
+        "######~~~~~~~~######",
+        "######~~~~~~~~######",
+        "######~~~~~~~~######",
+        "######~~~~~~~~######",
+        "####################",
+    ];
+
+    // A ledge four rows above the ground that is reached **only** by a hanging vine in open
+    // air — no wall beside it for a wall climb, and far too tall for a jump.
+    const VINE: &[&str] = &[
+        "................",
+        ".....V..........",
+        ".....V######....",
+        ".....V..........",
+        ".....V..........",
+        ".....V..........",
+        "################",
+        "################",
+    ];
+
+    #[test]
+    fn a_wide_pool_is_a_crossing_and_not_a_wall() {
+        let lv = level("pool", POOL, (1, 4), &[("goal", 18, 4)]);
+        let with = report(&lv);
+        assert!(
+            with.goal_reached,
+            "a body can swim this pool, so the level is beatable: {:?}",
+            with.diagnosis
+        );
+        assert!(with.culprit.is_none());
+
+        // And the crossing really is the swim: take the script away and the same terrain is a
+        // six-tile gap, which no jump in this game crosses.
+        let without = report_with(
+            &lv,
+            ReachOptions {
+                swim: false,
+                ..ReachOptions::default()
+            },
+        );
+        assert!(!without.goal_reached);
+        assert!(
+            without.diagnosis.is_some(),
+            "an unbeatable level owes the designer a reason"
+        );
+    }
+
+    #[test]
+    fn a_swim_trajectory_reaches_the_far_bank() {
+        let lv = level("pool", POOL, (1, 4), &[("goal", 18, 4)]);
+        let platforms = extract_platforms(&lv);
+        let far = platforms
+            .iter()
+            .find(|p| p.surface_row == 5 && p.x0 > 6)
+            .expect("the far bank is a platform")
+            .id;
+        for dive in [false, true] {
+            let swim = simulate_swim(&lv, &platforms, 5.0, 5, TakeoffDir::Right, dive);
+            assert_eq!(
+                swim.landed_on,
+                Some(far),
+                "the swim (dive = {dive}) should land on the far bank: {swim:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hanging_vine_is_a_route_a_jump_is_not() {
+        let lv = level("vine", VINE, (5, 5), &[("goal", 11, 1)]);
+        let with = report(&lv);
+        assert!(
+            with.goal_reached,
+            "the vine climbs to the ledge, so the level is beatable: {:?}",
+            with.diagnosis
+        );
+
+        // Switch the vine off and the level is a four-tile wall with nothing beside it: the
+        // exact false negative the owner hit when the oracle knew only jumps and walls. It is a
+        // real control now because a jump that catches the vine is not credited to the jump
+        // sweep — the vine script owns that landing.
+        let without = report_with(
+            &lv,
+            ReachOptions {
+                vine: false,
+                ..ReachOptions::default()
+            },
+        );
+        assert!(!without.goal_reached);
+        let d = without.diagnosis.clone().expect("a diagnosis");
+        assert!(d.contains("wall too tall"), "unexpected diagnosis: {d}");
+    }
+
+    #[test]
+    fn a_vine_climb_reaches_the_ledge_it_hangs_beside() {
+        let lv = level("vine", VINE, (5, 5), &[("goal", 11, 1)]);
+        let platforms = extract_platforms(&lv);
+        let ledge = platforms
+            .iter()
+            .find(|p| p.surface_row == 2 && p.contains_col(7))
+            .expect("the ledge is a platform")
+            .id;
+        let x = 5.0 + (1.0 - PHYSICS.player_w) * 0.5;
+        let climb = simulate_vine_climb(&lv, &platforms, x, 6, TakeoffDir::Right);
+        assert_eq!(
+            climb.landed_on,
+            Some(ledge),
+            "the climb should end on the ledge: {climb:?}"
+        );
+        assert!(climb.ticks > 30, "a four-tile climb is not instantaneous");
     }
 
     #[test]
