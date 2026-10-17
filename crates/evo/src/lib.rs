@@ -16,7 +16,9 @@ pub mod es;
 pub mod fitness;
 pub mod ga;
 pub mod genome;
+pub mod imitate;
 pub mod population;
+pub mod route_play;
 
 pub use champion::{
     check_reproducibility, ChampionFile, ChampionMetadata, NetworkSpec, TrainingSummary,
@@ -39,6 +41,10 @@ pub use ga::{
     ARCHIVE_TIME_BINS, ARCHIVE_TIME_SLOTS, MUTATION_RATES,
 };
 pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
+pub use imitate::{
+    clone_from_play, from_route, warm_population, warm_set, ImitateConfig, ImitationReport,
+};
+pub use route_play::{replay, Decision, RoutePlay};
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///
@@ -50,7 +56,9 @@ pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUT
 pub(crate) mod fixture {
     use sim::Level;
 
-    const GLYPHS: [char; 7] = ['.', '#', 'S', 'B', 'W', '^', 'G'];
+    /// The glyphs a fixture may use: every tile the level format has. The cracked materials are
+    /// the lowercase of the material they break (`d` for dirt, which is `#`), and `v` is the pad.
+    const GLYPHS: [char; 12] = ['.', '#', 'S', 'B', 'W', '^', 'G', 'd', 's', 'b', 'w', 'v'];
 
     pub fn level_src(
         name: &str,

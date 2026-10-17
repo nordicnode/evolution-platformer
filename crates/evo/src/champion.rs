@@ -316,6 +316,32 @@ impl ChampionFile {
 
     /// Refuse anything this build cannot reproduce (§8).
     pub fn check_compat(&self, level: &Level) -> Result<(), String> {
+        self.check_trainable()?;
+        if self.metadata.level_hash != level.content_hash_string() {
+            return Err(format!(
+                "level_hash mismatch: champion was trained on {} ({}) but this level hashes to {}",
+                self.metadata.level_name,
+                self.metadata.level_hash,
+                level.content_hash_string()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a file this build could not **train on**, ignoring which level it came from.
+    ///
+    /// The whole of [`ChampionFile::check_compat`] except the level hash, and the pair exists
+    /// because the hash is answering two different questions. As a *claim* ("this genome scores
+    /// 1 240 on this level") the hash is the point: a champion replayed on another level would be
+    /// a lie, which is why `replay` and the window's view of a champion go through
+    /// `check_compat`. As *starting material* it is the wrong question entirely: the interesting
+    /// seed is a champion from a level that is not this one — the collision the designer just
+    /// moved, or the harder level the same policy should face — and refusing it would refuse
+    /// exactly the case [`crate::ga::Trainer::from_champion`] exists for. What is *not* relaxed is
+    /// anything that would make the seeded run unreproducible or the genes unreadable: the format,
+    /// this build's version, the version trio, the action cadence, the activations and the gene
+    /// counts against the declared shape are all still refusals.
+    pub fn check_trainable(&self) -> Result<(), String> {
         if self.format != CHAMPION_FORMAT {
             return Err(format!(
                 "not a champion file: format {:?} (expected {CHAMPION_FORMAT:?})",
@@ -337,12 +363,10 @@ impl ChampionFile {
             self.metadata.action_repeat,
         )?;
         self.network.check_compat("champion")?;
-        if self.metadata.level_hash != level.content_hash_string() {
+        if self.network.activation_hidden != "tanh" || self.network.activation_output != "tanh" {
             return Err(format!(
-                "level_hash mismatch: champion was trained on {} ({}) but this level hashes to {}",
-                self.metadata.level_name,
-                self.metadata.level_hash,
-                level.content_hash_string()
+                "unsupported activations ({:?} / {:?}); this build only implements tanh",
+                self.network.activation_hidden, self.network.activation_output
             ));
         }
         Ok(())
@@ -384,6 +408,48 @@ impl ChampionFile {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         champ.to_genome()?;
         Ok(champ)
+    }
+
+    /// Load a champion as **starting material** rather than as a claim about a level.
+    ///
+    /// [`ChampionFile::load_for_level`] with the level hash left out of the check (see
+    /// [`ChampionFile::check_trainable`] for why that is the right half to drop when the question
+    /// is "what should this run start from" rather than "what does this genome score"). The
+    /// caller is expected to say out loud which level the file came from — [`ChampionFile::level_note`]
+    /// is the sentence, and it is written here rather than in a front-end for the same reason
+    /// `PopulationFile::level_note` is: three front-ends each inventing their own wording is how
+    /// one of them ends up not saying it at all.
+    pub fn load_seed(path: impl AsRef<std::path::Path>) -> Result<ChampionFile, String> {
+        let path = path.as_ref();
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let champ = ChampionFile::from_json_str(&src)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        champ
+            .check_trainable()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        champ.to_genome()?;
+        Ok(champ)
+    }
+
+    /// What the operator should know about starting a run *here* from this champion.
+    ///
+    /// `None` when the level is the one the champion was trained on — a fine-tune, where the
+    /// fitness before and after are comparable. A different level is not an error (it is the point
+    /// of seeding), but it does change what the run means, so it is said out loud instead of being
+    /// left to be inferred from two files in two directories.
+    pub fn level_note(&self, level: &Level) -> Option<String> {
+        let here = level.content_hash_string();
+        if self.metadata.level_hash == here {
+            return None;
+        }
+        Some(format!(
+            "champion was trained on {} ({}) and is seeding a run on {} ({}): fitness before and after are not comparable",
+            self.metadata.level_name,
+            &self.metadata.level_hash[..self.metadata.level_hash.len().min(16)],
+            level.name,
+            &here[..here.len().min(16)]
+        ))
     }
 
     /// One-line summary for CLI output.

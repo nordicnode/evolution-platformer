@@ -202,10 +202,24 @@ fn a_mirrored_level_is_learned_within_the_same_budget_as_the_level_it_mirrors() 
     }
 }
 
-/// Generations allowed for `l4-rhythm` at pop 64. The measured first win is
-/// generation 15 (seed 2) and 13 on a second seed tried (seed 9), so this bound is a
-/// regression guard with room to spare, not a performance claim.
+/// Generations allowed for `l4-rhythm` at pop 64. A regression guard with room to spare, not a
+/// performance claim — and the reason the test below sweeps seeds rather than pinning one.
 const L4_CAP: u32 = 60;
+
+/// Seeds the `l4-rhythm` sweep tries, and how many of them must solve inside [`L4_CAP`].
+///
+/// **A rate, because this level sits near the edge at pop 64 and a single seed is a coin flip.**
+/// Measured at pop 64, `--stop-on-win`, seeds 1-6: four of six seeds solve inside 60 generations (at
+/// generations 4, 4, 28 and 32 — seeds 1, 2, 3 and 5) while seeds 4 and 6 stall past 300 and hand the
+/// run to the curriculum. So the claim worth pinning is "this level still falls to evolution at this
+/// population size", which a 4-of-6 rate with a bound of 2 out of 4 states — and "seed 2 wins within
+/// 60 generations" does not: that is a statement about one 64-net draw, and any change to the sensor
+/// vector re-rolls it (measured: the same sweep on a 101-input build put the solves at 8, 7, 4 and 9
+/// and the stalls on seeds 2 and 5, which is what a *rate* with a bound survives and a pinned seed
+/// does not). What a broken sensor, fitness or GA would show up as is the rate collapsing, which is
+/// exactly what the assertion catches.
+const L4_SEEDS: [u64; 4] = [1, 2, 3, 4];
+const L4_SOLVES_REQUIRED: usize = 2;
 
 #[test]
 fn the_gap_tutorial_is_learned_in_a_handful_of_generations() {
@@ -232,20 +246,33 @@ fn the_gap_tutorial_is_learned_in_a_handful_of_generations() {
 #[test]
 fn the_first_earned_level_still_falls_to_evolution() {
     let level = level("l4-rhythm");
-    let mut trainer = Trainer::new(config(2));
-    let mut generation = 0;
-    let mut wins = 0;
-    while generation <= L4_CAP {
-        wins = trainer.step(&level).wins;
-        if wins > 0 {
+    let mut solved: Vec<(u64, u32)> = Vec::new();
+    for seed in L4_SEEDS {
+        let mut trainer = Trainer::new(config(seed));
+        for generation in 0..=L4_CAP {
+            if trainer.step(&level).wins > 0 {
+                solved.push((seed, generation));
+                break;
+            }
+        }
+        if solved.len() >= L4_SOLVES_REQUIRED {
             break;
         }
-        generation += 1;
     }
     assert!(
-        wins > 0,
-        "l4-rhythm was not solved within {L4_CAP} generations at pop {POP} on seed \
-         2 (measured first win: generation 15). The level, the sensors or the \
-         fitness function regressed, or the GA stopped breeding winners"
+        solved.len() >= L4_SOLVES_REQUIRED,
+        "l4-rhythm was solved on only {} of the first {} seeds within {L4_CAP} generations at pop \
+         {POP} (measured: 4 of 6 seeds on both sides of the v11 sensor bump, at generations 4-32 and \
+         4-9). The level, the sensors or the fitness function regressed, or the GA stopped breeding \
+         winners",
+        solved.len(),
+        L4_SEEDS.len(),
+    );
+    // And the ones that did solve did it early, which is the "handful of generations" half of the
+    // claim rather than a bare existence proof: a population that crawls to a win at generation 59
+    // would satisfy the count above and say nothing about the level being learnable at this size.
+    assert!(
+        solved.iter().any(|(_, generation)| *generation <= 20),
+        "the level was solved, but not one seed inside twenty generations: {solved:?}"
     );
 }

@@ -26,6 +26,32 @@ pub fn episode_seed(master_seed: u64, generation: u32, genome_id: u32, trial: u3
     z ^ (z >> 31)
 }
 
+/// The genome id that means **no genome**: the id a shared episode is derived under.
+///
+/// Out of every id a genome can be given (they are issued from a counter starting at zero), so
+/// `episode_seed(master, generation, NO_GENOME, trial)` cannot be the episode of any genome, and
+/// the one avalanche in [`episode_seed`] serves both policies rather than a second mixer that
+/// would have to be frozen and pinned separately.
+pub const NO_GENOME: u32 = u32::MAX;
+
+/// The seed of a **shared** episode: `(master_seed, generation, trial)`, with the genome id fixed
+/// at [`NO_GENOME`] so every genome in a generation is judged on the same episode.
+///
+/// This is common random numbers, and it is the difference between a ranking that compares
+/// *policies* and one that compares *worlds*. On a walker level the patrol phase is drawn from the
+/// episode seed, so under [`episode_seed`] genome 7 and genome 8 of one generation face different
+/// phases: the tournament then picks whichever genome drew the easier world, and the population is
+/// being told which draw was lucky. Sharing the episode removes that term, and it does not memorise
+/// the phase either — the generation is still mixed in, so the world is re-rolled every generation
+/// exactly as before, and a genome that wins by rote loses its rote.
+///
+/// Frozen beside [`episode_seed`] and neither is a substitute for the other: a single-level run
+/// whose configuration asks for shared episodes uses this one everywhere, and a run that does not
+/// must keep deriving the seeds it always did.
+pub fn common_episode_seed(master_seed: u64, generation: u32, trial: u32) -> u64 {
+    episode_seed(master_seed, generation, NO_GENOME, trial)
+}
+
 /// Construct the per-episode generator.
 ///
 /// `rand_xoshiro` seeds `Xoshiro256PlusPlus` from `u64` via SplitMix64, so a
@@ -80,6 +106,37 @@ mod tests {
         assert_ne!(base, episode_seed(42, 11, 20, 0), "generation");
         assert_ne!(base, episode_seed(42, 10, 21, 0), "genome id");
         assert_ne!(base, episode_seed(42, 10, 20, 1), "trial");
+    }
+
+    #[test]
+    fn a_shared_episode_is_the_same_episode_for_every_genome() {
+        // The claim the whole common-random-numbers half rests on: the seed does not depend on
+        // the genome, and it *does* still depend on the generation and the trial.
+        let a = common_episode_seed(7, 3, 0);
+        let b = common_episode_seed(7, 3, 0);
+        assert_eq!(a, b, "the same episode for the population");
+        assert_ne!(a, common_episode_seed(7, 4, 0), "a new generation is a new world");
+        assert_ne!(a, common_episode_seed(7, 3, 1), "a second trial is a second phase");
+        assert_ne!(a, common_episode_seed(8, 3, 0), "a different master seed");
+        assert_eq!(a, episode_seed(7, 3, NO_GENOME, 0), "one mixer, not two");
+        // And it is nobody's own episode: the ids a genome can carry are issued from a counter.
+        for id in [0u32, 1, 42, 199, u32::MAX - 1] {
+            assert_ne!(
+                a,
+                episode_seed(7, 3, id, 0),
+                "genome {id} must not have been judged on the shared episode by accident"
+            );
+        }
+    }
+
+    #[test]
+    fn common_episode_seed_pins_known_values() {
+        // Frozen beside `episode_seed`'s golden values: a change here re-scores every run taken
+        // under shared episodes and is a `sim_version` bump.
+        assert_eq!(common_episode_seed(1, 0, 0), episode_seed(1, 0, NO_GENOME, 0));
+        assert_eq!(common_episode_seed(0, 0, 0), 0x73b1_3ba2_aff1_81c0);
+        assert_eq!(common_episode_seed(1, 0, 0), 0xc42c_5a1a_a382_0138);
+        assert_eq!(common_episode_seed(0xDEAD_BEEF, 87, 2), 0x8252_05ec_7505_74e2);
     }
 
     #[test]

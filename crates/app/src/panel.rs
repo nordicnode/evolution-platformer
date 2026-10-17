@@ -2636,13 +2636,31 @@ mod tests {
     fn the_replay_panel_names_the_record_and_quotes_the_stars_own_clock() {
         let level = sim::Level::starter("panel-replay", 40, 8);
         let packet = crate::lab::scored_packet(&level, "panel-reading");
-        let mut replay = crate::replay::Replay::new(&packet, &level, &evo::EvalConfig::default())
+
+        // Whether *this* fixture's population has won is the genome draw's business, and the draw
+        // moves with the observation layout — a sensor bump reshuffles the whole weight stream, so a
+        // level this generation solved is one the next build's first generation may not (and the
+        // other way round, which is how this test was found to be reading a record it did not
+        // intend). The claim below is about a run that has **never** won, so it is stated by taking
+        // the record off the packet: the same generation, the same episodes, read as a run with no
+        // time to beat. What the packet holds as written is checked beside it instead of assumed.
+        let mut no_record = packet.clone();
+        no_record.fastest = None;
+        no_record.fastest_agent = None;
+        let mut replay = crate::replay::Replay::new(&no_record, &level, &evo::EvalConfig::default())
             .expect("a scored generation holds an agent to replay");
+        // And when the draw did win, the same packet with its record intact says so: one word per
+        // record, from the record's own name rather than from this module's choice of phrase.
+        if packet.fastest_agent.is_some() {
+            let won = crate::replay::Replay::new(&packet, &level, &evo::EvalConfig::default())
+                .expect("a winning packet replays");
+            assert_eq!(won.star().basis.label(), "the run's quickest win");
+        }
 
         let readings = replay_readings(&replay);
         assert_eq!(readings.len(), 3);
-        // The label is the record's own name (`StarBasis::label`), not a word this module picked: the
-        // fixture has won nothing, so it is the best attempt rather than a time to beat.
+        // The label is the record's own name (`StarBasis::label`), not a word this module picked: with
+        // no record on the packet there is no time to race, so it is the best attempt.
         assert_eq!(readings[1].unit, replay.star().basis.label());
         assert_eq!(readings[1].unit, "the run's best attempt");
         assert_eq!(

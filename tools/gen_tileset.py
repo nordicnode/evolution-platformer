@@ -49,13 +49,16 @@ from art.common import CELL, CHECKER, TRANSPARENT, cell, rgba  # noqa: E402
 # to write an atlas a sprite does not fit in, so the failure is a clear error and not a
 # silently missing tile.
 #
-# Fourteen rows held two hundred and twenty-three sprites with one cell to spare, which is
-# a full atlas and not a growable one: the window's own tool glyphs (`art/ui.py`) are the
-# family that made it fifteen. They are the first sprites here that the *game* never draws,
-# and they arrived last for the same reason the seams did — a family whose whole purpose is
-# the application's chrome can wait for one that goes in the level.
+# Fifteen rows held two hundred and thirty-three sprites with seven cells to spare, and `ROWS` went
+# to sixteen for the trap tiles rather than to fifteen-and-a-half: the two tiles and their four
+# crack overlays fit either way, and a growable atlas is the point of it being wider than it needs
+# to be. Fourteen rows held two hundred and twenty-three with one cell spare — a full atlas rather
+# than a growable one — and the window's own tool glyphs (`art/ui.py`) are the family that made it
+# fifteen. They are the first sprites here that the *game* never draws, and they arrived last for
+# the same reason the seams did: a family whose whole purpose is the application's chrome can wait
+# for one that goes in the level.
 COLS = 16
-ROWS = 15
+ROWS = 16
 
 # Read order, so the manifest is stable and the preview is readable: nothing may
 # reorder this except a change to `assets/README.md`, which lists the same names.

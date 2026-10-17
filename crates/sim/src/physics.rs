@@ -30,6 +30,20 @@ pub struct Physics {
     pub gravity: f32,
     /// Upward velocity imparted by a jump, tiles/tick.
     pub jump_v0: f32,
+    /// Upward velocity a **spring pad** gives a body that lands on it, tiles/tick.
+    ///
+    /// A second rung of the jump ladder, derived the same way and for the same reason: `h =
+    /// v0²/(2g)` is **4.90 tiles** and `t = 2·v0/g` is **56 ticks**, against the 2.50 tiles and
+    /// 40 ticks of a fully held jump. So a pad buys roughly two jumps of height and half again
+    /// the airtime of one, and all four numbers a level author needs (height, airtime, and the
+    /// carry at run and sprint speed) follow from the one constant.
+    ///
+    /// **Only the body's vertical velocity is written**, which is what "maintaining momentum"
+    /// means here: a body that arrives at run speed leaves at run speed, so the pad's carry is
+    /// `vx × airtime` with the `vx` the body brought — 5.60 tiles at run speed and 8.40 at
+    /// sprint — and a level can aim a pad at a landing exactly the way it aims a jump. See
+    /// [`Tile::Spring`](crate::Tile::Spring).
+    pub spring_v0: f32,
     /// Terminal downward velocity, tiles/tick (safety against tunnelling).
     pub max_fall: f32,
     /// Horizontal speed cap, tiles/tick (6.0 tiles/s).
@@ -176,6 +190,7 @@ pub struct Physics {
 pub const PHYSICS: Physics = Physics {
     gravity: 0.0125,
     jump_v0: 0.25,
+    spring_v0: 0.35,
     max_fall: 0.75,
     run_speed: 0.10,
     sprint_speed: 0.15,
@@ -246,6 +261,33 @@ impl Physics {
     /// Peak height a wall jump reaches: `wall_jump_v0²/(2g)`.
     pub fn wall_jump_height(&self) -> f32 {
         self.wall_jump_v0 * self.wall_jump_v0 / (2.0 * self.gravity)
+    }
+
+    /// Peak rise of a spring pad's launch: `spring_v0²/(2g)`.
+    ///
+    /// Here rather than in the sim for the reason every other reach in this file is: the number
+    /// a level is designed against has to be the number the physics derives, not a second
+    /// statement of it. The sim does not consult this function to launch a body — it writes
+    /// `spring_v0` and lets the integrator do the rest — so the two can only agree, which is the
+    /// same arrangement [`Physics::max_jump_height`] and the reachability oracle have.
+    pub fn spring_height(&self) -> f32 {
+        self.spring_v0 * self.spring_v0 / (2.0 * self.gravity)
+    }
+
+    /// Ticks a spring launch spends in the air: `2·spring_v0/g`.
+    pub fn spring_air_time_ticks(&self) -> f32 {
+        2.0 * self.spring_v0 / self.gravity
+    }
+
+    /// Horizontal carry of a spring launch taken at `speed`.
+    ///
+    /// Deliberately the same `speed × airtime` a jump is measured by, so a pad and a jump are
+    /// compared in one unit rather than two. Note it is a *parameter* rather than a constant on
+    /// purpose: the pad preserves whatever the body arrived with, so "how far does a spring throw
+    /// me" has no single answer, and the honest form of the question is the one that names a
+    /// speed. A level that needs the long one is a level that needs a sprint's runway before it.
+    pub fn spring_carry(&self, speed: f32) -> f32 {
+        speed * self.spring_air_time_ticks()
     }
 
     /// Peak height of the shortest possible jump: released the instant
@@ -499,6 +541,23 @@ pub fn row_span(top: f32, height: f32) -> (i32, i32) {
     tile_span(top, height)
 }
 
+/// Ticks between a body standing on a brittle tile and that tile leaving the level.
+///
+/// Thirty-two, which is eight decision blocks: a body running at `run_speed` covers 3.2 tiles in
+/// that time, so a cracked bridge is a span of about three tiles crossed at a run and about five
+/// at a sprint. Both halves of that are the design. Short enough that a bridge is a *decision* —
+/// stand still on one and you are going into the pit that appears under you — and long enough
+/// that the crossing is a run rather than a reflex, since the shortest thing the agent can ask
+/// for is one decision block and the whole action set is held in blocks of
+/// [`crate::DECISION_TICKS`].
+///
+/// It is a multiple of the decision cadence for the same reason `Physics::min_jump_hold` is: a
+/// timer the agent's own clock cannot divide evenly gives it a deadline it can never quite aim
+/// at. Nothing about the physics depends on the number; what depends on it is whether a bridge is
+/// learnable, and a bridge the population can only cross by luck is a bridge that teaches it
+/// nothing.
+pub const CRUMBLE_TICKS: u32 = 8 * crate::DECISION_TICKS;
+
 /// How much of the **top** of a spike's tile is not the spike.
 ///
 /// The sprite's top three of sixteen pixel rows are transparent, and deliberately so: a
@@ -531,6 +590,81 @@ pub fn spike_lethal_box(tx: i32, ty: i32) -> Rect {
         1.0,
         1.0 - SPIKE_TOP_CLEARANCE,
     )
+}
+
+/// How much of the **top** of a pad's tile is not the pad.
+///
+/// The spring sprite leaves its first four of sixteen pixel rows transparent, for the reason the
+/// spike's does: a pad drawn to its ceiling would touch the tile above it and stop reading as a
+/// thing standing in a cell. The launch zone follows the drawing rather than the tile, so a body
+/// that lands on a pad is landing on the pad it can see — the same rule [`SPIKE_TOP_CLEARANCE`]
+/// follows for the hazard (see `crates/sim/tests/physics.rs` and `REVIEW.md` §2.12, which is where
+/// the price of the alternative was measured).
+///
+/// A body cannot tunnel through a box this tall: the deepest a body falls in one tick is
+/// `Physics::max_fall` (0.75 tiles) and the box is 0.75 tiles tall, so consecutive positions of a
+/// falling body's box always overlap it. The margin is thin on purpose — a taller clearance would
+/// be a bigger dead band above the pad, and a wider box would be a pad that catches a body which
+/// has not reached it.
+pub const SPRING_TOP_CLEARANCE: f32 = 4.0 / 16.0;
+
+/// The live box of a spring pad: the part of the cell the sprite actually covers.
+///
+/// Horizontally the whole cell, because the pad's base and cap reach both edges; vertically from
+/// [`SPRING_TOP_CLEARANCE`] below the cell's top down to its floor. Contrast
+/// [`spike_lethal_box`], which is the same construction for the other tile a body arrives on.
+#[inline]
+pub fn spring_launch_box(tx: i32, ty: i32) -> Rect {
+    Rect::new(
+        tx as f32,
+        ty as f32 + SPRING_TOP_CLEARANCE,
+        1.0,
+        1.0 - SPRING_TOP_CLEARANCE,
+    )
+}
+
+/// Throw a body that is **descending onto** a pad under it, if there is one.
+///
+/// The pad writes the body's *vertical* velocity and nothing else, so the horizontal momentum the
+/// body arrived with is the momentum it leaves with: a spring is a redirection of a fall, not a
+/// speed the level hands out ([`Tile::Spring`](crate::Tile::Spring)).
+///
+/// **Only a descending body is launched** (`vy > 0`), which is the whole of what "jumps on it"
+/// means and the difference between a pad and an obstacle: a body rising through the cell from
+/// below, or walking across it on the ground, passes through untouched. It is also why the pad
+/// needs no collision of its own — it is not solid, so a body that is not thrown falls through it
+/// and is caught by whatever is underneath.
+///
+/// Tested against the box the *sprite* covers ([`spring_launch_box`]) rather than the whole cell,
+/// for the reason the spike's kill zone is: a pad's art leaves its top quarter transparent so it
+/// does not touch the ceiling, and a body that lands on the pad it can see is a body landing on the
+/// pad. See that box's own note for why the height cannot be tunnelled through at
+/// [`Physics::max_fall`].
+///
+/// **It lives beside the box and the physics because two callers must not be able to disagree about
+/// it: the episode loop and the reachability oracle.** `Sim::step` runs this after the physics tick;
+/// [`crate::reach`] runs it at the same point inside its canonical trajectories, which is what lets
+/// the oracle answer "is this level beatable" about a level whose only way across a gap is a pad at
+/// the lip. It used to drive [`PlayerState::tick`] alone — one layer below this rule — and so
+/// modelled a game with no pads in it (`REVIEW.md` §1.12).
+///
+/// Returns whether a launch happened, which the oracle needs and the episode loop does not.
+pub fn spring_launch(level: &Level, player: &mut PlayerState, ph: &Physics) -> bool {
+    if player.vy <= 0.0 {
+        return false;
+    }
+    let body = player.aabb();
+    let (sx0, sx1) = tile_span(body.x, body.w);
+    let (sy0, sy1) = row_span(body.y, body.h);
+    for ty in sy0..=sy1 {
+        for tx in sx0..=sx1 {
+            if level.is_spring(tx, ty) && body.overlaps(&spring_launch_box(tx, ty)) {
+                player.bounce(ph.spring_v0);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The player's body and movement state.
@@ -820,6 +954,28 @@ impl PlayerState {
     /// True when a jump would currently be accepted.
     pub fn can_jump(&self) -> bool {
         self.grounded || self.coyote_ticks > 0
+    }
+
+    /// Throw the body upward at `v0`, **keeping its horizontal velocity**, from a spring pad.
+    ///
+    /// The horizontal half is what "maintaining momentum" means and it is the absence of code:
+    /// this writes `vy` and `grounded` and touches nothing else, so the `vx` the body arrived
+    /// with is the `vx` it leaves with. A body that reaches a pad at run speed carries the pad's
+    /// whole 56 ticks of airtime at run speed, which is what [`Physics::spring_carry`] is.
+    ///
+    /// **It spends the jump cut, and that is not a detail.** The pad's throw is not a button: a
+    /// body that arrives on a pad is not holding jump, and the cut ([`Physics::jump_cut`]) exists
+    /// to shorten a *released* ascent. Left unspent, the very next tick would cut the throw to 45%
+    /// of itself and a pad would deliver 0.99 tiles of rise instead of [`Physics::spring_height`]'s
+    /// 4.90 — a documented number the sim did not produce, which is exactly the shape of bug the
+    /// spike's kill band was (0.10.0, `REVIEW.md` §2.12). The measurement is in
+    /// `a_spring_launches_a_falling_body_upward_and_keeps_its_momentum`: unspent, a pad's rise is
+    /// 0.91 tiles against a jump's 2.37.
+    pub fn bounce(&mut self, v0: f32) {
+        self.vy = -v0;
+        self.grounded = false;
+        self.jump_cut_applied = true;
+        self.jump_hold_ticks = 0;
     }
 
     /// True while the body is sliding down a wall it is pressing into.

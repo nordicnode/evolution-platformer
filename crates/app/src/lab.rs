@@ -37,9 +37,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use evo::{
-    curriculum_step, practice_level_for_stall, practice_step, save_practice_level, BestEver,
-    ChampionFile, EpisodeResult, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind,
-    PopulationFile, Trainer,
+    curriculum_step, from_route, practice_level_for_stall, practice_step, save_practice_level,
+    warm_population, BestEver, ChampionFile, EpisodeResult, EpisodeRunner, EvalConfig, GaConfig,
+    Genome, ImitateConfig, LaneKind, PopulationFile, Trainer,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use render::trace::{ChampionTrace, TraceLog, TracePoint, TRACE_SAMPLE_FRAMES};
@@ -83,6 +83,57 @@ pub fn slug(name: &str) -> String {
     }
 }
 
+/// A fresh population's worth of genomes warmed from the level's own route, or `None` when the
+/// level has no walk to clone.
+///
+/// The whole of the window's route warm start: walk the level with the reachability oracle's plan
+/// ([`evo::route_play::replay`]), clone the walk into a genome ([`evo::imitate`]), and assemble a
+/// full population of `cfg.pop_size` from that clone plus random genomes — a quarter warm by
+/// default, which is the measured optimum (`FINDINGS.md`, "The route as a demonstration": a
+/// quarter of the population solves every level on every seed and reaches a first win two to four
+/// times sooner than random, while warming *every* slot is the worst arm there is).
+///
+/// **Nothing here can fail a run.** A level whose route the replay cannot walk still clones
+/// *something* — a partial walk is a warm start worth what it demonstrated — and a level with no
+/// walk at all (no route to its flag, or a stand the graph cannot leave) returns `None`, which
+/// leaves the caller with the fresh random population it would have had anyway. The note is what
+/// the window shows, so a warm start is never silent.
+///
+/// The fit is the shipped default (300 gradient passes). It runs once, on the worker thread, before
+/// the first generation: a fraction of a second at the default pop size, against the generations it
+/// saves.
+fn warm_seed_from_route(level: &Level, cfg: &GaConfig) -> Option<(Vec<Genome>, String)> {
+    let eval = cfg.eval_config();
+    let imit = ImitateConfig::default();
+    let (play, report) = from_route(level, cfg.master_seed, &eval, cfg.shape.clone(), &imit).ok()?;
+    let mut rng = sim::rng::rng_from_seed(cfg.master_seed ^ 0x2E5E_ED2E_5EED_2E5E);
+    let warm = (cfg.pop_size / 4).max(1);
+    let pop = warm_population(
+        &report.genome,
+        cfg.pop_size,
+        warm - 1,
+        cfg.mutation_sigma,
+        cfg.mutation_rate,
+        &mut rng,
+    );
+    let walked = if play.won() {
+        format!("walked the whole route ({:?} hops)", play.route_hops)
+    } else {
+        format!("walked part of the route ({} hops closed)", play.hops_closed)
+    };
+    Some((
+        pop,
+        format!(
+            "warmed from this level's own route: the replay {walked} in {} decisions and a genome \
+             was cloned from them ({:.0}% of the demonstrated actions reproduced); {warm} of {} \
+             genomes start from that clone, the rest are random",
+            play.decisions.len(),
+            report.agreement * 100.0,
+            cfg.pop_size,
+        ),
+    ))
+}
+
 /// How a run was asked for: how long it may run, where it starts from, and what to do
 /// when it stops moving.
 ///
@@ -100,6 +151,17 @@ pub struct RunPlan {
     pub resume: Option<PathBuf>,
     /// The easier level to fall back to when the run stalls, and for how long.
     pub curriculum: Option<Curriculum>,
+    /// Warm a **fresh** population from the level's own route: walk it with the reachability
+    /// oracle's plan, clone the walk into a genome, and start a quarter of generation 0 from that
+    /// clone (`evo::imitate`, and `train-cli`'s `--from-route`).
+    ///
+    /// It is a *default* for the window rather than something to ask for, because the level the
+    /// window trains on is usually one somebody has just drawn: measured, the warm arm reaches a
+    /// first win two to four times sooner than a random population on the shipped pack's harder
+    /// levels, and its failure mode is bounded (a level with no route to its flag falls back to a
+    /// random population, and a partial walk is a warm start still). Ignored when the run resumes a
+    /// checkpoint, which already *has* a population.
+    pub warm_from_route: bool,
 }
 
 /// A run's fallback level: what a stalled population gets trained on instead (§12 M5).
@@ -372,6 +434,12 @@ impl Lanes {
     }
 
     /// Advance by `dt` seconds of wall clock at `speed`.
+    ///
+    /// A lane's own episode is stepped, and the *only* thing that used to make this expensive was
+    /// the route table: a lane's sim owns a copy of the level, and a copy of a cold route cache
+    /// swept the whole move graph itself (24 ms on a 60x15 level) the first time it asked for a
+    /// waypoint. The levels are shared now ([`sim::Level::routes`]), so a generation's eight lanes
+    /// ask the question once and every one of them reads the answer: this loop is microseconds.
     pub fn advance(&mut self, dt: f32, speed: u32) {
         self.carry += ticks_for(dt, speed);
         let whole = self.carry.floor();
@@ -533,7 +601,13 @@ impl Generator {
                     Trainer::resume(cfg.clone(), checkpoint.to_genomes()?, checkpoint.generation)?;
                 (trainer, Some(origin))
             }
-            None => (Trainer::new(cfg.clone()), None),
+            // A fresh run warms itself from the level's own route when it has one. See
+            // [`warm_seed_from_route`] and [`RunPlan::warm_from_route`].
+            None => match plan.warm_from_route.then(|| warm_seed_from_route(&level, &cfg)).flatten()
+            {
+                Some((pop, note)) => (Trainer::resume(cfg.clone(), pop, 0)?, Some(note)),
+                None => (Trainer::new(cfg.clone()), None),
+            },
         };
         Ok(Generator {
             eval: cfg.eval_config(),
@@ -586,7 +660,24 @@ impl Generator {
         cfg.mutation_rate = mutation_rate;
         cfg.trials = if level.walkers.is_empty() { 1 } else { 3 };
         self.eval = cfg.eval_config();
-        self.trainer = Trainer::new(cfg.clone());
+        // A restart is a fresh population on the level as it stands *now*, which is exactly the
+        // case the route warm start is for: the edit may have moved the flag, the pit or the whole
+        // level, and a walk of the current one is the best thing a new population can be handed.
+        self.trainer = match self
+            .plan
+            .warm_from_route
+            .then(|| warm_seed_from_route(&level, &cfg))
+            .flatten()
+        {
+            Some((pop, note)) => {
+                self.origin = Some(note);
+                Trainer::resume(cfg.clone(), pop, 0).unwrap_or_else(|_| Trainer::new(cfg.clone()))
+            }
+            None => {
+                self.origin = None;
+                Trainer::new(cfg.clone())
+            }
+        };
         self.cfg = cfg;
         self.traces = TraceLog::new();
         self.history.clear();
@@ -1245,9 +1336,19 @@ impl Lab {
         }
     }
 
-    /// Ask for the next generation. Called when the animation of the current one
-    /// finishes — the run's own rate limit, and the reason a paused window trains
-    /// nothing.
+    /// Ask for the next generation — one *ahead* of the one on screen.
+    ///
+    /// The window calls this the moment it takes a generation, so the worker computes the
+    /// successor while the viewer watches what is already there, and again on the frame a
+    /// generation finishes with nothing queued behind it. That second call is what makes
+    /// this the run's rate limit: a request while one is in flight is refused, so the
+    /// worker never runs more than one generation past the screen, and a paused or
+    /// scrubbing window parks it as soon as the generation in flight lands.
+    ///
+    /// Asking early rather than late is what keeps a *long* generation off the screen: the
+    /// forty-generation practice detour a stall triggers is one packet of ~1.7 s at pop 200
+    /// (`app::evolve_step`'s lookahead carries the measurement), and under the one-ahead
+    /// rule that whole second of work happens while the previous generation plays.
     pub fn request_next(&mut self) {
         let mut state = self.hub.state.lock().unwrap();
         if state.finished || state.quit {
@@ -1417,6 +1518,71 @@ mod tests {
             .join("../../levels")
             .join(format!("{slug}.json"));
         Level::from_json_file(&path).unwrap_or_else(|e| panic!("{slug}: {e}"))
+    }
+
+    /// Take the packet the worker has ready, waiting for it.
+    ///
+    /// Requests nothing on purpose: *when* the worker is asked — at take time, which is the
+    /// lookahead, or when an animation ends with nothing queued, which is the fallback — is what
+    /// the test below is about, so asking is its caller's job rather than this helper's.
+    fn take_waiting(lab: &mut Lab) -> Lanes {
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            if let Some(lanes) = lab.take() {
+                return lanes;
+            }
+            assert!(Instant::now() < deadline, "the worker never produced a generation");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The lookahead's invariant: the window may ask for one generation ahead of the one on
+    /// screen, and the worker never runs more than one past it.
+    #[test]
+    fn the_worker_never_runs_more_than_one_generation_past_the_window() {
+        let mut lab = Lab::start(
+            &shipped("l3-gauntlet"),
+            tiny_config(),
+            DEFAULT_BEST_LANES,
+            DEFAULT_RANDOM_LANES,
+            RunPlan::default(),
+            scratch("lookahead"),
+        )
+        .expect("the run starts");
+
+        // A fresh run has asked for its first generation already (that is what `Lab::start`
+        // does), so the window's guard is closed until it takes one.
+        assert!(
+            lab.asked(),
+            "a run asks for its first generation when it starts"
+        );
+        let first = take_waiting(&mut lab);
+        assert_eq!(first.packet().generation, 0);
+
+        // Taking a generation clears the ask — which is exactly what lets the window ask for
+        // the next one the moment this one is on screen, instead of waiting out its animation.
+        assert!(
+            !lab.asked(),
+            "taking a generation has to clear the ask, or the lookahead can never happen"
+        );
+        lab.request_next();
+        assert!(
+            lab.asked(),
+            "with one generation in flight the window's own guard refuses a second request, \
+             which is what bounds the lookahead to a single generation"
+        );
+        let second = take_waiting(&mut lab);
+        assert_eq!(second.packet().generation, 1);
+
+        // And now the worker is parked on the generation the window is holding: nothing has
+        // asked for another one, and a run is not allowed to train ahead of its viewer. The
+        // wait is many generations' worth of work at this population size.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            lab.take().is_none(),
+            "the worker computed a generation nobody asked for"
+        );
+        lab.stop();
     }
 
     /// A population small enough that a test can run several generations in
@@ -2103,6 +2269,57 @@ mod tests {
         assert!(
             missing.is_err(),
             "a checkpoint that does not load must not silently train a fresh population"
+        );
+    }
+
+    /// **A fresh run on a level with a route starts from a walk of it.**
+    ///
+    /// The window's half of `train-cli --from-route`: the first generation's population is not
+    /// random, the level's own route walked it into existence, and the run *says so* — the origin
+    /// note is what the panel shows, so a warm start is never something the operator has to infer
+    /// from the first generation's scores.
+    #[test]
+    fn a_fresh_run_warmed_from_the_route_says_so_and_is_not_random() {
+        let dir = scratch("route-warm");
+        // `l2-first-gap` is the pack's first earned level and its route walks on every seed, so the
+        // warm start is not a partial one here — the strongest form of the claim.
+        let level = shipped("l2-first-gap");
+        let cfg = tiny_config();
+        let warm = Generator::new(
+            level.clone(),
+            cfg.clone(),
+            2,
+            2,
+            RunPlan {
+                warm_from_route: true,
+                ..RunPlan::default()
+            },
+            dir.clone(),
+        )
+        .expect("a warmed run starts");
+        let note = warm
+            .origin()
+            .expect("a warmed run says where its first generation came from")
+            .to_string();
+        assert!(
+            note.contains("walked the whole route") && note.contains("cloned"),
+            "the note names the walk and the clone: {note}"
+        );
+        assert!(note.contains("2 of 8 genomes"), "{note}");
+
+        // The same level, unwarmed, is the control: same seeds, same budget, a random population.
+        let cold = Generator::new(
+            level,
+            cfg,
+            2,
+            2,
+            RunPlan::default(),
+            dir,
+        )
+        .expect("a plain run starts");
+        assert!(
+            cold.origin().is_none(),
+            "nothing to declare about a population nobody handed over"
         );
     }
 

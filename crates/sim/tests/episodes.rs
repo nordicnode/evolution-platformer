@@ -114,7 +114,15 @@ fn golden_state_hash_after_ten_thousand_frames() {
     // which is precisely why the pin has to be re-recorded with the version: a champion
     // replayed against an older build would otherwise agree on every visible number and
     // disagree on this one.
-    const GOLDEN_LONG_RUNWAY_HASH: u64 = 4_559_670_468_595_301_688;
+    //
+    // Re-recorded for 0.11.0, and again for the *hash* rather than the trajectory: the sim now
+    // keeps the terrain a body has destroyed and the fuses still burning (`Sim::broken`,
+    // `Sim::crumbles`) and both are folded into `state_hash`. This runway has neither a brittle
+    // tile nor a pad, so both readings are empty from the first frame to the last and the episode
+    // itself is bit-identical — but a hash that says "the same state" for a level that has lost a
+    // bridge and one that never had one would be the wrong hash, which is the whole reason the
+    // two are in there.
+    const GOLDEN_LONG_RUNWAY_HASH: u64 = 1_557_231_695_008_748_248;
 
     let level = common::long_runway();
     let mut sim = sim::Sim::new(&level, SEED);

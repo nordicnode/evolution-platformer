@@ -1,0 +1,37 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 1,
+  "name": "scratch-trap-crossing",
+  "width": 48,
+  "height": 16,
+  "spawn": {
+    "x": 1,
+    "y": 12
+  },
+  "tiles": [
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "................................................",
+    "......................................sss.......",
+    "##############ddddddddd..ddddddddd##############",
+    "##############....................##############",
+    "##############ssssssssssssssssssss##############"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 46,
+      "y": 12
+    }
+  ],
+  "_notes": "Scratch: the trap tiles as a *route* rather than a demo. The only way to the flag is the bridge — columns 14-22 and 25-33 are cracked (`d`) over a 20-tile pit whose floor (row 15) is spikes, and the two columns between them (23, 24) are missing, so the crossing is a commitment: keep moving, take the gap in the middle on the fly, and let the deck fall in behind you. A body that hesitates anywhere on the span loses the tile under its feet and lands on the spikes; there is no second route and no pad. Three spikes on the far ground (columns 38-40) are the crossing's last test. `reach` reads the bridge as ground, so the level is beatable in principle and unbeatable without the crossing. For the learning measurement in FINDINGS.md."
+}

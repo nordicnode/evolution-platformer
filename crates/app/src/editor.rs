@@ -113,8 +113,25 @@ pub enum Brush {
     Brick,
     /// Solid terrain of a fourth material: milled decking, scaffolding, a jetty.
     Plank,
+    /// **Brittle** soil: solid ground that leaves the level a body has stood on it for
+    /// [`sim::physics::CRUMBLE_TICKS`].
+    ///
+    /// Four brushes rather than one "brittle" toggle over the four materials, and that is a
+    /// choice about what a palette is for. A toggle is one more mode a person has to hold in
+    /// their head while painting ("am I brittle right now?"), and it makes the four materials
+    /// share a switch that has nothing to do with which of them is in hand; four cells say the
+    /// same thing by being visible. The cost is four more buttons, in a grid that wraps.
+    Cracked,
+    /// Brittle sand.
+    CrackedSand,
+    /// Brittle brick.
+    CrackedBrick,
+    /// Brittle timber.
+    CrackedPlank,
     /// A lethal spike.
     Spike,
+    /// A spring pad: not solid, and it throws a body that lands on it upward.
+    Spring,
     /// Clears terrain.
     Empty,
     /// Moves the spawn point.
@@ -196,12 +213,25 @@ impl Shape {
 }
 
 impl Brush {
-    pub const ALL: [Brush; 11] = [
+    /// Every brush, in the order the palette draws them: the six materials (four sound, four
+    /// brittle — soil's brittle twin sits beside the ground it breaks, and so on down the row),
+    /// then the spike and the pad, then the entities, then the two that act on a cell rather than
+    /// fill it.
+    ///
+    /// Material, then *what that material's brittle self is*, all the way down: a person painting a
+    /// bridge reaches for `cracked` in the same glance they found `ground` in, which a row that
+    /// grouped all four brittle cells together would not give them.
+    pub const ALL: [Brush; 16] = [
         Brush::Solid,
+        Brush::Cracked,
         Brush::Sand,
+        Brush::CrackedSand,
         Brush::Brick,
+        Brush::CrackedBrick,
         Brush::Plank,
+        Brush::CrackedPlank,
         Brush::Spike,
+        Brush::Spring,
         Brush::Scenery,
         Brush::Empty,
         Brush::Spawn,
@@ -209,6 +239,31 @@ impl Brush {
         Brush::Walker,
         Brush::Erase,
     ];
+
+    /// Does this brush paint brittle ground?
+    pub fn is_cracked(self) -> bool {
+        matches!(
+            self,
+            Brush::Cracked | Brush::CrackedSand | Brush::CrackedBrick | Brush::CrackedPlank
+        )
+    }
+
+    /// The sprite drawn *under* this brush's icon in the palette, when it needs one.
+    ///
+    /// Only the cracked brushes do, and the reason is the same reason the view draws two layers
+    /// for a brittle tile: the cracked art is a **transparent crack**, so the cell that shows the
+    /// brush has to put its material underneath it or it draws a scratch on a plate. The material
+    /// is the sound brush's own icon, which is what makes the pair read as one family — the same
+    /// picture, plus a crack.
+    pub fn base_sprite(self) -> Option<&'static str> {
+        match self {
+            Brush::Cracked => Some("ground_1"),
+            Brush::CrackedSand => Some("sand_1"),
+            Brush::CrackedBrick => Some("brick_1"),
+            Brush::CrackedPlank => Some("wood_1"),
+            _ => None,
+        }
+    }
 
     /// The atlas sprite that represents this brush in the palette.
     ///
@@ -220,10 +275,15 @@ impl Brush {
     pub fn sprite(self) -> &'static str {
         match self {
             Brush::Solid => "ground_1",
+            Brush::Cracked => "cracked_ground",
             Brush::Sand => "sand_1",
+            Brush::CrackedSand => "cracked_sand",
             Brush::Brick => "brick_1",
+            Brush::CrackedBrick => "cracked_brick",
             Brush::Plank => "wood_1",
+            Brush::CrackedPlank => "cracked_wood",
             Brush::Spike => "spike",
+            Brush::Spring => "spring",
             Brush::Scenery => "bush_c",
             Brush::Empty => "empty",
             Brush::Spawn => "spawn_marker",
@@ -236,10 +296,15 @@ impl Brush {
     pub fn label(self) -> &'static str {
         match self {
             Brush::Solid => "ground",
+            Brush::Cracked => "cracked",
             Brush::Sand => "sand",
+            Brush::CrackedSand => "cracked sand",
             Brush::Brick => "brick",
+            Brush::CrackedBrick => "cracked brick",
             Brush::Plank => "timber",
+            Brush::CrackedPlank => "cracked timber",
             Brush::Spike => "spikes",
+            Brush::Spring => "spring",
             Brush::Scenery => "scenery",
             Brush::Empty => "clear",
             Brush::Spawn => "spawn",
@@ -253,10 +318,17 @@ impl Brush {
     pub fn about(self) -> &'static str {
         match self {
             Brush::Solid => "Solid tile: blocks movement from every side.",
+            Brush::Cracked => "Cracked ground: solid until a body stands on it, then it breaks \
+                away. A span of it is a bridge with a deadline.",
             Brush::Sand => "Sand: solid tile, same physics, drawn as a beach.",
+            Brush::CrackedSand => "Cracked sand: a beach that gives way underfoot.",
             Brush::Brick => "Brick: solid tile, same physics, drawn as mortared brickwork.",
+            Brush::CrackedBrick => "Cracked brick: masonry that gives way underfoot.",
             Brush::Plank => "Timber: solid tile, same physics, drawn as milled decking.",
+            Brush::CrackedPlank => "Cracked timber: decking that gives way underfoot.",
             Brush::Spike => "Spike: not solid, lethal on contact.",
+            Brush::Spring => "Spring: not solid. A body that lands on it is thrown upward, \
+                keeping the speed it arrived with.",
             Brush::Scenery => "Scenery: a bush, tree, rock... decoration the physics ignores.\n\
                 Pick which one in the row under the palette.",
             Brush::Empty => "Empty space: clears a tile.",
@@ -546,10 +618,15 @@ impl Editor {
     fn paint_one(&mut self, brush: Brush, tx: i32, ty: i32) -> bool {
         match brush {
             Brush::Solid => self.level.set_tile(tx, ty, Tile::Solid),
+            Brush::Cracked => self.level.set_tile(tx, ty, Tile::Cracked),
             Brush::Sand => self.level.set_tile(tx, ty, Tile::Sand),
+            Brush::CrackedSand => self.level.set_tile(tx, ty, Tile::CrackedSand),
             Brush::Brick => self.level.set_tile(tx, ty, Tile::Brick),
+            Brush::CrackedBrick => self.level.set_tile(tx, ty, Tile::CrackedBrick),
             Brush::Plank => self.level.set_tile(tx, ty, Tile::Plank),
+            Brush::CrackedPlank => self.level.set_tile(tx, ty, Tile::CrackedPlank),
             Brush::Spike => self.level.set_tile(tx, ty, Tile::Spike),
+            Brush::Spring => self.level.set_tile(tx, ty, Tile::Spring),
             Brush::Empty => self.level.set_tile(tx, ty, Tile::Empty),
             Brush::Spawn => {
                 if self.level.spawn_tile() == (tx, ty) {
@@ -684,10 +761,15 @@ impl Editor {
         } else {
             match self.level.tile(tx, ty) {
                 Some(Tile::Solid) => self.brush = Some(Brush::Solid),
+                Some(Tile::Cracked) => self.brush = Some(Brush::Cracked),
                 Some(Tile::Sand) => self.brush = Some(Brush::Sand),
+                Some(Tile::CrackedSand) => self.brush = Some(Brush::CrackedSand),
                 Some(Tile::Brick) => self.brush = Some(Brush::Brick),
+                Some(Tile::CrackedBrick) => self.brush = Some(Brush::CrackedBrick),
                 Some(Tile::Plank) => self.brush = Some(Brush::Plank),
+                Some(Tile::CrackedPlank) => self.brush = Some(Brush::CrackedPlank),
                 Some(Tile::Spike) => self.brush = Some(Brush::Spike),
+                Some(Tile::Spring) => self.brush = Some(Brush::Spring),
                 // Air is a brush like any other — the clear one — and the flag's own tile is air
                 // with an entity on it, which the branch above caught.
                 Some(Tile::Empty | Tile::Goal) => self.brush = Some(Brush::Empty),
@@ -1660,7 +1742,7 @@ mod tests {
 
         // What is already in hand is not news: the same pick twice reports nothing the second
         // time, which is what keeps the status line from being chatter.
-        assert!(ed.pick_at(20, floor - 1) == false || ed.brush == Some(Brush::Walker));
+        assert!(!ed.pick_at(20, floor - 1) || ed.brush == Some(Brush::Walker));
         assert!(!ed.pick_at(20, floor - 1));
     }
 

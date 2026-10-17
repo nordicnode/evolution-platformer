@@ -7,8 +7,9 @@ use std::time::Instant;
 use evo::champion::replay as replay_champion;
 use evo::ga::MUTATION_SIGMA_RANGE;
 use evo::{
-    curriculum_step, practice_level_for_stall, practice_step, save_practice_level, ChampionFile,
-    EsConfig, EsTrainer, EvalConfig, GaConfig, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
+    curriculum_step, from_route, practice_level_for_stall, practice_step, save_practice_level,
+    warm_population, ChampionFile, EsConfig, EsTrainer, EvalConfig, GaConfig, ImitateConfig,
+    ImitationReport, PopulationFile, RoutePlay, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
     FITNESS_VERSION,
 };
 use render::chart::{fitness_stall, HistoryPoint};
@@ -18,7 +19,7 @@ use sim::{Level, Outcome, SIM_VERSION};
 
 use crate::args::{Args, ParseError};
 
-const TRAIN_OPTS: &[&str] = &[
+pub(crate) const TRAIN_OPTS: &[&str] = &[
     "level",
     "suite",
     "generations",
@@ -36,11 +37,23 @@ const TRAIN_OPTS: &[&str] = &[
     "archive-children",
     "archive-on-diversity",
     "novelty",
+    "rank-pessimism",
     "reheat-factor",
     "adaptive-sigma",
     "feedback",
+    "hidden",
     "trials",
     "no-auto-trials",
+    "common-episodes",
+    "no-common-episodes",
+    "race-episodes",
+    "no-race-episodes",
+    "resume",
+    "from-champion",
+    "from-route",
+    "warm",
+    "clone-epochs",
+    "route-seed",
     "curriculum",
     "curriculum-generations",
     "out",
@@ -61,6 +74,7 @@ const ES_OPTS: &[&str] = &[
     "learning-rate",
     "action-repeat",
     "feedback",
+    "hidden",
     "trials",
     "max-seconds",
     "stop-on-win",
@@ -155,6 +169,10 @@ pub fn train(a: &Args) -> Result<(), String> {
     };
 
     let cfg = train_config(a)?;
+    // What the header prints, when the header prints the *shape* of the search space: the
+    // trainer's own clamps applied first, because a header that quotes `--hidden 1000` while the
+    // run trains at 64 would be exactly the sort of number this file's comments exist to prevent.
+    let shown = cfg.clone().sanitized(None);
 
     if !quiet {
         // A suite prints one line per level, because "which levels" *is* the experiment: the
@@ -176,6 +194,17 @@ pub fn train(a: &Args) -> Result<(), String> {
             "ga      pop {}  elite {}  tournament {}  sigma {:.2}  rate {:.3}  crossover {:.2}  action_repeat {}  trials {}",
             cfg.pop_size, cfg.elite, cfg.tournament, cfg.mutation_sigma,
             cfg.mutation_rate, cfg.crossover_rate, cfg.action_repeat, cfg.trials
+        );
+        // The net itself, which no line above describes: `ga` is the population, `search` is how
+        // the population moves, and this is what it moves *in*. `--hidden` and `--feedback` are
+        // the two flags that change the size of the search space by thousands of genes, and a run
+        // whose header stayed silent about them would be a table row nobody could reproduce. The
+        // rank is here for the same reason and a different one: it changes what "best" means, so a
+        // reading taken with it on is not comparable with one taken with it off.
+        println!(
+            "net     {}  rank {}",
+            shown.shape.label(),
+            rank_label(shown.rank_pessimism)
         );
         // The episode budget is per level and comes from the trainer's own rule (three patrol
         // phases where a level has walkers, one where it does not), so a suite prints what each
@@ -239,7 +268,11 @@ pub fn train(a: &Args) -> Result<(), String> {
     // to without being asked.
     let stem = if suite { format!("{stem}-suite") } else { stem };
 
-    let mut trainer = Trainer::new(cfg);
+    // Where the population comes from: a fresh random one, a checkpoint, or a champion plus a
+    // shell around it (`seeded_trainer`). It is one call rather than three branches here because
+    // `bench` starts its arms the same way, and two copies of "how a run begins" is two answers
+    // to "what did this table measure".
+    let mut trainer = seeded_trainer(cfg, &level, a)?;
     let effective = trainer.config.clone();
     let started = Instant::now();
     let mut solved_at: Option<u32> = None;
@@ -426,7 +459,17 @@ pub fn train(a: &Args) -> Result<(), String> {
         &effective,
     );
 
-    let champion_path = Path::new(&out_dir).join(format!("{stem}.json"));
+    // A **seeded** run writes to a name that steps aside rather than over the file it started
+    // from. On a fine-tune — `--from-champion champions/l5-tightrope.json`, same level, same
+    // directory — the default path *is* the seed's own path, so the run would replace the evidence
+    // it started from with the result it produced, at the moment that evidence is most wanted
+    // (`REVIEW.md` §2.8's silent replacement, in the one directory this tool writes to unasked).
+    let champion_path = match a.opt("from-champion") {
+        Some(seed) if same_file(seed, &Path::new(&out_dir).join(format!("{stem}.json"))) => {
+            Path::new(&out_dir).join(format!("{stem}-seeded.json"))
+        }
+        _ => Path::new(&out_dir).join(format!("{stem}.json")),
+    };
     champion.save(&champion_path)?;
 
     if let Some(csv_path) = a.opt("csv") {
@@ -568,6 +611,235 @@ pub fn train(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// The hidden-layer widths `--hidden` asks for, or the trainer's own default.
+///
+/// A comma list — `--hidden 32`, `--hidden 32,16` — because the parser takes one value per option
+/// (`args.rs`) and because the list *is* the topology: the shipped net is one layer of 16, and the
+/// question this flag exists to ask is whether a wider one searches better, which is a question
+/// about a list rather than about a number. The widths are bounded by
+/// [`evo::genome::MAX_HIDDEN_WIDTH`] and the count by [`evo::genome::MAX_HIDDEN_LAYERS`] in
+/// `GaConfig::sanitized`, which is where the *run* is protected; what is refused here is the
+/// spelling mistakes that would otherwise be silently repaired — a zero-width layer, a stray
+/// comma, a word.
+pub(crate) fn parse_hidden(a: &Args, default: &[usize]) -> Result<Vec<usize>, String> {
+    let Some(spec) = a.opt("hidden") else {
+        return Ok(default.to_vec());
+    };
+    let mut widths = Vec::new();
+    for piece in spec.split(',') {
+        let piece = piece.trim();
+        let width = piece.parse::<usize>().map_err(|_| {
+            format!(
+                "usage: --hidden expects layer widths, e.g. --hidden 32 or --hidden 32,16 (got {piece:?})"
+            )
+        })?;
+        if width == 0 {
+            return Err("usage: --hidden 0 is not a narrower network, it is a broken one".into());
+        }
+        widths.push(width);
+    }
+    if widths.is_empty() {
+        return Err("usage: --hidden needs at least one width, e.g. --hidden 32".into());
+    }
+    Ok(widths)
+}
+
+/// How [`evo::GaConfig::rank_pessimism`] reads on a header line.
+///
+/// Spelled out rather than left as `rank 0.00` for the same reason the sigma is printed with its
+/// units: the two ends of this knob are different *questions* about a genome ("what does it usually
+/// do" against "what does it do when the world is at its worst"), and "0.35" alone says nothing
+/// about which of them a table row was taken with.
+fn rank_label(pessimism: f32) -> String {
+    if pessimism <= 0.0 {
+        "mean of a genome's trials".to_string()
+    } else if pessimism >= 1.0 {
+        "worst trial of a genome's trials".to_string()
+    } else {
+        format!(
+            "mean, less {:.2} of the gap to the worst trial",
+            pessimism
+        )
+    }
+}
+
+/// Do these two spellings name the same file? Used only to keep a seeded run from overwriting its
+/// own seed.
+///
+/// The output path usually does not exist yet, so its parent is the thing that has to resolve: a
+/// file name is only the same file if the directory around it is. When the parent cannot be
+/// resolved at all (it does not exist yet either) the answer is `false`, and the run keeps the
+/// default name — the conservative direction, since the cost of a wrong `true` here is a champion
+/// saved under a name nobody expects.
+fn same_file(seed: &str, out: &Path) -> bool {
+    let seed = match Path::new(seed).canonicalize() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    if seed.file_name() != out.file_name() {
+        return false;
+    }
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    seed.parent() == Some(parent.as_path())
+}
+
+/// The trainer a run starts from.
+///
+/// Three answers, and the two flags that give the second and third are alternatives rather than
+/// two knobs: `--resume` names a **population** (the artifact a stall writes, ids and generation
+/// included) and `--from-champion` names a **single genome** that [`Trainer::from_champion`] turns
+/// into one. Naming both is two contradictory answers to "where does this run start", so it is a
+/// usage error rather than a precedence rule.
+///
+/// Factored out of `train` because `bench` starts its arms here too: a protocol run has to begin
+/// the way a training run begins, or a sweep would be measuring a different starting population
+/// from the one the operator asked for.
+///
+/// Both paths announce themselves. A resumed population says what it is and whether the level moved
+/// (`PopulationFile::level_note`), and a seeded champion does the same through
+/// [`ChampionFile::level_note`] — because the fitness before and after such a step are *not*
+/// comparable, and a run that quietly changed level between two chart lines would be the most
+/// easily misread artifact this tool can produce.
+#[allow(clippy::let_and_return)]
+pub(crate) fn seeded_trainer(
+    cfg: GaConfig,
+    level: &Level,
+    a: &Args,
+) -> Result<Trainer, String> {
+    let resume = a.opt("resume");
+    let from_champion = a.opt("from-champion");
+    let from_route = a.has_flag("from-route");
+    let named = usize::from(resume.is_some()) + usize::from(from_champion.is_some())
+        + usize::from(from_route);
+    if named > 1 {
+        return Err(
+            "usage: --resume, --from-champion and --from-route are alternatives: they are three \
+             answers to \"where does this run start from\""
+                .into(),
+        );
+    }
+    if from_route {
+        return route_seeded_trainer(cfg, level, a);
+    }
+    if let Some(path) = resume {
+        let checkpoint = PopulationFile::load(path)?;
+        println!("resuming {}", checkpoint.summary());
+        if let Some(note) = checkpoint.level_note(level) {
+            println!("note    {note}");
+        }
+        Trainer::resume(cfg, checkpoint.to_genomes()?, checkpoint.generation)
+    } else if let Some(path) = from_champion {
+        let champion = ChampionFile::load_seed(path)?;
+        let note = champion.level_note(level);
+        if let Some(note) = note {
+            println!("note    {note}");
+        }
+        let genome = champion.to_genome()?;
+        println!(
+            "seeded  {} ({} genes, resumed as generation 0 of a new run)",
+            champion.summary(),
+            genome.n_genes()
+        );
+        Trainer::from_champion(cfg, genome)
+    } else {
+        Ok(Trainer::new(cfg))
+    }
+}
+
+/// A run warmed from **the level's own route**: the oracle walks the level, the walk is cloned into a
+/// genome, and a quarter of the population starts from that clone.
+///
+/// `--from-route` is the level-generation half of the same idea `--from-champion` is the
+/// fine-tuning half of. The reachability oracle can already walk a route it has proved
+/// (`sim::reach`), and [`evo::route_play::replay`] can drive that route through the real sim — so on
+/// a level the owner has just drawn, the run does not have to discover the route at all: it starts
+/// from a policy that walks it.
+///
+/// **The clone is a walker, not a solver, and the reason is the decision cadence.** The oracle
+/// presses a take-off on the *tick* its script reaches it (`sim::reach`'s sweeps use the sim's own
+/// stepper), while a policy decides once every `action_repeat` ticks — four — and holds its arm in
+/// between, so the demonstrated press has no tick of the policy's to be made on. Measured on
+/// `l2-first-gap`: a 4000-epoch clone reproduces **every one** of the walk's 139 decisions and still
+/// walks into the pit, on all eight seeds; and at `action_repeat = 1` the same fit solves `l2`, `l4`
+/// and `l5` on all eight seeds with identical frame counts. `crate::evo::imitate`'s docs and
+/// `crates/evo/tests/imitate.rs` carry the measurement. What the clone brings is still a policy that
+/// covers ground: on `l2-first-gap`, `l3-gauntlet`, `l4-rhythm`, `l5-tightrope`, `l7-ascent` and
+/// `l9-wait-and-climb` it lands at the 90th-100th percentile of a **random population's** fitness,
+/// against a random *median* of zero.
+///
+/// **And its share of the population is a budget, not a detail.** Six seeds at pop 64, first-win
+/// generations summed (and levels solved of six), the same master seed in every arm and every arm a
+/// full population through the same `resume` path:
+///
+/// | warm of 64 | `l2-first-gap` | `l4-rhythm` | `l5-tightrope` | `l7-wall-school` |
+/// |---|---|---|---|---|
+/// | 0 (random) | 6/6, 59 | 5/6, 186 | 4/6, 195 | 6/6, 124 |
+/// | 1 | 6/6, 56 | 6/6, 93 | 4/6, 207 | 6/6, 70 |
+/// | 8 | 6/6, 37 | 5/6, 132 | 5/6, 156 | 6/6, 22 |
+/// | **16 (default)** | **6/6, 22** | **6/6, 71** | **6/6, 43** | 6/6, 75 |
+/// | 64 (all) | 5/6, 142 | 4/6, 222 | 6/6, 87 | 5/6, 136 |
+///
+/// A quarter of the population is the arm that solves every level on every seed and is two to four
+/// times faster to a first win than random; warming *everything* is the worst arm — the clone's
+/// basin is a high-fitness plateau with no win on it, and a population standing on one plateau has
+///
+/// **The table's arms each drew their own random remainder** ([`warm_population`] fills the clone's
+/// slots first and takes the rest from the same stream), so it is a survey of arms rather than a
+/// paired measurement of one population's slots. The paired arms are the ones pinned in
+/// `crates/evo/tests/imitate.rs` — the same 48 random genomes under the same ids in both, sixteen
+/// slots warm — and they read 12 generations against random's 15 on `l2-first-gap` and 24 against 130
+/// on `l5-tightrope`, so the direction is the same one the table shows.
+/// nothing to its left. The default is `pop / 4` for that reason, and `--warm` moves it.
+///
+/// The clone is printed with its own numbers, and a replay that did **not** reach the flag says so:
+/// a partial walk is still a warm start (the clone is worth what it demonstrated and nothing past
+/// where the walk stopped), but a run that was told its population can play this level should never
+/// have to infer that the walk failed.
+fn route_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer, String> {
+    let default_warm = (cfg.pop_size / 4).max(1);
+    let warm = usage(a.usize_opt("warm", default_warm))?.clamp(1, cfg.pop_size);
+    let epochs = usage(a.usize_opt("clone-epochs", ImitateConfig::default().epochs))?;
+    let route_seed = usage(a.u64_opt("route-seed", cfg.master_seed))?;
+    let shape = cfg.shape.clone();
+    let eval = EvalConfig {
+        action_repeat: cfg.action_repeat,
+    };
+    let icfg = ImitateConfig {
+        epochs,
+        ..ImitateConfig::default()
+    };
+    let (play, report): (RoutePlay, ImitationReport) =
+        from_route(level, route_seed, &eval, shape, &icfg)?;
+    println!("route   {} (seed {route_seed})", play.note);
+    println!("clone   {}", report.line());
+    if !play.won() {
+        println!(
+            "note    the replay did not reach the flag, so the clone is a **partial** route: it \
+             walks to where the walk stopped and is worth nothing past it"
+        );
+    }
+    let mut rng = sim::rng::rng_from_seed(cfg.master_seed ^ 0x2E5E_ED2E_5EED_2E5E);
+    let pop = warm_population(
+        &report.genome,
+        cfg.pop_size,
+        warm - 1,
+        cfg.mutation_sigma,
+        cfg.mutation_rate,
+        &mut rng,
+    );
+    println!(
+        "seeded  {warm} of {} genomes from the clone (1 clone + {} mutated relatives), {} random",
+        cfg.pop_size,
+        warm - 1,
+        cfg.pop_size.saturating_sub(warm)
+    );
+    Trainer::resume(cfg, pop, 0)
+}
+
 /// The GA configuration a `train` invocation asks for.
 ///
 /// Factored out so the flag defaults have exactly **one** home ([`GaConfig::default`]) and a test
@@ -580,7 +852,7 @@ pub fn train(a: &Args) -> Result<(), String> {
 /// level's walkers; that rule now lives in the trainer and the caller asks
 /// [`GaConfig::effective_trials`] for the answer, so the only thing the second parameter could do
 /// here was sit unused.
-fn train_config(a: &Args) -> Result<GaConfig, String> {
+pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
     let default = GaConfig::default();
     // Trials used to be chosen *here* — a hard-coded `3` beside the flag name for a level with
     // walkers — which is the same defect the doc comment above records for the reheat factor, and
@@ -615,6 +887,11 @@ fn train_config(a: &Args) -> Result<GaConfig, String> {
         // for behaving rarely, added to the **selection** score and never to a recorded one. Default
         // 0.0 comes from the trainer, like every other default here.
         novelty_weight: usage(a.f32_opt("novelty", default.novelty_weight))?,
+        // How pessimistically a genome's own trials are ranked: 0.0 is their mean (the default,
+        // and what every recorded number was taken with), 1.0 is the worst of them. See
+        // `GaConfig::rank_pessimism` — like the novelty weight, it is a *ranking* knob and cannot
+        // change a recorded number.
+        rank_pessimism: usage(a.f32_opt("rank-pessimism", default.rank_pessimism))?,
         reheat_factor: usage(a.f32_opt("reheat-factor", default.reheat_factor))?,
         action_repeat: usage(a.usize_opt("action-repeat", default.action_repeat as usize))? as u32,
         // Memory: how much of the network's own first hidden layer is fed back into the next
@@ -622,7 +899,14 @@ fn train_config(a: &Args) -> Result<GaConfig, String> {
         // default comes from the trainer's shape (0 — a memoryless net, which is what every
         // measurement in `REVIEW.md` was taken with), and the trainer clamps the width to
         // `genome::MAX_FEEDBACK`, so a typo is a slower run rather than a failed allocation.
+        //
+        // Capacity is the other half of the same question and comes through the same shape: the
+        // shipped net is one hidden layer of 16 (`default_shape`), and `--hidden` is how a run asks
+        // whether a wider one searches better. Both are *live* shapes, so the trainer's own clamps
+        // (`GaConfig::sanitized`) are the contract — a mis-typed width is a smaller run, never a
+        // failed allocation — and `--hidden`'s own parsing refuses only what is not a number at all.
         shape: evo::NetShape {
+            hidden: parse_hidden(a, &default.shape.hidden)?,
             feedback: usage(a.usize_opt("feedback", default.shape.feedback))?,
             ..default.shape
         },
@@ -630,6 +914,24 @@ fn train_config(a: &Args) -> Result<GaConfig, String> {
         // (those with walkers): elsewhere every trial is the same episode.
         trials,
         auto_trials,
+        // Which episodes the population is judged on, and whether the extra trials are spent on
+        // everything or only on what is still in contention. Both defaults come from the trainer;
+        // `--no-common-episodes` is the arm every table in `REVIEW.md` taken before the field
+        // existed was measured under, and it is the one an old reading is reproduced with.
+        common_episodes: if a.has_flag("common-episodes") {
+            true
+        } else if a.has_flag("no-common-episodes") {
+            false
+        } else {
+            default.common_episodes
+        },
+        race_episodes: if a.has_flag("race-episodes") {
+            true
+        } else if a.has_flag("no-race-episodes") {
+            false
+        } else {
+            default.race_episodes
+        },
         master_seed: usage(a.u64_opt("seed", default.master_seed))?,
     })
 }
@@ -786,8 +1088,10 @@ fn es_config(a: &Args) -> Result<EsConfig, String> {
         learning_rate: usage(a.f32_opt("learning-rate", default.learning_rate))?,
         master_seed: usage(a.u64_opt("seed", default.master_seed))?,
         // The same one-flag-plus-a-copy-of-the-default shape the GA path uses, so the memory
-        // width is comparable across the two arms.
+        // width *and the capacity* are comparable across the two arms — a baseline searching a
+        // different net would be a comparison of two questions rather than of two searches.
         shape: evo::NetShape {
+            hidden: parse_hidden(a, &default.shape.hidden)?,
             feedback: usage(a.usize_opt("feedback", default.shape.feedback))?,
             ..default.shape
         },
@@ -1099,10 +1403,14 @@ pub(crate) fn find_level_by_hash(dir: &str, hash: &str) -> Result<Option<Level>,
 /// `replay` is for the recorded-episode half.
 ///
 /// **The episodes are fresh ones, and that is deliberate.** They are the episodes this genome
-/// would have been judged on in generation 0 of its own run — `episode_seed(master_seed, 0,
-/// genome_id, trial)`, with the master seed the champion recorded — rather than the single episode
-/// the file carries. `replay` verifies the recorded one; this asks the wider question, and asking
-/// it with the same seeds every time is what makes two champions comparable.
+/// would have been judged on in generation 0 of a default run — the trainer's own episode policy
+/// ([`evo::ga::episode_seed_for`], asked of `GaConfig::default()` with the master seed the champion
+/// recorded) rather than the single episode the file carries. `replay` verifies the recorded one;
+/// this asks the wider question, and asking it with the same seeds every time is what makes two
+/// champions comparable — which is also why the seed is asked of the trainer rather than rebuilt
+/// here: under `common_episodes` the whole population of a generation shares one episode, and a
+/// second copy of that rule in this command is exactly the kind of quiet divergence the two ends of
+/// this project have been bitten by before.
 ///
 /// Trials come from the **trainer's own rule** rather than from what the champion was trained
 /// with, so a level with walkers in it is judged on three patrol phases: a policy that solves a
@@ -1144,6 +1452,12 @@ pub fn score(a: &Args) -> Result<(), String> {
         action_repeat: champion.metadata.action_repeat,
     };
     let master = usage(a.u64_opt("seed", champion.metadata.training_config.master_seed))?;
+    // The episode policy this command asks the trainer for, and the only thing it takes from the
+    // default configuration: which episodes generation 0 of a default run would have used.
+    let policy = GaConfig {
+        master_seed: master,
+        ..GaConfig::default()
+    };
 
     println!(
         "champion  {} (gen {}, id {})",
@@ -1188,7 +1502,8 @@ pub fn score(a: &Args) -> Result<(), String> {
         let mut wins = 0usize;
         let mut first: Option<evo::EpisodeResult> = None;
         for trial in 0..trials {
-            let seed = sim::rng::episode_seed(master, 0, champion.metadata.genome_id, trial);
+            let seed =
+                evo::ga::episode_seed_for(&policy, 0, champion.metadata.genome_id, trial);
             let r = evo::run_episode(level, &genome, &eval, seed);
             sum += r.fitness;
             if r.won() {
@@ -1742,9 +2057,11 @@ mod tests {
         assert_eq!(cli.immigrants, default.immigrants);
         assert_eq!(cli.archive_children, default.archive_children);
         assert_eq!(cli.novelty_weight, default.novelty_weight);
+        assert_eq!(cli.rank_pessimism, default.rank_pessimism);
         assert_eq!(cli.reheat_factor, default.reheat_factor);
         assert_eq!(cli.action_repeat, default.action_repeat);
         assert_eq!(cli.shape.feedback, default.shape.feedback);
+        assert_eq!(cli.shape.hidden, default.shape.hidden);
         assert_eq!(cli.trials, default.trials);
         assert_eq!(cli.master_seed, default.master_seed);
 
@@ -1785,6 +2102,122 @@ mod tests {
             1,
             "--no-auto-trials is how the numbers taken before the rule existed are reproduced"
         );
+    }
+
+    /// The two flags that change what a run can *be* rather than how it steps: the capacity of the
+    /// net, and the question a genome is ranked by.
+    ///
+    /// Both are checked at this level rather than only in the trainer's own tests because the way
+    /// they fail is a command line that silently means something else: `--hidden` is a comma list
+    /// parsed here, and `--rank-pessimism` is an `f32` that has to survive the trainer's clamps.
+    #[test]
+    fn the_capacity_and_ranking_flags_reach_the_trainer() {
+        let level_path = wpath("levels/l1-flat-run.json");
+        let asked = train_config(&a(&[
+            "train",
+            "--level",
+            &level_path,
+            "--hidden",
+            "32,16",
+            "--rank-pessimism",
+            "0.5",
+        ]))
+        .expect("parses");
+        assert_eq!(asked.shape.hidden, vec![32, 16], "a list is a topology, not a number");
+        assert_eq!(
+            asked.shape.feedback,
+            GaConfig::default().shape.feedback,
+            "widening the net must not disturb the memory width it was not asked about"
+        );
+        assert_eq!(asked.rank_pessimism, 0.5);
+        let run = asked.sanitized(None);
+        assert_eq!(
+            run.shape.hidden,
+            vec![32, 16],
+            "a width an operator asked for must survive the trainer's own clamping"
+        );
+        assert_eq!(run.rank_pessimism, 0.5, "and so must the pessimism");
+        // A zero-width layer is refused here rather than repaired, because it is not a narrower
+        // network: the layer above it would fan in to a row of zeros and the one below to nothing.
+        let broken = train_config(&a(&["train", "--level", &level_path, "--hidden", "0"]))
+            .expect_err("a zero-width layer is a usage error");
+        assert!(broken.contains("--hidden 0"), "{broken}");
+        let word = train_config(&a(&["train", "--level", &level_path, "--hidden", "wide"]))
+            .expect_err("a word is not a width");
+        assert!(word.contains("layer widths"), "{word}");
+    }
+
+    /// A run seeded from a champion starts from it, says which level it came from when that is not
+    /// this one, and does not overwrite the file it started from.
+    ///
+    /// The last part is the one worth a test. A fine-tune names a champion in the same directory the
+    /// run writes to, so the default champion path *is* the seed's own path: without the guard the
+    /// run would replace the evidence it began from with the result it produced, one directory, no
+    /// warning, and the "before" of a before-and-after gone (`REVIEW.md` §2.8).
+    #[test]
+    fn a_run_seeded_from_a_champion_starts_there_and_writes_beside_its_seed() {
+        let (level, champion, dir) = tiny_run("seeded-run", "3", "16");
+        let out = dir.to_string_lossy().to_string();
+        let seed_arg = champion.to_string_lossy().to_string();
+        let level_path = wpath("levels/l1-flat-run.json");
+        let before = ChampionFile::load_for_level(&champion, &level).expect("the seed is a champion");
+
+        train(&a(&[
+            "train",
+            "--level",
+            &level_path,
+            "--generations",
+            "2",
+            "--pop",
+            "16",
+            "--seed",
+            "9",
+            "--out",
+            &out,
+            "--from-champion",
+            &seed_arg,
+            "--quiet",
+        ]))
+        .expect("a seeded run trains");
+
+        let after = ChampionFile::load_for_level(&champion, &level).expect("the seed still loads");
+        assert_eq!(
+            after.metadata.genome_id, before.metadata.genome_id,
+            "the file the run started from is the file it started from"
+        );
+        assert_eq!(after.fitness, before.fitness);
+        let seeded = dir.join("l1-flat-run-seeded.json");
+        assert!(
+            seeded.exists(),
+            "a seeded run writes beside its seed rather than over it"
+        );
+        let written = ChampionFile::load_for_level(&seeded, &level)
+            .expect("the seeded run's champion is a champion of this level");
+        assert!(
+            written.fitness.is_finite() && written.metadata.genome_id > 0,
+            "a run that started from a genome still has to produce one"
+        );
+
+        // And the alternatives are alternatives: two answers to "where does this start" is a usage
+        // error, checked *before* either file is read, which is why the checkpoint's path need not
+        // exist for this assertion to mean something.
+        let both = train(&a(&[
+            "train",
+            "--level",
+            &level_path,
+            "--resume",
+            "nowhere.population.json",
+            "--from-champion",
+            &seed_arg,
+            "--out",
+            &out,
+            "--quiet",
+        ]))
+        .expect_err("one run cannot start from both a population and a genome");
+        assert!(both.starts_with("usage:"), "{both}");
+        assert!(both.contains("alternatives"), "{both}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The baseline arm's flags default from the trainer too, for the same reason, and — the part

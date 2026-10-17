@@ -52,11 +52,14 @@
 // (the type alias), without shadowing the alias name.
 use rand_xoshiro::rand_core::Rng as _;
 use rayon::prelude::*;
-use sim::rng::{episode_seed, next_f32, rng_from_seed, Rng};
+use sim::rng::{common_episode_seed, episode_seed, next_f32, rng_from_seed, Rng};
 use sim::Level;
 
 use crate::fitness::{self, EpisodeResult, EvalConfig};
-use crate::genome::{crossover, default_shape, mutate, mutate_few, reheat, Genome, NetShape, MAX_FEEDBACK};
+use crate::genome::{
+    crossover, default_shape, mutate, mutate_few, reheat, Genome, NetShape, MAX_FEEDBACK,
+    MAX_HIDDEN_LAYERS, MAX_HIDDEN_WIDTH,
+};
 
 /// GA hyperparameters (§7.5). Populated with the plan's v1 values.
 #[derive(Clone, Debug)]
@@ -184,6 +187,32 @@ pub struct GaConfig {
     /// because a mechanism that reads one number to make a policy general has to earn its place
     /// against the number it is reading.
     pub novelty_weight: f32,
+    /// Where between the **mean** of a genome's trials and the **worst** of them the ranking
+    /// sits: `0.0` — the default — is the mean, `1.0` is the floor, and anything between is the
+    /// interpolation `mean + k × (floor - mean)`.
+    ///
+    /// **A ranking knob rather than a reward knob, and that is what makes it cheap.** It changes
+    /// the score selection and the tournament read and nothing else — the chart, the champion, the
+    /// CSV export and every number in `REVIEW.md` keep their meaning, because everything that
+    /// *records* a number reads [`EpisodeResult::fitness`] and [`EpisodeResult::mean_fitness`]
+    /// (see [`selection_scores`]). Nothing here is versioned, no champion is invalidated, and a
+    /// level with no walkers is unaffected at any setting: one episode is its own floor, so the
+    /// score is the mean and the ladder's numbers stay reproducible.
+    ///
+    /// It exists because of the one thing a mean over patrol phases cannot say. `episode_seed`
+    /// mixes in the generation, so a walker level re-rolls every genome's patrol phase every
+    /// generation: an elite can be handed a phase it never solved and fall out of the run
+    /// (finding 14), and the run then re-learns something it already knew. A mean prices a genome
+    /// by what it usually does; the floor prices it by what it does when the world is at its
+    /// worst, which is the genome a run wants to keep.
+    ///
+    /// **What it costs is the mirror image, and it is the reason to sweep it rather than assume
+    /// it.** A pessimist also discards the genome that won by luck — and on a level where luck is
+    /// the only thing that has ever reached the flag, that genome is the run's champion and its
+    /// only evidence that the level falls at all. So the two ends are a real trade and not a
+    /// free lunch: `0.0` keeps the lucky lineage, `1.0` keeps the steady one, and the measurement
+    /// (REVIEW.md §4, the pessimism arm) is what decides where this run's default sits.
+    pub rank_pessimism: f32,
     /// Let the mutation size tune itself by the rule described in [`Trainer::tune_sigma`].
     ///
     /// **Off by default, and that is a measurement rather than a preference.** On
@@ -231,6 +260,74 @@ pub struct GaConfig {
     /// six-generation lottery; `false` pins every level to the literal `trials`, which is what
     /// the measurements taken before this lock existed can be reproduced with.
     pub auto_trials: bool,
+    /// Judge every genome of a generation on the **same** episodes: common random numbers.
+    ///
+    /// On, episodes are derived from `(master_seed, generation, trial)` alone
+    /// ([`sim::common_episode_seed`]) and the whole population meets the same patrol phase, the
+    /// same drawn geometry, the same world. Off, each genome gets its own episode from
+    /// `(master_seed, generation, genome id, trial)` ([`sim::episode_seed`]) — the policy every
+    /// measurement in `REVIEW.md` taken before this field existed was made under.
+    ///
+    /// **What pairing buys is that a comparison means something.** On a walker level the patrol
+    /// phase is a uniform draw over `walker_speed × patrol length`, so an unpaired tournament is
+    /// a contest between *worlds* as much as between genomes: the winner of a round is, on
+    /// average, half the time the genome that drew the easier phase, and selection spends
+    /// generations chasing that luck. Ranking on three unpaired trials rather than one reduces the
+    /// variance of the *estimate* but cannot remove the term, which is why the pack's walker
+    /// levels want a trial count at all. Pairing removes the term at its source: within a
+    /// generation, two genomes differ by their policy and by nothing else, and the generation is
+    /// still mixed into the seed, so the world is re-rolled every generation and no phase can be
+    /// memorised.
+    ///
+    /// What it does **not** fix is the *across*-generation noise, and that is worth stating because
+    /// it is the next question a reader will ask. A run's best-so-far, its stagnation counter and
+    /// its elites carry a score taken on some other generation's world, so a run can still be
+    /// impressed by the generation that drew a quiet market and re-heat on evidence it did not
+    /// have. Pairing is the half that can be fixed at the seed, and it is a strict improvement for
+    /// every reader of a *ranking*: it changes no recorded fitness (a champion still records trial
+    /// 0 of its own level, and `replay` still reproduces it), it invalidates no artifact, and it
+    /// moves no version — the same genome, the same level, a different draw of the world.
+    ///
+    /// **The cost, measured, is the reason this is a field and not a rewrite of `episode_seed`.**
+    /// Under pairing every genome of a generation faces one phase, so on a level where that phase
+    /// happens to be unsolvable the whole generation is told so, and on a level where it is trivial
+    /// the whole generation wins at once: a single generation is a *sharper* reading of the
+    /// population than it was, in both directions. Whether that helps or hurts a run is a
+    /// measurement on the level rather than an argument, and the arm is in `REVIEW.md` §4.
+    pub common_episodes: bool,
+    /// Spend extra trials only on the genomes still in contention: **successive halving** over the
+    /// episodes a level's budget asks for.
+    ///
+    /// Round one judges every genome on trial 0. Then the population is halved — the better half
+    /// stays by the same rule selection uses ([`GaConfig::rank_pessimism`] included) — and only
+    /// the survivors are played on trial 1, and then the survivors of *those* on trial 2. A
+    /// walker level's three-phase budget therefore costs `1 + 1/2 + 1/4` of a flat three-trial
+    /// pass instead of `3` — under a third of the episode time freed, or the same wall clock
+    /// spent on twice the generations, with the final ranking as well informed as it was.
+    ///
+    /// It is unsound without [`GaConfig::common_episodes`] and is **dropped rather than
+    /// interpreted** without it: culling on unpaired episodes would compare two different worlds
+    /// and then pay for the comparison with a genome's life. [`GaConfig::sanitized`] turns racing
+    /// *off* when the two disagree — the episode policy is the request that wins — and a test pins
+    /// that. Under pairing the round-one cull is the *fair* comparison, one world with every genome
+    /// on it, which is what makes racing sound at all.
+    ///
+    /// **On by default, from the arm rather than from the arithmetic.** The three shipped protocols
+    /// at pop 200 and twelve seeds, `--stop-on-win`: `gauntlet` 12 of 12 either way (median 19 raced
+    /// against 13 flat, p = 1.00), `marathon` 12 of 12 either way at the same median 10.5, and
+    /// `chain` 10 of 12 raced against 7 of 12 flat — the *unpaired* arm's own count — for 1.75
+    /// episodes per genome against 3.00. So the saving is bought without a measured loss anywhere,
+    /// and on the level that separates the arms at all it is the raced arm that keeps the flat
+    /// run's coverage. See `REVIEW.md` §4 for the tables.
+    ///
+    /// Two consequences a reader of the numbers should know. A culled genome's
+    /// [`EpisodeResult::worst_trial`] is a floor over fewer episodes than a survivor's, so the
+    /// pessimistic reading is not comparable between them — nothing selects on it after the race
+    /// and the archive stores fitness, but a report printed from one generation's results is not a
+    /// table of like with like. And a champion is unaffected: trial 0 of the first level is run for
+    /// every genome in round one, so the recorded episode and its seed are exactly what a flat run
+    /// would have recorded.
+    pub race_episodes: bool,
     /// Root seed for the whole run.
     pub master_seed: u64,
     pub shape: NetShape,
@@ -250,12 +347,15 @@ impl Default for GaConfig {
             archive_children: 0,
             archive_on_diversity: false,
             novelty_weight: 0.0,
+            rank_pessimism: 0.0,
             adaptive_sigma: false,
             stagnation_generations: 20,
             immigrants: 8,
             reheat_factor: 3.0,
             trials: 1,
             auto_trials: true,
+            common_episodes: true,
+            race_episodes: true,
             master_seed: 1,
             shape: default_shape(),
             action_repeat: fitness::ACTION_REPEAT,
@@ -358,6 +458,21 @@ impl GaConfig {
         // The bound is a ceiling on a knob, not a policy about its value — the arm that was
         // measured used 16.
         self.novelty_weight = self.novelty_weight.clamp(0.0, NOVELTY_WEIGHT_MAX);
+        // Pessimism is a fraction of the gap between the mean and the floor, so both ends are
+        // meaningful and nothing outside `0.0..=1.0` is a statement about a genome: above one the
+        // ranking would prefer a genome whose floor is *worse* than any trial it ran.
+        self.rank_pessimism = self.rank_pessimism.clamp(0.0, 1.0);
+        // A hidden layer of zero width is not a narrower network, it is a broken one: the layer
+        // below it would fan in to nothing and the layer above would fan in to a row of zeros.
+        // The clamp is the same bargain `feedback` makes — a typo is a smaller run, never a
+        // failed allocation or a silent mis-slicing of the gene vector.
+        self.shape.hidden.truncate(MAX_HIDDEN_LAYERS);
+        if self.shape.hidden.is_empty() {
+            self.shape.hidden = default_shape().hidden;
+        }
+        for width in &mut self.shape.hidden {
+            *width = (*width).clamp(1, MAX_HIDDEN_WIDTH);
+        }
         // The reheat step is derived from sigma, so this bound is on the *multiple*: 8.0 with the
         // shipped sigma of 0.30 already asks for 2.4 and lands on the ceiling, and a negative
         // factor would mean a batch thrown *towards* the champion, which is not a search move.
@@ -367,6 +482,19 @@ impl GaConfig {
             self.stagnation_generations = 2;
         }
         self.trials = self.trials.max(1);
+        // A race culls genomes on evidence, and evidence is only comparable when the episodes are:
+        // half a population is not worth a comparison between two different worlds. So racing
+        // cannot be *turned on* here — only turned off — when the two disagree.
+        //
+        // **The episode policy wins, and racing yields**, which is the opposite of what an earlier
+        // draft did (it switched pairing on for a racer) and is the reason for the reversal: the
+        // default pairing is `true`, so `common_episodes: false` can only be somebody asking for the
+        // unpaired policy — and a request for the old behaviour must not be silently overruled by a
+        // mechanism that happens to be on by default. A racer that cannot be sounded is not run, and
+        // `--no-common-episodes` therefore means exactly what it says.
+        if !self.common_episodes {
+            self.race_episodes = false;
+        }
         // Memory is a gene count rather than a behaviour, so the bound is about arithmetic:
         // `--feedback 100000` should clamp to a slower run, never to a failed allocation, and
         // the state can never be asked to be wider than the first hidden layer twice over.
@@ -605,6 +733,11 @@ pub fn evaluate_population(
 /// The per-genome work is [`suite_score`], which is also the function a front-end calls to ask the
 /// same question about one genome — the champion, after the run — so "what did this suite do" has
 /// one implementation rather than two that could disagree.
+///
+/// Under [`GaConfig::race_episodes`] the pass is [`evaluate_suite_raced`] instead: the same arithmetic
+/// on fewer episodes, with the extra trials spent only on the genomes still in contention. The
+/// results are element-wise comparable to a flat pass — same order, same meaning per field — and the
+/// representative episode is the same one, because round one plays every genome on trial 0.
 pub fn evaluate_suite(
     levels: &[Level],
     genomes: &[Genome],
@@ -612,10 +745,253 @@ pub fn evaluate_suite(
     generation: u32,
 ) -> Vec<EpisodeResult> {
     assert!(!levels.is_empty(), "a suite needs at least one level");
+    if cfg.race_episodes && levels.iter().any(|l| cfg.effective_trials(l) > 1) {
+        return evaluate_suite_raced(levels, genomes, cfg, generation).0;
+    }
     genomes
         .par_iter()
         .map(|g| suite_score(levels, g, cfg, generation).0)
         .collect()
+}
+
+/// A suite pass in which the extra trials are spent only on the genomes still in contention.
+///
+/// Round one judges every genome on trial 0 of every level — the whole population, the same episodes
+/// the flat pass would have used, so the representative episode and the recorded champion are
+/// untouched by this. Then the population is halved ([`RACE_KEEP_DIVISOR`]) and only the survivors
+/// are played on trial 1, and then the survivors of *those* on trial 2, for as many rounds as the
+/// longest level's budget asks for. A level whose own budget is shorter than the round being played
+/// is simply skipped: a level with no walkers has one episode and there is nothing to halve.
+///
+/// **The cull ranks on the same number selection does**, [`pessimistic`] of the readings so far —
+/// the recorded aggregate and the floor over the episodes run so far — so a race does not introduce
+/// a second opinion about what a genome is worth. [`GaConfig::novelty_weight`] is deliberately not
+/// part of it: rarity is a property of the *population's* behaviour cells, and cells counted over
+/// the shrinking set of contenders are a different quantity from the ones the run ranks on. The
+/// race's job is to buy trials back, not to spend them on a tie-break.
+///
+/// The parallelism is per genome within a round and the threads never touch the tallies: a round's
+/// episodes are collected in genome order and folded in single-threaded, so the rounding of the
+/// sums and therefore the whole run is independent of the thread count, exactly as the flat pass is.
+///
+/// Returns the results **and the number of episodes actually spent**, which is what a reader of a
+/// "raced or not" arm needs to divide a wall clock by, and what the test that pins the saving reads.
+/// A number that only exists in a doc comment is a number nobody can be wrong about.
+fn evaluate_suite_raced(
+    levels: &[Level],
+    genomes: &[Genome],
+    cfg: &GaConfig,
+    generation: u32,
+) -> (Vec<EpisodeResult>, usize) {
+    let eval = cfg.eval_config();
+    let rounds = levels
+        .iter()
+        .map(|l| cfg.effective_trials(l))
+        .max()
+        .unwrap_or(1);
+    let mut tallies: Vec<SuiteTally> = (0..genomes.len())
+        .map(|_| SuiteTally::new(levels.len()))
+        .collect();
+    let mut contenders: Vec<usize> = (0..genomes.len()).collect();
+    let mut spent = 0usize;
+
+    for trial in 0..rounds {
+        let played: Vec<(usize, Vec<(usize, EpisodeResult)>)> = contenders
+            .par_iter()
+            .map(|&gi| {
+                let genome = &genomes[gi];
+                let mut runs: Vec<(usize, EpisodeResult)> = Vec::new();
+                for (li, level) in levels.iter().enumerate() {
+                    if cfg.effective_trials(level) <= trial {
+                        continue;
+                    }
+                    let seed = episode_seed_for(cfg, generation, genome.id, trial);
+                    runs.push((li, fitness::run_episode(level, genome, &eval, seed)));
+                }
+                (gi, runs)
+            })
+            .collect();
+        for (gi, runs) in played {
+            spent += runs.len();
+            for (li, r) in runs {
+                tallies[gi].record(li, trial, r);
+            }
+        }
+        if trial + 1 == rounds {
+            break;
+        }
+        // Rank the contenders by what is known about them so far and keep the better half. The
+        // tie-break is the genome's position in the population, so the same generation always
+        // culls the same genomes whatever the thread count.
+        let mut ranked: Vec<usize> = contenders.clone();
+        ranked.sort_by(|&a, &b| {
+            tallies[b]
+                .race_score(cfg.rank_pessimism)
+                .partial_cmp(&tallies[a].race_score(cfg.rank_pessimism))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let keep = ranked.len().div_ceil(RACE_KEEP_DIVISOR).max(1);
+        ranked.truncate(keep);
+        contenders = ranked;
+    }
+
+    let results = tallies
+        .into_iter()
+        .map(|t| t.result(levels.len()))
+        .collect();
+    (results, spent)
+}
+
+/// The seed of one episode of one genome, under this run's own episode policy.
+///
+/// One function, so that "which episode is this genome judged on" has one answer: the trainer,
+/// the suite scorer and the CLI's re-scoring of a saved champion all come through here, and a run
+/// reproduced from a champion's file gets the same episodes it was trained on.
+///
+/// [`GaConfig::common_episodes`] decides between [`sim::common_episode_seed`] — the whole
+/// population on one world, the genome's id deliberately absent from the seed — and
+/// [`episode_seed`] — every genome its own draw, which is what this trainer did before the field
+/// existed.
+pub fn episode_seed_for(cfg: &GaConfig, generation: u32, genome_id: u32, trial: u32) -> u64 {
+    if cfg.common_episodes {
+        common_episode_seed(cfg.master_seed, generation, trial)
+    } else {
+        episode_seed(cfg.master_seed, generation, genome_id, trial)
+    }
+}
+
+/// How many contenders survive one round of a race: half of them, rounded up.
+///
+/// Successive halving with a keep-half rule is the version whose arithmetic is worth writing down:
+/// `k` trials cost `2 - 2^(1-k)` of a flat `k`-trial pass, so three trials cost 1.75 of 3 (42 %
+/// saved) and four cost 1.875 of 4, and the saving is bought entirely in the first round, where
+/// every genome is still judged on one episode — the cheap round the pairing field made meaningful.
+pub const RACE_KEEP_DIVISOR: usize = 2;
+
+/// Episodes one genome is judged on, **averaged over the population**, under this configuration on
+/// this suite: the flat product of the levels' own budgets, or — with [`GaConfig::race_episodes`] —
+/// the successive-halving sum, where round `r` is played only by the survivors of round `r - 1` and
+/// only on the levels whose budget reaches that far.
+///
+/// It exists because "the same episode budget buys twice the generations" is a claim about a *cost*,
+/// and a cost that lives in a doc comment is a cost nobody can be wrong about. It is the number a
+/// benchmark arm records beside its wall clock, and the test that pins the racing saving asserts that
+/// it agrees with the episodes the code actually spent.
+pub fn episodes_per_genome(levels: &[Level], pop: usize, cfg: &GaConfig) -> f32 {
+    assert!(!levels.is_empty(), "a suite needs at least one level");
+    let rounds = levels
+        .iter()
+        .map(|l| cfg.effective_trials(l))
+        .max()
+        .unwrap_or(1);
+    if !cfg.race_episodes || rounds <= 1 {
+        return levels
+            .iter()
+            .map(|l| cfg.effective_trials(l) as f32)
+            .sum();
+    }
+    let mut contenders = pop.max(1);
+    let mut total = 0usize;
+    for trial in 0..rounds {
+        let playing = levels
+            .iter()
+            .filter(|l| cfg.effective_trials(l) > trial)
+            .count();
+        total += contenders * playing;
+        contenders = contenders.div_ceil(RACE_KEEP_DIVISOR).max(1);
+    }
+    total as f32 / pop.max(1) as f32
+}
+
+/// Fold one genome's episodes into the two readings selection uses.
+///
+/// It exists so the flat pass ([`suite_score`]) and the raced one ([`evaluate_suite`] under
+/// [`GaConfig::race_episodes`]) combine episodes in exactly **one** place. A race changes which
+/// episodes a genome is judged on; it must not change how they are combined, and two copies of
+/// this arithmetic would be two runs nobody could reconcile.
+#[derive(Clone, Debug)]
+struct SuiteTally {
+    /// Trial 0 of the suite's **first** level: the representative episode, the one a champion
+    /// records and `replay` reproduces. Set by whichever path runs that episode, which is both of
+    /// them: round one of a race is the whole population.
+    representative: Option<EpisodeResult>,
+    /// Sum of the fitnesses folded in per level, in the suite's own order.
+    sums: Vec<f32>,
+    /// Episodes folded in per level.
+    counts: Vec<u32>,
+    /// Levels whose every episode so far won. A level with no episode yet counts as won, which is
+    /// the conservative reading: it is credited only once something has actually won it, and
+    /// [`SuiteTally::result`] reads the flag rather than the absence of evidence.
+    won: Vec<bool>,
+    /// The lowest single episode, over every level and every trial.
+    worst: f32,
+}
+
+impl SuiteTally {
+    fn new(levels: usize) -> SuiteTally {
+        SuiteTally {
+            representative: None,
+            sums: vec![0.0; levels],
+            counts: vec![0; levels],
+            won: vec![true; levels],
+            worst: f32::INFINITY,
+        }
+    }
+
+    /// Fold one episode in. `level` is the suite's own index of the level, `trial` that level's
+    /// trial index — both are needed because the representative episode is defined as *the first
+    /// trial of the first level* rather than by any property of what it scored.
+    fn record(&mut self, level: usize, trial: u32, r: EpisodeResult) {
+        self.sums[level] += r.fitness;
+        self.counts[level] += 1;
+        self.worst = self.worst.min(r.fitness);
+        self.won[level] &= r.won();
+        if level == 0 && trial == 0 {
+            self.representative = Some(r);
+        }
+    }
+
+    /// The mean fitness of each level, in the suite's own order.
+    fn level_means(&self) -> Vec<f32> {
+        self.sums
+            .iter()
+            .zip(&self.counts)
+            .map(|(sum, n)| sum / (*n).max(1) as f32)
+            .collect()
+    }
+
+    /// The aggregate the suite ranks on: the mean of the level this genome is **worst** at.
+    fn aggregate(&self) -> f32 {
+        self.level_means().into_iter().fold(f32::INFINITY, f32::min)
+    }
+
+    /// The number a race culls on: [`pessimistic`] of the readings this genome has so far, which is
+    /// what the run itself ranks a finished genome by. It is computed from the sums rather than from
+    /// a finished [`EpisodeResult`], because a cull happens between rounds and there is no finished
+    /// result to hold yet.
+    fn race_score(&self, k: f32) -> f32 {
+        let mean = self.aggregate();
+        mean + k * (self.worst - mean)
+    }
+
+    /// The result selection sees, given how many levels the suite has. Consumes the tally: the
+    /// representative episode is the one episode this genome's judgement hands on, and copying it
+    /// would copy its trajectory.
+    fn result(mut self, levels: usize) -> EpisodeResult {
+        let mut result = self
+            .representative
+            .take()
+            .expect("a suite has at least one level and one trial of it");
+        // One level is not a suite: `suite_wins` stays 0, so a single-level run's report cannot be
+        // misread as "this genome solved the suite".
+        if levels > 1 {
+            result.suite_wins = self.won.iter().filter(|w| **w).count() as u32;
+        }
+        result.mean_fitness = self.aggregate();
+        result.worst_trial = self.worst;
+        result
+    }
 }
 
 /// One genome on a whole suite: the result selection sees, and the per-level means beside it.
@@ -638,9 +1014,17 @@ pub fn evaluate_suite(
 /// because a walker level judged on one patrol phase is a coin flip, and a suite that credited a
 /// single phase would inherit exactly the lottery [`GaConfig::auto_trials`] was wired to remove.
 ///
-/// Episode seeds stay `(master_seed, generation, genome id, trial)` with no level index, so the
-/// suite's first level is played on the seed a single-level run would have given it and a
-/// champion's recorded `episode_seed` keeps meaning what it meant.
+/// Episodes carry **no level index** in their seed, so the suite's first level is played on the seed
+/// a single-level run would have given it and a champion's recorded `episode_seed` keeps meaning what
+/// it meant. Which seed that is, is [`GaConfig::common_episodes`]'s question and one function's
+/// answer ([`episode_seed_for`]): under pairing the whole population plays `(master_seed,
+/// generation, trial)` of the suite's world, and without it every genome draws its own.
+///
+/// [`EpisodeResult::worst_trial`] is filled in here as well, over every trial of every level, and
+/// it is the one reading this function adds that nothing else can: the suite's aggregate is a
+/// minimum of *means*, so a genome that is steady everywhere and a genome that wins one level and
+/// dies on the next can carry the same aggregate. The floor is what tells them apart, and
+/// [`GaConfig::rank_pessimism`] is the knob that lets a run rank on it.
 pub fn suite_score(
     levels: &[Level],
     genome: &Genome,
@@ -649,53 +1033,39 @@ pub fn suite_score(
 ) -> (EpisodeResult, Vec<f32>) {
     assert!(!levels.is_empty(), "a suite needs at least one level");
     let eval = cfg.eval_config();
-    let master_seed = cfg.master_seed;
-    let mut representative: Option<EpisodeResult> = None;
-    let mut level_means: Vec<f32> = Vec::with_capacity(levels.len());
-    let mut suite_wins = 0u32;
+    let mut tally = SuiteTally::new(levels.len());
 
     for (li, level) in levels.iter().enumerate() {
         // Per level, because the trial count is a property of the level: a walker level is
         // stochastic and judged on more than one patrol phase. See `effective_trials`.
-        let trials = cfg.effective_trials(level);
-        let mut sum = 0.0f32;
-        let mut won_every_trial = true;
-        for trial in 0..trials {
+        for trial in 0..cfg.effective_trials(level) {
             // RNG and sim are constructed inside the loop: never shared.
-            let seed = episode_seed(master_seed, generation, genome.id, trial);
+            let seed = episode_seed_for(cfg, generation, genome.id, trial);
             let r = fitness::run_episode(level, genome, &eval, seed);
-            sum += r.fitness;
-            won_every_trial &= r.won();
-            // Trial 0 of the first level is the representative: it is the one anyone can
-            // reproduce, so it is the one a champion records.
-            if li == 0 && trial == 0 {
-                representative = Some(r);
-            }
-        }
-        level_means.push(sum / trials as f32);
-        if won_every_trial {
-            suite_wins += 1;
+            tally.record(li, trial, r);
         }
     }
 
-    let mut result = representative.expect("a suite has at least one level");
-    // One level is not a suite: `suite_wins` stays 0, so a single-level run's report cannot be
-    // misread as "this genome solved the suite", and the aggregate below is the mean of its own
-    // trials exactly as it always was.
-    if levels.len() > 1 {
-        result.suite_wins = suite_wins;
-    }
-    result.mean_fitness = level_means.iter().copied().fold(f32::INFINITY, f32::min);
-    (result, level_means)
+    let level_means = tally.level_means();
+    (tally.result(levels.len()), level_means)
 }
 
 /// The score every genome in a generation is **ranked and bred by**, given the recorded results.
 ///
-/// At [`GaConfig::novelty_weight`] `0.0` — the default — this is the recorded fitness itself, and
-/// the caller skips this function entirely so a run is bit-identical to the one before the field
-/// existed. Otherwise each genome is paid for behaving *rarely*: rarity is `1 - share`, where
-/// `share` is the fraction of the population occupying the same behavioural cell, and a genome
-/// alone in its cell collects the whole weight.
+/// At [`GaConfig::novelty_weight`] `0.0` *and* [`GaConfig::rank_pessimism`] `0.0` — both defaults —
+/// this is the recorded fitness itself, and the caller skips this function entirely so a run is
+/// bit-identical to the one before either field existed. Otherwise each genome is scored on
+/// [`pessimistic`] fitness and paid for behaving *rarely*: rarity is `1 - share`, where `share` is
+/// the fraction of the population occupying the same behavioural cell, and a genome alone in its
+/// cell collects the whole weight.
+///
+/// The two are separate terms on purpose, and the difference is what each one is *for*. Pessimism
+/// decides what a genome is worth — the floor of its own trials rather than their mean — and it is
+/// paid in the run's own fitness units, so it competes with the fitness it is read from. Novelty is
+/// a *bonus* on top, in fitness units per unit of rarity, and it decides who else gets to be
+/// bred at all. A run can ask for either, both or neither, and at neither the function is not
+/// called: the branch that would compute these cells costs a pass over the population and a grid
+/// of counters, and a plain run does not pay for it.
 ///
 /// Two things about that measure are deliberate rather than cheap. The cells are the quality-
 /// diversity archive's own descriptors — how far toward the flag the genome got, how many safe
@@ -707,7 +1077,12 @@ pub fn suite_score(
 /// the unfinished keep crowding into the one slot they share. And it is a *population* reading
 /// taken once per generation, so it has no memory to seed and no drift to reproduce: the run stays
 /// a function of (genome, levels, seed).
-fn selection_scores(level: &Level, results: &[EpisodeResult], weight: f32) -> Vec<f32> {
+fn selection_scores(
+    level: &Level,
+    results: &[EpisodeResult],
+    weight: f32,
+    pessimism: f32,
+) -> Vec<f32> {
     let mut counts = [0usize; ARCHIVE_CELLS];
     let mut cells: Vec<usize> = Vec::with_capacity(results.len());
     for r in results {
@@ -720,8 +1095,27 @@ fn selection_scores(level: &Level, results: &[EpisodeResult], weight: f32) -> Ve
     results
         .iter()
         .zip(cells)
-        .map(|(r, idx)| r.mean_fitness + weight * (1.0 - counts[idx] as f32 / pop))
+        .map(|(r, idx)| pessimistic(r, pessimism) + weight * (1.0 - counts[idx] as f32 / pop))
         .collect()
+}
+
+/// What a genome is worth to a ranking that does not trust a mean: `mean + k × (floor - mean)`.
+///
+/// `k` is [`GaConfig::rank_pessimism`], and the two ends of it are the two honest answers to "how
+/// good was this genome": the mean of its trials is what it usually does, and the floor is what it
+/// does when the world is at its worst. The interpolation is linear rather than a confidence
+/// interval for a reason that reads in the run's own units: `k` is *how much of the gap to the
+/// worst episode the run is willing to pay to avoid it*, so `k = 0.5` on a genome whose three
+/// patrol phases scored 100, 100 and 40 is a score of 85 — a statement a human can check against
+/// the trials that produced it, which is the same test this repository applies to a novelty weight
+/// in fitness units.
+///
+/// A one-trial genome is its own floor (see [`EpisodeResult::worst_trial`]), so this is exactly
+/// its mean at every `k`. That is not a coincidence to rely on but a property to test: it is what
+/// keeps every number measured on a deterministic level valid at any pessimism, and it is asserted
+/// (`a_deterministic_level_is_ranked_the_same_way_at_any_pessimism`).
+fn pessimistic(r: &EpisodeResult, k: f32) -> f32 {
+    r.mean_fitness + k * (r.worst_trial - r.mean_fitness)
 }
 
 /// Number of progress bins in the MAP-Elites quality-diversity archive.
@@ -1011,6 +1405,24 @@ impl Trainer {
         let config = config.sanitized(Some(genomes.len()));
         for g in &genomes {
             g.validate()?;
+            // Every member has to agree with the run about the network, and this is checked here
+            // rather than trusted because the failure is silent and total: breeding stamps the
+            // *config's* shape onto every child it makes (`breed`) while the genes it slices came
+            // from a parent of another shape, so one mismatched genome poisons the generation that
+            // follows it — a fan-in read from the wrong offset, and a run that keeps reporting
+            // numbers about a policy that is no longer the one in the file. The shape is not a
+            // detail the run can differ on: `--feedback 8` on a memoryless checkpoint used to be
+            // accepted, and it is the same error as `--hidden`.
+            if g.shape != config.shape {
+                return Err(format!(
+                    "genome {} was built as {} but this run asks for {}: a population cannot be \
+                     bred across two shapes (drop the flag that changed it, or resume a \
+                     checkpoint taken with it)",
+                    g.id,
+                    g.shape.label(),
+                    config.shape.label()
+                ));
+            }
         }
         let next_id = genomes.iter().map(|g| g.id).max().unwrap_or(0) + 1;
         let mut rng = rng_from_seed(config.master_seed ^ 0x5DEE_CE66_D1CE_4B1D);
@@ -1041,6 +1453,68 @@ impl Trainer {
             fastest: None,
             fastest_agent: None,
         })
+    }
+
+    /// Start from a **known good point**: the champion genome, plus `pop_size - 1` reheated copies
+    /// of it.
+    ///
+    /// The champion is the one point in a previous run that is known to be worth something, and
+    /// this is the smallest change that turns one point into a population: slot 0 is the genome
+    /// itself, gene for gene, and every other slot is a [`reheat`] of it — the run's own mutation
+    /// size applied to *every* gene, scaled by [`GaConfig::reheat_factor`], which is the same step
+    /// the immigrant batch uses to attack a plateau and the same one this project swept and sized
+    /// there (1.0 against 3.0, §4). No new number is introduced: the shell is the run's own idea of
+    /// "far from a known-good point", so a config that asks for a hard shake gets a hard one.
+    ///
+    /// **What it is for, and what it is not.** Three uses, in order of how much they are worth:
+    ///
+    /// 1. **Continuing a run.** `--resume` continues a *population*, which is the right artifact
+    ///    for a stall; this continues a *champion*, which is the only artifact a run leaves behind
+    ///    when it was stopped without a checkpoint (a `--max-seconds` cutoff, a closed terminal, a
+    ///    level the operator edited afterwards). Before this existed, three hundred generations of
+    ///    work were not resumable at all unless the stall chain happened to have written a
+    ///    population file.
+    /// 2. **Fine-tuning on a level that changed.** The flag is a *seed*, not a claim about the
+    ///    level: the level hash is deliberately not checked (see `ChampionFile`), because the
+    ///    interesting case is exactly the one that would fail it — the collision you just moved, or
+    ///    the harder level you want the same policy to face.
+    /// 3. **A curriculum ladder.** One level's champion becomes the next level's starting
+    ///    population, which is how a run is supposed to accumulate ability rather than re-earning
+    ///    it per level.
+    ///
+    /// **It cannot import what the *search* knew, only what the *policy* is.** The archive, the
+    /// history, the best-ever record, the fastest win and the RNG stream all belong to a run rather
+    /// than to a genome, and none of them survives the trip: a seeded population is generation 0 of
+    /// a new run, and the shell around the champion is drawn from the new master seed. Saying that
+    /// out loud matters because the alternative reading — "this continues the old run" — would make
+    /// the fitness before and after look comparable when they are a different level's, which is
+    /// what the terminal prints a note about.
+    pub fn from_champion(config: GaConfig, champion: Genome) -> Result<Trainer, String> {
+        champion.validate()?;
+        let config = config.sanitized(None);
+        if champion.shape != config.shape {
+            return Err(format!(
+                "the champion is {} but this run asks for {}: a seeded population has to be one \
+                 shape (pass the shape the champion was trained with, or omit the flag)",
+                champion.shape.label(),
+                config.shape.label()
+            ));
+        }
+        let mut rng = rng_from_seed(config.master_seed ^ 0x5EED_0F5E_ED0F_5EED);
+        let sigma = config.reheat_sigma();
+        let mut genomes: Vec<Genome> = Vec::with_capacity(config.pop_size);
+        genomes.push(champion.clone());
+        for slot in 1..config.pop_size {
+            let mut child = reheat(&champion, sigma, &mut rng);
+            // Ids are issued from the champion's own, continuing the numbering of the run it came
+            // from: they are part of every episode seed, so a reissued id would make the seeded
+            // population face the episodes of a genome it has nothing to do with.
+            child.id = champion.id + slot as u32;
+            genomes.push(child);
+        }
+        // `resume` does the rest — validation, id bookkeeping, `next_id` — and it starts the run at
+        // generation 0 with no history, which is what a *new* run seeded from an old point is.
+        Trainer::resume(config, genomes, 0)
     }
 
     /// Replace the population with `genomes`, keeping everything the **run** owns.
@@ -1301,13 +1775,20 @@ impl Trainer {
         // gives a total order, so this cannot panic on a NaN the way
         // `partial_cmp().unwrap()` would, and it is stable across platforms.
         //
-        // The selection score is the recorded fitness unless `novelty_weight` is set, in which
-        // case it is that fitness plus a rarity bonus (see `selection_scores`), and the branch is
-        // skipped entirely at 0.0 so a plain run is bit-identical to one from before the field
-        // existed. Everything *recorded* — the chart, the champion, every number in `REVIEW.md` —
-        // reads `results`, so a rarity bonus can change what is bred and never what is claimed.
-        let selection: Vec<f32> = if self.config.novelty_weight > 0.0 {
-            selection_scores(&levels[0], &results, self.config.novelty_weight)
+        // The selection score is the recorded fitness unless `novelty_weight` or
+        // `rank_pessimism` is set, in which case it is a pessimistic reading of that fitness plus a
+        // rarity bonus (see `selection_scores`), and the branch is skipped entirely at both 0.0 so
+        // a plain run is bit-identical to one from before either field existed. Everything
+        // *recorded* — the chart, the champion, every number in `REVIEW.md` — reads `results`, so a
+        // ranking knob can change what is bred and never what is claimed.
+        let selection: Vec<f32> = if self.config.novelty_weight > 0.0 || self.config.rank_pessimism > 0.0
+        {
+            selection_scores(
+                &levels[0],
+                &results,
+                self.config.novelty_weight,
+                self.config.rank_pessimism,
+            )
         } else {
             results.iter().map(|r| r.mean_fitness).collect()
         };
@@ -2441,6 +2922,8 @@ mod tests {
             genome_id: 0,
             fitness,
             mean_fitness: fitness,
+            // One synthetic episode is its own floor, exactly as a real single-trial one is.
+            worst_trial: fitness,
             outcome: sim::Outcome::Running,
             frames: 0,
             progress_pixels: 0.0,
@@ -2467,6 +2950,153 @@ mod tests {
             checkpoints,
             ..episode(fitness)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // pessimism: ranking a genome by its worst trial (REVIEW.md §4)
+    // -----------------------------------------------------------------------
+
+    /// A genome's score is its mean at `k = 0` and its floor at `k = 1`, and the two ends are
+    /// different *questions* rather than two spellings of one number.
+    ///
+    /// Built rather than run, in the style of the rarity tests below: two episodes with hand-picked
+    /// means and floors, so the arithmetic is checkable by eye. `steady` is mediocre and reliable;
+    /// `lucky` is better on average and much worse at its worst — which is exactly the genome a mean
+    /// rewards and a run that keeps losing its elites to an unseen patrol phase does not want.
+    #[test]
+    fn a_pessimistic_ranking_prefers_the_steady_genome_to_the_lucky_one() {
+        let level = flat_level();
+        let steady = EpisodeResult {
+            worst_trial: 90.0,
+            ..episode_in(100.0, 100.0, 1)
+        };
+        let lucky = EpisodeResult {
+            worst_trial: 20.0,
+            ..episode_in(120.0, 100.0, 1)
+        };
+        let results = vec![steady, lucky];
+
+        // The two ends of the knob: the mean, and the floor.
+        assert_eq!(
+            selection_scores(&level, &results, 0.0, 0.0),
+            vec![100.0, 120.0],
+            "k = 0 is the recorded mean, untouched"
+        );
+        let by_floor = selection_scores(&level, &results, 0.0, 1.0);
+        assert!(
+            by_floor[1] < by_floor[0],
+            "by its worst episode the lucky genome is the worse one: {by_floor:?}"
+        );
+        assert!((by_floor[0] - 90.0).abs() < 1e-4, "{:?}", by_floor[0]);
+        assert!((by_floor[1] - 20.0).abs() < 1e-4, "{:?}", by_floor[1]);
+        // And halfway is halfway between a genome's *own* two numbers, not between the two genomes'.
+        let half = selection_scores(&level, &results, 0.0, 0.5);
+        assert!((half[0] - 95.0).abs() < 1e-4, "{:?}", half[0]);
+        assert!((half[1] - 70.0).abs() < 1e-4, "{:?}", half[1]);
+    }
+
+    /// **The invariant that keeps the pack's ladder valid.** On a level with no walkers a genome is
+    /// judged on one episode, that episode is its own floor, so the ranking is the recorded mean at
+    /// *every* setting of `rank_pessimism`.
+    ///
+    /// This is the claim that makes the knob cheap rather than expensive: every first-win generation
+    /// in `FINDINGS.md` measured on a deterministic level is reproducible with the pessimism left
+    /// wherever an operator put it.
+    #[test]
+    fn a_deterministic_level_is_ranked_the_same_way_at_any_pessimism() {
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 9,
+            ..GaConfig::default()
+        };
+        let trainer = Trainer::new(cfg.clone());
+        let results = evaluate_population(&level, &trainer.genomes, &cfg, 0);
+        assert_eq!(cfg.effective_trials(&level), 1, "the fixture has no walkers");
+        assert!(
+            results.iter().all(|r| r.worst_trial == r.mean_fitness),
+            "one episode is its own floor"
+        );
+        let mean: Vec<f32> = results.iter().map(|r| r.mean_fitness).collect();
+        for k in [0.0, 0.25, 0.5, 1.0] {
+            assert_eq!(selection_scores(&level, &results, 0.0, k), mean, "k = {k}");
+        }
+    }
+
+    /// And the same reading on a level that *is* stochastic: the floor is taken from the trials, it
+    /// is never above the mean it belongs to, and within a few generations of evolution both halves
+    /// of the mechanism are visible — a genome whose phase moved its score, and a pair of genomes
+    /// that disagree about "better on average" and "better at its worst".
+    ///
+    /// **Both halves have to be searched for, and this test used to assume them.** On a *fresh* random
+    /// population of this fixture the reading is empty: under pairing every genome's three trials
+    /// score bit-identically (0 of 16 genomes, spread 0.0 exactly — see
+    /// [`pairing_is_what_a_walker_fixture_measures_and_a_world_lottery_is_not`]), and without pairing
+    /// the 24 mean-versus-floor disagreements that appear are luck drawn from the genome id. The
+    /// walker becomes something a policy has to get past a few generations in, and *which* generation
+    /// that is moves whenever the observation moves, so the test sweeps the first eight and asserts
+    /// the invariants on every one of them rather than pinning the generation the effect appears in.
+    #[test]
+    fn a_walker_level_reports_a_floor_at_or_below_its_mean() {
+        let level = crate::fixture::walker_runway("ga-walker-fixture", 24, 22, 12);
+        let cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 4,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg.clone());
+        // The invariants are asserted on every generation of the sweep, not only on the one the
+        // mechanism shows up in, and the sweep itself is the honest part: the phase reaches the
+        // score a few generations in, and *which* generation moves when the observation does.
+        let mut visible = None;
+        for generation in 0..8 {
+            let results = evaluate_population(&level, &trainer.genomes, &cfg, generation);
+            // The floor is the minimum of a genome's trials and the mean is their sum divided by
+            // three, so the floor cannot exceed the mean — *up to a rounding step*. When all three
+            // episodes come out identical (a policy that is insensitive to the patrol phase),
+            // `3a / 3` in `f32` can land one part in 2^24 below `a`, and the invariant then reads
+            // violated for a genome whose three episodes were the same episode. The tolerance is
+            // that step, scaled to the size of the numbers here, and it is deliberately tiny: it is
+            // a statement about division, not a licence.
+            assert!(
+                results
+                    .iter()
+                    .all(|r| r.worst_trial <= r.mean_fitness + r.mean_fitness.abs() * 1e-6 + 1e-3),
+                "a genome's worst trial cannot be better than its mean (generation {generation})"
+            );
+            for (score, r) in selection_scores(&level, &results, 0.0, 1.0)
+                .iter()
+                .zip(&results)
+            {
+                assert!(
+                    (score - r.worst_trial).abs() < 1e-2,
+                    "k = 1 is the floor, genome for genome: {score} against {}",
+                    r.worst_trial
+                );
+            }
+            // The premise: the phase has to move *somebody's* score, or three trials are three
+            // copies of one episode and the floor is the mean by construction.
+            let sensitive = results
+                .iter()
+                .filter(|r| r.worst_trial < r.mean_fitness)
+                .count();
+            let reordered = results.iter().enumerate().any(|(i, a)| {
+                results.iter().enumerate().any(|(j, b)| {
+                    i != j && a.mean_fitness > b.mean_fitness && a.worst_trial < b.worst_trial
+                })
+            });
+            if sensitive > 0 && reordered {
+                visible = Some((generation, sensitive));
+                break;
+            }
+            trainer.step(&level);
+        }
+        let (generation, sensitive) = visible.expect(
+            "no generation in the first eight had both a genome whose patrol phase moved its score \
+             and a pair of genomes that disagree about the mean and the floor, so the knob has \
+             nothing to reorder on this level",
+        );
+        assert!(sensitive > 0, "generation {generation} was quoted for it");
     }
 
     // -----------------------------------------------------------------------
@@ -2602,6 +3232,170 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // where a run starts (the transfer arm: a champion as a seed)
+    // -----------------------------------------------------------------------
+
+    /// A seeded run is the champion in slot 0 and a shell of reheated copies around it, and the ids
+    /// continue the champion's own numbering.
+    ///
+    /// Both halves matter and for the same reason. The champion is the one point a previous run
+    /// proved was worth something, so it is copied *exactly* — gene for gene, id and all — because a
+    /// seed that had already been mutated before the run began would be a claim nobody made ("this
+    /// genome scored 1 240" is a statement about a genome). And the ids are part of every
+    /// `episode_seed`, so the shell has to continue the numbering rather than restart it: a reissued
+    /// id would make a shell genome face the episodes of a genome it has nothing to do with.
+    #[test]
+    fn a_seeded_population_is_the_champion_plus_a_shell_around_it() {
+        let mut rng = rng_from_seed(21);
+        let champion = Genome::random(7, default_shape(), &mut rng);
+        let cfg = GaConfig {
+            pop_size: 12,
+            master_seed: 3,
+            ..GaConfig::default()
+        };
+        let mut seeded = Trainer::from_champion(cfg.clone(), champion.clone()).expect("seeds a run");
+
+        assert_eq!(seeded.genomes.len(), 12);
+        assert_eq!(
+            seeded.genomes[0].weights, champion.weights,
+            "slot 0 is the champion, gene for gene"
+        );
+        assert_eq!(seeded.genomes[0].biases, champion.biases);
+        assert_eq!(seeded.genomes[0].id, champion.id);
+        assert_eq!(
+            seeded.genomes.iter().map(|g| g.id).collect::<Vec<u32>>(),
+            (7..19).collect::<Vec<u32>>(),
+            "ids continue the champion's numbering: they are part of every episode seed"
+        );
+        assert_eq!(seeded.next_id(), 19);
+        assert!(
+            seeded.genomes[1..]
+                .iter()
+                .all(|g| g.weights != champion.weights),
+            "the shell is a shell: no other slot is the champion over again"
+        );
+        // It is generation 0 of a *new* run, not a continuation of the old one: nothing the search
+        // knew travels with a genome.
+        assert_eq!(seeded.generation, 0);
+        assert!(seeded.history().is_empty());
+        assert!(seeded.best_ever().is_none());
+        // And it is a run like any other: the first step is generation 0, scored on a full population.
+        let report = seeded.step(&pit_level());
+        assert_eq!(report.generation, 0);
+        assert_eq!(report.results.len(), 12);
+
+        // A shape the champion was not built with is refused rather than quietly mixed: breeding
+        // stamps the *config's* shape onto every child, so two shapes in one population is a gene
+        // vector read at the wrong offsets.
+        let wider = GaConfig {
+            shape: NetShape {
+                hidden: vec![32],
+                ..default_shape()
+            },
+            ..cfg
+        };
+        let err = Trainer::from_champion(wider, champion).unwrap_err();
+        assert!(err.contains("two shapes") || err.contains("one shape"), "{err}");
+        assert!(
+            err.contains(&default_shape().label()),
+            "the refusal names the net the champion is: {err}"
+        );
+        assert!(
+            err.contains(&NetShape {
+                hidden: vec![32],
+                ..default_shape()
+            }
+            .label()),
+            "and the net the run asked for: {err}"
+        );
+    }
+
+    /// A population cannot be resumed into a run that asks for a different network, and the refusal
+    /// is the shape's own words rather than "something went wrong".
+    ///
+    /// The failure this catches used to be silent and total: `--feedback 8` on a memoryless
+    /// checkpoint was accepted, the resident genomes kept their own gene vectors, and the next
+    /// generation's children were stamped with the *config's* shape — one generation later the
+    /// population was two networks wearing one name.
+    #[test]
+    fn resuming_across_two_network_shapes_is_refused() {
+        let cfg = GaConfig {
+            pop_size: 4,
+            master_seed: 2,
+            ..GaConfig::default()
+        };
+        let source = Trainer::new(cfg.clone());
+        let with_memory = GaConfig {
+            shape: NetShape {
+                feedback: 4,
+                ..default_shape()
+            },
+            ..cfg
+        };
+        let err = Trainer::resume(with_memory, source.genomes.clone(), 5).unwrap_err();
+        assert!(err.contains("cannot be bred across two shapes"), "{err}");
+        assert!(err.contains("memory 4"), "{err}");
+    }
+
+    /// The two bounds a live shape lives under: a wider layer and a hotter pessimism are both
+    /// clamped rather than refused, so a typo is a smaller run — never a failed allocation and never
+    /// a ranking that prefers a genome whose floor is worse than any trial it ran.
+    #[test]
+    fn the_network_and_ranking_bounds_are_the_trainers_own() {
+        let greedy = GaConfig {
+            shape: NetShape {
+                hidden: vec![1000, 1000, 1000, 1000, 1000],
+                ..default_shape()
+            },
+            ..GaConfig::default()
+        }
+        .sanitized(None);
+        assert_eq!(
+            greedy.shape.hidden,
+            vec![MAX_HIDDEN_WIDTH; MAX_HIDDEN_LAYERS],
+            "a wider net is clamped to this build's ceiling"
+        );
+        let broken = GaConfig {
+            shape: NetShape {
+                hidden: vec![0],
+                ..default_shape()
+            },
+            ..GaConfig::default()
+        }
+        .sanitized(None);
+        assert_eq!(
+            broken.shape.hidden,
+            vec![1],
+            "a zero-width layer is not a narrower network, it is a broken one"
+        );
+        let layerless = GaConfig {
+            shape: NetShape {
+                hidden: Vec::new(),
+                ..default_shape()
+            },
+            ..GaConfig::default()
+        }
+        .sanitized(None);
+        assert_eq!(
+            layerless.shape.hidden,
+            default_shape().hidden,
+            "a shape with no hidden layer at all falls back to the shipped recipe"
+        );
+        let hot = GaConfig {
+            rank_pessimism: 3.0,
+            ..GaConfig::default()
+        }
+        .sanitized(None);
+        assert_eq!(hot.rank_pessimism, 1.0, "pessimism is a fraction of a genome's own gap");
+        let cold = GaConfig {
+            rank_pessimism: -1.0,
+            ..GaConfig::default()
+        }
+        .sanitized(None);
+        assert_eq!(cold.rank_pessimism, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
     // the rarity bonus (REVIEW.md §4 item 4's reward half)
     // -----------------------------------------------------------------------
 
@@ -2616,7 +3410,7 @@ mod tests {
         let paired_twin = episode_in(90.0, 100.0, 1);
         let alone = episode_in(80.0, 300.0, 3);
         let results = vec![paired.clone(), paired_twin, alone.clone()];
-        let scores = selection_scores(&level, &results, weight);
+        let scores = selection_scores(&level, &results, weight, 0.0);
 
         // The two in the populated cell share it three ways (2 of 3), the solitary one does not.
         let crowded = weight * (1.0 - 2.0 / 3.0);
@@ -2651,14 +3445,14 @@ mod tests {
         let rare = episode_in(100.0, 300.0, 3);
         let results = vec![fit_but_common, crowded_a, crowded_b, rare];
 
-        let off = selection_scores(&level, &results, 0.0);
+        let off = selection_scores(&level, &results, 0.0, 0.0);
         assert_eq!(
             off,
             results.iter().map(|r| r.mean_fitness).collect::<Vec<f32>>(),
             "at weight 0 the selection score is the recorded fitness, untouched"
         );
 
-        let on = selection_scores(&level, &results, 32.0);
+        let on = selection_scores(&level, &results, 32.0, 0.0);
         assert!(
             on[3] > on[0],
             "the rare genome ({:.1}) must be able to outrank the fitter common one ({:.1})",
@@ -2721,7 +3515,7 @@ mod tests {
         };
         assert_eq!(
             b.ranking,
-            ranked_by(&selection_scores(&level, &b.results, 16.0)),
+            ranked_by(&selection_scores(&level, &b.results, 16.0, 0.0)),
             "a novelty run is ranked by the rarity scores"
         );
         assert_eq!(
@@ -3354,22 +4148,39 @@ mod tests {
         let generation = 3;
         let genome = Genome::zeros(7, cfg.shape.clone());
         let eval = cfg.eval_config();
+        // The seeds come from the trainer's own policy rather than from a literal here, for the same
+        // reason the trial *count* does: an episode policy that moved would otherwise leave this
+        // test agreeing with a formula the trainer no longer implements.
         let score = |trial: u32| {
             fitness::run_episode(
                 &level,
                 &genome,
                 &eval,
-                episode_seed(cfg.master_seed, generation, genome.id, trial),
+                episode_seed_for(&cfg, generation, genome.id, trial),
             )
             .fitness
         };
         let trials = cfg.effective_trials(&level);
         assert_eq!(trials, 3, "the walker rule is what decides this count");
         let scores: Vec<f32> = (0..trials).map(score).collect();
-        assert_ne!(
-            scores[0], scores[1],
-            "a walker's patrol phase must actually differ between trials, or this test proves nothing"
+        // Three trials are three *episodes*: the seeds differ, which is the trainer's own claim, and
+        // is checked through the policy helper rather than by comparing fitnesses. Fitnesses may
+        // legitimately coincide — a policy that does not care which way the walkers are going scores
+        // the phase the same either way, and that is a fact about the policy rather than about the
+        // trial count (the guard that the count is *worth* spending is the next block).
+        let seeds: Vec<u64> = (0..trials)
+            .map(|t| episode_seed_for(&cfg, generation, genome.id, t))
+            .collect();
+        assert!(
+            seeds.windows(2).all(|w| w[0] != w[1]),
+            "every trial must be its own episode: {seeds:?}"
         );
+        // That the phase *reaches the score* is a claim about a population rather than about this
+        // genome, and it is measured on an evolved one in
+        // `a_walker_level_reports_a_floor_at_or_below_its_mean` — deliberately not here, because on a
+        // fresh random population it can be false for the whole population (0 of 16 on that fixture)
+        // while the seeds are still three different worlds. Two tests for one claim, one of which is
+        // measuring the wrong population, is how a suite grows a flaky assertion.
 
         let results = evaluate_population(&level, std::slice::from_ref(&genome), &cfg, generation);
         assert_eq!(results.len(), 1);
@@ -3393,6 +4204,274 @@ mod tests {
         let one_result = evaluate_population(&level, std::slice::from_ref(&genome), &one, generation);
         assert_eq!(one.effective_trials(&level), 1);
         assert_eq!(one_result[0].mean_fitness, scores[0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // the episode policy: common random numbers, and racing on top of them
+    // -----------------------------------------------------------------------
+
+    /// Every genome of a generation is judged on **the same world** under
+    /// [`GaConfig::common_episodes`], and on a world of its own without it.
+    ///
+    /// This is the whole of the mechanism, and it is asserted on the seed rather than on the
+    /// fitness because the seed is the thing that moved: two genomes of one generation now derive
+    /// the same episode, and the difference between their results is the difference between their
+    /// *policies* on one draw of the patrol phase rather than between two draws.
+    #[test]
+    fn pairing_puts_a_whole_generation_on_one_episode() {
+        let level = crate::fixture::walker_runway("episode-pairing", 24, 22, 12);
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 11,
+            ..GaConfig::default()
+        };
+        assert!(cfg.common_episodes, "pairing is the default");
+        let generation = 5;
+        let trainer = Trainer::new(cfg.clone());
+        let paired = evaluate_population(&level, &trainer.genomes, &cfg, generation);
+        let seeds: Vec<u64> = paired.iter().map(|r| r.seed).collect();
+        assert!(
+            seeds.windows(2).all(|w| w[0] == w[1]),
+            "under pairing the whole population shares one episode: {seeds:?}"
+        );
+        assert_eq!(
+            seeds[0],
+            sim::common_episode_seed(cfg.master_seed, generation, 0),
+            "and it is the trainer's documented seed, not merely a shared one"
+        );
+        // A different generation is still a different world, so nothing can be memorised by rote.
+        let next = evaluate_population(&level, &trainer.genomes, &cfg, generation + 1);
+        assert_ne!(seeds[0], next[0].seed, "the phase re-rolls every generation");
+
+        // And the arm it replaces really does hand out different episodes, one per genome.
+        let unpaired = GaConfig {
+            common_episodes: false,
+            ..cfg.clone()
+        };
+        let own = evaluate_population(&level, &trainer.genomes, &unpaired, generation);
+        let own_seeds: Vec<u64> = own.iter().map(|r| r.seed).collect();
+        assert!(
+            own_seeds.windows(2).all(|w| w[0] != w[1]),
+            "without pairing every genome draws its own patrol phase: {own_seeds:?}"
+        );
+        // The trainer's own helper is the one answer to "which episode", so it must agree with
+        // what each arm just did rather than with one of them.
+        assert_eq!(episode_seed_for(&cfg, generation, 3, 0), seeds[0]);
+        assert_eq!(
+            episode_seed_for(&unpaired, generation, 3, 0),
+            own_seeds[3]
+        );
+    }
+
+    /// Racing **yields** to the episode policy rather than quietly overruling it: a run that asks
+    /// for unpaired episodes gets unpaired episodes and no race, because culling half a population
+    /// on unpaired evidence compares two worlds and then charges a genome for losing the
+    /// comparison.
+    ///
+    /// The direction matters and is not arbitrary. Pairing is on by default, so `common_episodes:
+    /// false` can only be an explicit request for the old policy — and a mechanism that happens to
+    /// be on by default must not silently overrule a request about *what an episode is*.
+    #[test]
+    fn racing_yields_to_an_unpaired_episode_policy() {
+        let asked = GaConfig {
+            race_episodes: true,
+            common_episodes: false,
+            ..GaConfig::default()
+        };
+        let run = asked.sanitized(None);
+        assert!(!run.common_episodes, "the episode policy is the request that wins");
+        assert!(!run.race_episodes, "and a race that cannot be sounded is not run");
+        // The pairing default is what makes that reading unambiguous: `false` here is somebody
+        // having asked, never a default.
+        assert!(GaConfig::default().common_episodes);
+        // And a run that asks for both gets both.
+        let paired = GaConfig {
+            race_episodes: true,
+            common_episodes: true,
+            ..GaConfig::default()
+        };
+        assert!(paired.sanitized(None).race_episodes);
+    }
+
+    /// A raced pass spends **fewer episodes** than a flat one, judges the survivors on the same
+    /// extra trials a flat pass would have, and leaves every genome's representative episode — the
+    /// one a champion records and `replay` reproduces — exactly where the flat pass left it.
+    ///
+    /// The last of those is the claim that makes racing a free lunch rather than a different run:
+    /// a run that races must be able to save a champion that a flat run would have saved *from the
+    /// same episode*, or a champion's file would depend on a speed knob.
+    #[test]
+    fn racing_buys_trials_back_without_moving_the_recorded_episode() {
+        let level = crate::fixture::walker_runway("episode-race", 24, 22, 12);
+        let cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 21,
+            common_episodes: true,
+            race_episodes: false,
+            ..GaConfig::default()
+        };
+        let generation = 2;
+        let trainer = Trainer::new(cfg.clone());
+        let genomes = &trainer.genomes;
+        let trials = cfg.effective_trials(&level);
+        assert_eq!(trials, 3, "a walker level's budget is what a race is spent against");
+
+        let flat = evaluate_population(&level, genomes, &cfg, generation);
+        let raced_cfg = GaConfig {
+            race_episodes: true,
+            ..cfg.clone()
+        };
+        let (raced, spent) = evaluate_suite_raced(
+            std::slice::from_ref(&level),
+            genomes,
+            &raced_cfg,
+            generation,
+        );
+
+        // 16 + 8 + 4 episodes against a flat 16 × 3 = 48: the published keep-half arithmetic, read
+        // off the code that actually ran rather than off the formula in `RACE_KEEP_DIVISOR`.
+        assert_eq!(spent, 16 + 8 + 4);
+        // And the cost the benchmark records is the cost that was spent: the helper and the loop
+        // agree, so an arm's "episodes per genome" is not a second opinion about the same run.
+        assert_eq!(
+            spent as f32 / genomes.len() as f32,
+            episodes_per_genome(std::slice::from_ref(&level), genomes.len(), &raced_cfg)
+        );
+        assert_eq!(
+            episodes_per_genome(std::slice::from_ref(&level), genomes.len(), &cfg),
+            3.0,
+            "without racing the cost is the level's own budget"
+        );
+        assert!(
+            spent < genomes.len() * trials as usize,
+            "the race must spend strictly less than the flat pass ({spent} against {})",
+            genomes.len() * trials as usize
+        );
+
+        // Every genome still has a verdict, and the representative episode is untouched.
+        assert_eq!(raced.len(), flat.len());
+        for (r, f) in raced.iter().zip(&flat) {
+            assert_eq!(r.genome_id, f.genome_id);
+            assert_eq!((r.fitness, r.seed), (f.fitness, f.seed), "genome {}", f.genome_id);
+            assert_eq!(r.outcome, f.outcome);
+        }
+        // The episode counts per round are asserted above from what the code spent rather than from
+        // the keep-half formula written down twice — and deliberately **not** inferred from
+        // `worst_trial == mean_fitness`: a genome judged on three identical episodes has a floor that
+        // equals its mean, so that reading cannot tell one episode from three and would be a test
+        // that passes for the wrong reason.
+    }
+
+    /// A suite races per level, and the levels whose budget is already one episode pay nothing and
+    /// are skipped: the extra rounds are the walker level's alone.
+    #[test]
+    fn a_race_on_a_suite_spends_only_where_a_level_has_more_than_one_episode() {
+        let walkers = crate::fixture::walker_runway("episode-race-suite", 24, 22, 12);
+        let plain = pit_level();
+        assert!(plain.walkers.is_empty());
+        let levels = vec![plain, walkers];
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 3,
+            race_episodes: true,
+            ..GaConfig::default()
+        };
+        let trainer = Trainer::new(cfg.clone());
+        let (raced, spent) = evaluate_suite_raced(&levels, &trainer.genomes, &cfg, 1);
+        // Round 0: 8 genomes × 2 levels. Round 1: 4 surviving genomes × 1 level (the walker one;
+        // the plain level's budget is one episode and it is not played again). Round 2: 2 × 1.
+        assert_eq!(spent, 16 + 4 + 2);
+        assert_eq!(
+            spent as f32 / trainer.genomes.len() as f32,
+            episodes_per_genome(&levels, trainer.genomes.len(), &cfg)
+        );
+        assert_eq!(raced.len(), trainer.genomes.len());
+        assert!(
+            raced.iter().all(|r| r.suite_wins <= levels.len() as u32),
+            "a race still counts suite wins the way a flat pass does"
+        );
+    }
+
+    /// The episode policy's own reading of a fixture, kept as a test because it is the *evidence*
+    /// the two tests above rest on, and because the numbers in its name are the ones the doc
+    /// comment quotes: a fresh population on a walker fixture is phase-insensitive under pairing and
+    /// very much not without it, which is the measurement pairing was introduced for.
+    ///
+    /// On `walker_runway(24, 22, 12)` at pop 16, seed 4, generation 0: **paired, 0 of 16 genomes
+    /// score their three trials differently and there are 0 mean-versus-floor reorder pairs;
+    /// unpaired, 14 of 16 differ and there are 24 reorder pairs.** Every genome's three trial traces
+    /// are distinct in both arms, so what the old policy was buying was a different *world* per
+    /// genome, not a different phase for one genome's own judgement. Five generations later the
+    /// population has met the walker and the real phase effect appears: 16 of 16 genomes differ,
+    /// mean spread 688 fitness units, 8 reorder pairs.
+    #[test]
+    fn pairing_is_what_a_walker_fixture_measures_and_a_world_lottery_is_not() {
+        let level = crate::fixture::walker_runway("probe-phase", 24, 22, 12);
+        let mut cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 4,
+            ..GaConfig::default()
+        };
+        let eval = cfg.eval_config();
+        let trials = cfg.effective_trials(&level);
+        let mut trainer = Trainer::new(cfg.clone());
+        for generation in 0..6 {
+            let mut readings: Vec<(usize, usize)> = Vec::new();
+            for paired in [true, false] {
+                cfg.common_episodes = paired;
+                let (mut varied, mut reorder) = (0usize, 0usize);
+                let mut means: Vec<(f32, f32)> = Vec::new();
+                for g in &trainer.genomes {
+                    let scores: Vec<f32> = (0..trials)
+                        .map(|t| {
+                            fitness::run_episode(
+                                &level,
+                                g,
+                                &eval,
+                                episode_seed_for(&cfg, generation, g.id, t),
+                            )
+                            .fitness
+                        })
+                        .collect();
+                    let hi = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let lo = scores.iter().copied().fold(f32::INFINITY, f32::min);
+                    if hi != lo {
+                        varied += 1;
+                    }
+                    means.push((scores.iter().sum::<f32>() / trials as f32, lo));
+                }
+                for i in 0..means.len() {
+                    for j in 0..means.len() {
+                        if i != j && means[i].0 > means[j].0 && means[i].1 < means[j].1 {
+                            reorder += 1;
+                        }
+                    }
+                }
+                readings.push((varied, reorder));
+            }
+            if generation == 0 {
+                // The claim, as a comparison rather than as two pinned counts: at generation 0 the
+                // *pairing* is what is empty and the *unpairing* is what looks full. (The counts
+                // themselves move with the observation — 0/0 against 14/24 at sensors v10 — which is
+                // why what is asserted here is the shape of the result.)
+                assert_eq!(
+                    readings[0],
+                    (0, 0),
+                    "paired at generation 0: one world, so no genome's own three trials differ"
+                );
+                assert!(
+                    readings[1].0 > 0 && readings[1].1 > 0,
+                    "unpaired at generation 0 the population looks phase-sensitive: {readings:?}"
+                );
+            }
+            if generation == 5 {
+                assert!(
+                    readings[0].0 >= 8,
+                    "five generations in, the phase reaches most of the population: {readings:?}"
+                );
+            }
+            trainer.step(&level);
+        }
     }
 
     /// The diversity-gated archive waits for a run that has stopped *both* improving and
@@ -3538,6 +4617,7 @@ mod tests {
             genome_id: id,
             fitness: 0.0,
             mean_fitness: 0.0,
+            worst_trial: 0.0,
             outcome,
             frames,
             progress_pixels: progress,

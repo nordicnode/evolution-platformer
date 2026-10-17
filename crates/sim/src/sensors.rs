@@ -2,10 +2,12 @@
 //! the encodings, or the action-repeat cadence is a `VERSION` bump, and every
 //! champion file records it (§8).
 //!
-//! `N_INPUTS = 95`. The patch is deliberately 9×9 rather than 13×13: Togelius
-//! 2009 showed small controllers beating large ones, and input size multiplies
-//! the search space. Widening the patch is the documented upgrade path, gated on
-//! evolution visibly plateauing on levels that should be solvable.
+//! `N_INPUTS = 81` patch cells plus 19 scalars, 100 in all (`input_names()` is the
+//! authoritative layout, `train-cli sensors` prints it). The patch is deliberately 9×9 rather
+//! than 13×13: Togelius 2009 showed small controllers beating large ones, and input size
+//! multiplies the search space. Widening the patch is the documented upgrade path, gated on
+//! evolution visibly plateauing on levels that should be solvable; the scalars beside it have
+//! grown one at a time, each with a measurement in [`VERSION`].
 //!
 //! v2 appends the three inputs the movement abilities need and changes what `vx`
 //! means; every earlier index keeps its meaning and its position, so the diff between
@@ -100,7 +102,48 @@ use crate::physics::{AgentAction, Physics, PlayerState, Walker};
 /// same pass — directional checkpoint credit — and the tower is measurably quicker for it, 94
 /// against the committed build's 122 at the same 10 of 12; that is a different arm and it is
 /// recorded as one in `REVIEW.md`.) The grid is unchanged: this is the scalar's own range.
-pub const VERSION: u32 = 8;
+///
+/// v9: the two tiles the trap pass added — a cracked tile and a spring pad — are encoded in the
+/// patch rather than folded into [`ENC_SOLID`] and [`ENC_EMPTY`]. Nothing about the *layout*
+/// moved: not one index changed meaning and [`N_INPUTS`] is unmoved, which is the cheapest a
+/// sensor change can be. What moved is what a cell of the grid **says**, and it had to, because
+/// both tiles are exactly the case the sand precedent does not cover.
+///
+/// Sand is a material: it is solid, and physics draws no distinction between it and soil, so a
+/// sensor that did would be inventing a problem. A cracked tile is not a material — it is
+/// ordinary ground a body is about to lose, and a spring is a cell that will throw a body many
+/// tiles into the air. A patch that reported either as plain solid or plain air would be telling
+/// the population something false about the world, and both lies are the expensive kind: the
+/// first hides the only cue that a bridge is a bridge, and the second makes the single most
+/// useful object in a level invisible at the moment a body is deciding whether to jump onto it.
+///
+/// It is a **re-reading** rather than an addition, so it re-scores every champion (it is a
+/// version bump, and the champion loader is what enforces that) without changing a single one's
+/// shape: a champion trained on the levels that have neither tile observes byte-identical inputs
+/// and plays exactly as it did.
+///
+/// v10 appends `phase_x, phase_y` at indices 98 and 99: **where the body is inside the tile the
+/// patch is keyed on**. It is here because of a measurement, and the measurement has two halves.
+///
+/// The observation without it is *tile-keyed*: the patch sits on `floor(centre)`, the two gap probes
+/// on the body's own edges, and the only continuous position signal anywhere in the vector is the
+/// goal vector — which is **clamped** at [`GOAL_VIEW_DISTANCE`]. So for a body approaching an
+/// obstacle further from the flag than that horizon, a state and the same state a fifth of a tile
+/// later are one vector, and the press has nothing to be timed by. (Stated precisely, because it was
+/// checked: no two decisions in any demonstrated walk over the shipped pack share a vector and
+/// disagree about the action — the pack's obstacles are mostly inside the horizon, where the goal
+/// delta is a fine but *nonlinear* position signal. This slot is the same information as a straight
+/// line the fit can threshold, and that is the difference the second half measures.)
+///
+/// And the second half, which is what actually got it built: `evo::imitate` fits a network to the
+/// walk `evo::route_play` makes, and its visible failure is *the press* — a clone walks to the pit and
+/// steps in. With these two slots a 4000-epoch fit misses **0 to 2** of a demonstration's decisions
+/// where the 98-wide vector misses **18 to 19** of them; and at the oracle's own tick cadence a fit
+/// that misses nothing solves `l2-first-gap`, `l4-rhythm` and `l5-tightrope` on all eight seeds where
+/// the one that misses eighteen solves none of them. It does not make a clone *play* at the shipped
+/// four-tick cadence — that is `evo::imitate`'s own finding, and it is about the cadence rather than
+/// about the vector — but it is what makes the demonstrated press a function a fit can reach.
+pub const VERSION: u32 = 10;
 
 /// Tiles per side of the local patch (`9×9 = 81` inputs).
 pub const PATCH_RADIUS: i32 = 4;
@@ -117,7 +160,11 @@ pub const PATCH_RADIUS: i32 = 4;
 /// telling a memoryless policy at the foot of a left-going leg to run right. The waypoint vector
 /// points from the body to the next landing stand along [`crate::reach::GoalRoutes`] (or to the
 /// flag itself once on the final stand), normalised by [`GOAL_VIEW_DISTANCE`].
-pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1 + 1 + 2;
+///
+/// **v10 appends the body's sub-tile phase (`phase_x, phase_y`)** at indices 98 and 99: the part of
+/// the body's position inside its own tile, which is the one positional quantity no other slot
+/// carries once the goal vector is clamped. See [`VERSION`] for the measurement.
+pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1 + 1 + 2 + 2;
 
 /// Inputs appended in v2: wall side, wall slide, sprint charge.
 pub const N_ABILITY_INPUTS: usize = 3;
@@ -152,6 +199,22 @@ pub const ENC_SPIKE: f32 = -0.5;
 pub const ENC_EMPTY: f32 = 0.0;
 pub const ENC_ENEMY: f32 = -1.0;
 
+/// A spring pad: a cell that is not ground and that a body *wants* under it.
+///
+/// Positive, and above [`ENC_EMPTY`] rather than beside [`ENC_SOLID`]: the value's job is to read
+/// as "worth aiming at", which is the one thing a plain solid tile does not say, and the network
+/// has no reason to learn a mapping that puts it on the bright side of air.
+pub const ENC_SPRING: f32 = 0.5;
+
+/// A cracked tile: ground, and ground that is about to stop being ground.
+///
+/// Negative and *between* air and a spike — the ordering is the design. A cracked tile is a
+/// smaller danger than a spike (it drops the body, it does not kill it) and a larger one than
+/// open air, which costs the body nothing until it lands somewhere; a body that reads the three
+/// as ordered learns one axis rather than three unrelated labels. Like every value in the patch
+/// it says what the cell *is*, never what to do about it.
+pub const ENC_CRUMBLE: f32 = -0.25;
+
 /// The plan's sensor table omits tiles for spikes, which would leave the single
 /// most common hazard invisible to the agent. Spikes therefore get
 /// [`ENC_SPIKE`] — distinct from, and less alarming than, an enemy.
@@ -163,7 +226,12 @@ fn encode_tile(t: Tile) -> f32 {
         // to the sensors would be a new problem for the population to solve, which is the one
         // thing adding a *colour* of ground must never be.
         Tile::Solid | Tile::Sand | Tile::Brick | Tile::Plank => ENC_SOLID,
+        // A cracked tile is solid for the same reason and until the same moment, and then it is
+        // not: the variant is a fact about the ground's *future* rather than about what it is
+        // made of, which is why it reads differently here and not differently anywhere else.
+        Tile::Cracked | Tile::CrackedSand | Tile::CrackedBrick | Tile::CrackedPlank => ENC_CRUMBLE,
         Tile::Spike => ENC_SPIKE,
+        Tile::Spring => ENC_SPRING,
         Tile::Empty | Tile::Goal => ENC_EMPTY,
     }
 }
@@ -187,6 +255,8 @@ fn encode_tile(t: Tile) -> f32 {
 /// | 93  | 1  | sprint charge, 0 at `run_speed` and 1 at `sprint_speed` |
 /// | 94  | 1  | gap to the left of the feet |
 /// | 95  | 1  | the same walker's direction of travel (+1 right, −1 left, 0 none in sight) |
+/// | 96  | 2  | route `dx, dy` to the next landing stand, normalised by [`GOAL_VIEW_DISTANCE`] |
+/// | 98  | 2  | where the body is inside its own tile, each axis in −1..1 |
 ///
 /// The v7 slot describes *the walker* the two slots above it describe, not a second, nearer one:
 /// a level with two walkers in sight reports the closest pair's position and that walker's
@@ -309,6 +379,16 @@ pub fn observe_from_stand(
     out[96] = (wdx / GOAL_VIEW_DISTANCE).clamp(-1.0, 1.0);
     out[97] = (wdy / GOAL_VIEW_DISTANCE).clamp(-1.0, 1.0);
 
+    // ---- v10: where the body is inside its own tile ----------------------
+    // The patch above is keyed on `(cx.floor(), cy.floor())`, so every other input is a function of
+    // the body's *tile*. These two slots are the remainder — `0` at the tile's own origin, rising
+    // toward the next boundary — and they are what a press has to be timed by. Mapped to `[-1, 1)`
+    // so the slot reads like the velocities beside it wherever the body is in its tile, and
+    // centre-based so it is the exact complement of the patch's key rather than a second, slightly
+    // different notion of position.
+    out[98] = (2.0 * (cx - ctx as f32) - 1.0).clamp(-1.0, 1.0);
+    out[99] = (2.0 * (cy - cty as f32) - 1.0).clamp(-1.0, 1.0);
+
     debug_assert!(out.iter().all(|v| v.is_finite()));
     out
 }
@@ -377,6 +457,8 @@ pub fn input_names() -> Vec<String> {
     names.push("enemy_dir".into());
     names.push("waypoint_dx".into());
     names.push("waypoint_dy".into());
+    names.push("phase_x".into());
+    names.push("phase_y".into());
     debug_assert_eq!(names.len(), N_INPUTS);
     names
 }

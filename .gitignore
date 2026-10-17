@@ -13,6 +13,18 @@
 # Fitness-chart CSV exports from `train-cli train --csv`
 /out/
 
+# Route-graph caches, written beside the level file they were derived from (`sim`'s
+# `route_cache`, named `l1-flat-run.json.routes`). Keyed by the level's content hash and
+# regenerated on demand, so they are artifacts rather than sources — and they follow the level
+# file around rather than living in one directory, which is why this is a suffix rule and not
+# a path. Deliberately not `*.json`: everything that lists levels does it by that extension.
+*.routes
+
+# Recorded sweep arms from `train-cli bench` (its default `--out`), which are measurements
+# rather than sources: one command regenerates an arm, and the arm names every knob it was
+# taken with, so the file is a convenience for a reader rather than the record itself.
+/bench/
+
 # Editor / OS noise
 .DS_Store
 /.idea/

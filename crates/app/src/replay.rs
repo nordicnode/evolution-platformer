@@ -647,8 +647,12 @@ mod tests {
     }
 
     /// The seed the evaluator used for one agent's representative episode.
+    ///
+    /// Asked of the trainer rather than derived here, so a test that pins the replays of a run is
+    /// pinned to the run's own episode policy ([`GaConfig::common_episodes`]) instead of to a copy of
+    /// it that would silently stop agreeing with the trainer the day the policy moved.
     fn scored_seed(generation: u32, genome_id: u32) -> u64 {
-        sim::episode_seed(GaConfig::default().master_seed, generation, genome_id, 0)
+        evo::ga::episode_seed_for(&GaConfig::default(), generation, genome_id, 0)
     }
 
     /// Run the champion to the end, with a cap so a bug cannot hang the suite.
@@ -913,8 +917,27 @@ mod tests {
                 agent.result.seed,
                 scored_seed(packet.generation, agent.genome.id)
             );
-            assert_ne!(agent.result.seed, replay.star().seed);
         }
+        // Under `common_episodes` — the default — those seeds are *all the same one*, the star's
+        // included: the generation is one world and every lane in it is a policy played on that
+        // world, which is what makes the panel's side-by-side comparison a comparison. The trainer
+        // is asked rather than assumed, so this test follows the policy instead of pinning one:
+        // with pairing off the lanes are each agent's own episode and this block reads the other way.
+        let seeds: Vec<u64> = packet.agents.iter().map(|a| a.result.seed).collect();
+        let paired = GaConfig::default().common_episodes;
+        assert!(
+            if paired {
+                seeds.windows(2).all(|w| w[0] == w[1])
+            } else {
+                seeds.windows(2).all(|w| w[0] != w[1])
+            },
+            "the lanes do not follow the episode policy (paired = {paired}): {seeds:?}"
+        );
+        assert_eq!(
+            replay.star().seed,
+            scored_seed(packet.generation, star),
+            "and the star replays the episode its own generation was judged on"
+        );
     }
 
     #[test]

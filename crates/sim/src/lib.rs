@@ -3,10 +3,23 @@
 //! Hard boundary rules, enforced by review rather than by the type system:
 //!
 //! 1. No `std::time`, no threads, no `println!` inside [`Sim::step`], no `HashMap`
-//!    in hot paths (SipHash has a per-process random seed → nondeterminism).
+//!    in hot paths (SipHash has a per-process random seed → nondeterminism). The crate's
+//!    one use of threads is the oracle's take-off sweep (the private `edges_from_all` in
+//!    [`reach`]): offline work, a pure function of the terrain, run on a scoped pool and
+//!    assembled in job order, so it cannot change what a run computes — only how long the
+//!    answer takes to arrive. `a_parallel_sweep_answers_exactly_what_a_sequential_one_does`
+//!    is what keeps that claim true rather than tidy.
 //! 2. Everything the sim needs crosses the boundary as plain data:
 //!    `&Level`, `AgentAction`, `seed: u64`.
 //! 3. Rendering only ever borrows `&Sim`.
+//!
+//! A level's terrain is also asked questions that are expensive and pure — the move-graph
+//! route table ([`reach::goal_routes`]) and the oracle's verdict ([`reach::report`]) — so both
+//! are cached beside the level file, keyed by its content hash and the two behaviour versions
+//! of the oracle that produced them (`route_cache`, private: nothing outside the crate asks
+//! where an answer was kept, only for the answer). It is a derived artifact of what the level
+//! already says, so it cannot change what a run computes — only how long the answer takes to
+//! arrive, which for the second process to open a level is nothing at all.
 //!
 //! Version trio (§8): [`SIM_VERSION`], [`sensors::VERSION`], and
 //! `evo::fitness::VERSION`. All three are stamped into every champion file.
@@ -18,10 +31,15 @@ pub mod reach;
 pub mod rng;
 pub mod sensors;
 
+/// The derived cache beside a level file.
+mod route_cache;
+
+use crate::physics::tile_span;
+
 pub use crate::hash::StateHasher;
 pub use crate::level::{Level, Rect, Scenery, Tile};
 pub use crate::physics::{AgentAction, Physics, PlayerState, Walker, PHYSICS};
-pub use crate::rng::{episode_seed, rng_from_seed, Rng};
+pub use crate::rng::{common_episode_seed, episode_seed, rng_from_seed, Rng};
 
 /// Sim behaviour version. Bump on *any* change to physics, tile semantics, or
 /// episode termination — champions carrying an older value must be refused.
@@ -226,7 +244,15 @@ impl EpisodeStats {
 }
 
 /// The route stand index of the level's spawn point, when the spawn rests on a standable zone.
-fn spawn_route_stand(level: &Level) -> Option<usize> {
+/// The route stand the level's spawn stands on, if it stands on one.
+///
+/// Public because *two* callers need the same answer and they must not drift: the sim uses it to
+/// seed an episode's route progress (`hops_to_flag` from the spawn, which every later crossing is
+/// measured against), and `evo` uses it to ask what a full route even is — the replay's length and
+/// the frontier curriculum's starting stand. The three-tile window (exact column, then its
+/// neighbours) is the same reading `Level::checkpoint_zone` makes of a body's feet, and it exists
+/// because a spawn authored on the seam between two zones should not count as off-route.
+pub fn spawn_route_stand(level: &Level) -> Option<usize> {
     let surface = Level::tile_y(level.spawn.y + level.spawn.h + 0.05);
     let col = Level::tile_x(level.spawn.x + level.spawn.w * 0.5);
     level
@@ -283,6 +309,20 @@ pub struct Sim {
     spawn_hops: Option<u32>,
     /// Minimum `hops_to_flag` reached on a grounded stand so far in this episode.
     min_hops_reached: Option<u32>,
+    /// Brittle tiles whose fuse is burning: `((tile_x, tile_y), ticks remaining)`.
+    ///
+    /// A short `Vec` for the same reason [`Sim::credited`] is one — a level lights a handful per
+    /// episode — and searched linearly, which is cheaper than the hashing a set would cost on the
+    /// one frame in a hundred that has anything in it.
+    crumbles: Vec<((i32, i32), u32)>,
+    /// Every brittle tile that has left the level this episode, oldest first.
+    ///
+    /// The sim does not need this to *run* — the level's own tile array is the truth, and it is
+    /// what the renderer draws — but it is what makes [`Sim::state_hash`] a complete statement of
+    /// the terrain a body has changed: the tiles that are gone cannot be recovered from a level
+    /// that was already missing them when the episode started, and two runs can only agree on
+    /// this list if they agreed on every fuse that lit.
+    broken: Vec<(i32, i32)>,
 }
 
 impl Sim {
@@ -317,6 +357,8 @@ impl Sim {
             current_route_stand,
             spawn_hops,
             min_hops_reached: spawn_hops,
+            crumbles: Vec::new(),
+            broken: Vec::new(),
         }
     }
 
@@ -358,6 +400,14 @@ impl Sim {
         if touched.jumped {
             self.stats.jumps += 1;
         }
+
+        // ---- springs: a pad throws a falling body back up -----------------
+        // The rule itself — and the reasoning for every half of it — is `physics::spring_launch`,
+        // beside the launch box and the height the throw produces. It is shared with the
+        // reachability oracle rather than written here because the two must not disagree about how
+        // far a move goes: the oracle runs the same call inside its canonical trajectories, which
+        // is what makes a pad-only crossing something it can find (`REVIEW.md` §1.12).
+        crate::physics::spring_launch(&self.level, &mut self.player, ph);
 
         // ---- hazards ------------------------------------------------------
         if touched.touched_spike {
@@ -403,6 +453,59 @@ impl Sim {
         if self.player.y > self.level.height as f32 {
             self.die();
             return;
+        }
+
+        // ---- brittle ground: light the fuses, then burn them ----------------
+        // A brittle tile is ordinary solid ground until a body *stands* on it, so the ignition
+        // test is the same "which tiles are under the feet" question the checkpoint pass below
+        // asks, and it is the standing that matters rather than the touch: a body that clips the
+        // edge of a cracked tile on its way over a pit did not walk on it.
+        //
+        // **A walker's patrol does not light a fuse**, and that is a decision rather than an
+        // oversight. A patrol is a machine walking the same three tiles for the whole episode: it
+        // would demolish a level's floor without ever meeting the problem the level is built
+        // around, and every cracked bridge in the pack would have to be drawn to survive a walker
+        // as well as a player. Brittle ground is a trap for the body that has to *choose* to cross
+        // it, which is the body the level is addressed to.
+        //
+        // Burn first, then light, and the order is the fuse's own definition: a tile lit on frame F
+        // spends `CRUMBLE_TICKS` frames underfoot and is gone on frame `F + CRUMBLE_TICKS`. Lighting
+        // first would spend the fuse's first frame on the very frame the body stepped down, which
+        // makes the stated length of a fuse a number nobody can point at from outside the sim.
+        //
+        // Written through [`Level::burn_tile`] rather than through `set_tile`: the physics below
+        // reads the live grid, so a hole the body has just opened is a hole it falls through,
+        // while the route table the waypoint sensor steers by keeps describing the level as it
+        // was authored. Rebuilding that table per broken tile was, at a sweep of milliseconds a
+        // time, the single largest cost in training a level with brittle ground.
+        if !self.crumbles.is_empty() {
+            let mut i = 0;
+            while i < self.crumbles.len() {
+                let (tile, left) = self.crumbles[i];
+                if left <= 1 {
+                    self.crumbles.swap_remove(i);
+                    self.level.burn_tile(tile.0, tile.1);
+                    self.broken.push(tile);
+                } else {
+                    self.crumbles[i].1 = left - 1;
+                    i += 1;
+                }
+            }
+        }
+        // Which brittle tiles the body is standing on this frame, and therefore which fuses are
+        // lit. The tiles are read *after* the pass above, so a tile that left the level on this
+        // frame is not immediately lit again by the body that was standing on it.
+        if self.player.grounded {
+            let row = Level::tile_y(self.player.y + self.player.h + 0.05);
+            let (c0, c1) = tile_span(self.player.x, self.player.w);
+            for tx in c0..=c1 {
+                if self.level.get(tx, row).is_cracked()
+                    && !self.crumbles.iter().any(|(tile, _)| *tile == (tx, row))
+                {
+                    self.crumbles
+                        .push(((tx, row), crate::physics::CRUMBLE_TICKS));
+                }
+            }
         }
 
         // ---- checkpoints & geodesic route progress -----------------------
@@ -555,6 +658,20 @@ impl Sim {
         for (row, zone) in &self.credited {
             h.u32(*row as u32);
             h.u32(*zone as u32);
+        }
+        // The terrain a body has changed, and the fuses still burning: the level started this
+        // episode as a document and is now two different things in two runs that stood on
+        // different tiles, so a hash that left this out would call those two runs the same state.
+        h.u32(self.broken.len() as u32);
+        for (tx, ty) in &self.broken {
+            h.i32(*tx);
+            h.i32(*ty);
+        }
+        h.u32(self.crumbles.len() as u32);
+        for ((tx, ty), left) in &self.crumbles {
+            h.i32(*tx);
+            h.i32(*ty);
+            h.u32(*left);
         }
         match self.stats.death_pos {
             Some((x, y)) => {

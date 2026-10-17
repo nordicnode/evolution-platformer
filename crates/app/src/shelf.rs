@@ -165,23 +165,36 @@ pub fn read_with(path: &Path, champions: Option<&Path>) -> Entry {
     }
 }
 
-/// Which materials the level is made of, in palette order, plus the hazard.
+/// Which materials the level is made of, in palette order, plus the hazard and the pad.
+///
+/// **A brittle tile reports the material it is made of.** A cracked bridge is not a sixth
+/// substance — it is the same earth as the ground it spans, with a deadline on it — which is the
+/// same thing the renderer says when it draws a cracked tile with its material's own autotile
+/// family. "What is this level made of" and "what will hold a body up" are two questions, and
+/// this is the first one; the second is the sim's, and it is asked of a tile that is already
+/// gone.
 pub fn materials_of(level: &Level) -> Vec<&'static str> {
     use sim::Tile;
-    let mut found = [false; 5];
+    let mut found = [false; 6];
     for ty in 0..level.height {
         for tx in 0..level.width {
-            match level.tile(tx, ty) {
-                Some(Tile::Solid) => found[0] = true,
-                Some(Tile::Sand) => found[1] = true,
-                Some(Tile::Brick) => found[2] = true,
-                Some(Tile::Plank) => found[3] = true,
-                Some(Tile::Spike) => found[4] = true,
-                _ => {}
+            if let Some(tile) = level.tile(tx, ty) {
+                // Brittleness is stripped off before anything is recorded: `d`, `s`, `b` and `w`
+                // *are* soil, sand, brick and timber. A card that listed a cracked beach as
+                // something other than a beach would answer a question nobody asked it.
+                match tile.base_material() {
+                    Tile::Solid => found[0] = true,
+                    Tile::Sand => found[1] = true,
+                    Tile::Brick => found[2] = true,
+                    Tile::Plank => found[3] = true,
+                    Tile::Spike => found[4] = true,
+                    Tile::Spring => found[5] = true,
+                    _ => {}
+                }
             }
         }
     }
-    let names = ["soil", "sand", "brick", "timber", "spikes"];
+    let names = ["soil", "sand", "brick", "timber", "spikes", "springs"];
     names
         .iter()
         .zip(found)
@@ -209,12 +222,17 @@ pub fn thumbnail_grid(width: i32, height: i32) -> (usize, usize) {
 }
 
 /// Downsample a level into thumbnail cells: the material of the *topmost* solid tile in
-/// each block, or the hazard if a spike is in it.
+/// each block, or the hazard or pad if one is in it.
 ///
 /// Topmost rather than "any" because the thumbnail's job is the surface line: a column of
 /// soil with a beach on top is a beach, and a block whose top tile is air but whose bottom
-/// tile is floor has to draw the floor. Hazard and entities win over terrain so a level's
-/// danger is visible at a glance.
+/// tile is floor has to draw the floor. Objects win over terrain so a level's danger — and its
+/// one tile that throws you across the level — is visible at a glance.
+///
+/// "Object" is exactly *not solid, and drawn*: a spike and a spring are the two tiles that stand
+/// in a cell rather than being a material the level is made of, and they are the two that take a
+/// block whatever they are above. Brittle ground is not one of them: a thumbnail says what a
+/// level is made of, and a cracked floor is a floor.
 pub fn thumbnail(level: &Level, columns: usize, rows: usize) -> Vec<Option<Color32>> {
     let mut out = vec![None; columns * rows];
     let scale_x = (level.width.max(1) as f32 / columns as f32).max(1.0);
@@ -230,12 +248,16 @@ pub fn thumbnail(level: &Level, columns: usize, rows: usize) -> Vec<Option<Color
                 for tx in tx0..tx1.max(tx0 + 1) {
                     if let Some(tile) = level.tile(tx, ty) {
                         if let Some(colour) = theme::material_colour(tile) {
-                            // Topmost wins for terrain; anything wins over air. A spike is
-                            // not terrain at all, so it is kept whatever it is above.
-                            if seen.is_none() || tile == sim::Tile::Spike {
+                            // Topmost wins for terrain; anything wins over air. A spike and a
+                            // spring are not terrain at all, so they are kept whatever they are
+                            // above, and they win over the floor in their own block: a card that
+                            // reported the ground under a pad and not the pad would hide the one
+                            // tile a reader scanning a shelf of levels is looking for.
+                            let object = !tile.is_solid();
+                            if seen.is_none() || object {
                                 seen = Some(colour);
                             }
-                            if tile == sim::Tile::Spike {
+                            if object {
                                 break;
                             }
                         }
@@ -560,7 +582,7 @@ mod tests {
         std::fs::create_dir_all(&champions).unwrap();
         std::fs::create_dir_all(&levels).unwrap();
         let level = shipped("l1-flat-run");
-        level.to_json_file(&levels.join("l1-flat-run.json")).unwrap();
+        level.to_json_file(levels.join("l1-flat-run.json")).unwrap();
 
         // Nothing saved yet, and no champions directory at all: no card claims a win.
         assert!(scan(&levels, Some(&champions))[0].champion.is_none());
@@ -596,5 +618,53 @@ mod tests {
         assert!(!materials_of(&level).contains(&"spikes"));
         level.set_tile(10, level.height - 2, sim::Tile::Spike);
         assert!(materials_of(&level).contains(&"spikes"));
+    }
+
+    /// A pad is a material the shelf names, and **brittle ground is the material it is made of
+    /// rather than a substance of its own**.
+    ///
+    /// The second half is the one worth pinning: the whole reason a cracked tile is a variant and
+    /// not a material is so that the answer to "what is this level made of" does not grow a
+    /// second vocabulary for the same four things, and a shelf card is where that vocabulary is
+    /// read out.
+    #[test]
+    fn a_brittle_tile_is_its_material_and_a_pad_is_its_own_entry() {
+        // Small enough that a thumbnail cell is one tile, so the two halves of this test can
+        // name a cell by the tile in it.
+        let mut level = Level::starter("brittle", 8, 5);
+        let floor = level.height - 1;
+        level.set_tile(2, floor, sim::Tile::Cracked);
+        level.set_tile(3, floor, sim::Tile::CrackedSand);
+        level.set_tile(4, floor - 1, sim::Tile::Spring);
+
+        let listed = materials_of(&level);
+        assert!(
+            listed.contains(&"soil") && listed.contains(&"sand"),
+            "brittle soil and brittle sand are still soil and sand: {listed:?}"
+        );
+        assert!(listed.contains(&"springs"), "a pad is named: {listed:?}");
+        assert_eq!(
+            listed,
+            vec!["soil", "sand", "springs"],
+            "the brittle tiles are tiles of their material, not entries of their own"
+        );
+
+        // And a pad takes its thumbnail cell from the floor beside it, the way a spike does.
+        let (columns, rows) = thumbnail_grid(level.width, level.height);
+        assert_eq!((columns, rows), (8, 5), "a cell per tile at this size");
+        let thumb = thumbnail(&level, columns, rows);
+        // The pad stands in the open cell above the floor, which is the cell a thumbnail has to
+        // keep it in: the block below it is the ground the pad is bolted to.
+        let pad_cell = (floor - 1) as usize * columns + 4;
+        assert_eq!(
+            thumb[pad_cell],
+            theme::material_colour(sim::Tile::Spring),
+            "the pad's cell should draw the pad"
+        );
+        assert_eq!(
+            thumb[floor as usize * columns + 4],
+            theme::material_colour(sim::Tile::Solid),
+            "and the cell under it is still the floor"
+        );
     }
 }

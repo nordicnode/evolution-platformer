@@ -10,6 +10,21 @@ mod common;
 use sim::sensors;
 use sim::AgentAction;
 
+/// Ground rows 4..5, 30 columns wide, with the flag past the sensor's sixteen-tile horizon.
+///
+/// The width is the point: [`GOAL_VIEW_DISTANCE`](sensors::GOAL_VIEW_DISTANCE) is sixteen tiles, so
+/// on this fixture the goal vector — and the route waypoint that falls back to it — read their
+/// clamped extremes while the body is on the far side of the level. That is the state in which the
+/// pre-v10 vector carries no sub-tile position at all, which is what the phase slots are for.
+const CORRIDOR: &[&str] = &[
+    "..............................",
+    "..............................",
+    "..............................",
+    "..............................",
+    "##############################",
+    "##############################",
+];
+
 /// Ground rows 4..5, 12 columns wide.
 const GROUND: &[&str] = &[
     "............",
@@ -104,19 +119,26 @@ fn patch_index(dx: i32, dy: i32) -> usize {
 
 #[test]
 fn the_vector_has_the_documented_named_layout() {
-    // 98 = the plan's 90 plus the three ability inputs appended by v2, v3's second goal
-    // axis, v4's second gap probe, v7's enemy heading, and v8's two waypoint axes. Every
-    // earlier index keeps its slot, which is what makes the diff between the layouts
-    // reviewable.
+    // 100 = the plan's 90 plus the three ability inputs appended by v2, v3's second goal
+    // axis, v4's second gap probe, v7's enemy heading, v8's two waypoint axes, and v10's two
+    // sub-tile phases. Every earlier index keeps its slot, which is what makes the diff between
+    // the layouts reviewable.
     assert_eq!(
         sensors::N_INPUTS,
-        98,
-        "§7.2's 90 plus v2's three, v3's and v4's one each, v7's enemy_dir and v8's waypoint"
+        100,
+        "§7.2's 90 plus v2's three, v3's and v4's one each, v7's enemy_dir, v8's waypoint and \
+         v10's two phases"
     );
     // v5 bounded the enemy slots and v6 widened that bound; both moved the reading without
     // moving a slot. v7 and v8 are appends, which is why this number moved: the whole
     // reason the layout is asserted by name rather than by one opaque blob.
-    assert_eq!(sensors::VERSION, 8);
+    //
+    // v9 is the *other* kind of change and the reason this constant is asserted at all: nothing in
+    // the layout moved — no index changed meaning and `N_INPUTS` above is unmoved — and what moved
+    // is what two cells of the patch *say* (a brittle tile and a pad, see [`sensors::ENC_CRUMBLE`]).
+    // A champion replayed against a build with pads in it is being read a world it was never
+    // trained on, which is a version bump whether the vector got wider or not.
+    assert_eq!(sensors::VERSION, 10);
 
     let names = sensors::input_names();
     assert_eq!(names.len(), sensors::N_INPUTS);
@@ -148,7 +170,94 @@ fn the_vector_has_the_documented_named_layout() {
     assert_eq!(names[95], "enemy_dir", "v7 appends the walker's heading");
     assert_eq!(names[96], "waypoint_dx", "v8 appends the route's next waypoint");
     assert_eq!(names[97], "waypoint_dy");
-    assert_eq!(names.len(), 90 + 3 + sensors::N_ABILITY_INPUTS + 2);
+    assert_eq!(
+        names[98], "phase_x",
+        "v10 appends where the body is inside its own tile"
+    );
+    assert_eq!(names[99], "phase_y");
+    assert_eq!(names.len(), 90 + 3 + sensors::N_ABILITY_INPUTS + 2 + 2);
+}
+
+/// **Where the goal vector is clamped, the phase slots are the only sub-tile position there is.**
+///
+/// This is the fixture the version bump is written for: the flag is past
+/// [`sensors::GOAL_VIEW_DISTANCE`], so both goal axes *and* both waypoint axes read their clamped
+/// extremes, and every remaining pre-v10 input — the whole 81-cell patch, both gap probes, the
+/// booleans, the two velocities excepted (those are state, not position) — is a function of the tile
+/// the body is in. So while the body runs across one tile, every other slot holds still and the two
+/// phases sweep; `phase_x` tracks the body's own fraction of its tile one to one.
+#[test]
+fn inside_one_tile_only_the_phase_slots_move() {
+    let level = common::fixture("corridor", CORRIDOR, (2, 3), &[("goal", 28, 3)]);
+    let mut sim = sim::Sim::new(&level, 11);
+    common::settle(&mut sim);
+
+    // The flag is past the sensor's own horizon, so `goal_*` and `waypoint_*` read their clamped
+    // extremes rather than a distance: that is the state this test is about.
+    let first = sim.observation();
+    assert_eq!(first[88], 1.0, "the flag is saturated to the right");
+    let tile = (sim.player().x + sim.player().w * 0.5).floor();
+
+    // `Run` for a third of a tile: the body is at rest (its centre exactly at the tile's middle,
+    // phase 0.0) and stays inside its starting tile for the whole sweep.
+    let mut phases = Vec::new();
+    for tick in 0..4 {
+        sim.step(AgentAction::Run);
+        let p = sim.player();
+        let here = sim.observation();
+        let centre = p.x + p.w * 0.5;
+        assert_eq!(
+            centre.floor(),
+            tile,
+            "the sweep has to stay inside one tile to say anything (tick {tick}, centre {centre})"
+        );
+        for i in 0..98 {
+            // The velocities are the body's *state*; every other pre-v10 slot is the body's tile.
+            if i == 85 || i == 86 {
+                continue;
+            }
+            assert_eq!(
+                here[i], first[i],
+                "slot {i} ({}) moved inside one tile: {} against {}",
+                sensors::input_names()[i],
+                here[i],
+                first[i]
+            );
+        }
+        let want = (2.0 * (centre - centre.floor()) - 1.0).clamp(-1.0, 1.0);
+        assert!(
+            (here[98] - want).abs() < 1e-5,
+            "phase_x {} should be the body's own fraction of its tile ({want})",
+            here[98]
+        );
+        phases.push(here[98]);
+    }
+
+    assert!(
+        phases.windows(2).all(|w| w[1] > w[0]),
+        "running right has to sweep the phase upward: {phases:?}"
+    );
+    assert!(
+        phases[3] - phases[0] > 0.15,
+        "and by enough to time a press on: {phases:?}"
+    );
+
+    // The vertical slot is the same claim on the other axis: a jump carries the body through its
+    // own row, and the phase is what says how far. (The patch legitimately moves here — the body
+    // crosses rows — so this half asserts the slot's *range*, not the invariance above.)
+    let ground_phase = sim.observation()[99];
+    sim.step(AgentAction::JumpInPlace);
+    let mut vertical = Vec::new();
+    for _ in 0..12 {
+        sim.step(AgentAction::JumpInPlace);
+        vertical.push(sim.observation()[99]);
+    }
+    let v_spread = vertical.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        - vertical.iter().copied().fold(f32::INFINITY, f32::min);
+    assert!(
+        v_spread > 0.05,
+        "a jump has to move phase_y: ground {ground_phase}, flight {vertical:?}"
+    );
 }
 
 /// **The slot no amount of training could recover.** `enemy_dx`/`enemy_dy` say where a walker
@@ -649,7 +758,7 @@ fn the_ability_slots_report_the_wall_and_the_sprint() {
 /// normaliser, lands on this number.
 #[test]
 fn golden_observation_hash_at_a_fixed_state() {
-    const GOLDEN_OBSERVATION_HASH: u64 = 968_527_753_083_078_216;
+    const GOLDEN_OBSERVATION_HASH: u64 = 13_055_861_740_400_240_297;
 
     let level = common::fixture("ground", GROUND, (5, 3), &[("walker", 9, 3), ("goal", 11, 3)]);
     let mut sim = sim::Sim::new(&level, 5);
@@ -662,4 +771,49 @@ fn golden_observation_hash_at_a_fixed_state() {
         "the observation vector drifted; if that was intentional, bump \
          sensors::VERSION and update this constant"
     );
+}
+
+/// **The two trap tiles are visible in the patch, and they do not look like the tiles they replace.**
+///
+/// A brittle tile is solid and a pad is not, so both of them *could* have been reported as the tiles
+/// they resemble — and both would then be invisible to a policy that has to decide whether to cross
+/// a bridge or to land on a pad. This is the pin for `sensors::VERSION` 9: the four new readings are
+/// distinct from `ENC_SOLID`, `ENC_EMPTY` and each other, on the tile the body is standing beside.
+#[test]
+fn a_cracked_tile_and_a_spring_read_differently_in_the_patch() {
+    /// Row 2 of the fixture: a pad at column 2, brittle ground at column 4, sound ground at 6.
+    const TRAPS: &[&str] = &[
+        "............",
+        "............",
+        "..v.d.#.....",
+        "............",
+        "############",
+        "############",
+    ];
+
+    let level = common::fixture("traps", TRAPS, (1, 3), &[("goal", 11, 3)]);
+    let mut sim = sim::Sim::new(&level, 5);
+    common::settle(&mut sim);
+    let obs = sim.observation();
+
+    // The patch is 9x9 row-major around the tile the body's centre is in, top-left first.
+    let cell = |dx: i32, dy: i32| -> f32 { obs[((dy + 4) * 9 + (dx + 4)) as usize] };
+
+    assert_eq!(cell(0, 1), sensors::ENC_SOLID, "control: the ground under it");
+    assert_eq!(cell(1, -1), sensors::ENC_SPRING, "the pad reads as a pad");
+    assert_eq!(cell(3, -1), sensors::ENC_CRUMBLE, "the brittle tile reads as brittle");
+    assert_eq!(cell(5, -1), sensors::ENC_SOLID, "the sound ground beside it reads as ground");
+
+    // And the readings are mutually distinct, which is the whole claim: a body can tell a pad from
+    // the air it stands in, and brittle ground from the ground that will still be there next frame.
+    for (a, b) in [
+        (sensors::ENC_SPRING, sensors::ENC_SOLID),
+        (sensors::ENC_SPRING, sensors::ENC_EMPTY),
+        (sensors::ENC_SPRING, sensors::ENC_CRUMBLE),
+        (sensors::ENC_CRUMBLE, sensors::ENC_SOLID),
+        (sensors::ENC_CRUMBLE, sensors::ENC_EMPTY),
+        (sensors::ENC_CRUMBLE, sensors::ENC_SPIKE),
+    ] {
+        assert_ne!(a, b, "two tiles the agent has to tell apart read the same");
+    }
 }

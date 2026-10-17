@@ -12,12 +12,14 @@
 //! | `play` | human keyboard playtest in the terminal (M1 exit criterion) |
 //! | `render` | print ASCII frames of a level with a fixed action, for eyeballing the sim |
 //! | `sensors` | print the sensor layout and action table |
+//! | `bench` | run a recorded seed-sweep protocol and compare two arms, paired |
 //!
 //! No subcommand needs a window, so this is the fast path: rayon over all cores,
 //! no GPU, no rendering. The planned web build replaces *this* binary, not the
 //! crates underneath it.
 
 mod args;
+mod bench;
 mod commands;
 mod watch;
 
@@ -83,6 +85,7 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         "play" => commands::play(&args),
         "render" => commands::render(&args),
         "sensors" => commands::sensors(&args),
+        "bench" => bench::bench(&args),
         other => Err(format!(
             "unknown subcommand {other:?} (try --help for the list)"
         )),
@@ -124,6 +127,8 @@ COMMANDS:
     play      Play a level yourself with the keyboard, in the terminal.
     render    Print ASCII frames of a level, for eyeballing physics and entities.
     sensors   Print the observation layout, the action table and the physics bible.
+    bench     Run one of the recorded seed-sweep protocols, record the arm, and compare two
+              recorded arms with a paired sign test (see BENCH OPTIONS).
 
     --help, -h      Show this text.
     --version, -V   Show version and the sim/sensor/fitness version trio.
@@ -154,6 +159,16 @@ TRAIN OPTIONS:
                           default (0.0); measured on the plateau and on the chain level in
                           REVIEW.md §4, and offered rather than shipped for the reason that
                           section records.                             [default 0.0]
+    --rank-pessimism <F>  Where between the **mean** of a genome's own trials and the **worst**
+                          of them the ranking sits: 0.0 (the default) is the mean, 1.0 is the
+                          worst trial, and 0.5 scores a genome halfway between what it usually
+                          does and what it did at its worst. A *ranking* knob only — it changes
+                          the score selection and the tournament read and never a number the
+                          run records, so a pessimistic run stays comparable with every other
+                          run in the notes. Free on a level with no walkers: one episode is
+                          its own floor. It is the knob that answers finding 14 (an elite
+                          re-rolled out of the run by a patrol phase it never saw).
+                                                                            [default 0.0]
     --generations <N>     Generations to run.                                [default 30]
     --pop <N>             Population size.                          [default 200 native]
     --seed <N>            Master seed; the whole run is reproducible.        [default 1]
@@ -220,6 +235,12 @@ TRAIN OPTIONS:
                           in `REVIEW.md` was taken with. Costs `N x 16` extra genes, and
                           is clamped to 64.
                                                                             [default 0]
+    --hidden <W[,W...]>   Width of each hidden layer: `--hidden 32` is one layer of 32,
+                          `--hidden 32,16` is two. The shipped recipe is one layer of 16 —
+                          1 739 genes — and this is the flag that asks whether a bigger net
+                          searches better. Clamped to 64 per layer and four layers by the
+                          trainer, so a typo is a smaller run rather than a failed allocation,
+                          and the net a run actually trains is printed in its header.
     --trials <N>          Episodes per genome, averaged. Only distinguishes anything
                           on levels with walkers, v1's one stochastic element. Left at its
                           default, a level **with walkers in it** is judged on three patrol
@@ -230,11 +251,65 @@ TRAIN OPTIONS:
     --no-auto-trials      Release that rule and judge every level on the literal `--trials`
                           count, which is how a number measured before the rule existed is
                           reproduced (and how the one-phase runs in the notes were taken).
+    --no-common-episodes  Judge every genome on **its own** episodes rather than on the
+                          generation's shared ones: `episode_seed(master, generation,
+                          genome id, trial)` instead of `common_episode_seed(master,
+                          generation, trial)`. This is the policy every measurement taken
+                          before the flag existed was made under, so it is how an older
+                          table is reproduced; it also switches racing off, because a race
+                          cannot be sounded on unpaired episodes. See REVIEW.md §4.
+    --race-episodes       Spend the second and third trial only on the genomes still in
+                          contention: the population is ranked on trial 0, the better half
+                          is played on trial 1, the better quarter on trial 2. A walker
+                          level's three-phase budget therefore costs 1.75 episodes per
+                          genome instead of 3.00 — about 29 % of the wall clock at pop 200
+                          on `l3-gauntlet` — with the same first-win counts on the shipped
+                          protocols. On by default; the flag is for saying so explicitly.
+    --no-race-episodes    Judge every genome on every trial, which is what a flat three-trial
+                          pass costs, for comparing against the raced default.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
     --curriculum-generations <N>
                           Generations spent there before returning. 0 takes the detour
                           out of the run altogether — the protocol measurements before
                           finding 50 were taken under.                       [default 40]
+    --resume <PATH>       Start from a **population checkpoint** — `<out>/<level>.population.json`,
+                          the artifact a stall writes — instead of a fresh population: the
+                          population, its genome ids (part of every episode seed) and its
+                          generation numbering all continue. A checkpoint taken on another
+                          level is accepted and reported rather than refused; that is the
+                          curriculum's whole point.
+    --from-champion <PATH>
+                          Start from one saved champion plus a shell of reheated copies of
+                          it: the run begins at generation 0 with the champion in slot 0.
+                          The champion's own level is deliberately *not* required to match —
+                          that is what makes this the way to fine-tune on a level you edited
+                          or to carry one level's policy into a harder one — and the mismatch
+                          is printed. The shape must match: pass the shape it was trained
+                          with. A run seeded this way writes `<level>-seeded.json` when it
+                          would otherwise overwrite its own seed.
+    --from-route          Warm the population from **this level's own route**: the reachability
+                          oracle walks the level, the walk is cloned into a genome, and that
+                          clone plus mutated relatives fills part of generation 0. What it buys
+                          is a starting population that already covers ground — measured on the
+                          shipped pack at the 90th-100th percentile of a random population's
+                          fitness — so the search is spent on the obstacle rather than on
+                          learning to walk. It is **not** a solver, and the reason is the decision
+                          cadence: the oracle presses a take-off on the tick its script reaches
+                          it while a policy decides once every four ticks, so a clone that
+                          reproduces every one of the walk's decisions still walks into the pit
+                          (at a one-tick cadence the same clone solves the level on every seed).
+                          The run reports the replay's own verdict (`route ...`) before it starts.
+    --warm <N>            How many of the population's slots the clone fills; the rest are random,
+                          and that remainder is the design rather than slack. Measured, six
+                          seeds at pop 64 per arm: a quarter of the population solves every
+                          level on every seed and reaches a first win two to four times sooner
+                          than random, and warming *every* slot is the **worst** arm — the
+                          clone's basin is a plateau with no win on it.   [default pop/4]
+    --clone-epochs <N>    Gradient passes over the replay's demonstration when cloning it.
+                                                                [default 300]
+    --route-seed <N>      Episode seed of the replay that produces the demonstration: the walk is
+                          deterministic, so this is what makes a warm start reproducible.
+                                                                    [default --seed]
     --out <DIR>           Champion output directory.                  [default champions]
     --csv <PATH>          Also write the (generation, max, avg) history as CSV.
     --max-seconds <S>     Stop early after S wall-clock seconds.
@@ -275,12 +350,41 @@ WATCH OPTIONS:
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
     --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --stagnation,
     --immigrants, --archive-children, --reheat-factor, --elite, --tournament, --crossover,
-    --action-repeat, --feedback, --trials
+    --action-repeat, --feedback, --hidden, --rank-pessimism, --trials
                           As for `train`.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
     --curriculum-generations <N>
                           Generations spent there before returning.        [default 40]
     --resume <PATH>       Start from a population checkpoint instead of a fresh one.
+
+BENCH OPTIONS:
+    A seed sweep as one command: run a named protocol over every seed, record the arm and
+    every knob that was in force to <out>/<protocol>-<arm>.json, then read two arms back
+    paired, seed by seed. `bench` accepts every TRAIN flag, because an arm *is* a training
+    configuration and nothing else; it refuses the flags that would change what a sweep
+    measures (--suite, --curriculum, --curriculum-generations, --csv, --max-seconds), and
+    it never fires a detour or reads a clock: it drives the trainer one level at a time for
+    a fixed number of generations and stops at the first win, which is exactly what
+    FINDINGS.md's own `for seed in $(seq 1 12)` loops do by hand.
+
+    --protocol <NAME>     The sweep: a frozen (level, pop, generations, seeds) row whose
+                          name is how a table in the notes is reproduced. `--list` prints
+                          the table.                                      [required]
+    --arm <LABEL>         What this arm is called. It names the result file, and it is the
+                          label `--compare` prints.                    [default default]
+    --seeds <N>           Seeds to sweep, starting at `--seed`.  [default the protocol's]
+    --level <PATH>        Run the protocol's shape on another level. An arm records the
+    --pop <N>             level it actually ran, so an overridden arm cannot be quoted as
+    --generations <N>     the protocol's own row.
+    --seed <N>            The *first* seed of the sweep.                   [default 1]
+    --out <DIR>           Where result files are written.              [default bench]
+    --compare <A,B>       Read two recorded arms and print the paired comparison: which arm
+                          won each seed (solved where the other did not, or solved sooner),
+                          the solved counts and medians, the two-sided exact sign test over
+                          the seeds the arms disagree on, and the seeds that flipped. The
+                          test reads the direction of each disagreement and not its size.
+    --list                Print the protocol table and exit.
+    --quiet               Drop the per-seed lines; the summary and the file remain.
 
 STALLING (train and watch):
     On a stall the run writes the stuck population to
@@ -346,6 +450,10 @@ RENDER OPTIONS:
 EXAMPLES:
     train-cli train --level levels/l1-flat-run.json --generations 40
     train-cli train --level levels/l2-first-gap.json --pop 200 --csv out/l2.csv
+    train-cli bench --protocol chain --arm default
+    train-cli bench --protocol tower --arm hidden32 --hidden 32
+    train-cli bench --compare bench/tower-default.json,bench/tower-hidden32.json
+    train-cli train --level levels/l5-tightrope.json --from-champion champions/l3-gauntlet.json
     train-cli es --level levels/scratch-tower.json --generations 300 --stop-on-win
     train-cli reach --all
     train-cli watch --level levels/l2-first-gap.json
@@ -393,7 +501,7 @@ mod tests {
     fn help_text_mentions_every_subcommand_the_dispatcher_accepts() {
         let text = help();
         for cmd in [
-            "train", "es", "watch", "reach", "replay", "play", "render", "sensors",
+            "train", "es", "watch", "reach", "replay", "play", "render", "sensors", "bench",
         ] {
             assert!(text.contains(cmd), "help text omits {cmd}");
         }

@@ -27,7 +27,7 @@ use egui::{ColorImage, Context, Pos2, Rect, TextureHandle, TextureOptions};
 /// The material seams (`blend_*`) are optional the same way, and more so than the rest:
 /// a tileset without them draws a hard edge between two materials, which is what every
 /// tileset drew before they existed.
-pub const REQUIRED: [&str; 71] = [
+pub const REQUIRED: [&str; 72] = [
     "empty",
     // The ground: one sprite per 4-bit open-side mask, and the rock the same way for
     // every mask with no sky above it.
@@ -56,6 +56,12 @@ pub const REQUIRED: [&str; 71] = [
     "deep_12",
     "deep_14",
     "spike",
+    // The two tiles a level can put *behaviour* in, rather than material: the pad a body is
+    // thrown by. A brittle tile needs nothing required of its own — it is drawn as the material
+    // it is made of plus one of the optional `cracked_*` overlays — but a pad is an object the
+    // game has no fallback picture for, exactly as a spike is, so a tileset without it is refused
+    // at startup rather than drawn as an empty cell a body bounces off for no visible reason.
+    "spring",
     // The player's animation set: two idle frames, a six-frame run, one pose per
     // airborne state, and the pose a dead agent is left in.
     "player_idle_a",
@@ -458,6 +464,18 @@ mod tests {
                 brush,
                 brush.sprite()
             );
+            // And the layer *under* the icon, for the brushes that have one: a cracked brush draws
+            // its material first and its own transparent crack over it, so a base sprite the atlas
+            // does not have is a crack drawn on a bare plate — the same blank-button failure, one
+            // layer down, and invisible unless somebody knows what the cell should look like.
+            if let Some(base) = brush.base_sprite() {
+                assert!(
+                    atlas.uv(base).is_ok(),
+                    "the {:?} brush would draw {base:?} under its own icon, and the atlas does not \
+                     have it",
+                    brush
+                );
+            }
         }
     }
 
@@ -1015,6 +1033,88 @@ mod tests {
             spike.opaque_rows().len() > 8,
             "and the spike itself should fill the rest of the cell"
         );
+    }
+
+    /// **The pad is drawn over exactly the band the sim leaves unlaunchable.**
+    ///
+    /// `physics::SPRING_TOP_CLEARANCE` is four of sixteen cell rows, and the sprite has to leave
+    /// those four empty and start drawing on the fifth — the drawing half of one number, checked
+    /// against the arithmetic half rather than against a copied-in 4. The spike taught this lesson
+    /// expensively (REVIEW.md §2.12): its kill box was the whole tile while its art stopped three
+    /// rows short, and the invisible band that mismatch left above every spike was lethal. The pad's
+    /// version of the same defect is the opposite way round and just as wrong: a body lands on the
+    /// pad it can see and is not thrown by it, because the launch zone starts *below* the drawing.
+    #[test]
+    fn the_spring_leaves_the_band_the_sim_will_not_launch_in_empty() {
+        let pixels = Pixels::load();
+        let spring = pixels.sprite("spring");
+        let clearance = (sim::physics::SPRING_TOP_CLEARANCE * spring.cell as f32) as i32;
+        assert_eq!(
+            clearance, 4,
+            "the sim's clearance is four of sixteen rows; if that constant moved, so must the art"
+        );
+        for y in 0..clearance {
+            assert!(
+                (0..spring.cell).all(|x| spring.at(x, y)[3] == 0),
+                "the pad draws in row {y}, which is inside the band a landing body is not \
+                 launched in — the art and the launch zone have drifted"
+            );
+        }
+        assert_eq!(
+            spring.opaque_rows().first().copied(),
+            Some(clearance),
+            "the pad's first drawn row is where the launch zone starts"
+        );
+        assert!(
+            spring.opaque_rows().len() >= 8,
+            "and the pad itself should fill the rest of the cell"
+        );
+    }
+
+    /// A crack is an **overlay**: ink and transparency, drawn over a material's own autotile, and
+    /// one per material rather than one picture reused four times.
+    ///
+    /// Both the renderer and the editor's palette depend on that (`view::cracked_overlay` lays it
+    /// over the tile, `Brush::base_sprite` puts the material under the palette's cell). The failure
+    /// it guards is a crack drawn as a *whole tile*: every brittle tile in every level would lose
+    /// its crown, its edges and its seams with the ground beside it — a floor of cracked tiles would
+    /// read as a row of loose blocks, which is exactly the reason the cracked tile is a variant plus
+    /// a mark rather than a fifth set of sixteen autotiles.
+    #[test]
+    fn a_crack_is_a_mark_on_its_material_and_not_a_tile() {
+        let pixels = Pixels::load();
+        let names = [
+            "cracked_ground",
+            "cracked_sand",
+            "cracked_brick",
+            "cracked_wood",
+        ];
+        let mut art = Vec::new();
+        for name in names {
+            let crack = pixels.sprite(name);
+            let drawn = crack.px.iter().filter(|p| p[3] > 0).count();
+            assert!(drawn > 8, "{name} draws {drawn} pixels, which is not a crack");
+            assert!(
+                drawn < 64,
+                "{name} draws {drawn} of {} pixels: a mark that thick is the tile, not a crack \
+                 drawn on one",
+                crack.px.len()
+            );
+            assert!(
+                crack.has_transparency(),
+                "{name} has no transparency: it would cover the material instead of marking it"
+            );
+            art.push(crack.colours());
+        }
+        for (i, one) in art.iter().enumerate() {
+            for other in &art[i + 1..] {
+                assert_ne!(
+                    one, other,
+                    "two of the four cracks are the same picture: a crack is its material's own \
+                     darkest tone, not one generic scratch"
+                );
+            }
+        }
     }
 
     /// A character stands on the bottom of its cell and is not a filled square: that is

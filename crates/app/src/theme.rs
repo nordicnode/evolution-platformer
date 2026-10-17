@@ -349,20 +349,32 @@ pub fn sunk_frame() -> egui::Frame {
 /// The colour a *material* is drawn in on a shelf thumbnail, from the tile itself.
 ///
 /// The shelf has to say what a level is made of without the atlas (a level the window has
-/// not opened has no loaded art behind it yet), so the five materials have five flat
-/// colours: the greens and browns of soil, the pale gold of a beach, the greys of stone,
-/// the terracotta of brick and the brown of timber. They are deliberately the *palette*
-/// of the art rather than the art: a thumbnail is a map of a level, and a map is not a
-/// picture.
+/// not opened has no loaded art behind it yet), so the materials have flat colours: the
+/// greens and browns of soil, the pale gold of a beach, the greys of stone, the terracotta
+/// of brick and the brown of timber. They are deliberately the *palette* of the art rather
+/// than the art: a thumbnail is a map of a level, and a map is not a picture.
+///
+/// **A brittle material is a darker shade of its material, not a colour of its own.** The
+/// thumbnail's question is what a level is made of, and a cracked bridge is made of the same
+/// earth as the ground it spans; the darker tone is the same sentence the crack is, said at
+/// the size a thumbnail can say it, and it keeps a level's palette reading as four materials
+/// rather than as eight. The spike and the pad are the two that *are* their own colours,
+/// because they are the two tiles that are not a material: one ends an episode and one throws
+/// a body across the level.
 pub fn material_colour(tile: sim::Tile) -> Option<Color32> {
     use sim::Tile;
     match tile {
         Tile::Empty | Tile::Goal => None,
         Tile::Solid => Some(Color32::from_rgb(96, 176, 96)),
+        Tile::Cracked => Some(Color32::from_rgb(62, 118, 64)),
         Tile::Sand => Some(Color32::from_rgb(230, 206, 140)),
+        Tile::CrackedSand => Some(Color32::from_rgb(178, 156, 98)),
         Tile::Brick => Some(Color32::from_rgb(196, 110, 84)),
+        Tile::CrackedBrick => Some(Color32::from_rgb(146, 78, 60)),
         Tile::Plank => Some(Color32::from_rgb(176, 132, 84)),
+        Tile::CrackedPlank => Some(Color32::from_rgb(126, 92, 58)),
         Tile::Spike => Some(Color32::from_rgb(226, 106, 106)),
+        Tile::Spring => Some(Color32::from_rgb(110, 196, 214)),
     }
 }
 
@@ -467,17 +479,24 @@ mod tests {
     }
 
     /// Every material a level can be made of has a thumbnail colour, and empty ground
-    /// has none — the four materials and the hazard, and nothing drawn for air.
+    /// has none — the four materials, their four brittle selves, the hazard and the pad, and
+    /// nothing drawn for air.
     #[test]
     fn every_material_has_a_thumbnail_colour() {
         use sim::Tile;
         assert!(material_colour(Tile::Empty).is_none());
+        assert!(material_colour(Tile::Goal).is_none());
         let solids = [
             Tile::Solid,
+            Tile::Cracked,
             Tile::Sand,
+            Tile::CrackedSand,
             Tile::Brick,
+            Tile::CrackedBrick,
             Tile::Plank,
+            Tile::CrackedPlank,
             Tile::Spike,
+            Tile::Spring,
         ];
         let colours: Vec<Color32> = solids.iter().filter_map(|t| material_colour(*t)).collect();
         assert_eq!(colours.len(), solids.len(), "every material is drawn");

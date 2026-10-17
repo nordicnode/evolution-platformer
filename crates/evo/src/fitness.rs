@@ -393,6 +393,24 @@ pub struct EpisodeResult {
     /// number about a genome reads [`EpisodeResult::fitness`]; everything that *ranks* one
     /// reads this.
     pub mean_fitness: f32,
+    /// Fitness of the **lowest-scoring trial** this genome was judged on; equal to
+    /// [`EpisodeResult::mean_fitness`] when it was judged on one, and equal to
+    /// [`EpisodeResult::fitness`] on a single episode.
+    ///
+    /// The pessimistic half of "what did this genome do". A mean over three patrol phases says a
+    /// genome is good on average; this says it was never worse than *this*, and on the levels
+    /// where the two come apart it is the number that matters: a genome that solved two phases
+    /// and died at the walker on the third has a good mean and a bad floor, which is exactly the
+    /// failure `REVIEW.md`'s finding 14 records — an elite re-rolled out of the run by a phase it
+    /// never saw. Nothing ranks on it unless the operator asks
+    /// ([`crate::ga::GaConfig::rank_pessimism`]); like the mean, it is a *reading*, and the
+    /// recorded number remains [`EpisodeResult::fitness`].
+    ///
+    /// Set by [`crate::ga::suite_score`], the one function that ever runs more than one episode
+    /// for a genome; a single episode is its own floor, which is what makes the field exactly
+    /// `mean_fitness` on every deterministic level and keeps a memoryless run's ranking
+    /// bit-identical whatever the pessimism is set to.
+    pub worst_trial: f32,
     pub outcome: Outcome,
     pub frames: u32,
     pub progress_pixels: f32,
@@ -497,6 +515,7 @@ impl EpisodeRunner {
             self.trace.u32(frames);
             self.trace.u8(self.action.index() as u8);
         }
+
         self.sim.step(self.action);
         self.iterations += 1;
     }
@@ -521,6 +540,9 @@ impl EpisodeRunner {
             genome_id: self.genome.id,
             fitness,
             mean_fitness: fitness,
+            // One episode was played, so it is its own floor. `suite_score` lowers this as it
+            // runs the rest of a genome's trials, and it is the only thing that can.
+            worst_trial: fitness,
             outcome,
             frames: stats.frames,
             progress_pixels: stats.progress_pixels,

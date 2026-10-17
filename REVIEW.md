@@ -282,6 +282,128 @@ running left all read the same), plus the relayouted
 `the_vector_has_the_documented_named_layout` and the re-pinned
 golden hash.
 
+### 1.10 A spring pad delivered 0.91 tiles of its advertised 4.90 — **bug, caught by the pad's own test**
+
+The trap pass' pad writes the body's vertical velocity and leaves the horizontal alone
+(`PlayerState::bounce`), and the first version of it wrote only `vy`. That is 45% of a launch, not
+all of it, because **the jump cut is a rule about a released ascent and a pad is not a button**:
+`jump_cut` fires on the first tick of any rise the player is not holding jump through, so the very
+next tick after a pad threw the body it cut the throw to 45% of itself. Measured on the pad
+fixture, the rise was **0.91 tiles** against a held jump's 2.37 — a pad that is *weaker than a
+jump*, from a constant the physics module advertises as 4.90.
+
+This is the same defect class as §2.12 and it is worth saying so: a documented number the sim did
+not produce, found by asking the sim what it did rather than by reading the constant. The
+assertion that caught it is the one that measures the apex against `PHYSICS::spring_height()`
+(`a_spring_launches_a_falling_body_upward_and_keeps_its_momentum`), not a re-statement of
+`spring_v0`, and the fix is one line in `bounce` — spend the cut at launch, because the pad's
+throw *is* an ascent nobody is holding the button through. With it spent, the measured rise is
+4.90 within 0.3, which is the same tolerance the jump ladder is quoted at.
+
+The lesson is not "test more": three of the pad's four rules were already covered (it launches a
+falling body, it ignores a rising one, it ignores a body walking over it) and all three passed
+against a pad delivering less than half its height. What was missing was the assertion that a pad
+is worth *using* — that it beats a jump by the margin the constant claims — and that is the kind of
+claim a physics test has to make out loud.
+
+### 1.11 The window froze for a second or two at random — **bug, and the cause was the stall's own remedy**
+
+Reported from play: an evolution run is smooth most of the time and then stops dead for a second
+or two. "At random", because the thing that causes it is the *stall*, and a stall is by definition
+not on a schedule.
+
+**What it was.** A packet is one generation of the search *except* when a stall fires a practice
+detour: forty generations of the excursion run inside a single `next_packet`, i.e. **1.73 s** of
+work at pop 200 against a scored generation's 27-50 ms — forty times the median. The window asked
+for each generation when the previous one's animation *ended*, so that 1.73 s happened with the
+previous generation already off screen: the level was drawn with nobody on it until the packet
+landed.
+
+**Measured, both ways, by a probe that emulates `evolve_step`'s real pacing** — 60 fps frames at
+8x, 90 generations of `scratch-tower` at pop 200, the same seed, once with the ask where it was and
+once with the ask one generation early:
+
+| the window's pacing | longest wait for a packet | waits > 100 ms | total waiting |
+|---|---|---|---|
+| ask when the animation ends (before) | **1535 ms**, gen 62, a practice detour | 2 | 5.16 s |
+| ask one generation ahead (after) | **68 ms**, gen 0, an ordinary generation | 0 | 0.07 s |
+
+The probe also asserts that the two arms compute the *same* generations, which is the point of the
+change: the search is untouched. Nothing about what is computed moved — only when the worker is
+allowed to start. The 68 ms that is left is the first generation of the run, and there is nothing
+on screen to hide it under yet; the window already says "evaluating the first generation…" for it.
+
+**The fix** is one generation of lookahead in `evolve_step`: ask for the successor as soon as a
+generation is on screen instead of when its animation finishes, so a packet's cost is paid out of
+animation the viewer was watching anyway (0.6-5 s of it at 8x). The bound the old rule existed for
+is unchanged — the worker computes at most one generation beyond the one on screen, because
+`Lab::request_next` refuses a second request while one is in flight and the worker will not start
+another until the window has taken what it queued — so a paused or scrubbing window still parks
+it, after the one generation already in flight rather than immediately. Held by
+`app::lab::tests::the_worker_never_runs_more_than_one_generation_past_the_window` (taking a
+generation clears the ask, a second request is refused while one is in flight, and a worker that
+has not been asked produces nothing while a generation sits on screen).
+
+**What is left, and it is a design wart rather than a rough edge.** The lookahead hides any packet
+cheaper than the animation covering it, which is every packet at 1x-16x; at 50x — where a
+generation's animation is 0.1-0.8 s — a 1.73 s detour packet still outruns it, and the honest
+answer there is that the *packet* is the wrong unit: one generation of the display should not be
+forty generations of the search. Streaming the detour — the excursion's generations returned as
+packets of their own, on the practice level, with the panel saying "practising the spot it is stuck
+at: generation 12 of 40" — removes both the residual freeze and the fact that the run's most
+interesting work is the one thing a viewer can never see. That is the next pass's work, and this
+fix is deliberately the measurement that makes the case for it rather than a guess at it.
+
+### 1.12 The oracle did not know about spring pads — **bug, reported from play**
+
+**The report.** A level built by hand — a pad on the lip of a wide gap — showed the editor's verdict
+"NOT beatable", and the population crossed it easily. The owner's read of the cause was right: the
+tool was not taking the pad into account.
+
+**Why it happened, and why it is the failure this module promises against.** `crates/sim/src/reach.rs`
+opens by saying the oracle "deliberately uses the **real** [`PlayerState::tick`] stepper and the real
+collision query, so the oracle can never disagree with the sim about how far a jump goes". Driving
+`PlayerState::tick` is exactly what it did — and the pad rule does not live there. It lives in the
+episode loop, in `Sim::step`, one layer up: a body whose box overlaps `physics::spring_launch_box`
+while `vy > 0` is thrown at `spring_v0` with the `vx` it arrived with. So every canonical trajectory
+the sweep built was a trajectory through a game with **no pads in it**, and a pit whose only crossing
+was a pad was reported unreachable by a tool whose whole value is that its negative answers are
+trustworthy.
+
+**The fix is a shared call, not a second model.** `physics::spring_launch` is now the rule (launch
+box, descending-only condition, `bounce`, all moved there beside the box and the height it produces),
+`Sim::step` calls it, and the oracle calls the *same* function at the same point in its tick
+(`oracle_tick`). `ReachOptions` gained a third ability — `spring`, on by default — so "this level needs
+a pad" becomes a claim a test can check, the way `sprint` and `wall_climb` already are. A pad is not a
+*script* like a wall climb is: it changes how far the move already under way goes, which is why nothing
+had to be taught, only wired in.
+
+**The consequence a cache makes unavoidable:** `MOVE_SET_VERSION` went **1 → 2**. Route-cache sidecars
+hold *verdicts*, and a verdict that a pad level is unbeatable is precisely what must not be reused; the
+key already covers this case by construction, which is what it is for (finding 59).
+
+**Measured rather than asserted**, on a fixture with a pad on the lip of a pit, sweeping the pit's width
+because the width is where the finding lives: with pads, every width from 5 to 9 is reachable; with
+`spring: false`, widths 7 and 8 are unreachable and 5 and 6 are not (a **sprinting** jump covers 6.00
+tiles and the body is 0.60 wide, so six columns are a jump and seven are not). At width 7 the crossing
+was reproduced by driving the real episode loop: sprint right, jump once near the lip, land on the pad,
+be thrown from inside the pad's column at `-spring_v0`, and win — the assertion the oracle-versus-sim
+promise needs, and the one that rules out the oracle crediting a pad for a jump's work. Second
+negative, same rule from the other side: a body that *walks* off a pad's ledge is not thrown, in the sim
+or in the oracle (`walking_off_a_pad_at_a_ledge_is_never_a_launch`).
+
+**Through the interface the report came from:** `train-cli reach --level levels/custom-l1-flat-run.json`
+now prints `OK … platforms 3 reachable 3` where it printed `UNBEATABLE … a sprinting jump covers 6.00
+tiles and must land past it`. Every other level in `levels/` answers exactly as it did before — including
+the one genuinely unreachable scratch tower — and the pack's own ladder and mirror tests are unchanged.
+
+**The general lesson, which is the reason this is written up rather than just fixed.** The oracle is an
+*equivalence claim*: model the game's rules, or the answers are wrong in the expensive direction. Sprint
+is arithmetic, a wall climb is a script, and a pad turned out to be neither — it is a tick rule, and a
+rule that lives in the episode loop is invisible to an oracle built on the body's stepper. The next
+mechanic added (a dash, a carry, a bounce) has to be asked the same question: does it happen in
+`PlayerState::tick`, or between ticks?
+
 ---
 
 ## 2. Bugs and rough edges found, not yet fixed (prioritised)
@@ -512,6 +634,123 @@ is air, and a body standing in the spike's own cell is still killed — the assu
 `Level::is_standable`, the checkpoint zones and the editor's placement rules are built on.
 
 ---
+
+### 2.13 No shipped course uses the trap tiles — **open, and it is the honest edge of the pass**
+
+The trap pass added two tiles and a fixture that demonstrates them
+(`levels/scratch-trap-tiles.json`), and the ladder that teaches the rest of the game — L1 flat run,
+L2 first pit, L3 spikes, L7 wall jumps, L8 sprint — has no rung for either. `reach --all` covers the
+fixture because it is part of the pack, and the terminal renderer shows both objects working, so the
+*mechanics* are verified; what is missing is the thing the rest of this project is about, which is
+evidence a population can learn them.
+
+The two claims that would settle it are each a training run and each has a shape:
+
+1. **A bridge crossed at speed.** The fuse (32 ticks) is set from the decision cadence, so the
+   argument that a cracked span is *learnable* — the crossing fits in three decision blocks — is an
+   argument, not a reading. The level that would test it is a cracked span long enough that stopping
+   on it is fatal, with a flat runway either side so the only new thing is the fuse.
+   **Written and measured; the argument was right and the answer is worth more than the argument.**
+   `levels/scratch-trap-crossing.json` is that level and it is a *route* rather than a demo: twelve
+   tiles of cracked deck over a twenty-tile pit whose floor is spikes, a two-tile hole at mid-span
+   that has to be taken on the fly, three spikes on the far ground, and no second way across (the
+   fixture `scratch-trap-tiles.json` is not a test at all — a random population falls into its pit,
+   hits the pads and is thrown to the flag, 11 genomes in 200 at generation 0).
+
+   Twelve seeds, pop 200, 300 generations, `--stop-on-win`, the protocol every other number in this
+   document uses (FINDINGS.md, "The trap crossing"):
+
+   | level | solved | mean first-win generation | won by the *initial* population |
+   |---|---|---|---|
+   | `scratch-trap-crossing` | **12 / 12** | **0.9** (median 0.5, worst 4) | 6 of 12 seeds |
+
+   So the span is *not* a wall, and the reason is the interesting half: the fuse punishes hesitation,
+   and a randomly wired policy does not hesitate — it holds one direction and keeps moving, which is
+   exactly the crossing. Zero generations of learning is needed because the level asks for the one
+   behaviour a random controller already has. **The tiles earn difficulty only where the route makes
+   the body *stop* or land precisely *on* the deck** — a walker to wait out, a spike on the deck, a
+   narrow landing, a climb at the far lip — and that is a rule for authors, not for the tiles. It is
+   recorded here rather than acted on because a course added to the pack moves the difficulty table
+   every other course is quoted against, which is the same reason item 2 is still open.
+2. **That the patch's two new values are enough.** A crack reads `-0.25` and a pad reads `+0.5`; a
+   pad is only reachable as a *target* if a policy can tell it from the air beside it, and the
+   cheapest level that asks is a pit whose far wall is higher than a jump: the pad at the bottom is
+   the only way across, so a population that never reads `+0.5` never solves it.
+
+**The second experiment cannot be built yet, and that is the real open item.** `sim::reach`
+simulates a body with `PlayerState::tick`, and the pad's launch lives in `Sim::step` — so the oracle
+treats a pad as air and would report a level whose only route is a pad as **unbeatable**, which is
+the one verdict that stops a level being shipped (`reach --all`, the editor's status line and
+`train-cli`'s pack sweep all read it). Two consequences worth stating plainly: every pad level the
+pack could ship today needs a jump route *beside* the pad, which is a weaker lesson than the one the
+tile is for; and the oracle cannot yet answer "is this pad placed where a body can land on it",
+which is the authoring question the object creates. Teaching `reach` about the launch is a bounded
+piece of work — the pad is a second canonical trajectory rather than a new mechanic — and it is the
+natural next step for this pass. A cracked tile is in the same position from the other side: the
+oracle stands on it forever, which is the right answer to "beatable at all" and no answer at all to
+"will this bridge still be here when the body is halfway across".
+
+**Where that leaves the item.** The bridge question is answered and the fixture stays a fixture: a
+course added to the pack moves the difficulty table every other course is quoted against, and a rung
+that a random genome clears in half the seeds belongs in that table only after the table is
+re-measured against 0.11.0. The pad question is still blocked on `sim::reach`, which is the item's
+real work. What the fixture did buy is the answer to "can a population learn the trap tiles at all":
+yes, in under a generation, because the crossing is a commitment and not a puzzle — and the honest
+note for the pack is that the *second* trap course has to pair the span with something that makes a
+body hesitate on it, or it is a tutorial rather than a wall.
+
+### 2.14 The editor's verdict still runs on the frame it is asked for — **open for an *edit* (7 ms of a 16.7 ms budget)**
+
+**The *open* is closed** (finding 59). A level's route table and the oracle's verdict are pure
+functions of its terrain, so both are now kept beside the level file (`<level>.json.routes`, keyed by
+the content hash and the sim/move-set version pair) and adopted at load: a reopened level costs a
+53 µs read instead of 18.7 ms of sweeps, `train-cli reach` as a process went 24 → **2 ms**, and the
+trainer's first generation at pop 8 went 10-12 → **3 ms**. That was the same 18.7 ms being computed
+again by every process that touched the level, which is why removing it once removes it everywhere.
+
+What is left is the **edit**, and it is left on purpose: a cache answers for a *file*, and every
+paint stroke makes the document a different level — so the document gives up its claim to the file's
+answers rather than being served a verdict about the terrain it used to be. Finding 58 took the graph
+and the oracle's sweeps from ~23 ms to **7.6 / 8.5 / 8.1 / 6.7 ms** by
+sweeping them across the machine's cores instead of one (measured on four levels; the editor's own
+oracle came down 22.8 → **7.1 ms**). That is a *faster* sweep, not a *smaller* one, and for an edit it
+is still asked for **on the UI thread**: [`Editor::refresh_report`] re-runs the whole oracle whenever
+the document's content hash moves, which is every paint stroke, so a stroke that lands 7 ms of work in
+a 16.7 ms budget eats 40% of the frame it lands in — and the sweep grows with the level, so a
+192-column course will not fit.
+
+The shape of the fix is already in the tree, twice, and neither time in the editor: the run's
+generations are computed on a worker behind a condvar handshake ([`app::lab::Hub`]) and adopted when
+they land, and the champion's route is recorded beside them rather than derived on screen. The same
+object for the verdict is a hash-keyed request: the editor publishes the document's hash, a worker
+computes the report for it, and the answer is adopted only if the hash still matches — otherwise it
+is dropped, because a verdict about the previous version of the level is worse than a verdict a
+frame late. Two things have to be decided rather than discovered: what the panel says while it is
+waiting (the previous verdict with its age, or a plain "checking"), and whether an edit that cannot
+change beatability — a scenery prop, a spawn nudge — is allowed to skip the round trip. The
+measurement that would close it is the one finding 58's numbers came from: a headless probe of
+`refresh_report` over a drag of N strokes, on the widest shipped level, before and after.
+
+### 2.15 The difficulty table's L9 row does not reproduce its generations — **open, low (documentation)**
+
+Found by auditing rather than by a failure: this pass re-ran the row under the current binary, because
+the claim it was making about the stall chain needed the row's protocol to be a known quantity. The
+row reproduces its **count** — 12 of 12 — and none of its twelve generations. As recorded and as the
+row's own paragraph states them: `30, 33, 54, 54, 58, 67, 68, 70, 81, 82, 90, 205` (median 67.5,
+slowest 205). Re-run at the same pop and `--stop-on-win`, with the trainer's own defaults, cap 420:
+**`28, 41, 46, 51, 53, 74, 81, 104, 111, 113, 124, 394`** (median 77.5, slowest 394). The re-run is
+not a different measurement — its twelve numbers are the detour arm's own, seed for seed, so the row
+and the new arm are the same protocol on the same binary — and the row's text already records one
+re-measurement, when fitness v8 re-rolled every episode. Something moved after that one: a level edit
+(any change to terrain re-rolls every episode) or a later change this pass did not bisect.
+
+**Why it is worth a line rather than a shrug.** The table is quoted as measurements: "the pack's
+slowest row by more than a factor of three" and the ladder's shape both rest on these numbers, and a
+row a reader cannot reproduce is a row a reader has to take on trust. Two things would close it, and
+they can be done together: re-derive the row and stamp the table with the revision it was taken at
+(the repository already stamps every champion with its version trio for exactly this reason), and write
+down which half of a row is a reproducible claim — the **count** is, and a generation is a draw from a
+spread five seeds wide, which this pass measured and put under the table's own reproduce snippet.
 
 ## 3. Feature improvements (existing features)
 
@@ -856,6 +1095,47 @@ re-tried: **the decision cadence is not the bottleneck.** `--action-repeat 3` (a
 control granularity than the default 4) reached `best_x 25.4` on the tight floor but
 finished *no* seed inside 800 generations at pop 1000,while the default cadence finished one — so the cadence stays 4.
 
+### The newest pass: the route as a demonstration (`--from-route`)
+
+Three things landed together and they are one idea: the reachability oracle can already walk a level
+it has proved, so **use the walk** — as a verdict, as a warm start, and as the instrument that checks
+the oracle itself. The full measurement is FINDINGS.md, "The route as a demonstration"; the short
+version, because two of the three results are negative and the negatives are the useful ones:
+
+* **`train --from-route` warms a quarter of the population from a cloned route walk.** Measured
+  gains: two to four times fewer generations to a first win on `l2` (22 against 59, summed over six
+  seeds at pop 64), `l4` (71 against 186) and `l5` (43 against 195), with the warm arm solving every
+  level on every seed where random's own rate is 21 of 24. It is the answer to "a level the oracle
+  can route should not have to be rediscovered by search".
+* **A clone reproduces the demonstration and does not play the level, and that is a fact about the
+  *decision cadence* rather than about the fit.** The oracle presses a take-off on the tick its script
+  reaches it; a policy decides once every four ticks and holds its arm in between, so the press has no
+  tick of the policy's to be made on. Measured: at the shipped cadence a 4000-epoch clone reproduces
+  **every one** of `l2-first-gap`'s 139 decisions and still walks into the pit, on all eight seeds;
+  forcing the replay itself to press on decision boundaries breaks the *walk* instead (`l2`, `l4`,
+  `l9` die at their first gap); and at `action_repeat = 1`, where the two grids are one grid, the same
+  fit solves `l2`, `l4` and `l5` on all eight seeds with identical frame counts. The first explanation
+  written here — that the observation aliases the demonstrated press — was **tested and refuted**: no
+  two decisions of any demonstrated walk over the pack share a vector and disagree about the action,
+  on the full vector or on the projection with the continuous goal and waypoint deltas dropped.
+  Sensors v10 (the sub-tile phase, `phase_x`/`phase_y`) survives that refutation on its own
+  measurement — a 4000-epoch fit misses 0-2 of a demonstration's decisions with it against 18-19
+  without — but it is a fidelity fix and not a solver.
+* **Warming the whole population is worse than warming a quarter.** All 64 slots drawn from the clone
+  is the worst arm on three of four levels, worse than random on `l2` and `l4`. A clone is a
+  high-fitness plateau with no win on it, and a population that starts on one plateau has nowhere to
+  go. This is also what `Trainer::from_champion` does with a single genome, so the caveat applies to
+  the fine-tuning path as well; `--warm` is the dial.
+
+Two things this pass did **not** do, stated so they are not mistaken for done. The replay still
+cannot walk `l6-marathon` (it closes all five route hops and is killed by a patrol on the last
+stretch) or `l8-long-jump` (a press the local sweep accepts and the live flight does not make — the
+oracle's clean spawn state against the state a live body carries), and both are pinned as named
+failures in `crates/evo/tests/route_play.rs` rather than tuned away. And a patrol is the one thing a
+plan over static terrain cannot express, so a replay's verdict on a patrolled level is a rate over
+patrol phases (`l3` and `l9` walk five seeds in ten) rather than a yes or no — which is what a level
+needs a *population* for, and what the warm start is protecting against when it hands one the route.
+
 ### Item 4, done and measured: the breed no longer only jumps
 
 Item 4 above asked for condition-triggered *immigrants*, hooked to the stall detector.
@@ -1009,6 +1289,23 @@ not a bug list. It is the list of things that still stand between this populatio
 person would call *smart*, ordered by how much each one actually limits that — with the cost and
 the evidence for each, because the next pass should not have to re-derive this.
 
+**One item belongs above the list, because it is the largest *available* gain rather than a cap.**
+The reachability oracle knows how to walk the pack — it walks `l9-wait-and-climb`'s whole nine-move
+chain in 619 frames and reports the hop if it fails — and the population takes a **median of 160
+generations** to find the same chain. The bridge between those two facts exists (`route_play` records
+the walk as a demonstration, `imitate` fits a policy to it, `--from-route` seeds a quarter of
+generation 0) and it is capped by one mismatch: the oracle presses a take-off on the *tick* its script
+reaches it, while a policy decides once every four ticks and holds its arm in between — so a clone
+that reproduces **every one** of the walk's decisions still walks into the pit, and at
+`action_repeat = 1` the same fit solves `l2`, `l4` and `l5` on all eight seeds. The fix is a
+**cadence-aware oracle**: sweep the canonical moves on the policy's control grid (press at a
+decision boundary, hold in blocks), which is a `sim::reach` pass with its own `MOVE_SET_VERSION` bump
+and its own measurement, and which would turn `--from-route` from a head start into a solver. It is
+not done here because a coarse-grid sweep has to be *searched*, not patched — forcing the existing
+replay's press onto decision boundaries breaks the walk itself (`l2`, `l4` and `l9` die at their first
+gap in under 200 frames) — and a half-searched move set would silently under-report which levels are
+beatable.
+
 1. **The tasks are the ceiling, not the search.** The shipped pack is solved almost
    immediately: `l1-flat-run` and `l2-first-gap` at **generation 1-2** at pop 200, and
    `l6-marathon` — the longest level in the pack — is won at generation **6 of 300**, by a
@@ -1112,6 +1409,238 @@ show it. Every item on this list now has a mechanism, a measurement and a paragr
 the measurement does *not* establish — which is the point at which the next pass should be
 re-ranking the list rather than working down it, and the two sections below are written so that
 re-ranking can start from the numbers rather than from the prose.
+
+### The next pass's levers, identified and ranked (not measured — that is the point)
+
+The list above is closed: every item on it has a mechanism and a measurement. These seven are what
+an audit of the *learning machinery* turns up beyond it, each with the code that shows the gap and
+the measurement that would settle it. They are ordered by expected effect on the one question that
+matters — does this population, given enough time, end up with behaviour a person would call
+sophisticated. Two of them (3 and 4) are sensor changes and therefore version bumps; the other five
+touch the search, the rule that ends an episode, or the trainer's schedule, and cost no champion.
+
+1. **Every genome is judged on its own episodes** (`sim::rng::episode_seed(master_seed, generation,
+   genome_id, trial)` — ga.rs's `suite_score` builds exactly that). On a walker level, genome 7 and
+   genome 8 of one generation therefore face *different patrol phases*, and the ranking is between
+   two different worlds rather than between two policies. **[Done and measured at the top of the
+   section below: landed as `GaConfig::common_episodes`, on by default.]** The project's own workaround is visible
+   above: three trials and a `rank_pessimism` knob, both of which exist to average out the noise the
+   seed formula injects. **Common random numbers** — one trial seed per (generation, trial), shared by
+   the whole population, still re-rolled every generation so no policy can memorise a phase — removes
+   the unfairness *inside* a generation instead of pricing it in. It also makes `rank_pessimism`
+   meaningful (a floor compared across paired episodes is a statement about reliability; across
+   unpaired ones it is partly a statement about luck) and it is the prerequisite for item 2.
+   *Measurement*: `l3-gauntlet` and `l9-wait-and-climb`, twelve seeds, first-win generation and the
+   between-trial spread of the generation's best at matched episode budget; the reading to beat is the
+   table in item 3 of the list above.
+2. **Racing: spend the second and third trial only on the genomes still in the running.** With
+   unpaired episodes this is unsound — an apparent leader may simply have drawn an easy phase — which
+   is why it should follow item 1 rather than precede it. **[Done and measured below: landed as
+   `GaConfig::race_episodes`, on by default, for 1.75 episodes per genome instead of 3.00.]** With common random numbers the population is
+   ranked on one episode, the top half is re-ranked on a second, the top quarter on a third, and about
+   half of a walker level's episode budget is freed. *Measurement*: same first-win generation at a
+   measured cost per generation, or the generations bought by the saved budget.
+3. **The agent cannot see its own arm.** `PlayerState::jump_held` is real, is part of the state hash,
+   and appears **nowhere** in `sensors::input_names()`. **[Built, measured, and *not* landed — the
+   section below has the two arms and the reason, which is that it costs the route-clone warm start
+   and buys nothing measurable.]** The jump is edge-triggered (`physics.rs`: a
+   press only registers on the frame the button goes down), so a policy that is holding a jump has no
+   input that says so and cannot deliberately release-and-press again — it must infer its own last
+   action from the body's velocity. This is the same class of defect as v7's walker heading and it is
+   cheaper: the field is private and reaches no observation, so it needs a `jump_held()` accessor
+   beside the two slots (jump held; sprint asked for) at indices 100-101, a `sensors` v11 and the
+   `--from-route`/champion retrain that any version bump costs. *Measurement*: the levels whose
+   solutions need repeated presses — `l4-rhythm`, `l7-ascent`, `l7-wall-school`, `l9`'s climb — at pop
+   200 over twelve seeds, against the same run without the slots.
+4. **Hand the population the route as an *input*, not as a demonstration.** The oracle's plan exists in
+   `level.routes()` and the observation already carries the next *stand* (`waypoint_dx/dy`, v8); it does
+   not carry the *move* — where the take-off is, how fast to be going when you press, whether it is a
+   hold, a climb or a walk-off. That is precisely the information the clone fails to transfer at a
+   four-tick cadence, and as an input it does not have to be transferred: the policy presses on its own
+   decision tick and evolution finds the cadence-adapted version of the oracle's move, which is a thing
+   no imitation can do. This is the cheaper sibling of the cadence-aware oracle written up above, and
+   the two are complements: the oracle says *what* the move is, the policy learns *when* at its own
+   resolution. *Measurement*: `l9-wait-and-climb`'s median first win (160 generations) and
+   `scratch-tower`'s 10 of 12, at pop 200, twelve seeds, with and without the slots.
+5. **Patience is capped at 600 frames while a patrol cycle is 950.** `NO_PROGRESS_FRAMES = 600` ends an
+   episode as `Stuck` unless the body makes a **new** closest approach to the flag or closes a new route
+   hop (lib.rs 567-586); standing still resets neither. `l9-wait-and-climb` is the level built to need a
+   wait across a nineteen-tile patrol, and a walker moves at `walker_speed = 0.04` tiles a tick: one
+   traverse is 475 frames and the round trip 950. So a policy whose answer is "let it pass and then go"
+   is terminated for standing still before the patrol comes back, on the level whose name is *wait*. The
+   fix is not to remove the anti-camping rule (it prices the park trap of fitness v3) but to let it
+   count the *world* making progress as well as the body: a walker that has turned, or that has left and
+   returned, is evidence that time is passing rather than being wasted. *Measurement first*: for each
+   patrol phase of `l9`, the earliest frame a crossing is safe and therefore the wait a correct policy
+   would need; if that distribution exceeds 600 the rule is the ceiling on a *smart* behaviour rather
+   than on a lazy one.
+6. **Practice is stall-triggered; make it frontier-driven.** `curriculum::practice_level_for_stall`
+   derives a practice level from the run's stuck point and `practice_step` trains the population on
+   `[practice, main]` for forty generations — measured above and working. But it fires after
+   `stagnation_generations` (20) of *no new best*, which on a chain level is twenty generations spent
+   not practising the next link. A frontier rule — solve the current practice level → derive the next
+   one from the new stuck point, immediately, and let the chain grow — is the same machinery with a
+   different trigger, and it is the cheapest form of the continuous curriculum the earlier list kept
+   asking for. *Measurement*: `l9-wait-and-climb` and `scratch-tower`, twelve seeds, first-win
+   generation and the number of practice excursions taken.
+7. **One level is still one level.** `Trainer::step_suite` exists and aggregates by the genome's
+   **worst** level, which is the right rule, but it needs a level *list* — so generalisation is only
+   measurable on levels somebody authored. A generator that emits variants of a level (mirrored,
+   terrain-jittered, patrol-phase-pooled, hazard-relocated) would make "behaves well anywhere" the
+   objective without new content, and the practice machinery already knows how to write a derived
+   level to disk. *Measurement*: held-out variants — train on sixty variants of `l4-rhythm`, score the
+   champion on twenty it has never seen, against a champion trained on `l4-rhythm` itself.
+
+The order to do them in is 1 → 2 (they are one change in two halves and they make every walker-level
+number below them cheaper and more trustworthy), then 5's probe (a day of measurement that may
+re-price `l9`), then 4 and 3 as capability slots, then 6 and 7. Nothing here is a substitute for
+harder content — item 1 of the ranked list still holds — but 4 and 5 are the two places where the pack
+currently asks for behaviour the interface cannot express, and that is a different kind of limit from
+a level being easy.
+
+**Status after this pass: 1 and 2 are landed and measured (and they re-price every walker-level
+number in this file, which is now taken under `common_episodes + race_episodes` unless it says
+otherwise); 3 was built, measured and reverted; 4, 5, 6 and 7 are untouched, with 5's probe still
+the one measurement that would re-rank the list.**
+
+### Items 1 and 2, done and measured: one world for the generation, extra trials for the contenders
+
+Two mechanisms, one idea. **Pairing** — `GaConfig::common_episodes`, on by default — derives an
+episode from `(master_seed, generation, trial)` with the genome id deliberately absent
+(`sim::rng::common_episode_seed`, which is `episode_seed` with the id fixed at `NO_GENOME`, so the
+two policies share one frozen mixer), and the generation is still mixed in, so the world re-rolls
+every generation and no policy can memorise a phase. **Racing** — `GaConfig::race_episodes`, also on
+by default — spends the second and third trial only on the genomes still in contention: everyone on
+trial 0, the better half on trial 1, the better quarter on trial 2. The cull halves on the same
+pessimistic score that selection ranks on, so racing introduces no second opinion about what a genome
+is worth.
+`GaConfig::sanitized` drops the race rather than the pairing when the two disagree, because
+`common_episodes: false` can now only be somebody asking for the old policy: `--no-common-episodes`
+means exactly what it says, and a race that cannot be sounded is not run. Which episodes a genome is
+judged on has **one** answer in the code — `episode_seed_for` — used by the trainer, the suite
+scorer and the CLI's re-scoring of a saved champion, and the cost is a recorded number rather than
+a formula in a comment (`ga::episodes_per_genome`, printed by `bench` as `episodes N per genome`).
+
+**Why pairing, in one measurement.** On the walker fixture (24 tiles, walker at 12, pop 16, master
+seed 4), at generation 0: under pairing **0 of 16 genomes** scored their three trials differently and
+there were **0** mean-versus-floor reorder pairs; without it, **14 of 16** scored differently and
+there were **24** reorder pairs. Every genome's three trial traces are distinct in *both* arms, so the
+difference is not a degenerate episode: what the unpaired policy hands out is a **different world per
+genome**, and the evidence that `rank_pessimism` had anything to reorder on — the assertion this
+test used to make at generation 0 — was the world draw. Five generations in, the population has met
+the walker and the *real* effect appears: 16 of 16 genomes score the phases differently, mean spread
+688 fitness units, 8 reorder pairs. That sequence is pinned as a test
+(`pairing_is_what_a_walker_fixture_measures_and_a_world_lottery_is_not`).
+
+**The arms.** Pop 200, twelve seeds, `--stop-on-win`, sensors v10, `bench` protocols; `--compare`
+reads two arms back seed by seed with the exact sign test.
+
+| protocol | per-genome (old) | paired | paired + raced |
+|---|---|---|---|
+| `gauntlet` (l3) | 12/12, median 16.0, mean 19.7 | 12/12, median 13.0, mean 20.6 | 12/12, median 19.0, mean 16.4 |
+| `marathon` (l6) | 12/12, median 10.5, mean 9.2 | 12/12, median 10.5, mean 9.7 | 12/12, median 10.5, mean 9.7 |
+| `chain` (l9) | **10/12**, median 97.5, mean 143.8 | **7/12**, median 116.0, mean 136.7 | **10/12**, median 146.0, mean 153.1 |
+
+* `gauntlet`, per-genome against paired: **p = 0.7744** (per-genome ahead on 5 seeds, paired on 7,
+  0 ties) — the level is solved in tens of generations by this population either way, and the
+  episodes a genome is judged on do not change that.
+* `chain`, per-genome against paired: p = 1.0000 on the *direction* of the first win (6 against 5),
+  but the two arms do not disagree about solvability symmetrically: four seeds solve without pairing
+  and not with it (2, 6, 8, 12) against one the other way (11). The exact sign test over those five
+  discordant seeds is **p ≈ 0.13** — suggestive, not established, and it is the one number in this
+section that argues against the new default.
+* `chain`, paired against paired + raced: p = 0.5488 on direction (4 against 7), and racing is the
+  arm that puts the solve count back to the unpaired arm's 10 of 12.
+
+The honest reading is that **pairing is a wash on the levels this population finds easy and costs
+three seeds of twelve on the one hard chain level (suggestively), while making every within-generation
+comparison a comparison of policies rather than of worlds** — and that racing, which pairing is the
+precondition of, pays for it: 1.75 episodes per genome against 3.00 buys a generation budget 71 %
+larger for the same wall clock. What a wall clock actually says, `l3-gauntlet` at pop 200 for 600
+generations with `--stop-on-win` off, two repetitions each:
+
+| arm | episodes per genome | run 1 | run 2 |
+|---|---|---|---|
+| paired + raced (default) | 1.75 | 11.21 s | 11.17 s |
+| per-genome, flat (old) | 3.00 | 15.73 s | 15.74 s |
+
+29 % off the clock, which is the 42 % off the *episode* work diluted by the part of a generation that
+is not episodes (breeding, selection, bookkeeping — about 30 % of it at this population size). The
+episode counts themselves are pinned by unit tests that read what the racing loop spent rather than
+the formula: 16 + 8 + 4 = 28 episodes against a flat 48 at pop 16 on a walker fixture, and 22 against
+32 on a suite of one walker level and one plain one.
+
+**What this does not establish.**
+
+* The `l9` solve-rate difference is suggestive, not established (p ≈ 0.13 over five discordant
+  seeds), so *"pairing costs solves on chain levels"* is a hypothesis with one arm behind it, not a
+  finding. The raced arm's l9 *median* first win is also worse than the flat paired one (146 against
+  116) even though it solves three more seeds: whichever arm is chosen, one of the two readings is
+  worse on that level.
+* Pairing fixes the noise **inside** a generation and nothing else. `best_ever`, the stagnation
+  counter and the elites still carry a score taken on another generation's world, so a run can still
+  be impressed by the generation that drew a quiet phase and re-heat on evidence it did not have.
+* A **culled** genome's `EpisodeResult::worst_trial` is a floor over fewer episodes than a survivor's,
+  so the two are not comparable; nothing selects on it after the cull, but a table printed from one
+  generation's results is not like-for-like, and that is why `bench` records the *average* episodes
+  per genome beside the trial count.
+* The ES shares `evaluate_population`, so it inherits pairing; its own arms were not re-taken and
+  its numbers are therefore now stated under a different episode policy than the ones recorded for
+  it above.
+
+### Item 3, built and measured — and not landed: the held arm costs the warm start
+
+The slot was built exactly as the list described it: one accessor (`PlayerState::jump_held`), one
+slot appended at index 100 (why *one* and not two: `speed_cap` is already observed, so "sprint asked"
+is recoverable from state, while a held *jump* is not — the press is edge-triggered, and no
+combination of `vy`, `can_jump` and the patch says whether the button is down), `sensors::VERSION`
+11, `N_INPUTS` 101, the layout table, the golden observation hash re-pinned, and the frozen trick
+re-fit. It was measured on three arms, then reverted, because the measurement is a **wash on learning
+and a cost on the one path that uses the oracle**.
+
+| what was measured | v10 (no slot) | v11 (slot) |
+|---|---|---|
+| `gauntlet`, 12 seeds, hand-paired (the tool refuses across a version trio) | median 13.0, mean 20.6 | median 12.0, mean 12.8 |
+| `gauntlet`, same seeds, discordant | 7 seeds faster | 5 seeds faster (p ≈ 0.77) |
+| `l4-rhythm`, pop 64, seeds 1-6, within 60 generations | 4 of 6 solved (at 4, 4, 28, 32) | 4 of 6 solved (at 8, 7, 4, 9) |
+| warm start, `l2-first-gap`, six paired seeds, total generations (cold 32 → 35) | **23** | **57** |
+| warm start, `l5-tightrope`, same six seeds (cold 171 → 152) | **56** | **143** |
+
+The last two rows are the ones that decided it, and they are a *revert*, not a nuisance. The warm
+start is the route clone (`--from-route`, `evo::imitate`), whose whole value is being a better
+starting point than noise: at 101 inputs the same fixed-budget fit is a visibly worse warm start on
+the level a warm start exists for (`l5`: six of six seeds solved with the clone at v10 against five of
+six at v11, total 56 against 143), and the imitation canary that guards it —
+`a_warm_quarter_learns_sooner_than_random` — fails outright on `l2-first-gap` (warm 41 against cold
+18). So a slot whose *learning* benefit is inside noise on both levels where it could be measured
+would have been landed against a measured cost on a headline feature, for another version bump and
+the retrain of every champion. The useful finding is not "the slot is bad" but **"a sensor slot has
+to be measured against the imitation path as well as against the search, and the fit is sensitive to
+the input width"**: the two ways to make it land are a clone re-fit at the new width (the fit's
+budget, not its inputs, is the binding constraint) or a slot that carries *move* information instead
+of a redundancy of the body's own state — which is item 4, and is now the more attractive of the two.
+
+### Item 3's sibling: what the two test fixes this pass are for
+
+Two canaries in this tree pinned a *single draw* where the claim was about a rate, and both fired
+for the same reason — a change moved the genome layout, and a layout is a re-roll of every random
+population:
+
+* `the_first_earned_level_still_falls_to_evolution` required `l4-rhythm` at pop 64 on **seed 2**
+  within 60 generations. Fine on the build it was written against; on a 101-input build seed 2 is
+  one of the two seeds that stall. It now sweeps four seeds and requires two solves, which is the
+  claim that was actually measured (`4 of 6 seeds inside 60 generations`, at generations 4-32).
+* `the_ghosts_are_the_generations_other_agents_in_rank_order` asserted that no lane shares the
+  star's seed — true of a per-genome policy and false of a paired one by construction. It now asks
+the trainer what the policy is and checks the lanes against it, so the panel's side-by-side
+comparison is pinned either way.
+
+Neither is a weakened assertion: the first was measuring one 64-net draw and now measures a rate, and
+the second was pinned to the policy it was written under and is now pinned to *the policy in force*.
+The third test worth naming here changed for the opposite reason — `a_walker_level_reports_a_floor_at_or_below_its_mean` used to assert that some pair of genomes disagreed about the mean and the floor
+at generation 0, which (per the fixture measurement above) was the world lottery; it now sweeps the
+first eight generations and asserts the invariants on each, including the premise that the phase
+reaches *somebody's* score.
 
 ### Memory: the policy can now have a state of its own
 
@@ -1368,6 +1897,85 @@ label/reading rows (`ui::stat_row`, a fixed label column so a long label truncat
 overprinting its value) under the same section rule every board uses, with the level's own board
 gaining the level's episode cap — the clock a solution is allowed to take, which is what the run's best
 time is read against.
+
+### The instrument, and the four dials it measured: capacity, pessimism, a seeded start, and the stall chain
+
+This pass asked the trainer four questions at once, and the first thing it built was the instrument to
+ask them with. **`train-cli bench`** runs a *protocol* — a named, frozen `(level, pop, generations,
+seeds)` row, printed by `--list` — over every seed of that row; records the arm to
+`bench/<protocol>-<arm>.json` together with every knob that was in force **and where the population
+began** (the one fact about a warm arm that is not recoverable from the arm itself); and `--compare`
+reads two arms back *paired*, seed by seed, with the exact two-sided sign test over the seeds they
+disagree on. Two protocols ship — `chain` (`l9-wait-and-climb`, 400 generations) and `tower` /
+`hazard-floor` (300) — and the flags that would shape a *train* run in a way a seed sweep cannot
+express are refused rather than ignored (`--suite`, `--curriculum`, `--curriculum-generations`,
+`--csv`, `--max-seconds`, because a detour would move a first win away from the run's own, a suite is
+several levels, a chart is one seed's history and a wall clock would make the cap depend on the
+machine). What is left *is* the arm: `--hidden`, `--rank-pessimism`, `--from-champion` and a protocol
+override are all recorded in the file, with `--level` adding a terminal note that the arm is a protocol
+*shape* on another level rather than the protocol's own row; and `--compare` refuses every flag a run
+would take, since it trains nothing and would otherwise accept them and quietly ignore them.
+
+**Its first result was about measurement rather than search, and it is what changed how every other
+number in this pass is written down.** The same arm, binary and level reads **6 of 12** on seeds 1–12 and
+**11 of 12** on seeds 13–24 — a five-seed spread between two batches of twelve, wider than every knob
+effect in the table below it. Twelve seeds is therefore not a measurement unit on its own, and the honest
+form of a result at that size is a *paired* one inside a batch. (A third reading of the same arm from a
+third direction — an unevolved, clustered population on ids 0–199 — is also 11 of 12, median 115.)
+
+What the four dials bought, in the order the pass asked:
+
+* **`--hidden 32` — capacity: unmeasured on the chain, and the direction on the plateau is against
+  widening.** The wide net solved three more seeds than the shipped 16-wide net *in the batch it was run
+  in* (9 against 6, median 123.0 against 130.5) and the 8-wide net two more (8, median 109.5) — while the
+  default's own second batch scored 11, more than either, and the paired tests read p = 0.23 and p = 0.34.
+  The tower adds one direction that survives inside a batch: the plateau solves **7 of 12 with the shipped
+  net against 6 of 12 with the 32-wide one** (median 142.0 against 199.5, paired 6–4, p = 0.75). So the
+  pack has no capacity problem to solve; the recipe stays at one layer of 16 (1 739 genes, and the run's
+  header prints the net it is actually training), and the arm that would settle it is a 24-seed one.
+* **`--rank-pessimism 1.0` — the other honest answer to *how good is this genome*: not its mean trial,
+  its worst.** Nine seeds against six, but a *worse* median (153.0 against 130.5) and a paired 6–4,
+  p = 0.75. A null, so the knob ships at its default `0.0` and no recorded number changes meaning; it is
+  worth its line because the cost it targets — an elite re-rolled out of the run by a patrol phase it
+  never saw (finding 14) — is real, and this separates it from the batch noise: measured pessimism does
+  not pay for itself on a walker level at this budget. The header spells the two ends out (`rank mean of
+  a genome's trials` against `rank mean, less 0.50 of the gap to the worst trial`) rather than printing a
+  bare `0.50`, because the two ends are different questions about a genome.
+* **`--from-champion` — where a population starts, and the pass's one decisive-looking result that did not
+  survive its control.** 10 of 12 at a median of 44 looked like transfer from L8's champion (against 6 at
+  130.5); a champion taken from **generation 0** of L8 — a genome nothing ever selected, one random draw
+  and 197 frames of stumbling — seeds a chain population that solves **11 of 12 at a median of 68**. The
+  transfer reading is dead. Then the *id space*: a genome id is part of every `episode_seed`, so a seeded
+  population does not face the same episodes a fresh one faces, and `from_champion` continues the
+  champion's id numbering deliberately (reissuing ids would face the shell with episodes belonging to
+  genomes it has nothing to do with). Removing that too — the same unevolved genome in a champion file
+  whose id was rewritten to 0, so its shell lands on ids 0–199 — gives 11 of 12, median 115, no better
+  than the default's own second batch. What survives is a mechanism rather than an effect, and both
+  halves of it are now stated where a reader will meet them: the id continuation in its own doc comment,
+  and the fact that `--from-champion` is the right way to continue a run whose checkpoint was never
+  written or to fine-tune on an edited level — *not* evidence that ability transfers between levels.
+* **`--resume` — continuing a *run* rather than a policy.** A population checkpoint carries the genomes,
+  the generation and the level it was taken from, and the level question is answered out loud
+  (`PopulationFile::level_note`, `ChampionFile::level_note`) because the fitness before and after a level
+  change are not comparable and a run that quietly changed level between two chart lines would be the
+  most easily misread artifact this tool can produce. `train` and the window share one constructor
+  (`seeded_trainer`), so a sweep arm and a watched run begin their populations the same way — which is
+  what makes `bench`'s rows describe the tool a user actually runs.
+
+**The one question `bench` cannot ask is the one the stall chain answers**, because `bench` drives
+`Trainer::step` a generation at a time and the detour belongs to `train`'s loop. Measured through `train`
+on both hard levels over two batches: **24 of 24** with the detour against **17 of 24** (chain) and **9 of
+24** (tower) without it, and 42 discordant *paired* outcomes one way against 3 the other (p ≈ 9 × 10⁻¹⁰)
+— including in the batch where the detour-free arm was already strong, where the detour still moved the
+median from 97.0 generations to 54.5. That is the largest effect in the pass, the only one that survives
+its own control, and the tables are in
+[FINDINGS.md](FINDINGS.md#what-the-search-can-be-and-what-the-stall-chain-is-worth).
+
+**Nothing shipped changed by default.** All four dials keep their defaults, the 16-wide recipe stays, the
+reward function and the sensors are untouched — so no champion file and no recorded number in this
+repository is invalidated by the pass. What it delivers is the instrument, one measured negative
+(capacity), one measured null (pessimism), one corrected claim (transfer), and the detour's own
+price-to-benefit, which no earlier pass had put a number on.
 
 ---
 
@@ -1691,6 +2299,107 @@ carries the version and the "edit · play · evolve · replay" reminder
   been in a frame anyone read. `/tmp`-style throwaway HTML pages that inline the PNGs as data URIs
   (`tools/art/shot_viewer.py`) were the only way to see them here — no display, no browser.
 
+* **The trap pass (brittle ground and spring pads; workspace 0.11.0, sensors v9, fitness v8).**
+  `cargo test --workspace` — **563 passed, 0 failed** (554 test functions at HEAD, +9: five for the
+  two tiles' behaviour in `sim::tests::physics`, one pinning the patch's two new readings, one for
+  the shelf's material census, and the two art contracts below). `cargo clippy --workspace
+  --all-targets -- -D warnings` — **clean**, after three lints: one this pass's own edit introduced
+  (`single_match` in `shelf::materials_of`) and two that pre-date it and are flagged by the clippy in
+  this environment (`bool_comparison` in an editor test, a needless borrow in a shelf test). They are
+  fixed rather than allowed, because "clippy is clean" is an invariant this file claims and an
+  `#[allow]` would make the claim true by fiat.
+* **The freeze report, and the trap tiles measured as a *route*.** `cargo test --workspace` —
+  **564 passed, 0 failed** (563 at the trap pass, +1: `app::lab::tests::
+  the_worker_never_runs_more_than_one_generation_past_the_window`; the two `#[ignore]`d perf probes
+  the diagnosis was made with are gone, and the numbers they produced are in §1.11 and
+  FINDINGS.md rather than in the tree). `cargo clippy --workspace --all-targets -- -D warnings` —
+  **clean**. Both halves of §1.11's measurement are readings rather than arguments: the pacing A/B
+  (1535 ms of waiting for a detour packet against 68 ms under the lookahead, with the probe
+  asserting that both arms computed the same generations), and `train-cli reach --all
+  --levels-dir levels` — **24 of 24 OK**, the new `levels/scratch-trap-crossing.json` among them
+  (five platforms, all reached, `goal Some(3)`). The crossing's learning number is a twelve-seed
+  sweep of the CLI (`FINDINGS.md`, "The trap crossing": 12 of 12 solved, mean first-win generation
+  0.9, six seeds won by the initial random population), and the changed window path was exercised
+  through its own front door: `evo-app --evolve --level levels/scratch-trap-crossing.json --pop 200
+  --seed 3 --screenshot /tmp/lookahead-frame.png` trained a real generation and wrote a 1360×800
+  frame.
+* **Two contracts a unit test could not see were worth adding, and both are art-versus-physics.**
+  `app::atlas::tests::the_spring_leaves_the_band_the_sim_will_not_launch_in_empty` checks the pad's
+  sprite against `physics::SPRING_TOP_CLEARANCE` *arithmetically* — four of sixteen rows derived from
+  the sim's constant, not a copied-in 4 — because the spike's own version of that mismatch (§2.12) was
+  a lethal invisible band and the pad's is a body that lands on the pad it can see and is not thrown.
+  `a_crack_is_a_mark_on_its_material_and_not_a_tile` holds the crack overlays to being mostly
+  transparent, four distinct pictures and not one generic scratch, and it is the test that says why
+  a cracked tile is a variant plus a mark rather than a fifth set of sixteen autotiles: a floor of
+  whole-tile cracks would lose its crowns, edges and seams. `every_brush_has_an_icon_in_the_atlas` was
+  extended to the palette's *second* layer (`Brush::base_sprite`), which is the same blank-button
+  failure one layer down.
+* **Both objects were checked through the interfaces a person uses, not only through the sim's.**
+  `train-cli reach --level levels/scratch-trap-tiles.json --verbose` reports the fixture **OK** (three
+  platforms, all reached, `goal Some(1)`) and the same command on a hand-mirrored copy of the file is
+  **OK** too, so the fixture and its mirror are both beatable — the level is part of the pack, so
+  `train-cli`'s own sweep covers it as well. `train-cli render --level levels/scratch-trap-tiles.json
+  --steps 600 --stride 60 --action run` shows both behaviours in one run: the cracked deck is already
+  losing tiles behind the runner by frame 60, at frame 180 the body is five rows up the pit with `vy`
+  negative after the pads threw it, and it lands past them and takes the flag at frame 407 of the
+  level's 1 760-frame cap. And the window itself: `evo-app --level levels/scratch-trap-tiles.json
+  --screenshot out/trap-tiles.png` (1360×800), read at 3-4× zoom, shows the four cracked palette cells
+  as material-plus-crack, the three pads as steel plates and a brass coil in their recess, the deck's
+  crack over milled timber where the span crosses the void, and the status line carrying the app's own
+  oracle verdict on the new level — `beatable: flag reachable over 3 platform(s)`.
+
+* **This pass (the instrument and the four dials: `bench`, `--hidden`, `--rank-pessimism`, a seeded
+  start, and the stall chain's own worth).** `cargo test --workspace` — **583 passed, 0 failed**
+  (564 at the end of the freeze pass; the additions this pass owns are named rather than counted:
+  the sign test's exact known cases, every protocol naming a level that loads and a unique name, a
+  tiny arm's file reading back with its recipe, and a sweep refusing the flags that would change what
+  it measures — `train_cli::bench`; a pessimistic ranking preferring the steady genome to the lucky
+  one and a deterministic level ranking the same way at any pessimism, a seeded population being the
+  champion plus a shell around it, and resuming across two network shapes being refused — `evo::ga`;
+  and the capacity and ranking flags reaching the trainer plus a champion-seeded run starting there
+  and writing beside its seed — `train_cli::commands`). `cargo clippy --workspace --all-targets -- -D
+  warnings` — **clean**. Every number in §4 is a recorded arm rather than an assertion: the sweep's
+  nine twelve-seed arms (the chain's five knobs, the plateau's two, the hazard floor's two, each saved
+  as its own file carrying the knobs and the starting population) plus three seeding controls, and
+  the detour's eight twelve-seed arms (two levels × two batches × off/on, 96 runs) went through the
+  real `train`/`bench` binaries; `--compare` re-reads any two of the recorded ones paired. The L9 difficulty row was **re-run**
+  rather than trusted, and it reproduced its count and none of its generations (`28, 41, 46, 51, 53,
+  74, 81, 104, 111, 113, 124, 394` against the recorded twelve) — which is in FINDINGS.md under the
+  table it belongs to, together with the batch effect that explains why a twelve-seed row is a count
+  before it is a generation. `cargo fmt --check` is **not** clean here and was not clean at `HEAD`
+  either: this environment's rustfmt (1.9.0-stable) wants to reformat committed code in files this
+  pass never opened (`crates/train-cli/src/args.rs`, `app/src/app.rs` among them), so it is toolchain
+  drift rather than a regression, and CI lints and tests without it.
+
+  **Not verified by this pass:** whether a *wider* net helps at a sample that could see it (the row's
+  own text names the 24-seed paired arm as the one to take, and this pass did not take it); whether
+  seeding transfers ability between levels at any sample size, since the control says the effect
+  measured was the clustered start and the id space rather than the genes; and the tower's
+  detour-free *rate*, which this pass found to be a batch artifact rather than a level property and
+  therefore quotes only as a paired count.
+
+* **Finding 1.12 (the oracle and spring pads).** `cargo test --workspace` — **586 passed, 0 failed**
+  (583 before it; the three new tests are named in §1.12). `cargo clippy --workspace --all-targets --
+  -D warnings` — **clean**. `SIM_VERSION` is **unchanged**, deliberately: the pad rule was not
+  altered, only moved somewhere two callers can share it, and the golden state-hash and episode tests
+  agree. `MOVE_SET_VERSION` went **1 → 2**, and the effect was checked on a real file rather than
+  argued: `levels/custom-l1-flat-run.json.routes` was written as `move_set: 1` and is now
+  `move_set: 2` with a recomputed verdict, which is the miss the constant exists to produce.
+
+  **Measured through the interfaces, before and after.** The owner's level: `UNBEATABLE … a sprinting
+  jump covers 6.00 tiles and must land past it` → **`OK … platforms 3 reachable 3`**. Every level in
+  `levels/` was then swept with `train-cli reach`: 26 files, the same verdicts as before the change in
+  25 of them, the exception being the reported one — including the scratch tower the oracle still calls
+  unreachable, which is the check that the fix did not simply make the oracle generous. The fixture's
+  crossing was also reproduced by hand through the real episode loop in a test rather than by eye, and
+  the widths where the pad is *necessary* (7 and 8 of a 5-to-9 sweep) are the widths a sprint jump
+  cannot cover.
+
+  **Not verified:** the width-9 crossing. The oracle credits it and the sweep's 20 take-off offsets
+  are the reason it can, but the one-gear-one-jump script the test uses does not find it — so the
+  claim that a nine-column pit is crossable with a pad is the oracle's alone, and it is written down
+  as such in FINDINGS.md finding 60 rather than as a measured crossing.
+
 **Not verified:** the pointer feel of finding 1.6's ghost, and any interactive
 clicking at all — there is no display in this environment, so every app check goes
 through `--screenshot` and the logic-level tests. The tile the mouse reports is
@@ -1791,6 +2500,21 @@ only support rather than settle.
 | A quicker win cannot be bought by skipping a checkpoint | `evo::fitness::tests::a_quicker_win_cannot_be_bought_by_skipping_a_checkpoint` |
 | A time in frames is written one way, in both shapes, and reads back as the frames it was made from | `sim::tests::a_time_in_frames_is_written_short_and_in_order` |
 | The archive keeps a niche per speed and still counts one way of moving | `evo::ga::tests::the_archive_keeps_a_niche_per_speed_and_counts_one_behaviour` |
+| A pad throws a falling body up, keeps the `vx` it arrived with, costs no jump, and beats a jump | `sim::tests::physics::a_spring_launches_a_falling_body_upward_and_keeps_its_momentum` |
+| A pad ignores a body rising through it, and a body walking across one on the floor | `sim::tests::physics::a_spring_does_not_launch_a_body_that_is_not_falling` |
+| A cracked tile holds a body up for exactly the fuse, then leaves the level — and the document it was loaded from keeps it | `sim::tests::physics::a_cracked_tile_holds_a_body_up_and_then_takes_itself_out_of_the_level` |
+| The four brittle materials are one behaviour: same frames, same state, same observation | `sim::tests::physics::the_four_brittle_materials_are_one_behaviour` |
+| A walker's patrol crosses brittle ground without lighting a fuse | `sim::tests::physics::a_walkers_patrol_does_not_light_a_cracked_floor` |
+| A cracked tile and a pad are both visible in the patch, and neither reads as the tile it resembles | `sim::tests::sensors::a_cracked_tile_and_a_spring_read_differently_in_the_patch` |
+| Every tile the format has survives a glyph round trip, brittle and pad included | `sim::tests::levels::sand_is_a_material_and_not_a_mechanic` |
+| The terrain a body has destroyed and the fuses still burning are part of the state hash | `sim::tests::episodes::golden_state_hash_after_ten_thousand_frames` (re-recorded for it) |
+| Brittle ground is its material on a shelf card; a pad is its own entry and takes its thumbnail cell | `app::shelf::tests::a_brittle_tile_is_its_material_and_a_pad_is_its_own_entry` |
+| Every material, its brittle self and the pad have a distinct thumbnail colour | `app::theme::tests::every_material_has_a_thumbnail_colour` |
+| The pad's sprite starts drawing exactly where the sim stops launching | `app::atlas::tests::the_spring_leaves_the_band_the_sim_will_not_launch_in_empty` |
+| A crack is transparency and ink, four distinct marks, not a tile | `app::atlas::tests::a_crack_is_a_mark_on_its_material_and_not_a_tile` |
+| Every brush's icon *and* the layer under it are in the shipped atlas | `app::atlas::tests::every_brush_has_an_icon_in_the_atlas` |
+| A lane label is never a glyph the scene draws, tiles included | `train_cli::watch::tests::no_lane_label_can_be_mistaken_for_an_enemy_or_a_mark` |
+| The trap fixture is in the pack, so it is swept for beatability like every other level | `train_cli::commands::tests::reach_checks_all_shipped_levels_and_they_are_beatable` |
 | A run reports the quickest win it has recorded, and keeps it across a generation that wins nothing | `evo::ga::tests::a_run_reports_the_quickest_win_it_has_recorded` |
 | The run's panel says four things, including the clock, and an em dash when there is no win to time | `app::panel::tests::the_run_panel_says_four_things` |
 | The panel's pace stepper moves one rung, stops at both ends, and reports rather than applies | `app::panel::tests::the_panel_has_a_pace_stepper_that_walks_the_same_ladder_as_the_keys` |
@@ -1799,3 +2523,24 @@ only support rather than settle.
 | A session remembers its quickest win and keeps it across a restart | `app::play::tests::a_session_remembers_its_quickest_win_and_keeps_it_across_a_restart` |
 | Being in front of the AI is the clock against the clock, running or finished | `app::play::tests::being_in_front_of_the_record_is_the_clock_against_the_clock` |
 | A champion's summary line says its clock as a time as well as a frame count | `evo::champion::tests::a_champions_summary_says_its_clock_as_a_time_and_a_frame_count` |
+| A route table is shared by every clone of one terrain, and an edit gets its own | `sim::tests::levels::a_route_table_is_shared_by_every_clone_of_one_terrain_and_dropped_by_an_edit` |
+| A brittle tile burning out leaves the route table it was built with | `sim::tests::physics::a_cracked_tile_holds_a_body_up_and_then_takes_itself_out_of_the_level` |
+| The parallel take-off sweep answers exactly what the sequential one does, order included | `sim::reach::tests::a_parallel_sweep_answers_exactly_what_a_sequential_one_does` |
+| A level's answers are kept beside its file, and the next process reads them instead of sweeping | `sim::tests::levels::a_reopened_level_answers_from_the_cache_beside_its_file` |
+| A level that has changed is not answered by the cache it left behind (a tile, the spawn, the flag, a walker, the name) | `sim::tests::levels::a_changed_level_is_not_answered_by_the_cache_it_left_behind` |
+| A cache that is not this level's is a miss, never a failure or a guess | `sim::tests::levels::an_unusable_route_cache_is_a_miss_rather_than_a_failure` |
+| An edited document — or one that has broken a tile — neither reads nor writes its file's cache | `sim::tests::levels::an_edited_document_neither_answers_from_nor_writes_its_files_cache` |
+| A cache is never offered to a level lister as a level | `sim::route_cache::tests::the_sidecar_sits_beside_the_level_and_does_not_look_like_one` |
+| A recorded arm reads back with every knob it was taken with, and where its population began | `train_cli::bench::tests::a_tiny_arm_writes_a_file_that_reads_back_with_its_recipe` |
+| The paired test is the exact sign test on its known cases | `train_cli::bench::tests::the_sign_test_matches_its_exact_known_cases` |
+| Every protocol names a level that loads, and the names are unique | `train_cli::bench::tests::every_protocol_names_a_level_that_loads_and_a_unique_name` |
+| A flag that would change what a sweep measures is refused rather than ignored | `train_cli::bench::tests::flags_that_would_change_what_a_sweep_measures_are_refused` |
+| A pessimistic ranking prefers the steady genome to the lucky one | `evo::ga::tests::a_pessimistic_ranking_prefers_the_steady_genome_to_the_lucky_one` |
+| A deterministic level ranks the same way at any pessimism | `evo::ga::tests::a_deterministic_level_is_ranked_the_same_way_at_any_pessimism` |
+| A seeded population is the champion plus a shell around it, ids included | `evo::ga::tests::a_seeded_population_is_the_champion_plus_a_shell_around_it` |
+| Resuming across two network shapes is refused, and the width and ranking bounds are the trainer's own | `evo::ga::tests::resuming_across_two_network_shapes_is_refused`, `evo::ga::tests::the_network_and_ranking_bounds_are_the_trainers_own` |
+| `--hidden` and `--rank-pessimism` reach the trainer, and widening does not disturb the memory width | `train_cli::commands::tests::the_capacity_and_ranking_flags_reach_the_trainer` |
+| A champion-seeded run starts at the champion and writes beside its seed rather than over it | `train_cli::commands::tests::a_run_seeded_from_a_champion_starts_there_and_writes_beside_its_seed` |
+| A pad at the lip is what crosses a gap no jump can clear (and not with `spring: false`) | `sim::reach::tests::a_pad_at_the_lip_is_what_crosses_a_gap_no_jump_can` |
+| The episode loop really makes the crossing the oracle credits to a pad | `sim::reach::tests::the_sim_crosses_the_gap_the_oracle_credits_to_the_pad` |
+| Walking over a pad is not landing on one — in the sim and in the oracle | `sim::reach::tests::walking_off_a_pad_at_a_ledge_is_never_a_launch`, `sim::tests::physics::a_spring_does_not_launch_a_body_that_is_not_falling` |

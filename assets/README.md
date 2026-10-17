@@ -6,7 +6,7 @@ Generated art. `tools/gen_tileset.py` rewrites everything in this directory:
 
 | file | what it is |
 |---|---|
-| `tileset.png` | the atlas: 16x16 pixel cells, 16 columns by 15 rows (256x240) |
+| `tileset.png` | the atlas: 16x16 pixel cells, 16 columns by 16 rows (256x256) |
 | `tileset.json` | the manifest the game reads: cell size, grid, and where each named sprite lives |
 | `tileset_preview.png` | an 8x nearest-neighbour upscale on a checked background, for eyeballing |
 
@@ -20,10 +20,11 @@ drift into three palettes. The table below is the manifest in words; it is check
 against the shipped manifest by
 `atlas::tests::the_assets_readme_lists_every_shipped_sprite`, so it cannot go stale
 quietly. Most names are **required** (`crate::atlas::REQUIRED`): the game refuses to
-start without them. The tile variants, the last eight props and every material seam are
-*optional* — a tileset that omits them draws the plainer equivalent instead (a hard edge,
-for a missing seam), and the fallbacks are in `crate::view::scenery_sprite` and
-`crate::view::draw_seams`. The `ui_*` glyphs are optional in the same way and for a stronger
+start without them. The tile variants, the last eight props, every material seam and the
+four `cracked_*` overlays are *optional* — a tileset that omits them draws the plainer
+equivalent instead (a hard edge, for a missing seam; a brittle tile as the material it is made
+of, for a missing crack), and the fallbacks are in `crate::view::scenery_sprite`,
+`crate::view::draw_seams` and `crate::view::cracked_overlay`. The `ui_*` glyphs are optional in the same way and for a stronger
 reason: they are the one family the *game* never draws, so a tileset drawn before the window's
 tool bar grew pictures still runs — its buttons carry their names instead of an icon
 (`crate::ui::icon_button`).
@@ -47,6 +48,8 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `brick_1_b`, `brick_1_c` | the brick coping plus moss, and plus weathered mortar chips |
 | `wood_1_b`, `wood_1_c` | the timber deck plus wood knots, and plus countersunk iron rivets |
 | `spike` | a lethal non-solid tile: three spikes on a stone base, top row transparent so it never looks like part of the ceiling |
+| `spring` | a spring pad: a brass coil between two steel plates, standing in its cell with the top quarter of the cell left transparent (the launch zone follows that gap, `sim::physics::SPRING_TOP_CLEARANCE`). A body that *lands* on it is thrown upward and keeps the horizontal speed it arrived with |
+| `cracked_ground`, `cracked_sand`, `cracked_brick`, `cracked_wood` | one material's crack, on an otherwise transparent cell, drawn **over** that material's own tile by `crate::view`. The tile it marks is ordinary solid ground until a body stands on it, and then it leaves the level (`sim::physics::CRUMBLE_TICKS`) |
 | `player_idle_a`, `player_idle_b` | the runner at rest, breathing |
 | `player_run_1`, `player_run_2`, `player_run_3`, `player_run_4`, `player_run_5`, `player_run_6` | the six-frame run cycle |
 | `player_jump`, `player_fall`, `player_land`, `player_hurt` | rising, falling, the landing frame, and the pose a dead agent is left in |

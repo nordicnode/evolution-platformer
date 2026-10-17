@@ -429,6 +429,64 @@ fn every_shipped_levels_mirror_is_reachable_in_principle() {
     }
 }
 
+/// The route table is one answer, shared by every copy of one terrain.
+///
+/// This is the difference between a window that runs and a window that stutters. `Level`
+/// derives `Clone`, and a bare `OnceLock` is *copied* by `Clone`: a copy taken before the
+/// first ask started with an empty cache and paid the whole sweep itself. Every copy of one
+/// terrain exists at once in the app — the run's own document, the eight lanes animated over
+/// it, each ghost in a replay, and every episode's sim inside the trainer — and the sweep is
+/// 24 ms on a 60x15 level, so at eight or a hundred copies it was not a cost, it was the
+/// frame budget spent several times over.
+///
+/// Two claims, and the second is the reason the first is safe: a clone reuses the graph built
+/// for its terrain, and a level whose terrain has *changed* does not — it builds a graph for
+/// the ground it has now, while the copies still holding the old ground keep the one that
+/// describes them.
+#[test]
+fn a_route_table_is_shared_by_every_clone_of_one_terrain_and_dropped_by_an_edit() {
+    let sky = "....".to_string();
+    let level = common::fixture(
+        "shared-routes",
+        &[sky.clone(), sky.clone(), "####".into()],
+        (1, 1),
+        &[("goal", 3, 1)],
+    );
+
+    // **The copy is taken cold, before anything has asked for a route.** That order is the whole
+    // of the bug this pins: a copy made *after* the first build inherits the finished graph even
+    // with a bare `OnceLock`, so cloning afterwards would pass on the code that stuttered. Every
+    // copy the window and the trainer make is made before the first ask.
+    let cold = level.clone();
+    let built = level.routes();
+    assert!(
+        std::ptr::eq(built, cold.routes()),
+        "a copy taken before the first ask must reuse the one route table built for this \
+         terrain, not sweep the whole level for a second one"
+    );
+    assert!(
+        std::ptr::eq(built, level.clone().routes()),
+        "and a copy taken after it must reuse it too"
+    );
+    assert!(
+        std::ptr::eq(built, cold.clone().routes()),
+        "nor must a copy of a copy"
+    );
+
+    // An edit is a different terrain: it gets its own graph, and the copies that still hold the
+    // terrain the first graph was built for keep it.
+    let mut edited = level.clone();
+    assert!(edited.set_tile(1, 1, sim::Tile::Solid), "the edit lands on the grid");
+    assert!(
+        !std::ptr::eq(built, edited.routes()),
+        "an edited level must not answer with a graph built for the ground it used to have"
+    );
+    assert!(
+        std::ptr::eq(built, level.routes()),
+        "and the level that was not edited must not lose the graph it already had"
+    );
+}
+
 /// Sand is a material, not a mechanic: the same level in sand simulates identically.
 ///
 /// This is the whole of what `Tile::Sand` promises, and it is worth a test because the
@@ -445,15 +503,11 @@ fn every_shipped_levels_mirror_is_reachable_in_principle() {
 ///   it sees soil, so a beach is not a new problem to learn.
 #[test]
 fn sand_is_a_material_and_not_a_mechanic() {
-    // The glyph round trip, including that sand, brick, plank and soil are different glyphs.
-    for tile in [
-        sim::Tile::Empty,
-        sim::Tile::Solid,
-        sim::Tile::Sand,
-        sim::Tile::Brick,
-        sim::Tile::Plank,
-        sim::Tile::Spike,
-    ] {
+    // The glyph round trip, over **every tile the format has** (`Tile::ALL`, so a tile added to the
+    // enum cannot quietly skip this). It matters most for the two trap tiles, because they are the
+    // two a level file can *lose* on a save: a pad or a brittle tile that came back as plain ground
+    // would be a level that plays differently from its file, and no rendering test could see it.
+    for tile in sim::Tile::ALL {
         assert_eq!(
             sim::Tile::from_glyph(tile.glyph()),
             Some(tile),
@@ -467,6 +521,25 @@ fn sand_is_a_material_and_not_a_mechanic() {
     assert!(sim::Tile::Sand.is_solid(), "sand has to hold a body up");
     assert!(sim::Tile::Brick.is_solid(), "brick has to hold a body up");
     assert!(sim::Tile::Plank.is_solid(), "plank has to hold a body up");
+
+    // The trap tiles, which are the two carve-outs from that rule and each for its own reason: a
+    // brittle tile is ground until the sim says it is not, and a pad is deliberately not ground at
+    // all — a body that could stand on one would never be thrown by it.
+    for tile in [
+        sim::Tile::Cracked,
+        sim::Tile::CrackedSand,
+        sim::Tile::CrackedBrick,
+        sim::Tile::CrackedPlank,
+    ] {
+        assert!(tile.is_solid(), "{tile:?} is ground while it lasts");
+        assert!(tile.is_cracked(), "{tile:?} is brittle");
+        assert_ne!(tile.glyph(), tile.base_material().glyph());
+        assert!(tile.base_material().is_solid(), "and its material is ground");
+    }
+    assert!(!sim::Tile::Spring.is_solid(), "a pad is not ground");
+    assert!(sim::Tile::Spring.is_spring());
+    assert_ne!(sim::Tile::Cracked.glyph(), sim::Tile::Solid.glyph());
+    assert_ne!(sim::Tile::Spring.glyph(), sim::Tile::Cracked.glyph());
 
     let sky = "....".to_string();
     let rows = vec![sky.clone(), sky.clone(), "#SBW".to_string()];
@@ -518,4 +591,379 @@ fn sand_is_a_material_and_not_a_mechanic() {
     }
     assert_eq!(a.outcome(), b.outcome());
     assert!(a.player().grounded, "the body should be standing on the floor");
+}
+
+// ---------------------------------------------------------------------------
+// The route cache beside a level file
+// ---------------------------------------------------------------------------
+
+/// A diagnosis no oracle would ever produce, written into a cache so that a *hit* is visible.
+///
+/// Timing a second load would be evidence about this machine; handing the cache an answer
+/// nobody would compute and seeing it come back is evidence about the code, because the only
+/// way out of the file is into the answer.
+const SENTINEL: &str = "this verdict came out of the cache, not out of a sweep";
+
+/// A private directory for one cache test, named after the test so the tests can run in
+/// parallel without sharing a level file — or the sidecar derived from it.
+fn cache_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("evo-route-cache-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    dir
+}
+
+/// The level the cache tests are written against: two stands, a pit between them, the flag on
+/// the far one.
+///
+/// Deliberately small — sweeping it is microseconds, so these tests can only be about *whether*
+/// an answer was computed — and deliberately not one flat floor, so the route table is a graph
+/// (two nodes, one crossing) rather than a single stand with nothing to say.
+fn cache_fixture(name: &str) -> sim::Level {
+    let sky = "..........".to_string();
+    common::fixture(
+        name,
+        &[
+            sky.clone(),
+            sky.clone(),
+            sky.clone(),
+            "###...####".to_string(),
+        ],
+        (1, 2),
+        &[("goal", 8, 2)],
+    )
+}
+
+/// One row of a cache test's edit table: what the edit is called, and how to make it.
+///
+/// Named because clippy is right about the bare array type: `[(&str, fn(&mut sim::Level)); 5]`
+/// says the shape twice and the meaning not at all.
+type Edit = (&'static str, fn(&mut sim::Level));
+
+/// Where a level's cache lives: its file's own name plus `.routes`.
+///
+/// Written out here rather than asked of the crate, deliberately: the name is part of the
+/// contract these tests are about (the file has to sit beside the level and must not look like
+/// one to the tools that list levels by extension), and a test that asks the implementation
+/// where it put something can only ever agree with it.
+fn sidecar_of(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.routes", path.display()))
+}
+
+/// Rewrite a cache file, so that a value out of it can be told from a value computed fresh.
+fn poison(path: &std::path::Path, edit: impl Fn(&mut serde_json::Value)) {
+    let src = std::fs::read_to_string(path).expect("the cache was written");
+    let mut doc: serde_json::Value = serde_json::from_str(&src).expect("the cache is JSON");
+    edit(&mut doc);
+    std::fs::write(path, doc.to_string()).expect("the poisoned cache is written");
+}
+
+/// Poison both halves: a graph that calls every stand `u32::MAX` crossings from the flag (no
+/// sweep produces that) and a verdict with a diagnosis no oracle says.
+///
+/// The two assertions at the end are not decoration: a poison that failed to land would make
+/// every test built on it pass while proving nothing.
+fn poison_answers(path: &std::path::Path) {
+    poison(path, |doc| {
+        doc["routes"]["hops"][0] = serde_json::json!(u32::MAX);
+        doc["verdict"]["report"]["diagnosis"] = serde_json::json!(SENTINEL);
+    });
+    let poisoned = std::fs::read_to_string(path).expect("the cache reads back");
+    assert!(
+        poisoned.contains(&u32::MAX.to_string()) && poisoned.contains(SENTINEL),
+        "the poison has to be in the file for a hit to be visible: {poisoned}"
+    );
+}
+
+/// A level's answers are kept beside its file, and the next process reads them instead of
+/// sweeping.
+///
+/// The cache appears with the first *answer*, not with the level, and a poisoned cache is
+/// served whole: the route table through `routes()` and the verdict through `report()`, which
+/// are the two asks that cost milliseconds on a real level.
+#[test]
+fn a_reopened_level_answers_from_the_cache_beside_its_file() {
+    let dir = cache_dir("adopt");
+    let path = dir.join("reopened.json");
+    cache_fixture("reopened")
+        .to_json_file(&path)
+        .expect("the level is written");
+    let sidecar = sidecar_of(&path);
+
+    let cold = sim::Level::from_json_file(&path).expect("the level loads");
+    assert!(
+        !sidecar.exists(),
+        "nothing is cached before anything has been asked: the file is derived from an answer"
+    );
+    let _ = cold.routes();
+    assert!(
+        sidecar.exists(),
+        "the route table is kept beside the level file it describes"
+    );
+    let _ = sim::reach::report(&cold);
+    poison_answers(&sidecar);
+
+    let reopened = sim::Level::from_json_file(&path).expect("the level loads again");
+    assert_eq!(
+        reopened.routes().hops_to_flag(0),
+        Some(u32::MAX),
+        "the level answers with the route table beside its file, not with a second sweep"
+    );
+    assert_eq!(
+        sim::reach::report(&reopened).diagnosis.as_deref(),
+        Some(SENTINEL),
+        "and with the verdict beside it, not with a second report"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A level that has *changed* is a different level, and answers for itself.
+///
+/// Every input the two answers are functions of is checked on its own, because a key can be
+/// wrong in two directions and only one of them is cheap: a miss costs a sweep, while a hit for
+/// a level the answers do not describe reads a jump that cannot be made off ground that is not
+/// there. The poisoned cache is what tells the two apart — a correct answer here is only
+/// evidence if a stale one would have been visibly wrong.
+#[test]
+fn a_changed_level_is_not_answered_by_the_cache_it_left_behind() {
+    let dir = cache_dir("invalidated");
+    let path = dir.join("edited.json");
+    let original = cache_fixture("edited");
+    let src = original.to_json_pretty().expect("the level serializes");
+    original
+        .to_json_file(&path)
+        .expect("the level is written");
+    let sidecar = sidecar_of(&path);
+
+    let warm = sim::Level::from_json_file(&path).expect("the level loads");
+    let _ = warm.routes();
+    let _ = sim::reach::report(&warm);
+
+    // The edits: a tile, the spawn, the flag, the name and a walker. The last two change
+    // nothing about either answer, and are here because the key is the *content* hash — the
+    // honest way to be wrong about this is to key on the file's timestamp and then rename a
+    // level, so the cheap-and-wrong version of this key is the one worth pinning.
+    fn paint(level: &mut sim::Level) {
+        assert!(level.set_tile(4, 2, sim::Tile::Solid), "the paint lands");
+    }
+    fn move_spawn(level: &mut sim::Level) {
+        level.set_spawn_tile(3, 2);
+    }
+    fn move_flag(level: &mut sim::Level) {
+        assert!(level.set_goal_tile(5, 2), "the flag lands");
+    }
+    fn rename(level: &mut sim::Level) {
+        level.name = "renamed".into();
+    }
+    fn add_walker(level: &mut sim::Level) {
+        assert!(level.add_walker_tile(8, 2), "the walker lands");
+    }
+    let edits: [Edit; 5] = [
+        ("a tile", paint),
+        ("the spawn", move_spawn),
+        ("the flag", move_flag),
+        ("the name", rename),
+        ("a walker", add_walker),
+    ];
+
+    for (what, edit) in edits {
+        let mut changed = sim::Level::from_json_str(&src).expect("the original text");
+        edit(&mut changed);
+        changed
+            .to_json_file(&path)
+            .expect("the changed level is written");
+        poison_answers(&sidecar);
+
+        let reopened = sim::Level::from_json_file(&path).expect("the changed level loads");
+        let expected = sim::Level::from_json_str(
+            &changed.to_json_pretty().expect("the changed level serializes"),
+        )
+        .expect("and parses back");
+        assert_ne!(
+            reopened.routes().hops_to_flag(0),
+            Some(u32::MAX),
+            "{what}: the cache of the level this used to be answered, and it is not that level"
+        );
+        assert_eq!(
+            reopened.routes(),
+            expected.routes(),
+            "{what}: the route table beside the file is not this terrain's"
+        );
+        assert_eq!(
+            sim::reach::report(&reopened),
+            sim::reach::report(&expected),
+            "{what}: the verdict beside the file is not this terrain's"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cache that is not this level's answer is a **miss**: never an error, and never a guess.
+///
+/// The variants are the ways a sidecar can stop being usable, in the order they happen in
+/// practice: another build's file (both versions), a level that was edited and saved (the
+/// hash), a file caught mid-write, and a file that is not this tool's JSON at all. Every one of
+/// them has to leave the level loading and answering correctly, which is the whole reason the
+/// key exists rather than a "the cache is definitely up to date" flag somewhere.
+#[test]
+fn an_unusable_route_cache_is_a_miss_rather_than_a_failure() {
+    let dir = cache_dir("unusable");
+    let path = dir.join("unusable.json");
+    cache_fixture("unusable")
+        .to_json_file(&path)
+        .expect("the level is written");
+    let sidecar = sidecar_of(&path);
+
+    // This terrain's own answers, computed with no cache anywhere near them: what every miss
+    // below has to produce.
+    let truth = sim::Level::from_json_str(
+        &cache_fixture("unusable")
+            .to_json_pretty()
+            .expect("serializes"),
+    )
+    .expect("parses");
+    let warm = sim::Level::from_json_file(&path).expect("the level loads");
+    let _ = warm.routes();
+    let _ = sim::reach::report(&warm);
+    poison_answers(&sidecar);
+    let poisoned = std::fs::read_to_string(&sidecar).expect("the cache reads back");
+
+    // The contrast that makes every case below mean something: with a matching key, this file
+    // is used, poison and all.
+    let adopted = sim::Level::from_json_file(&path).expect("the level loads");
+    assert_eq!(
+        adopted.routes().hops_to_flag(0),
+        Some(u32::MAX),
+        "a cache with this level's key is adopted"
+    );
+
+    // A file with only half the answers is not broken, it is *early*: the oracle's verdict and
+    // the route table are produced by different asks, so whichever comes first is written on its
+    // own and the other half lands on the next write.
+    poison(&sidecar, |doc| doc["routes"] = serde_json::Value::Null);
+    let half = sim::Level::from_json_file(&path).expect("the level loads");
+    assert_eq!(
+        half.routes(),
+        truth.routes(),
+        "the route table the file has not got yet is computed"
+    );
+    assert_eq!(
+        sim::reach::report(&half).diagnosis.as_deref(),
+        Some(SENTINEL),
+        "and the verdict it does have is still used"
+    );
+
+    let doc: serde_json::Value = serde_json::from_str(&poisoned).expect("the cache is JSON");
+    let mut variants: Vec<(&str, String)> = vec![
+        ("not JSON at all", "half a file {".to_string()),
+        ("an empty file", String::new()),
+        (
+            "a file caught mid-write",
+            poisoned[..poisoned.len() / 2].to_string(),
+        ),
+    ];
+    for (what, field, value) in [
+        ("another tool's format", "format", serde_json::json!("someone-elses-cache")),
+        ("a format version from the future", "version", serde_json::json!(9999)),
+        ("another sim build", "sim_version", serde_json::json!("0.0.1")),
+        ("another move set", "move_set", serde_json::json!(9999)),
+        (
+            "another level's hash",
+            "level_hash",
+            serde_json::json!("fnv1a64:0000000000000000"),
+        ),
+    ] {
+        let mut patched = doc.clone();
+        patched[field] = value;
+        variants.push((what, patched.to_string()));
+    }
+
+    for (what, contents) in variants {
+        std::fs::write(&sidecar, contents).expect("the broken cache is written");
+        let level = sim::Level::from_json_file(&path).expect("a level loads despite the cache");
+        assert_ne!(
+            level.routes().hops_to_flag(0),
+            Some(u32::MAX),
+            "{what}: the file was answered from even though it is not this level's"
+        );
+        assert_eq!(level.routes(), truth.routes(), "{what}: recomputed exactly");
+        assert_eq!(
+            sim::reach::report(&level),
+            sim::reach::report(&truth),
+            "{what}: the verdict recomputed exactly too"
+        );
+    }
+
+    // And no cache at all, which is the state every level starts in.
+    std::fs::remove_file(&sidecar).expect("the cache is removed");
+    let none = sim::Level::from_json_file(&path).expect("a level loads with no cache");
+    assert_eq!(none.routes(), truth.routes());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A document that has been edited — or has had the ground broken out from under it — is not
+/// the document its file describes, so it neither answers from that file's cache nor writes to
+/// it.
+///
+/// Both halves matter, and they are different rules for different reasons. Reading has to stop
+/// because the answers are about terrain the document no longer has, and the interesting case
+/// is the editor: a level that adopted its verdict on the first frame must not keep serving it
+/// after the user has moved the flag. Writing has to stop because the file's key is the content
+/// hash, and a document that has drifted is a document whose hash no longer describes the file
+/// it was loaded from.
+///
+/// Breaking a tile during an episode is the second half of this: the route table survives it on
+/// purpose (the compass answers for the level as *authored*, so a bridge giving way must not
+/// swing it), while the file's cache goes.
+#[test]
+fn an_edited_document_neither_answers_from_nor_writes_its_files_cache() {
+    let dir = cache_dir("edited-document");
+    let path = dir.join("doc.json");
+    cache_fixture("doc")
+        .to_json_file(&path)
+        .expect("the level is written");
+    let sidecar = sidecar_of(&path);
+
+    let warm = sim::Level::from_json_file(&path).expect("the level loads");
+    let _ = warm.routes();
+    let _ = sim::reach::report(&warm);
+    poison_answers(&sidecar);
+    let poisoned = std::fs::read_to_string(&sidecar).expect("the cache reads back");
+
+    // The edit, on a document whose cache is in use before the edit lands.
+    let mut edited = sim::Level::from_json_file(&path).expect("the level loads");
+    assert_eq!(
+        edited.routes().hops_to_flag(0),
+        Some(u32::MAX),
+        "the document starts from a cache it is really using"
+    );
+    assert!(edited.set_tile(7, 2, sim::Tile::Solid), "the edit lands");
+    let as_text = edited.to_json_pretty().expect("the document serializes");
+    let expected = sim::Level::from_json_str(&as_text).expect("and parses back");
+    assert_eq!(
+        sim::reach::report(&edited),
+        sim::reach::report(&expected),
+        "an edited document's verdict is computed, not read off the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("the cache still reads back"),
+        poisoned,
+        "nor does an edited document write its own content into the file's cache"
+    );
+
+    // And the ground giving way, which is the same rule from the other side.
+    let mut broken = sim::Level::from_json_file(&path).expect("the level loads");
+    assert_eq!(broken.routes().hops_to_flag(0), Some(u32::MAX));
+    broken.burn_tile(7, 3);
+    assert_ne!(
+        sim::reach::report(&broken).diagnosis.as_deref(),
+        Some(SENTINEL),
+        "a broken floor is a different level and gets a verdict of its own"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("the cache still reads back"),
+        poisoned,
+        "while the cache of the level it used to be is left where it is"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

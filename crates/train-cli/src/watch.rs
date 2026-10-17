@@ -78,8 +78,14 @@ const WATCH_OPTS: &[&str] = &[
     "adaptive-sigma",
     "action-repeat",
     "feedback",
+    "hidden",
+    "rank-pessimism",
     "trials",
     "no-auto-trials",
+    "common-episodes",
+    "no-common-episodes",
+    "race-episodes",
+    "no-race-episodes",
     "out",
     "speed",
     "best",
@@ -217,10 +223,19 @@ pub fn watch(a: &Args) -> Result<(), String> {
         // As in `train`: the default lives in the config, not in a second copy here.
         reheat_factor: usage(a.f32_opt("reheat-factor", GaConfig::default().reheat_factor))?,
         crossover_rate: usage(a.f32_opt("crossover", 0.75))?,
+        // And the ranking rule, for the same reason: a watched run and a trained run with the same
+        // flags have to be the same run, or the panel is showing numbers no table can quote.
+        rank_pessimism: usage(a.f32_opt(
+            "rank-pessimism",
+            GaConfig::default().rank_pessimism,
+        ))?,
         action_repeat: usage(a.usize_opt("action-repeat", 4))? as u32,
-        // As in `train`: the width of the recurrent state, defaulted from the trainer's own
-        // shape rather than from a second copy here, and clamped by the trainer.
+        // As in `train`: the width of the recurrent state and the capacity of the hidden layers,
+        // both defaulted from the trainer's own shape rather than from a second copy here, and both
+        // clamped by the trainer. The header line below prints the net a viewer is watching, which
+        // is the point of watching a capacity sweep rather than reading its table afterwards.
         shape: evo::NetShape {
+            hidden: crate::commands::parse_hidden(a, &GaConfig::default().shape.hidden)?,
             feedback: usage(a.usize_opt("feedback", GaConfig::default().shape.feedback))?,
             ..GaConfig::default().shape
         },
@@ -229,6 +244,24 @@ pub fn watch(a: &Args) -> Result<(), String> {
         // API all get from the same place.
         trials: usage(a.usize_opt("trials", GaConfig::default().trials as usize))? as u32,
         auto_trials: !a.has_flag("no-auto-trials"),
+        // The episode policy, so a watched run is the run `train` would have made with the same
+        // flags: pairing is what makes the patrol phase in the panel a *common* difficulty rather
+        // than a per-lane draw, and a panel showing unpaired lanes beside a paired table would be
+        // showing two different searches.
+        common_episodes: if a.has_flag("common-episodes") {
+            true
+        } else if a.has_flag("no-common-episodes") {
+            false
+        } else {
+            GaConfig::default().common_episodes
+        },
+        race_episodes: if a.has_flag("race-episodes") {
+            true
+        } else if a.has_flag("no-race-episodes") {
+            false
+        } else {
+            GaConfig::default().race_episodes
+        },
         master_seed: usage(a.u64_opt("seed", 1))?,
         ..GaConfig::default()
     };
@@ -550,11 +583,35 @@ struct LaneInfo {
     mean_fitness: f32,
 }
 
-/// Random-lane labels, with `e` and `x` left out.
+/// Random-lane labels: the alphabet minus every glyph the scene draws.
 ///
-/// Those are the walker glyphs ([`GLYPH_WALKER_ALIVE`], [`GLYPH_WALKER_DEAD`]), and
-/// a lane that looks like an enemy is worse than no label at all.
-const RANDOM_LABELS: &[u8] = b"abcdfghijklmnopqrstuvwyz";
+/// A lane's letter is drawn in the rows the level is drawn in, so a label that is also a tile is a
+/// lane that looks like terrain, and a lane that looks like an *enemy* is worse than no label at
+/// all. [`reserved_glyphs`] is that set, and it is derived from [`sim::level`]'s own tile list
+/// rather than written out here, because the hand-written version of this comment went stale the
+/// moment two tiles arrived: the trap pass took `d`, `s`, `b`, `w` and `v` for brittle ground and
+/// pads, and the alphabet below went on offering all five as agent names — with a guard test that
+/// passed, since checking a lane label is `ascii_graphic` and not `e`/`x` says nothing about a
+/// letter that has quietly become a wall of brick.
+const RANDOM_LABELS: &[u8] = b"acfghijklmnopqrtuyz";
+
+/// Every glyph the level scene puts on the screen: the tiles, the walkers, the goal, the grave.
+///
+/// The tiles come from [`sim::Tile::ALL`], so a tile added to the sim is a letter taken out of the
+/// label alphabet without anyone having to remember this function exists. It is the *check* on
+/// [`RANDOM_LABELS`] rather than the source of it — the alphabet is a constant and this is the
+/// question asked of it — which is why its one reader is the test below.
+#[cfg(test)]
+fn reserved_glyphs() -> Vec<char> {
+    let mut glyphs: Vec<char> = sim::Tile::ALL.iter().map(|tile| tile.glyph()).collect();
+    glyphs.push(GLYPH_WALKER_ALIVE);
+    glyphs.push(GLYPH_WALKER_DEAD);
+    // The two marks that are not tiles: the goal trigger the scene overlays, and the grave a dead
+    // lane becomes ([`lane_glyph`]).
+    glyphs.push('!');
+    glyphs.push('+');
+    glyphs
+}
 
 fn lane_info(lanes: &[ShowcaseLane]) -> Vec<LaneInfo> {
     // Labels come from each lane's **position within its group**, not from
@@ -2109,9 +2166,17 @@ mod tests {
             a_lane(7, LaneKind::Random, 15),
         ];
         let info = lane_info(&lanes);
+        // The expected labels are read off the two sequences ([`lane_label`]'s own) rather than
+        // spelled out here, which is what this assertion used to do: it said `['1','2','a','b',
+        // 'c','d']`, and the trap pass took `b` and `d` out of the label alphabet, so the literal
+        // had become a second copy of the rule — the kind that can only ever disagree with it.
+        let expected: Vec<char> = ['1', '2']
+            .into_iter()
+            .chain(RANDOM_LABELS.iter().take(4).map(|b| *b as char))
+            .collect();
         assert_eq!(
             info.iter().map(|l| l.label).collect::<Vec<char>>(),
-            vec!['1', '2', 'a', 'b', 'c', 'd']
+            expected
         );
         let unique: std::collections::BTreeSet<char> = info.iter().map(|l| l.label).collect();
         assert_eq!(unique.len(), info.len());
@@ -2127,10 +2192,20 @@ mod tests {
 
     #[test]
     fn no_lane_label_can_be_mistaken_for_an_enemy_or_a_mark() {
-        // What matters is the glyphs drawn in the *same region* as the lanes: walkers
-        // (`e` alive, `x` dead), the `+` a dead lane becomes, and the goal. The chart
-        // glyphs live above the level view, so sharing a letter with them is fine.
-        let reserved = [GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD, '+', '!'];
+        // What matters is the glyphs drawn in the *same region* as the lanes: the tiles of the
+        // level, the walkers (`e` alive, `x` dead), the `+` a dead lane becomes, and the goal. The
+        // chart glyphs live above the level view, so sharing a letter with them is fine. The list is
+        // the module's own ([`reserved_glyphs`]) and covers every tile, so a tile that takes a
+        // letter out of the alphabet fails here rather than in a picture of eight lanes sitting on a
+        // wall of brick.
+        let reserved = reserved_glyphs();
+        for label in RANDOM_LABELS {
+            assert!(
+                !reserved.contains(&(*label as char)),
+                "the label alphabet offers {:?}, which is a glyph the scene draws",
+                *label as char
+            );
+        }
         for ordinal in 0..40 {
             for kind in [LaneKind::Best, LaneKind::Random] {
                 let label = lane_label(kind, ordinal);

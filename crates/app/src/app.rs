@@ -775,6 +775,9 @@ impl EvoApp {
             cap: self.options.generations,
             resume: self.options.resume.clone(),
             curriculum,
+            // A fresh run on a level somebody has just drawn starts from a walk of it; a resumed
+            // run already has the population it was handed. See `lab::RunPlan::warm_from_route`.
+            warm_from_route: self.options.resume.is_none(),
         })
     }
 
@@ -817,6 +820,13 @@ impl EvoApp {
         // The run's rate limit, and the reason a paused window costs nothing: while a
         // generation is on screen — or while the viewer is paused or scrubbing — nothing
         // asks the worker for another one, so it stays parked instead of training ahead.
+        //
+        // Since the worker is now asked for one generation *ahead* (see the lookahead in
+        // the take below), this is the second half of the same rule rather than the whole
+        // of it: it covers the frame a generation finishes and the next one is not queued
+        // yet, and the first generation of a run, where there is nothing on screen to
+        // take. `Lab` refuses a second request while one is in flight, so the two paths
+        // cannot ask twice between them.
         if self.lanes.is_none() && !self.view.paused && self.view.scrub.is_none() {
             if let Some(lab) = &mut self.lab {
                 if !lab.asked() {
@@ -824,9 +834,9 @@ impl EvoApp {
                 }
             }
         }
-
+        let taken = self.lab.as_mut().and_then(|lab| lab.take());
         let mut ended = false;
-        if let Some(lanes) = self.lab.as_mut().and_then(|lab| lab.take()) {
+        if let Some(lanes) = taken {
             let packet = lanes.packet().clone();
             if packet.genius {
                 self.genius_left = 6.0;
@@ -843,6 +853,33 @@ impl EvoApp {
             self.packet = Some(packet);
             self.lanes = Some(lanes);
             ended = self.packet.as_ref().is_some_and(|packet| packet.finished);
+
+            // **One generation of lookahead.** Ask for the next generation as soon as this
+            // one is on screen, rather than when its animation ends: the worker's own work
+            // then hides under animation the viewer was going to watch anyway, instead of
+            // happening on a level with nobody on it.
+            //
+            // It is worth a generation of slack because generations are not all the same
+            // size. A scored generation is 27-50 ms at pop 200 on a shipped level, but the
+            // packet that contains a stall's practice detour is forty generations of the
+            // search in one piece — **1.73 s** measured on `scratch-tower`, forty times the
+            // median — and it was that stall, and only that stall, that the viewer saw as a
+            // one-to-two second freeze (a generation's animation is 0.6-5 s at 8x, so the
+            // work is almost always cheaper than the animation covering it).
+            //
+            // The bound the old rule existed for is unchanged: the worker computes at most
+            // one generation beyond the one on screen, because `Lab::request_next` refuses a
+            // second request while one is in flight and the worker will not start another
+            // until the window has taken what it queued. What moved is only *when* it may
+            // start — so a paused or scrubbing window still parks it after the one generation
+            // already in flight, rather than during the whole of the generation on screen.
+            if !ended && !self.view.paused && self.view.scrub.is_none() {
+                if let Some(lab) = &mut self.lab {
+                    if !lab.asked() {
+                        lab.request_next();
+                    }
+                }
+            }
         }
 
         if ended {
@@ -1985,13 +2022,31 @@ impl EvoApp {
         }
     }
 
-    /// The palette: what to paint with, in two rows of tiles, and the shape the stroke is.
+    /// The sprite drawn *under* a brush's icon, when it has one.
     ///
-    /// A wrapped *grid* rather than one brush per row (which is what this was): eleven
+    /// Only a cracked brush does, and the two halves of that are asked separately and on purpose:
+    /// [`Brush::is_cracked`] is whether the brush paints something that needs two layers at all,
+    /// and [`Brush::base_sprite`] is which picture goes underneath. A palette cell drawn from the
+    /// second alone would show a *sound* material's face on a brush that paints a brittle one the
+    /// day somebody adds a fifth brittle material without an icon, which is the failure this
+    /// window has already had once (`Brush::sprite`'s own note: a missing name is a blank button
+    /// and no error anywhere).
+    fn brush_base(brush: Brush) -> Option<&'static str> {
+        if brush.is_cracked() {
+            brush.base_sprite()
+        } else {
+            None
+        }
+    }
+
+    /// The palette: what to paint with, in a wrapped grid of tiles, and the shape the stroke is.
+    ///
+    /// A wrapped *grid* rather than one brush per row (which is what this was): sixteen
     /// brushes laid out one to a line is a column the height of the panel that says nothing
-    /// about which of them go together. Wrapped, the five materials and the hazard sit
-    /// together at the top and the entities under them, and the whole palette fits above
-    /// the scenery picker without scrolling.
+    /// about which of them go together. Wrapped, one material and its brittle self sit side by
+    /// side, the hazard and the pad follow them, and the entities come after — and the panel
+    /// scrolls for the frames where the window is too short to show all of it, which is the
+    /// bargain a grid of this many cells makes rather than a claim that it always fits.
     ///
     /// **The panel has one line of type in it, and it names the brush that is on.** The title used
     /// to be a bare *Parts*, with the selected brush named under the grid and a sentence about
@@ -2030,13 +2085,24 @@ impl EvoApp {
                 let plate = ui::bevel(state, rect);
                 let painter = ui.painter_at(rect);
                 ui::paint(&painter, &plate);
-                if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
-                    painter.image(
-                        self.atlas.texture_id(),
-                        plate.content.shrink(2.0),
-                        uv,
-                        Color32::WHITE,
-                    );
+                // Two layers, when a brush has two. A cracked brush's own icon is a *transparent
+                // crack* — what it paints is a material plus a crack — so its cell draws the
+                // material the crack breaks underneath it, in the same socket and at the same
+                // size. That is the pair the level draws for a brittle tile, and it is what makes
+                // a cracked cell read as "the floor above this one, about to go" rather than as a
+                // scratch on the palette. Every other brush has no base layer and is unchanged.
+                for name in [Self::brush_base(brush), Some(self.brush_icon(brush))]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Ok(uv) = self.atlas.uv(name) {
+                        painter.image(
+                            self.atlas.texture_id(),
+                            plate.content.shrink(2.0),
+                            uv,
+                            Color32::WHITE,
+                        );
+                    }
                 }
                 let response = response.on_hover_text(format!(
                     "{}: {}\nDrag onto the level to place it.",
@@ -2463,29 +2529,49 @@ impl EvoApp {
             "walkers",
             level.walkers.len().to_string(),
         );
-        let (mut solid, mut sand, mut spike) = (0, 0, 0);
+        // Every solid tile counts as ground, including the brittle ones — they hold a body up
+        // exactly as their material does, and it is the *level* the row is describing. Two of the
+        // readings are named out loud when a level has any, in the existing voice: sand, because
+        // it is the tile whose *material* an author chooses deliberately (a level with sand in it
+        // is being built as a beach), and cracked, because a bridge that gives way is the level's
+        // whole idea rather than a texture. The two are separate axes rather than a partition — a
+        // cracked beach is sand and is brittle — and a row that showed one and hid the other would
+        // make a level's most important decision invisible from the window it was drawn in.
+        let (mut solid, mut sand, mut cracked, mut spike, mut spring) = (0, 0, 0, 0, 0);
         for ty in 0..level.height {
             for tx in 0..level.width {
-                match level.tile(tx, ty) {
-                    Some(Tile::Solid) => solid += 1,
-                    // Counted apart from the rest of the ground because it is the one tile
-                    // whose *material* an author chooses deliberately: a level with sand in
-                    // it is being built as a beach, and the reading says how much of it is.
-                    Some(Tile::Sand) => sand += 1,
-                    Some(Tile::Spike) => spike += 1,
-                    _ => {}
+                let Some(tile) = level.tile(tx, ty) else {
+                    continue;
+                };
+                if tile.is_solid() {
+                    solid += 1;
+                }
+                if tile.is_sand() {
+                    sand += 1;
+                }
+                if tile.is_cracked() {
+                    cracked += 1;
+                }
+                if tile == Tile::Spike {
+                    spike += 1;
+                }
+                if tile.is_spring() {
+                    spring += 1;
                 }
             }
         }
-        ui::stat_row(
-            ui,
-            "tiles",
-            if sand > 0 {
-                format!("{} solid ({sand} sand), {spike} spikes", solid + sand)
-            } else {
-                format!("{solid} solid, {spike} spikes")
-            },
-        );
+        let mut census = if cracked > 0 {
+            format!("{solid} solid ({sand} sand, {cracked} cracked)")
+        } else if sand > 0 {
+            format!("{solid} solid ({sand} sand)")
+        } else {
+            format!("{solid} solid")
+        };
+        census.push_str(&format!(", {spike} spikes"));
+        if spring > 0 {
+            census.push_str(&format!(", {spring} springs"));
+        }
+        ui::stat_row(ui, "tiles", census);
         // The content hash, which a champion file records: shown because a viewer comparing a run
         // against a level wants to know the two are the same terrain, and it is the hash rather
         // than a date because that is what the file can be checked against.
@@ -2871,13 +2957,20 @@ impl EvoApp {
             }
             target.union(above)
         } else {
-            if let Ok(uv) = self.atlas.uv(self.brush_icon(brush)) {
-                painter.image(
-                    self.atlas.texture_id(),
-                    target,
-                    uv,
-                    Color32::from_white_alpha(170),
-                );
+            // The same two layers the palette cell draws, for the same reason: the ghost of a
+            // cracked brush has to promise a *cracked tile* on the level, not a bare crack.
+            for name in [Self::brush_base(brush), Some(self.brush_icon(brush))]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(uv) = self.atlas.uv(name) {
+                    painter.image(
+                        self.atlas.texture_id(),
+                        target,
+                        uv,
+                        Color32::from_white_alpha(170),
+                    );
+                }
             }
             target
         };

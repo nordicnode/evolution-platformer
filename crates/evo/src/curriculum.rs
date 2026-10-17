@@ -439,9 +439,8 @@ fn route_rank(routes: &sim::reach::GoalRoutes, stand: usize, approach: f32) -> S
     let hops = routes.hops_to_flag(stand).unwrap_or(u32::MAX);
     let crossing_ahead = hops > 0
         && routes
-            .crossings_from(stand)
-            .iter()
-            .any(|&j| routes.hops_to_flag(j).is_some_and(|hj| hj < hops));
+            .crossing_stands_from(stand)
+            .any(|j| routes.hops_to_flag(j).is_some_and(|hj| hj < hops));
     StandRank {
         nothing_ahead: u8::from(!crossing_ahead),
         hops,
@@ -623,7 +622,7 @@ pub fn next_stand(main: &Level, from: (i32, i32)) -> Option<(i32, i32)> {
             if zone == stuck {
                 continue;
             }
-            if !routes.crossings_from(stuck).contains(&zone) {
+            if !routes.crossing_stands_from(stuck).any(|j| j == zone) {
                 continue;
             }
             let Some(hops) = routes.hops_to_flag(zone) else {

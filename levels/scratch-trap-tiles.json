@@ -1,0 +1,36 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 1,
+  "name": "scratch-trap-tiles",
+  "width": 44,
+  "height": 15,
+  "spawn": {
+    "x": 1,
+    "y": 12
+  },
+  "tiles": [
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "............................................",
+    "####dddddwwww###vvv#########################",
+    "####.........###############################"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 42,
+      "y": 12
+    }
+  ],
+  "_notes": "Scratch: the two trap tiles on one floor. Columns 4-8 are cracked soil (`d`) and 9-12 cracked timber (`w`) with nothing under them, so the dashed span is a bridge that falls into the pit a body stood on it; columns 16-18 are a one-tile pit with three spring pads at the bottom of it. `render --action run` shows both: the deck goes out from under the runner's back foot and the pads throw it out of the pit and into the flag. For out/trap-tiles.png."
+}

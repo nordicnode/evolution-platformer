@@ -68,6 +68,17 @@ members = [
 # it: a physics change, so the trio moves and every earlier champion is refused rather than
 # replayed against physics it was not trained on. See REVIEW.md §2.12.
 #
+# 0.11.0: the trap pass — brittle ground and spring pads. Two tiles, and between them they are
+# the first change to the *world* rather than to the body: a cracked tile (`d`/`s`/`b`/`w`) is solid
+# ground that leaves the level `sim::physics::CRUMBLE_TICKS` after a body stands on it, and a spring
+# (`v`) is a cell that throws a falling body upward at `Physics::spring_v0` while keeping the
+# horizontal speed it arrived with. A tile that removes itself is new *state* — `Sim` carries the
+# tiles it has lost and the fuses still burning, both folded into `state_hash` — and a pad is new
+# physics, so the trio moves. Sensors moved with it (v9) without the vector getting any wider: what a
+# cell of the patch says changed, which is a re-reading rather than an addition. The pad's launch
+# also spends the jump cut it was silently paying (see `PlayerState::bounce`), so a pad delivers the
+# height its own derivation advertises rather than 45% of it when nobody is holding the button.
+#
 # 0.9.0: a grounded turn is crisp. `Physics::turn_accel_scale` multiplies the horizontal
 # acceleration when the press opposes the body's own velocity, but **only while grounded**: an
 # airborne reversal stays exactly as slow as it was, because that is what keeps the pack's
@@ -76,7 +87,7 @@ members = [
 # so the trio moves and every earlier champion is refused rather than replayed against physics
 # it was not trained on.
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"

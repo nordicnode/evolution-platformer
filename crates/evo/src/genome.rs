@@ -83,6 +83,28 @@ pub fn default_shape() -> NetShape {
 /// silently shrinking it would reinterpret those genes).
 pub const MAX_FEEDBACK: usize = 64;
 
+/// The widest single hidden layer either front-end will let an operator ask for.
+///
+/// A bound on a *live* shape only, applied by `GaConfig::sanitized`, exactly as
+/// [`MAX_FEEDBACK`] is: a file that claims a wider net is refused by
+/// `champion::NetworkSpec::check_compat` rather than clamped, because a spec is a claim about
+/// genes that exist and shrinking it would reinterpret them. 64 is twice the shipped width and
+/// the same size as the memory ceiling, which is where the arithmetic stops being cheap: layer 0
+/// of the shipped sensor vector is 96 inputs, so a 64-wide first layer is ~6 400 genes per
+/// layer — five times the whole 1 739-gene genome this project trains by default, and no more
+/// than a typo away from a sweep that costs ten times what it reads as.
+pub const MAX_HIDDEN_WIDTH: usize = 64;
+
+/// The most hidden layers a single command line can ask for.
+///
+/// The project's whole argument for fixed topology is that a small net wins here (`lib.rs`: the
+/// plan's 90 → 16 → 6, and MarI/O's winning network had under a dozen neurons), so the flag this
+/// bounds exists to widen a layer, not to grow a tower. Four is the point past which "deep"
+/// becomes an experiment of its own, with its own measurement to make, rather than a capacity
+/// question — and a fourth layer through `tanh` is already a harder thing to search than the
+/// 1 739-gene flat genome every number in this repository was measured on.
+pub const MAX_HIDDEN_LAYERS: usize = 4;
+
 impl NetShape {
     /// Number of layers with weights, hidden layers plus the output layer.
     pub fn n_layers(&self) -> usize {
@@ -144,6 +166,28 @@ impl NetShape {
     /// The width of the recurrent state, clamped to what this build will build.
     pub fn feedback_width(&self) -> usize {
         self.feedback.min(MAX_FEEDBACK)
+    }
+
+    /// One-line description of the topology: `96>16>11`, with the memory width appended when
+    /// there is one.
+    ///
+    /// Lives beside the shape rather than in a front-end because it is the *only* spelling of a
+    /// net that both the trainer's own refusals and the terminal's run header use, and a program
+    /// that prints one net and refuses another is a program nobody can debug. It is what makes
+    /// "this champion is `96>8>11` and this run asks for `96>32>11`" a sentence an operator can
+    /// act on.
+    pub fn label(&self) -> String {
+        let mut out = self.inputs.to_string();
+        for width in &self.hidden {
+            out.push('>');
+            out.push_str(&width.to_string());
+        }
+        out.push('>');
+        out.push_str(&self.outputs.to_string());
+        if self.feedback > 0 {
+            out.push_str(&format!(" memory {}", self.feedback));
+        }
+        out
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -630,15 +674,17 @@ mod tests {
     #[test]
     fn default_shape_matches_the_plan() {
         let s = default_shape();
-        // v8: 98 inputs (the plan's 90, plus wall side/wall slide/sprint charge from v2,
+        // v10: 100 inputs (the plan's 90, plus wall side/wall slide/sprint charge from v2,
         // plus the goal's vertical component and the leftward gap probe, plus the nearest
-        // walker's heading, plus the route's next waypoint) and eleven outputs
+        // walker's heading, plus the route's next waypoint, plus the body's sub-tile phase)
+        // and eleven outputs
         // (the plan's six, plus sprint, sprint_jump, retreat_jump and the two leftward
         // sprinting arms). The pin is the *recipe* — one hidden layer of sixteen,
         // argument-max output — with the two ends read from the sim so this test cannot
         // disagree with the action table or the sensor layout.
         assert_eq!(s.inputs, N_INPUTS);
-        assert_eq!(s.inputs, 98);
+        // The recipe's own width, written down: 81 patch cells plus nineteen scalars.
+        assert_eq!(s.inputs, 100);
         assert_eq!(s.hidden, vec![16]);
         assert_eq!(s.outputs, N_OUTPUTS);
         assert_eq!(s.outputs, 11);
@@ -646,10 +692,10 @@ mod tests {
         // before `feedback` existed is: the flag exists, the default does not use it.
         assert_eq!(s.feedback, 0);
         assert_eq!(s.feedback_width(), 0);
-        assert_eq!(s.n_weights(), 98 * 16 + 16 * 11);
+        assert_eq!(s.n_weights(), N_INPUTS * 16 + 16 * 11);
         assert_eq!(s.n_biases(), 16 + 11);
-        assert_eq!(s.n_genes(), 98 * 16 + 16 * 11 + 16 + 11);
-        assert_eq!(s.n_genes(), 1771, "the recipe's own gene count, written down");
+        assert_eq!(s.n_genes(), N_INPUTS * 16 + 16 * 11 + 16 + 11);
+        assert_eq!(s.n_genes(), 1803, "the recipe's own gene count, written down");
         s.validate().expect("shape is valid");
     }
 
@@ -659,17 +705,25 @@ mod tests {
     fn memory_costs_a_feedback_matrix_of_genes_and_the_width_is_bounded() {
         let mut s = default_shape();
         s.feedback = 8;
-        assert_eq!(s.layer(0), (98 + 8, 16), "layer 0 reads the observation and the state");
-        assert_eq!(s.n_weights(), (98 + 8) * 16 + 16 * 11);
+        assert_eq!(
+            s.layer(0),
+            (N_INPUTS + 8, 16),
+            "layer 0 reads the observation and the state"
+        );
+        assert_eq!(s.n_weights(), (N_INPUTS + 8) * 16 + 16 * 11);
         assert_eq!(s.n_biases(), 16 + 11);
-        assert_eq!(s.n_genes(), 106 * 16 + 16 * 11 + 27);
-        assert_eq!(s.max_width(), 106, "the layer-0 input buffer is the widest thing");
+        assert_eq!(s.n_genes(), (N_INPUTS + 8) * 16 + 16 * 11 + 27);
+        assert_eq!(
+            s.max_width(),
+            N_INPUTS + 8,
+            "the layer-0 input buffer is the widest thing"
+        );
         assert_eq!(s.feedback_width(), 8);
         s.validate().expect("a shape with memory is valid");
 
         s.feedback = MAX_FEEDBACK + 1000;
         assert_eq!(s.feedback_width(), MAX_FEEDBACK, "a live shape is clamped");
-        assert_eq!(s.layer(0).0, 98 + MAX_FEEDBACK);
+        assert_eq!(s.layer(0).0, N_INPUTS + MAX_FEEDBACK);
         // The weights and the scratch agree, which is the property the clamp exists for: a
         // genome built from this shape must still be sliceable by it.
         let mut rng = rng_from_seed(21);
@@ -835,17 +889,17 @@ mod tests {
     #[test]
     fn jump_timing_mutations_touch_only_the_jump_decision_genes() {
         // The slot set pinned by hand against the action table: the output layer of the
-        // default recipe starts at 16 × 98 = 1 568 weights and its row for action `j` is
-        // sixteen weights at `1 568 + 16j`, with biases at `1 744 + 16 + j` after the
-        // layer's 176 weights and the hidden layer's 16 biases. Jump actions are 1, 3, 5,
-        // 7 and 10 (run_jump, sprint_jump, retreat_jump, jump_in_place, retreat_sprint_jump).
+        // default recipe starts at 16 × 100 = 1 600 weights and its row for action `j` is
+        // sixteen weights at `1 600 + 16j`, with biases at `1 776 + 16 + j` after the layer's
+        // 176 weights and the hidden layer's 16 biases. Jump actions are 1, 3, 5, 7 and 10
+        // (run_jump, sprint_jump, retreat_jump, jump_in_place, retreat_sprint_jump).
         let shape = default_shape();
         let mut expect: Vec<usize> = Vec::new();
         for j in [1usize, 3, 5, 7, 10] {
             for k in 0..16 {
-                expect.push(1568 + j * 16 + k);
+                expect.push(16 * N_INPUTS + j * 16 + k);
             }
-            expect.push(1744 + 16 + j);
+            expect.push(16 * N_INPUTS + 176 + 16 + j);
         }
         expect.sort_unstable();
         let mut slots = jump_timing_slots(&shape);

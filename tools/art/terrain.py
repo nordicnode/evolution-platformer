@@ -69,7 +69,10 @@ from .common import (
     GRASS_LIGHT,
     GRASS_MID,
     IRON_BOLT,
+    IRON_FRAME,
     IRON_LIGHT,
+    LANTERN_GLOW,
+    LANTERN_WARM,
     MASONRY,
     MASONRY_DARK,
     MASONRY_DEEP,
@@ -851,6 +854,118 @@ def blend(look: str, side: str) -> Image.Image:
     return img
 
 
+# --- the two trap tiles -----------------------------------------------------
+#
+# Both of these are drawn *over* something rather than instead of it, and that is the whole of
+# how they relate to the materials they belong to.
+#
+# A cracked tile is its material with a **transparent** crack drawn on top, so the renderer can
+# put the crack over the material's own autotile: a brittle beach is still drawn as a beach —
+# its crown, its edges, its seams with the lawn beside it — and the crack says the one thing the
+# material's picture cannot. Cutting whole `cracked_*` cells instead would mean every brittle
+# tile looked like a lone block, because a 16-mask family is what tells a floor from a pillar.
+#
+# The spring is the opposite: it is an *object* standing in a cell, like the spike, so it is
+# drawn whole with air around it and shares the spike's one drawing rule — nothing touches the
+# top of the cell, because a tile that reaches its ceiling stops reading as a thing standing in
+# the cell and starts reading as part of the wall above it. The sim's launch zone follows that
+# gap (`physics::SPRING_TOP_CLEARANCE`), so what a body lands on is what it can see.
+
+#: How many rows at the top of a pad's cell are air. Must match `physics::SPRING_TOP_CLEARANCE`
+#: in the sim, which is the copy the *game* reads: `4 / 16` there and four rows here are the same
+#: statement, and `REVIEW.md` §2.12 is where the cost of letting the two drift was measured.
+SPRING_AIR_ROWS = 4
+
+#: The deep shade at the heart of a crack, and the dark one along its shoulders, per material.
+#: A crack is a shadow a material throws on itself, so it is drawn in that material's own tones:
+#: a grey fissure across a beach is the kind of detail that stops the eye reading sand.
+CRACK_TONES = {
+    "ground": (DIRT_DEEP, DIRT_DARK),
+    "sand": (SAND_DEEP, SAND_DARK),
+    "brick": (BRICK_DEEP, BRICK_DARK),
+    "wood": (WOOD_DEEP, WOOD_DARK),
+}
+
+
+def crack_overlay(look: str) -> Image.Image:
+    """One material's crack, on a transparent cell, for the renderer to lay over its autotile.
+
+    A fissure rather than a scratch, and **one pixel wide**: it walks down the cell drifting one
+    pixel sideways every couple of rows, its heart is the material's deepest shade, and a shoulder
+    pixel of the dark tone appears beside it now and then so the line has grain. The width is the
+    whole measurement — on brick or decking, whose own texture is a busy grid of mortar and plank
+    seams, a two-pixel crack stops being a crack and becomes a smudge that hides the material.
+
+    One branch leaves the fissure partway down and drifts away from it, which is what makes the
+    mark read as something that *happened* to the ground rather than something drawn on it.
+    """
+    heart, shoulder = CRACK_TONES[look]
+    img = cell()
+    px = img.load()
+    seed = 197 + sorted(CRACK_TONES).index(look) * 13
+    for start in (3, 10):
+        if h(start, 0, seed) < 0.25:
+            continue
+        x = start
+        drift = 1 if h(start, 9, seed + 23) < 0.5 else -1
+        for y in range(3, 15):
+            px[x, y] = heart
+            if h(x, y, seed + 7) < 0.18:
+                px[x + drift, y] = shoulder
+            if h(x, y, seed + 5) < 0.45:
+                x += drift
+            if h(x, y, seed + 29) < 0.12:
+                drift = -drift
+            x = max(1, min(14, x))
+        bx, by = start, 7 + int(h(start, 2, seed) * 4)
+        for step in range(2 + int(h(start, 3, seed) * 3)):
+            bx -= drift
+            by += 1
+            if 0 <= bx < 16 and by < 15:
+                px[bx, by] = heart if step == 0 else shoulder
+    return img
+
+
+def spring() -> Image.Image:
+    """A spring pad: a coiled column between two steel plates, standing in its cell.
+
+    **Nothing above** [`SPRING_AIR_ROWS`] **is drawn**, and the sim's launch zone starts where the
+    drawing does. That is the same contract the spike's top three rows keep with
+    `physics::spike_lethal_box`: the art is what the player can see, and the tile's behaviour is
+    aligned to it rather than the other way round.
+
+    Warm brass for the coil and cold steel for the plates — the same warm ink the lantern and the
+    flag use, which is what makes a pad read as a *friendly* object in a level full of grey spikes.
+    """
+    img = cell()
+    px = img.load()
+    top = SPRING_AIR_ROWS
+    # The cap: the plate a body lands on, lit along its top edge.
+    for x in range(1, 15):
+        px[x, top] = IRON_LIGHT
+        px[x, top + 1] = IRON_BOLT
+    # The coil: three bars, each with a short connector at one end, the end alternating so the
+    # zig-zag between the bars is what reads as a wound spring rather than a stack of stripes.
+    bars = list(range(top + 3, 13, 2))
+    for index, y in enumerate(bars):
+        left = 3 if index % 2 == 0 else 4
+        right = 12 if index % 2 == 0 else 13
+        for x in range(left, right + 1):
+            px[x, y] = LANTERN_WARM
+        px[left, y] = LANTERN_GLOW
+        px[right, y + 1] = IRON_FRAME
+        connector = left - 1 if index % 2 == 0 else right + 1
+        for gap in range(y + 1, min(y + 3, 14)):
+            px[connector, gap] = IRON_BOLT
+    # The base plate, which is what a pad is bolted to the ground with.
+    for x in range(0, 16):
+        px[x, 15] = IRON_FRAME
+        px[x, 14] = IRON_BOLT
+    for x in range(1, 15):
+        px[x, 13] = IRON_LIGHT if h(x, 13, 181) < 0.85 else IRON_BOLT
+    return img
+
+
 def spikes() -> Image.Image:
     """Three upward spikes on a stone base.
 
@@ -927,6 +1042,16 @@ def sprites() -> list[tuple[str, Image.Image]]:
     out.append(("wood_1_c", _with_detail(wood(1), _wood_rivets)))
 
     out.append(("spike", spikes()))
+
+    # The trap tiles, next to the spike because they are the same *kind* of thing: a tile the
+    # physics has an opinion about, drawn as an object rather than as a material. The four cracks
+    # go last of the group because the renderer draws them *over* the tile beneath, which is also
+    # where they sit in a level.
+    out.append(("spring", spring()))
+    out.append(("cracked_ground", crack_overlay("ground")))
+    out.append(("cracked_sand", crack_overlay("sand")))
+    out.append(("cracked_brick", crack_overlay("brick")))
+    out.append(("cracked_wood", crack_overlay("wood")))
     return out
 
 

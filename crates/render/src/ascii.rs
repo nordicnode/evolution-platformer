@@ -15,16 +15,29 @@
 //!
 //! One character per tile, never more — terminals wrap otherwise.
 //!
-//! | glyph | meaning                                            |
-//! |-------|----------------------------------------------------|
+//! | glyph | meaning                                             |
+//! |-------|-----------------------------------------------------|
 //! | `#`   | solid tile (also the invisible walls at the edges)  |
 //! | `S`   | sand tile: solid exactly as `#` is, another material |
-//! | `^`   | spike tile (not solid, lethal on overlap)           |
-//! | `.`   | empty space                                         |
-//! | `!`   | goal trigger box (drawn on top of empty tiles only) |
-//! | `e`   | live walker                                         |
-//! | `x`   | stomped/removed walker                              |
-//! | `@`   | the primary body (drawn last, so it always wins)    |
+//! | `B`   | brick tile: solid, drawn as mortared masonry         |
+//! | `W`   | plank tile: solid, drawn as milled timber            |
+//! | `d`   | cracked soil: solid, and it breaks away underfoot    |
+//! | `s`   | cracked sand: the same, on a beach                   |
+//! | `b`   | cracked brick: the same, in masonry                  |
+//! | `w`   | cracked timber: the same, in milled decking          |
+//! | `^`   | spike tile (not solid, lethal on overlap)            |
+//! | `v`   | spring pad (not solid, throws a falling body upward) |
+//! | `.`   | empty space                                          |
+//! | `!`   | goal trigger box (drawn on top of empty tiles only)  |
+//! | `e`   | live walker                                          |
+//! | `x`   | stomped/removed walker                               |
+//! | `@`   | the primary body (drawn last, so it always wins)     |
+//!
+//! The last handful arrived with the traps: a **cracked** tile is the lowercase of the
+//! material it falls apart from (`S`→`s`, `B`→`b`, `W`→`w`, and `#`→`d` for *dirt*, the one
+//! material with no letter to fold), and it is drawn exactly as its material is until a body has
+//! stood on it. The **spring** is the spike inverted — the one glyph pair here whose shapes say
+//! what they do, `^` ending an episode and `v` throwing a body back up it.
 //!
 //! [`GLYPHS`] is the legend for those defaults, **not a whitelist**: watch mode
 //! gives each agent its own letter, and any printable non-space ASCII character
@@ -46,7 +59,10 @@
 //! z-order, and [`Scene::from_sim`] places the player at index 0 so a single-agent
 //! view is unchanged from before this module took scenes.
 
-use sim::level::{GLYPH_BRICK, GLYPH_EMPTY, GLYPH_PLANK, GLYPH_SAND, GLYPH_SOLID, GLYPH_SPIKE};
+use sim::level::{
+    GLYPH_BRICK, GLYPH_CRACKED, GLYPH_CRACKED_BRICK, GLYPH_CRACKED_PLANK, GLYPH_CRACKED_SAND,
+    GLYPH_EMPTY, GLYPH_PLANK, GLYPH_SAND, GLYPH_SOLID, GLYPH_SPIKE, GLYPH_SPRING,
+};
 use sim::{Level, Sim};
 
 /// Player glyph.
@@ -64,12 +80,20 @@ pub const GLYPH_UNKNOWN: char = '?';
 ///
 /// A legend, not a whitelist — see the module docs. Watch mode draws each agent
 /// with its own letter and those letters are not listed here.
-pub const GLYPHS: [(char, &str); 10] = [
+pub const GLYPHS: [(char, &str); 15] = [
     (GLYPH_SOLID, "solid tile"),
     (GLYPH_SAND, "sand tile (solid, a beach)"),
     (GLYPH_BRICK, "stone brick tile (solid masonry)"),
     (GLYPH_PLANK, "wood plank tile (solid timber)"),
+    // The brittle four sit with the materials they are, because that is the whole of what they
+    // are: the table keeps one line per material and then one per material's cracked self, so a
+    // reader looking up `s` finds it where `S` is rather than at the end of the list.
+    (GLYPH_CRACKED, "cracked ground (solid, breaks away underfoot)"),
+    (GLYPH_CRACKED_SAND, "cracked sand (solid, breaks away underfoot)"),
+    (GLYPH_CRACKED_BRICK, "cracked brick (solid, breaks away underfoot)"),
+    (GLYPH_CRACKED_PLANK, "cracked timber (solid, breaks away underfoot)"),
     (GLYPH_SPIKE, "spike (lethal, not solid)"),
+    (GLYPH_SPRING, "spring pad (not solid, throws a falling body up)"),
     (GLYPH_EMPTY, "empty space"),
     (GLYPH_GOAL, "goal flag"),
     (GLYPH_WALKER_ALIVE, "live walker enemy"),

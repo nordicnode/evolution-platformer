@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::hash::StateHasher;
 use crate::physics::{PlayerState, PHYSICS};
+use crate::reach::{CachedVerdict, GoalRoutes, ReachOptions, ReachReport};
+use crate::route_cache::Slot;
 
 use crate::PIXELS_PER_TILE;
 
@@ -33,6 +35,12 @@ pub const MIN_LEVEL_W: i32 = 8;
 pub const MIN_LEVEL_H: i32 = 5;
 
 /// Grid characters. Anything else in a level file is a load error, not a shrug.
+///
+/// **The materials are uppercase and their cracked selves are lowercase.** `S`, `B` and `W`
+/// are sand, brick and timber; `s`, `b` and `w` are the same three materials about to fall
+/// apart. Soil has no uppercase letter to fold — it is `#`, the ground every level has had
+/// since the first one — so its brittle twin is `d`, for *dirt*. One rule covers the four:
+/// a cracked tile is written as the material, lowercased.
 pub const GLYPH_EMPTY: char = '.';
 pub const GLYPH_SOLID: char = '#';
 pub const GLYPH_SAND: char = 'S';
@@ -40,6 +48,18 @@ pub const GLYPH_BRICK: char = 'B';
 pub const GLYPH_PLANK: char = 'W';
 pub const GLYPH_SPIKE: char = '^';
 pub const GLYPH_GOAL: char = 'G';
+/// Cracked soil: solid until a body stands on it (`d`, for dirt).
+pub const GLYPH_CRACKED: char = 'd';
+pub const GLYPH_CRACKED_SAND: char = 's';
+pub const GLYPH_CRACKED_BRICK: char = 'b';
+pub const GLYPH_CRACKED_PLANK: char = 'w';
+/// A spring pad (`v`). Not solid, and it throws a **falling** body upward.
+///
+/// The inverted spike, deliberately: `^` is the tile that ends an episode and `v` is the
+/// tile that extends one, and the two are one character apart in shape as well as in the
+/// legend. Every other unclaimed symbol in a level file is either a letter a material wants
+/// or a character that does not read as a thing standing in a cell.
+pub const GLYPH_SPRING: char = 'v';
 
 /// Tile ids (§6): small integers so the grid stays cheap to clone and hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,9 +88,81 @@ pub enum Tile {
     /// Timber scaffolding / wood planks (`W`). Solid exactly as [`Tile::Solid`] is;
     /// drawn with the wood plank autotile family.
     Plank = 6,
+    /// Cracked soil (`d`): solid, and **brittle** — a body that stands on it lights a fuse,
+    /// and when the fuse burns out the tile is gone.
+    ///
+    /// ## What brittle ground is, and what it is not
+    ///
+    /// It is not a material. The four cracked variants are the four materials of
+    /// [`Tile::Solid`], [`Tile::Sand`], [`Tile::Brick`] and [`Tile::Plank`] with a *behaviour*
+    /// attached: each is drawn with its material's own autotile family (plus a crack), and it
+    /// holds a body up exactly as that material does — right up to the moment it does not.
+    /// That is why [`Tile::is_solid`] answers **yes** for a cracked tile, and why nothing about
+    /// the collision code had to change to add it: an intact tile is ground, and the state the
+    /// sim keeps is not "a brittle tile" but "this tile is gone", which it expresses by
+    /// setting the cell to [`Tile::Empty`].
+    ///
+    /// The fuse itself lives in the sim ([`crate::Sim`]), not in the tile, for the reason the
+    /// spike's kill zone lives in the physics rather than in the art: a tile is a fact about
+    /// the level, and the level file is the same document before and after a body has crossed
+    /// it. See [`crate::physics::CRUMBLE_TICKS`].
+    Cracked = 7,
+    /// Cracked sand (`s`). Solid and brittle, drawn as a beach. See [`Tile::Cracked`].
+    CrackedSand = 8,
+    /// Cracked brick (`b`). Solid and brittle, drawn as mortared brickwork.
+    CrackedBrick = 9,
+    /// Cracked timber (`w`). Solid and brittle, drawn as milled decking.
+    CrackedPlank = 10,
+    /// A spring pad (`v`): not solid, and it launches a **descending** body upward.
+    ///
+    /// Launches, not teleports: the pad sets the body's vertical velocity and touches nothing
+    /// else, so the horizontal velocity the body arrived with is still the horizontal velocity
+    /// it leaves with — which is what "maintaining momentum" means in a game whose whole
+    /// difficulty is a jump's carry (`Physics::max_jump_distance`). A pad that zeroed `vx`
+    /// would be a pad that punishes arriving fast, and a pad that *added* to `vx` would be a
+    /// speed the oracle cannot derive and the level author cannot aim.
+    ///
+    /// **Only a falling body is launched.** A body whose `vy > 0` is one that is on its way
+    /// down onto the pad; a body rising through it from below, or walking across it on the
+    /// ground, is not. That is one rule rather than two and it is what makes a pad something
+    /// you *land* on: the alternative (any overlap launches) makes a pad on a flat floor a
+    /// thing you cannot walk past, because the body crossing it would be thrown upward by
+    /// contact rather than by arrival.
+    ///
+    /// The launch is a fixed velocity every time rather than a fraction of the fall that
+    /// arrived, so the pad's output is a property of the level and not of the approach, and a
+    /// level built on one is repeatable — the same derivation the jump ladder is built on
+    /// (`Physics::spring_height`). A body that lands back on the pad is launched again, so a
+    /// pad with a ceiling over it pogoes for as long as the episode's no-progress timer allows;
+    /// that is the pad working, not a bug.
+    Spring = 11,
 }
 
 impl Tile {
+    /// Every tile the format has, in glyph order — the argument to any question shaped "all tiles".
+    ///
+    /// One array rather than a hand-written list at each place that wants one. Three do: the glyph
+    /// round-trip test, the terminal's legend, and `train-cli`'s lane-label alphabet, which must not
+    /// collide with anything the scene draws. Every one of them has been wrong in exactly the same
+    /// way — a new tile arrives and the list it is not on does not notice — and the lane labels are
+    /// the one where it shows: five letters were still being offered as agent names after the trap
+    /// tiles took them (`d`, `s`, `b`, `w`, `v`). So a tile is added **here** as well as to the enum,
+    /// and every list that matters is derived from this.
+    pub const ALL: [Tile; 12] = [
+        Tile::Empty,
+        Tile::Solid,
+        Tile::Sand,
+        Tile::Brick,
+        Tile::Plank,
+        Tile::Spike,
+        Tile::Goal,
+        Tile::Cracked,
+        Tile::CrackedSand,
+        Tile::CrackedBrick,
+        Tile::CrackedPlank,
+        Tile::Spring,
+    ];
+
     pub fn from_glyph(c: char) -> Option<Tile> {
         match c {
             GLYPH_EMPTY => Some(Tile::Empty),
@@ -80,6 +172,11 @@ impl Tile {
             GLYPH_PLANK => Some(Tile::Plank),
             GLYPH_SPIKE => Some(Tile::Spike),
             GLYPH_GOAL => Some(Tile::Goal),
+            GLYPH_CRACKED => Some(Tile::Cracked),
+            GLYPH_CRACKED_SAND => Some(Tile::CrackedSand),
+            GLYPH_CRACKED_BRICK => Some(Tile::CrackedBrick),
+            GLYPH_CRACKED_PLANK => Some(Tile::CrackedPlank),
+            GLYPH_SPRING => Some(Tile::Spring),
             _ => None,
         }
     }
@@ -93,11 +190,62 @@ impl Tile {
             Tile::Plank => GLYPH_PLANK,
             Tile::Spike => GLYPH_SPIKE,
             Tile::Goal => GLYPH_GOAL,
+            Tile::Cracked => GLYPH_CRACKED,
+            Tile::CrackedSand => GLYPH_CRACKED_SAND,
+            Tile::CrackedBrick => GLYPH_CRACKED_BRICK,
+            Tile::CrackedPlank => GLYPH_CRACKED_PLANK,
+            Tile::Spring => GLYPH_SPRING,
         }
     }
 
+    /// Does this tile block movement from every side?
+    ///
+    /// **Cracked tiles are solid**, and that is the whole of what makes a brittle bridge a
+    /// bridge rather than a row of holes: a level paints one, the sim stands a body on it, and
+    /// the tile leaves the level later — as [`Tile::Empty`], which is a state the collision code
+    /// already understands. A cracked tile answers no here only once the sim has replaced it.
     pub fn is_solid(self) -> bool {
-        matches!(self, Tile::Solid | Tile::Sand | Tile::Brick | Tile::Plank)
+        matches!(
+            self,
+            Tile::Solid
+                | Tile::Sand
+                | Tile::Brick
+                | Tile::Plank
+                | Tile::Cracked
+                | Tile::CrackedSand
+                | Tile::CrackedBrick
+                | Tile::CrackedPlank
+        )
+    }
+
+    /// Is this tile one that a body standing on it will break?
+    pub fn is_cracked(self) -> bool {
+        matches!(
+            self,
+            Tile::Cracked | Tile::CrackedSand | Tile::CrackedBrick | Tile::CrackedPlank
+        )
+    }
+
+    /// Is this tile a spring pad?
+    pub fn is_spring(self) -> bool {
+        matches!(self, Tile::Spring)
+    }
+
+    /// The tile this one is a *material of*, with any brittleness stripped off.
+    ///
+    /// The renderer's seam and autotile lookups are all about what a tile is made of, and
+    /// brittleness is not part of that answer: `S` and `s` are both beaches, and a cracked
+    /// beach beside a lawn has the same seam a sound one has. Rather than teach five tables
+    /// about a fourth axis, a cracked tile is *drawn as its material* and the crack is drawn
+    /// over it, which is exactly how the two relate in the world.
+    pub fn base_material(self) -> Tile {
+        match self {
+            Tile::Cracked => Tile::Solid,
+            Tile::CrackedSand => Tile::Sand,
+            Tile::CrackedBrick => Tile::Brick,
+            Tile::CrackedPlank => Tile::Plank,
+            other => other,
+        }
     }
 
     /// Is this tile only a different *material* of solid ground?
@@ -105,16 +253,20 @@ impl Tile {
     /// The one question the renderer asks about sand: which autotile family to draw it in.
     /// It is deliberately not a question about collision — nothing that decides where the
     /// player goes may care what the ground is made of.
+    ///
+    /// A cracked tile answers yes for the material it is made of. The question is what the
+    /// tile *is*, and a cracked beach is a beach; the brittleness is the [`Tile::is_cracked`]
+    /// question, asked separately by the one caller that draws the crack.
     pub fn is_sand(self) -> bool {
-        matches!(self, Tile::Sand)
+        matches!(self, Tile::Sand | Tile::CrackedSand)
     }
 
     pub fn is_brick(self) -> bool {
-        matches!(self, Tile::Brick)
+        matches!(self, Tile::Brick | Tile::CrackedBrick)
     }
 
     pub fn is_plank(self) -> bool {
-        matches!(self, Tile::Plank)
+        matches!(self, Tile::Plank | Tile::CrackedPlank)
     }
 }
 
@@ -254,8 +406,39 @@ pub struct Level {
     pub goals: Vec<Rect>,
     /// Placed scenery, in draw order. Inert: not simulated, not hashed, not sensed.
     pub scenery: Vec<Scenery>,
-    /// Lazily computed move-graph route table for this level, shared across clones via `Arc`.
-    routes_cache: std::sync::OnceLock<std::sync::Arc<crate::reach::GoalRoutes>>,
+    /// Lazily computed move-graph route table for this level.
+    ///
+    /// **The slot is shared between clones, not copied by them.** The graph is a pure
+    /// function of the terrain and costs a full sweep of every stand's canonical moves
+    /// ([`crate::reach::goal_routes`] — 24 ms on a 60x15 level), so the editor's document,
+    /// the run's copy of it, the lanes animated over it and every episode's own sim are all
+    /// asking the same question about the same terrain and should be answered by one build.
+    ///
+    /// A bare `OnceLock` could not do that: `Clone` copies it, so a clone taken *before* the
+    /// first build started with an empty slot and paid the whole sweep itself. That is what
+    /// a generation full of lanes, and a replay full of ghosts, each charged once, looked
+    /// like on screen: a 24 ms stall on the frame a lane first asked for a waypoint.
+    ///
+    /// A mutation replaces the `Arc` rather than filling it ([`Level::forget_routes`]), which
+    /// keeps two things true at once: a level whose terrain has changed gets a graph built
+    /// for the terrain it has now, and the clones that still hold the old terrain keep the
+    /// graph they were built for.
+    routes_cache: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<GoalRoutes>>>,
+    /// The route cache beside this level's file, for a level that came from one.
+    ///
+    /// Both things a level's terrain is asked for are already a function of the terrain — the
+    /// route table above, and the oracle's verdict ([`crate::reach::report`]) — so both are
+    /// kept beside the file the terrain came from, keyed by its content hash and the two
+    /// behaviour versions of the oracle that produced them ([`crate::route_cache`]). Opening
+    /// a level in a fresh process then costs a file read instead of a sweep of every canonical
+    /// move on it. It can never *change* an answer: what comes back is what the same code
+    /// would have computed for the same key.
+    ///
+    /// It is dropped by **every writer of the grid**: [`Level::forget_routes`] for an edit, and
+    /// [`Level::burn_tile`] for an episode's crumbling ground. That is what keeps the key
+    /// honest — while a slot is here, this document is still the document its file describes,
+    /// so [`Level::content_hash_string`] is the hash its answers were computed for.
+    cache: Option<Slot>,
 }
 
 impl Level {
@@ -317,7 +500,8 @@ impl Level {
             walkers: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
-            routes_cache: std::sync::OnceLock::new(),
+            routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cache: None,
         };
 
         // Spawn: bottom edge on the bottom of the spawn tile's row.
@@ -390,11 +574,37 @@ impl Level {
     }
 
     /// Load a level from a file path.
+    ///
+    /// This is the constructor that knows the level has a *file*, so it is the one that looks
+    /// for — and later writes — the route cache beside it ([`crate::route_cache`]).
     pub fn from_json_file(path: impl AsRef<std::path::Path>) -> Result<Level, String> {
         let path = path.as_ref();
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        Level::from_json_str(&src).map_err(|e| format!("{}: {e}", path.display()))
+        let mut level =
+            Level::from_json_str(&src).map_err(|e| format!("{}: {e}", path.display()))?;
+        level.adopt_cache(path);
+        Ok(level)
+    }
+
+    /// Take the answers kept beside `path`, when they are answers about this terrain.
+    ///
+    /// Adoption rather than computation is the whole point of the file: a graph that arrives
+    /// this way is in `routes_cache` before anything asks for it, so the first ask is an
+    /// atomic load, and a verdict that arrives this way is what [`crate::reach::report`]
+    /// returns without sweeping.
+    fn adopt_cache(&mut self, path: &std::path::Path) {
+        let slot = Slot::new(crate::route_cache::sidecar_path(path));
+        if let Some((routes, verdict)) = crate::route_cache::read(self, slot.path()) {
+            if let Some(routes) = routes {
+                self.routes_cache =
+                    std::sync::Arc::new(std::sync::OnceLock::from(std::sync::Arc::new(routes)));
+            }
+            if let Some(verdict) = verdict {
+                slot.remember(verdict);
+            }
+        }
+        self.cache = Some(slot);
     }
 
     /// Tile at `(tx, ty)`.
@@ -416,14 +626,129 @@ impl Level {
     fn set(&mut self, tx: i32, ty: i32, tile: Tile) {
         if tx >= 0 && tx < self.width && ty >= 0 && ty < self.height {
             self.tiles[(ty * self.width + tx) as usize] = tile;
-            self.routes_cache = std::sync::OnceLock::new();
+            self.forget_routes();
         }
     }
 
+    /// Take a tile out of the ground during an episode — a brittle tile burning out —
+    /// **without** dropping the route table.
+    ///
+    /// A route table ([`Level::routes`]) answers "which way is the flag" for the level as it
+    /// was *authored*; an episode's own crumbling is not an edit to the level. The flag has
+    /// not moved, so the compass the waypoint sensor steers by should not swing because a
+    /// bridge gave way under one agent's feet — and the geodesic `hops_to_flag` the score
+    /// reads stays a reading of the level's route rather than of one body's damage.
+    ///
+    /// The **physics is exact either way**: it reads the live grid ([`Level::get`]) on every
+    /// tick, so the hole a body has just opened is a hole it falls through, and
+    /// [`Level::tile`] shows the ground the episode actually has. What is shared is only the
+    /// route table, which is why this is not [`Level::set_tile`].
+    ///
+    /// It is also what keeps a crumbling level affordable. The sweep behind a route table
+    /// costs milliseconds, and an episode can break several tiles: rebuilding per cracked
+    /// tile was the largest cost in training (and in *watching*) a level with brittle ground.
+    ///
+    /// The **file's** cache goes, though, which is the opposite rule for the opposite reason
+    /// ([`Level::cache`]): a route table answers for the level as it was authored, but a cache
+    /// beside a file has to key itself on the content it describes, and this body has just
+    /// changed the content. A clone of the level that has broken a tile is no longer holding
+    /// the terrain its file does, so it must not write that file's cache — the model level,
+    /// which never burns anything, still does.
+    pub fn burn_tile(&mut self, tx: i32, ty: i32) {
+        if tx >= 0 && tx < self.width && ty >= 0 && ty < self.height {
+            self.tiles[(ty * self.width + tx) as usize] = Tile::Empty;
+            self.cache = None;
+        }
+    }
+
+    /// Drop this level's move-graph route table, because the terrain it described has just
+    /// changed.
+    ///
+    /// A fresh slot *for this level* rather than a clear of the shared one: the clones that
+    /// are still holding the terrain the graph was built for keep it (see
+    /// [`Level::routes_cache`]). Every writer of the grid or of the flag calls this —
+    /// [`Level::set`] for a tile, [`Level::resize`] for the grid, and the goal edits — so the
+    /// graph can never describe terrain the level no longer has.
+    fn forget_routes(&mut self) {
+        self.routes_cache = std::sync::Arc::new(std::sync::OnceLock::new());
+        // An edit also gives up this level's claim to its file's cache: the document is no
+        // longer the document the file describes, so it neither answers from it nor writes to
+        // it ([`Level::cache`]).
+        self.cache = None;
+    }
+
     /// Return the move-graph route table for this level, computing and caching it on first ask.
-    pub fn routes(&self) -> &crate::reach::GoalRoutes {
-        self.routes_cache
-            .get_or_init(|| std::sync::Arc::new(crate::reach::goal_routes(self)))
+    ///
+    /// The first ask does the sweep; every later ask from this level or from any clone of it
+    /// is an atomic load of the one shared answer — and for a level loaded from a file, the
+    /// first ask is usually not even a sweep: the answer is there in the cache beside the file,
+    /// adopted at load (`Level::adopt_cache`).
+    ///
+    /// A **build** here is the one moment this level writes that cache, because a build is the
+    /// one proof that the file's copy could not answer — a matching key is adopted before this
+    /// function is ever reached. A level that adopted its graph therefore leaves the file alone
+    /// rather than rewriting what it just read.
+    pub fn routes(&self) -> &GoalRoutes {
+        let cold = self.routes_cache.get().is_none();
+        let routes = self
+            .routes_cache
+            .get_or_init(|| std::sync::Arc::new(crate::reach::goal_routes(self)));
+        if cold {
+            self.write_cache(Some(&**routes), self.known_verdict());
+        }
+        routes
+    }
+
+    /// The oracle's verdict for this level, when its file has already been given one for
+    /// exactly these abilities.
+    ///
+    /// `None` is the ordinary answer — a level with no file behind it, a document that has been
+    /// edited since it was loaded, a cache written by another build, or a question about
+    /// abilities the cache does not hold — and every one of them means "sweep it", never an
+    /// error.
+    pub(crate) fn cached_verdict(&self, options: ReachOptions) -> Option<ReachReport> {
+        let cached = self.cache.as_ref()?.verdict()?;
+        (cached.options == options).then(|| cached.report.clone())
+    }
+
+    /// Keep `report` as this level's verdict, and put it in the file's cache.
+    ///
+    /// Only the oracle's own question is kept — [`crate::reach::ReachOptions::default`]. A
+    /// verdict for weakened abilities is a different claim about the same terrain, and the
+    /// consumers that ask for one are tests checking that a level *needs* an ability
+    /// (`crates/sim/tests/levels.rs`); giving each of those its own entry would rewrite one
+    /// file per ability set and hand the editor a miss for the verdict it actually wants.
+    pub(crate) fn remember_verdict(&self, options: ReachOptions, report: &ReachReport) {
+        if options != ReachOptions::default() {
+            return;
+        }
+        let Some(slot) = self.cache.as_ref() else {
+            return;
+        };
+        slot.remember(CachedVerdict {
+            options,
+            report: report.clone(),
+        });
+        self.write_cache(self.routes_cache.get().map(|r| &**r), self.known_verdict());
+    }
+
+    /// The verdict this level's file has, as the slot holds it.
+    fn known_verdict(&self) -> Option<&std::sync::Arc<CachedVerdict>> {
+        self.cache.as_ref()?.verdict()
+    }
+
+    /// Write this level's cache beside its file: the graph and the verdict, whichever of the
+    /// two this level has, and nothing at all for a level that has no file or has been edited
+    /// since it was loaded.
+    fn write_cache(
+        &self,
+        routes: Option<&GoalRoutes>,
+        verdict: Option<&std::sync::Arc<CachedVerdict>>,
+    ) {
+        let Some(slot) = self.cache.as_ref() else {
+            return;
+        };
+        crate::route_cache::write(self, slot, routes, verdict.map(|v| &**v));
     }
 
     pub fn is_solid(&self, tx: i32, ty: i32) -> bool {
@@ -432,6 +757,11 @@ impl Level {
 
     pub fn is_spike(&self, tx: i32, ty: i32) -> bool {
         self.get(tx, ty) == Tile::Spike
+    }
+
+    /// Is there a spring pad in this cell?
+    pub fn is_spring(&self, tx: i32, ty: i32) -> bool {
+        self.get(tx, ty).is_spring()
     }
 
     /// Can a body *stand* on this tile: solid ground, with room above it and no hazard in
@@ -636,7 +966,8 @@ impl Level {
             walkers: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
-            routes_cache: std::sync::OnceLock::new(),
+            routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cache: None,
         };
         for tx in 0..width {
             level.set(tx, height - 1, Tile::Solid);
@@ -782,7 +1113,7 @@ impl Level {
         self.tiles = tiles;
         self.width = width;
         self.height = height;
-        self.routes_cache = std::sync::OnceLock::new();
+        self.forget_routes();
 
         let mut report = ResizeReport::default();
         let (sx, sy) = self.spawn_tile();
@@ -960,7 +1291,7 @@ impl Level {
         }
         self.goals.clear();
         self.goals.push(goal_rect(tx, ty));
-        self.routes_cache = std::sync::OnceLock::new();
+        self.forget_routes();
         true
     }
 
@@ -991,7 +1322,7 @@ impl Level {
         let before = self.goals.len();
         self.goals.retain(|g| !goal_marker_covers(g, tx, ty));
         if self.goals.len() != before {
-            self.routes_cache = std::sync::OnceLock::new();
+            self.forget_routes();
             true
         } else {
             false

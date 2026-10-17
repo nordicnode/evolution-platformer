@@ -7,8 +7,8 @@
 mod common;
 
 use common::fixture;
-use sim::physics::{PlayerState, PHYSICS, SPIKE_TOP_CLEARANCE};
-use sim::AgentAction;
+use sim::physics::{PlayerState, CRUMBLE_TICKS, PHYSICS, SPIKE_TOP_CLEARANCE};
+use sim::{AgentAction, Tile};
 
 /// Ground rows 4..5, open sky above. 12 columns wide.
 const FLAT: &[&str] = &[
@@ -1346,3 +1346,424 @@ const PIT_SHAPE: &[&str] = &[
     "##########...#######",
     "##########...#######",
 ];
+
+// --- the trap pass: springs and brittle ground ------------------------------
+//
+// Two tiles, one behaviour each, and both of them are *interactions*: a pad only exists for a body
+// that falls onto it and a brittle tile only exists for a body that stands on it. So the fixtures
+// below are episodes rather than collision setups, and every assertion is about what happened to a
+// body over time.
+
+/// Floor rows 4..5, twelve columns, and a pad in the cell a jumping body passes through.
+///
+/// The pad is at row 2, which is deliberately *inside* the arc of a full jump from this floor: a
+/// body rising from bottom 4.0 to its 2.5-tile apex has its own box straddle that cell, so a
+/// fixture like this is the one that can tell "any overlap launches" apart from "a falling body
+/// launches" — which is the whole of the pad's rule.
+const PAD_IN_THE_ARC: &[&str] = &[
+    "............",
+    "............",
+    ".v..........",
+    "............",
+    "############",
+    "############",
+];
+
+#[test]
+fn a_spring_launches_a_falling_body_upward_and_keeps_its_momentum() {
+    // A running jump onto a pad, with the pad sitting in the floor's own surface row so the body
+    // lands on it the way a player would: at speed, from above, on the way down.
+    const RUNWAY: &[&str] = &[
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "............vv......",
+        "####################",
+    ];
+    let level = fixture("pad-runway", RUNWAY, (1, 6), &[("goal", 18, 6)]);
+    let mut sim = sim::Sim::new(&level, 4);
+    common::settle(&mut sim);
+
+    // Run up, jump, and keep running: the body has to arrive at the pad with horizontal speed it
+    // would notice losing, which is what makes the momentum half of this test mean anything.
+    let mut prev_vx = sim.player().vx;
+    let mut prev_vy = sim.player().vy;
+    let mut launch = None;
+    for frame in 0..600u32 {
+        let action = if sim.player().x < 8.5 {
+            AgentAction::Run
+        } else {
+            AgentAction::RunJump
+        };
+        prev_vx = sim.player().vx;
+        prev_vy = sim.player().vy;
+        sim.step(action);
+        if sim.player().vy == -PHYSICS.spring_v0 {
+            launch = Some(frame);
+            break;
+        }
+        assert!(
+            !sim.outcome().is_finished(),
+            "the body never reached the pad (outcome {:?} at x = {}, frame {frame})",
+            sim.outcome(),
+            sim.player().x
+        );
+    }
+    let frame = launch.expect("the body must land on the pad and be thrown up");
+    let vx_at_launch = sim.player().vx;
+
+    // It was falling, and it was running: the pad's rule is about a body *arriving* on it.
+    assert!(
+        prev_vy > 0.0,
+        "the pad launched a body that was not falling (vy was {prev_vy})"
+    );
+    assert!(
+        vx_at_launch > PHYSICS.run_speed * 0.9,
+        "the body should have arrived at the pad at running speed, not {vx_at_launch}"
+    );
+    // **Momentum is kept**, and asserted as "the pad wrote nothing horizontal": the only change in
+    // `vx` across the launch frame is the acceleration the body's own action asked for. A pad that
+    // zeroed it would show the whole run speed here, which is ten times this tolerance.
+    assert!(
+        (vx_at_launch - prev_vx).abs() <= PHYSICS.run_accel + 1e-6,
+        "the launch frame changed vx by {}, more than the body's own steering can explain: the pad \
+         is not momentum-preserving",
+        vx_at_launch - prev_vx
+    );
+    assert!(
+        sim.player().vy == -PHYSICS.spring_v0,
+        "the launch velocity is the bible's own constant, exactly"
+    );
+    // A bounce is not a decision: the agent spent one jump on the way to the pad, and the pad's
+    // throw is not charged as another (see `evo::fitness::JUMP_PENALTY` for what that pays for).
+    assert_eq!(
+        sim.stats().jumps,
+        1,
+        "the pad's throw must not be counted as a jump the agent made"
+    );
+
+    // And it out-jumps a jump, which is the reason a level author reaches for one: the rise is the
+    // bible's 4.90 tiles, measured as the highest the body's feet get above the surface it launched
+    // from, against the 2.4 a held jump reaches.
+    let surface = sim.player().y + sim.player().h;
+    let mut apex = 0.0f32;
+    for _ in 0..200u32 {
+        sim.step(AgentAction::Run);
+        let rise = surface - (sim.player().y + sim.player().h);
+        apex = apex.max(rise);
+        if sim.player().grounded || sim.outcome().is_finished() {
+            break;
+        }
+        assert_ne!(sim.outcome(), sim::Outcome::Died, "a pad is not a hazard");
+    }
+    assert!(
+        apex > PHYSICS.discrete_max_jump_height() + 1.0,
+        "a pad has to buy clearly more height than a jump ({apex:.2} against {:.2})",
+        PHYSICS.discrete_max_jump_height()
+    );
+    assert!(
+        (apex - PHYSICS.spring_height()).abs() < 0.3,
+        "the rise should be the derived {} tiles, measured {apex:.2}",
+        PHYSICS.spring_height()
+    );
+
+    // And the body that was thrown is still going the way it was going: it lands *past* where the
+    // pad threw it from, which is the carry a level is built around. The flight carried it over the
+    // flag at the far end of the runway, so the episode is allowed to be over — what it may not be
+    // is a death, and what it may not be is a landing back on the pad it left.
+    assert!(
+        sim.player().x > 13.0,
+        "a running spring launch carries the body well past the pad, landed at x = {}",
+        sim.player().x
+    );
+    assert_ne!(sim.outcome(), sim::Outcome::Died, "a pad is not a hazard");
+    let _ = frame;
+}
+
+#[test]
+fn a_spring_does_not_launch_a_body_that_is_not_falling() {
+    let level = fixture("pad-arc", PAD_IN_THE_ARC, (1, 3), &[("goal", 11, 3)]);
+    let mut sim = sim::Sim::new(&level, 9);
+    common::settle(&mut sim);
+    assert!(
+        sim.player().grounded,
+        "the control case needs a body on the ground"
+    );
+
+    // The body rises through the pad's cell on the way up, and a body that is *rising* must not be
+    // thrown: it is on its way past the pad, not onto it. (It is thrown on the way back down, when
+    // it really has fallen onto the pad from above — that is the pad working, and the assertion at
+    // the end of this half says so.)
+    let mut rising_inside_the_pad = false;
+    let mut launched_while_rising = false;
+    let mut thrown_on_the_way_down = false;
+    for _ in 0..160u32 {
+        let rising = sim.player().vy < 0.0;
+        sim.step(AgentAction::JumpInPlace);
+        let inside = sim
+            .player()
+            .aabb()
+            .overlaps(&sim::Rect::new(1.0, 2.0, 1.0, 1.0));
+        if rising && inside {
+            rising_inside_the_pad = true;
+        }
+        if rising && sim.player().vy <= -PHYSICS.spring_v0 {
+            launched_while_rising = true;
+        }
+        if !rising && sim.player().vy == -PHYSICS.spring_v0 {
+            thrown_on_the_way_down = true;
+        }
+        if sim.outcome().is_finished() {
+            break;
+        }
+    }
+    assert!(
+        rising_inside_the_pad,
+        "the fixture has to actually put the body through the pad's cell while it is rising, or this \
+         test is vacuous"
+    );
+    assert!(
+        !launched_while_rising,
+        "a body inside a pad's cell that is not falling onto it must not be launched: the pad's rule \
+         is about *arriving* on it"
+    );
+    assert!(
+        thrown_on_the_way_down,
+        "and the same body, falling back onto the pad, must be thrown — otherwise this test would \
+         pass just as well against a pad that does nothing at all"
+    );
+
+    // And a body walking across a pad on the ground is not launched either: `vy` is zero for a body
+    // standing on something, so the pad is a floor you can walk over and a target you have to land
+    // on. This is the half that keeps a pad in a corridor from being an obstacle.
+    let level = fixture("pad-corridor", PAD_IN_THE_ARC, (1, 3), &[("goal", 11, 3)]);
+    let mut walker = sim::Sim::new(&level, 9);
+    common::settle(&mut walker);
+    let mut lowest_walk = 0.0f32;
+    for _ in 0..80u32 {
+        walker.step(AgentAction::Run);
+        lowest_walk = lowest_walk.min(walker.player().vy);
+    }
+    assert_eq!(
+        lowest_walk, 0.0,
+        "walking over a pad is not landing on it: vy must never go negative"
+    );
+}
+
+/// Ground row 7, the first ten columns of it brittle: a floor that is a bridge with a deadline.
+const BRITTLE_BRIDGE: &[&str] = &[
+    "............",
+    "............",
+    "............",
+    "............",
+    "............",
+    "............",
+    "............",
+    "#dddddddddd#",
+];
+
+#[test]
+fn a_cracked_tile_holds_a_body_up_and_then_takes_itself_out_of_the_level() {
+    let authored = fixture("brittle", BRITTLE_BRIDGE, (1, 6), &[("goal", 11, 6)]);
+    let mut sim = sim::Sim::new(&authored, 11);
+    // The route table this episode steers by, taken before anything breaks. As a raw pointer:
+    // the body has to be stepped to break the tile, and stepping it needs `&mut sim`.
+    let routes = std::ptr::from_ref(sim.level().routes());
+
+    // Frame 1 is the frame the body is standing on brittle ground, so it is the frame the fuse
+    // starts. Before anything else: a cracked tile is *solid*, which is the whole reason a brittle
+    // bridge is a bridge rather than a row of holes.
+    sim.step(AgentAction::Walk);
+    assert!(sim.player().grounded, "the spawn is on the tile below it");
+    assert_eq!(
+        sim.level().tile(1, 7),
+        Some(Tile::Cracked),
+        "a cracked tile holds a body up; it is only brittle, not missing"
+    );
+
+    // The fuse is exactly `CRUMBLE_TICKS` frames long, counted rather than asserted loosely:
+    // "a while" is what a fuse is when nobody can say how long. A tile first stood on during frame
+    // F is underfoot for frames F..=F+CRUMBLE_TICKS-1 and gone on frame F+CRUMBLE_TICKS, so the
+    // body is grounded on every frame up to the last one of the fuse and the tile leaves the level
+    // on the frame after — which is the whole of what a level author is told when the number is
+    // quoted at them.
+    for _ in 0..(CRUMBLE_TICKS - 1) {
+        sim.step(AgentAction::Walk);
+        assert_eq!(
+            sim.level().tile(1, 7),
+            Some(Tile::Cracked),
+            "the tile must last the whole fuse, frame {}",
+            sim.stats().frames
+        );
+        assert!(sim.player().grounded, "and hold the body up while it does");
+    }
+    assert_eq!(
+        sim.stats().frames,
+        CRUMBLE_TICKS,
+        "the last frame of the fuse is a frame the body is still standing on it"
+    );
+    sim.step(AgentAction::Walk);
+    assert_eq!(
+        sim.level().tile(1, 7),
+        Some(Tile::Empty),
+        "standing on brittle ground for CRUMBLE_TICKS takes it out of the level"
+    );
+
+    // **The route table outlives the ground it was built on.** A brittle tile burning out under the
+    // body is an episode's own damage, not an edit to the level: the flag has not moved, so the
+    // compass the waypoint sensor steers by does not swing, and the geodesic `hops_to_flag` the
+    // score reads stays a reading of the level's route rather than of one body's damage. The
+    // physics is exact either way — it reads the live grid, as the assertion above shows — so what
+    // is shared is only the route.
+    //
+    // It is also the difference between a level with cracked ground being trainable and being
+    // unaffordable: the sweep behind a route table is milliseconds, and it used to be run again for
+    // every tile every episode broke (measured on a 60x15 level with six brittle tiles: 0.299
+    // s/generation re-sweeping, 0.015 with the route kept).
+    assert!(
+        std::ptr::eq(routes, std::ptr::from_ref(sim.level().routes())),
+        "a broken tile must not redraw the route table: the flag it points at has not moved"
+    );
+
+    // A tile the body never stood on never lights: brittleness is a trap for the body that *chooses*
+    // to cross it, not a floor with a countdown on it.
+    assert_eq!(
+        sim.level().tile(6, 7),
+        Some(Tile::Cracked),
+        "a cracked tile nobody stands on is untouched"
+    );
+
+    // **The document is not the episode.** The authored level still holds the tile it was drawn
+    // with, so a run can be replayed against it and the level file is never the thing a body
+    // destroys.
+    assert_eq!(
+        authored.tile(1, 7),
+        Some(Tile::Cracked),
+        "the sim mutates its own copy of the level, not the one it was built from"
+    );
+
+    // And with the tile gone the body is standing on nothing, over nothing: the fall ends in the
+    // pit the level always had under that floor.
+    let y0 = sim.player().y;
+    let mut died = false;
+    for _ in 0..120u32 {
+        sim.step(AgentAction::Walk);
+        if sim.outcome() == sim::Outcome::Died {
+            died = true;
+            break;
+        }
+    }
+    assert!(
+        sim.player().y > y0 + 1.0 || died,
+        "the body should fall through the hole it made (y {y0} -> {})",
+        sim.player().y
+    );
+    assert!(died, "and the fall out of the world is a death");
+}
+
+#[test]
+fn a_walkers_patrol_does_not_light_a_cracked_floor() {
+    // The player stands on sound ground at the left end; the patrol lives on the brittle span.
+    let level = fixture(
+        "walker-brittle",
+        BRITTLE_BRIDGE,
+        (0, 6),
+        &[("walker", 6, 6), ("goal", 11, 6)],
+    );
+    let mut sim = sim::Sim::new(&level, 3);
+    for _ in 0..300u32 {
+        sim.step(AgentAction::Walk);
+    }
+    assert!(
+        sim.walkers().iter().any(|w| w.alive),
+        "the patrol has to still be there, or this proves nothing"
+    );
+    for tx in 1..=10 {
+        assert_eq!(
+            sim.level().tile(tx, 7),
+            Some(Tile::Cracked),
+            "a walker crossed column {tx} and the floor it walks on is still there: a patrol must \
+             not demolish the level it lives in"
+        );
+    }
+}
+
+/// **The four brittle materials are one behaviour**, so a cracked beach, wall and decking are the
+/// same trap drawn in a different ground — the assertion `sand_is_a_material_and_not_a_mechanic`
+/// makes for the sound four, made for the brittle ones.
+///
+/// Four levels that differ only in which glyph their floor is written in, with the same action
+/// sequence run through all four: every frame has to agree on the state *and* on the observation,
+/// the tile has to leave the level on the same tick, and the tiles the body never stood on have to
+/// survive. The observation half is the one that matters to the population — all four read the same
+/// `ENC_CRUMBLE`, so which material an author chose is not a new problem to learn — and the state
+/// half is what makes "one behaviour" true rather than aspirational: the fuse, the removal and the
+/// hole left behind are the same arithmetic in all four.
+#[test]
+fn the_four_brittle_materials_are_one_behaviour() {
+    let sky = "............".to_string();
+    let level = |glyph: char| {
+        let mut rows = vec![sky.clone(); 7];
+        rows.push(format!("#{}{glyph}#", glyph.to_string().repeat(9)));
+        fixture("brittle-material", &rows, (1, 6), &[("goal", 11, 6)])
+    };
+
+    let glyphs = ['d', 's', 'b', 'w'];
+    let mut sims: Vec<(char, sim::Sim)> = glyphs
+        .iter()
+        .map(|g| (*g, sim::Sim::new(&level(*g), 5)))
+        .collect();
+    let mut broke_at: Vec<Option<u32>> = vec![None; sims.len()];
+    for frame in 1..=120u32 {
+        for (i, (_, sim)) in sims.iter_mut().enumerate() {
+            sim.step(AgentAction::Walk);
+            if broke_at[i].is_none() && sim.level().tile(1, 7) == Some(Tile::Empty) {
+                broke_at[i] = Some(frame);
+            }
+        }
+        for pair in sims.windows(2) {
+            assert_eq!(
+                pair[0].1.state_hash(),
+                pair[1].1.state_hash(),
+                "the {:?} and {:?} floors diverge at frame {frame}: a brittle material is behaving \
+                 as something other than brittle ground",
+                pair[0].0,
+                pair[1].0
+            );
+            assert_eq!(
+                pair[0].1.observation(),
+                pair[1].1.observation(),
+                "an agent can tell the {:?} and {:?} floors apart at frame {frame}, which makes a \
+                 material a mechanic",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    // The tile the body stood on left the level, on the same tick in all four.
+    assert!(
+        broke_at[0].is_some(),
+        "no floor broke in 120 frames of standing on it, so this test proves nothing"
+    );
+    for (glyph, when) in glyphs.iter().zip(&broke_at) {
+        assert_eq!(
+            *when, broke_at[0],
+            "the {glyph:?} floor broke on a different frame: {broke_at:?}"
+        );
+    }
+
+    // And the tiles nobody stood on are still there in every one of the four.
+    for (glyph, sim) in &sims {
+        for tx in 2..=10 {
+            assert_eq!(
+                sim.level().tile(tx, 7).map(|t| t.is_cracked()),
+                Some(true),
+                "{glyph:?}: column {tx} was never stood on and must still be brittle ground"
+            );
+        }
+    }
+}

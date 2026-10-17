@@ -866,7 +866,10 @@ fn autotile(level: &Level, tx: i32, ty: i32) -> Tiling {
     let surface = mask & 0b0001 != 0;
     let deep = !surface && depth_under_surface(level, tx, ty) >= ROCK_DEPTH;
     let soil = soil_name(mask, deep);
-    let tile = level.tile(tx, ty).unwrap_or(Tile::Solid);
+    // Brittleness is stripped off before anything below asks a question: every row of this match
+    // is about what a tile is *made of*, and a cracked beach is a beach. The one caller that cares
+    // that it is cracked draws the crack over this result.
+    let tile = level.tile(tx, ty).unwrap_or(Tile::Solid).base_material();
     let (look, name) = match (tile, surface, deep) {
         (Tile::Sand, true, _) => (Look::Beach, SAND[mask as usize]),
         (Tile::Sand, false, true) => (Look::Sandstone, SANDSTONE[mask as usize]),
@@ -1039,6 +1042,29 @@ fn tile_sprite(sprites: &Sprites, tiling: Tiling, tx: i32, ty: i32) -> Rect {
         (0, _) | (_, None) => sprites.get(plain),
         (n, Some(options)) => sprites.first_of(&[options[n - 1], plain]),
     }
+}
+
+/// The crack drawn over a brittle tile: its material's overlay, or `None` for a sound tile.
+///
+/// **Optional art, on the same terms as the sand family and the tile variants.** A tileset drawn
+/// before cracked ground existed draws a brittle tile as the material it is made of, and the only
+/// thing lost is the warning that it is about to go — which is a real loss, and still not a reason
+/// for somebody else's atlas to stop starting. The palette's cracked brushes lean on the same
+/// four sprites, so a tileset without them paints a cracked floor the colour of its material.
+///
+/// One overlay per **material** rather than one crack for all four, because a crack is the
+/// material's own darkest tone: a grey fissure across a beach is the kind of detail that makes the
+/// eye stop reading the tile as sand, and the layers here already exist for exactly this reason
+/// (`_with_detail(ground(1), _crack)` in `tools/art/terrain.py`).
+fn cracked_overlay(sprites: &Sprites, tile: Tile) -> Option<Rect> {
+    let name = match tile {
+        Tile::Cracked => "cracked_ground",
+        Tile::CrackedSand => "cracked_sand",
+        Tile::CrackedBrick => "cracked_brick",
+        Tile::CrackedPlank => "cracked_wood",
+        _ => return None,
+    };
+    sprites.try_get(name)
 }
 
 /// Draw the seams where this tile's material meets another one.
@@ -2268,16 +2294,39 @@ pub fn draw_level(
     for ty in ty0..ty1 {
         for tx in tx0..tx1 {
             let rect = sheet.tile(tx, ty);
-            match level.tile(tx, ty) {
+            let tile = level.tile(tx, ty);
+            match tile {
                 // Sand, brick and wood are drawn by the same call: which material a solid
                 // tile is made of is one lookup inside it, and nothing here has to know.
-                Some(Tile::Solid | Tile::Sand | Tile::Brick | Tile::Plank) => {
+                // A *cracked* tile is the same call again, and the crack is drawn over it:
+                // brittleness is a second thing about a tile, not a fifth material, so the
+                // material is drawn exactly as it would be if the tile were sound
+                // ([`crate::view::cracked_overlay`]).
+                Some(
+                    Tile::Solid
+                    | Tile::Sand
+                    | Tile::Brick
+                    | Tile::Plank
+                    | Tile::Cracked
+                    | Tile::CrackedSand
+                    | Tile::CrackedBrick
+                    | Tile::CrackedPlank,
+                ) => {
                     let tiling = autotile(level, tx, ty);
                     sheet.image(rect, tile_sprite(sheet.sprites, tiling, tx, ty));
                     draw_seams(sheet, level, tx, ty, rect, tiling.look);
+                    if let Some(crack) = tile.and_then(|t| cracked_overlay(sheet.sprites, t)) {
+                        sheet.image(rect, crack);
+                    }
                 }
                 Some(Tile::Spike) => {
                     sheet.image(rect, sheet.sprites.get("spike"));
+                }
+                // A spring pad fills its cell the way a spike does, and for the same reason:
+                // it is a thing standing in the tile a body passes through rather than a
+                // material the level is made of, so there is no autotile family to pick from.
+                Some(Tile::Spring) => {
+                    sheet.image(rect, sheet.sprites.get("spring"));
                 }
                 Some(Tile::Empty) | Some(Tile::Goal) | None => {}
             }
