@@ -2279,13 +2279,15 @@ mod tests {
     /// note is what the panel shows, so a warm start is never something the operator has to infer
     /// from the first generation's scores.
     ///
-    /// **The walk is a partial one, and that is the claim.** At the trainer's four-tick decision
-    /// cadence `l2-first-gap`'s replay closes one hop and stops (`train-cli train --from-route` over
-    /// the shipped pack leaves only `l1-flat-run` reaching its flag), which is the case the window is
-    /// built for: a partial walk is still a handover, and it still says where it came from. An
-    /// earlier version of this test asserted the *whole* route, and the claim it was really testing
-    /// was a route sidecar written before the take-off rule changed under an unchanged
-    /// `MOVE_SET_VERSION` — green here, red in CI, which rebuilds the graph from the terrain.
+    /// **The whole route, and this time because the walk takes it.** An earlier version of this test
+    /// asserted the same thing and was green for the wrong reason: it read the shipped file and
+    /// adopted whatever route sidecar was beside it, so the claim it measured was `MOVE_SET_VERSION`
+    /// 3's graph on a developer's disk rather than the graph this code builds — green here, red in
+    /// CI, which rebuilds from the terrain. The copy below cannot be adopted that way, so the
+    /// assertion is about the replay. `l2-first-gap` is the pack's first earned level and its route
+    /// walks at the trainer's decision cadence (three hops, `evo::tests::route_play`'s table), and a
+    /// window that found a *partial* walk here would still warm the population — the partial case is
+    /// the one that always has to keep working — but it is not the case this level is.
     #[test]
     fn a_fresh_run_warmed_from_the_route_says_so_and_is_not_random() {
         let dir = scratch("route-warm");
@@ -2316,8 +2318,8 @@ mod tests {
             .expect("a warmed run says where its first generation came from")
             .to_string();
         assert!(
-            note.contains("warmed from this level's own route")
-                && note.contains("the replay")
+            note.contains("walked the whole route")
+                && note.contains("warmed from this level's own route")
                 && note.contains("cloned"),
             "the note names the walk and the clone: {note}"
         );
