@@ -125,7 +125,7 @@ members = [
 # unchanged: the patch already said where the vine is, and what changed is what the body does on
 # it.
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"

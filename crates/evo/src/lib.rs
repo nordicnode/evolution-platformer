@@ -42,9 +42,10 @@ pub use ga::{
 };
 pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
 pub use imitate::{
-    clone_from_play, from_route, warm_population, warm_set, ImitateConfig, ImitationReport,
+    clone_from_play, from_plan, from_route, warm_population, warm_set, ImitateConfig,
+    ImitationReport,
 };
-pub use route_play::{replay, Decision, RoutePlay};
+pub use route_play::{replay, timed_play, Decision, RoutePlay};
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///

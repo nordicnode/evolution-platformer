@@ -135,8 +135,18 @@ pub struct RoutePlay {
     pub decisions: Vec<Decision>,
     pub outcome: Outcome,
     pub frames: u32,
+    /// The episode seed the walk ran under. A trajectory is only a demonstration if it can be
+    /// replayed, and a replay needs this.
+    pub seed: u64,
     /// Route hops closed on the way (`hops_to_flag` falling while the body stood on a stand).
     pub hops_closed: u32,
+    /// The number of decision blocks played before the walk's deepest route stand.
+    ///
+    /// A prefix of a demonstration is the state a stalled run reached; a planner can start
+    /// there, and a curriculum can hand that state back as a practice start.
+    pub best_block: usize,
+    /// The deepest stand the walk stood on, when it stood on one.
+    pub best_stand: Option<usize>,
     /// The route's own length in hops, when the graph had one: how much of it a win had to walk.
     pub route_hops: Option<u32>,
     /// One line saying what happened, in the terms a report reads — the failing hop included.
@@ -155,6 +165,27 @@ impl RoutePlay {
     /// The body reached the flag, driven only by the oracle's own route.
     pub fn won(&self) -> bool {
         self.outcome == Outcome::Won
+    }
+
+    /// The state the walk reached at its deepest route stand, rebuilt by replaying the recorded
+    /// block actions from the spawn.
+    ///
+    /// This is the hand-off point between the route walk and a planner: the walk gets the body
+    /// through the corridor, and the plan starts where the corridor ends. Replaying is exact
+    /// because the decisions are the same block actions the walk held, and the sim is
+    /// deterministic.
+    pub fn state_at_best(&self, level: &Level, cfg: &EvalConfig) -> Option<Sim> {
+        let repeat = cfg.action_repeat.max(1);
+        let mut sim = Sim::new(level, self.seed);
+        for d in self.decisions.iter().take(self.best_block) {
+            for _ in 0..repeat {
+                sim.step(d.action);
+                if sim.outcome().is_finished() {
+                    return None;
+                }
+            }
+        }
+        Some(sim)
     }
 }
 
@@ -491,6 +522,82 @@ fn choose_plan(
     candidates.into_iter().next().map(|(_, _, _, _, plan)| plan)
 }
 
+/// Drive a **planned** route through the real episode loop and record it as a demonstration.
+///
+/// The planner ([`sim::plan`]) already writes its answer in decision blocks, so this is a replay
+/// rather than a second controller: every action is held for one block, the observation is taken
+/// at the block's own state, and the outcome is the sim's. That is the difference between this
+/// and [`replay`], whose scripts are indexed in ticks and cannot be fitted at the policy's
+/// cadence.
+///
+/// A route that does not reach the flag is still a demonstration of the part that was played,
+/// and its `note` says so. Callers that need a guarantee (a seeded run, a report) should read
+/// [`RoutePlay::won`] rather than assume one.
+///
+pub fn timed_play(
+    level: &Level,
+    route: &sim::plan::TimedRoute,
+    cfg: &EvalConfig,
+) -> RoutePlay {
+    timed_play_from(level, route, &Sim::new(level, route.seed), cfg)
+}
+
+/// [`timed_play`] from a **snapshot**: the plan is the suffix after a route walk, and the
+/// observations it is recorded against are the ones the full episode had at that point.
+pub fn timed_play_from(
+    level: &Level,
+    route: &sim::plan::TimedRoute,
+    start: &Sim,
+    cfg: &EvalConfig,
+) -> RoutePlay {
+    debug_assert_eq!(level.width, start.level().width, "a plan replays on its own geometry");
+    let repeat = cfg.action_repeat.max(1);
+    let mut sim = start.clone();
+    let mut decisions: Vec<Decision> = Vec::new();
+    for action in &route.actions {
+        if sim.outcome().is_finished() {
+            break;
+        }
+        decisions.push(Decision {
+            observation: sim.observation(),
+            action: *action,
+        });
+        for _ in 0..repeat {
+            sim.step(*action);
+            if sim.outcome().is_finished() {
+                break;
+            }
+        }
+    }
+    let outcome = sim.outcome();
+    let frames = sim.stats().frames;
+    let note = if outcome == Outcome::Won {
+        format!(
+            "planned route walked in {frames} frames over {} decisions",
+            decisions.len()
+        )
+    } else {
+        format!(
+            "the planned route ended as {outcome:?} at ({:.2}, {:.2}) after {} decisions and {frames} frames",
+            sim.player().x,
+            sim.player().y,
+            decisions.len()
+        )
+    };
+    RoutePlay {
+        decisions,
+        outcome,
+        frames,
+        seed: route.seed,
+        hops_closed: route.hops,
+        best_block: 0,
+        best_stand: None,
+        route_hops: None,
+        note: note.clone(),
+        trace: vec![note],
+    }
+}
+
 /// Replay a level's route through the real episode loop.
 ///
 /// A level with no route to its flag has nothing to walk — [`sim::reach::report`] is the instrument
@@ -532,6 +639,12 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
     let mut closest_goal = f32::INFINITY;
     let route_hops = spawn_route_stand(level).and_then(|s| routes.hops_to_flag(s));
     let mut trace: Vec<String> = Vec::new();
+    // The deepest route state the walk actually stood in, as the prefix a planner or a
+    // curriculum can restart from. Recorded at the block boundary the decision is taken on, so
+    // `best_block` is the number of decisions that have already been played at that state.
+    let mut best_block = 0usize;
+    let mut best_stand: Option<usize> = None;
+    let mut best_stand_hops: Option<u32> = None;
 
     while !sim.outcome().is_finished() {
         let frames = sim.stats().frames;
@@ -746,6 +859,17 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
         last_x = x;
 
         if on_block {
+            if grounded {
+                if let Some(s) = stand_under(level, &sim) {
+                    if let Some(h) = routes.hops_to_flag(s) {
+                        if best_stand_hops.is_none_or(|b| h < b) {
+                            best_stand_hops = Some(h);
+                            best_stand = Some(s);
+                            best_block = decisions.len();
+                        }
+                    }
+                }
+            }
             decisions.push(Decision {
                 observation: sim.observation(),
                 action: held,
@@ -783,7 +907,10 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
         decisions,
         outcome: sim.outcome(),
         frames: sim.stats().frames,
+        seed,
         hops_closed,
+        best_block,
+        best_stand,
         route_hops,
         note,
         trace,

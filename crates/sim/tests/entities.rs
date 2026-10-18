@@ -457,6 +457,71 @@ fn a_mover_does_not_teleport_a_body_that_is_not_crossing_its_deck() {
     assert_eq!(sim.outcome(), Outcome::Running);
 }
 
+/// **Standing still for a deck is not camping.**
+///
+/// The anti-camper timer is 600 frames. On a mover level the right move is often to wait at the
+/// lip for the shuttle to come back, and a body that does so must not be declared stuck for it.
+/// The fixture's deck travels the whole level at the body's own height, so every frame of the
+/// wait is a frame a deck can arrive on; the control arm has the same body and no deck, and it is
+/// declared stuck on schedule.
+#[test]
+fn waiting_at_the_lip_for_a_deck_is_not_stuck() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let with_deck = level(
+        "wait-for-deck",
+        &rows,
+        (1, 4),
+        &[
+            "{\"type\":\"platform\",\"x\":8,\"y\":3,\"tiles\":2,\"span\":8,\"dir\":-1}"
+                .to_string(),
+            goal(19, 4),
+        ],
+    );
+    let without = level("no-deck", &rows, (1, 4), &[goal(19, 4)]);
+
+    // Long enough to pass the 600-frame anti-camper timer with room to spare, inside the level's
+    // own 800-frame budget.
+    let mut waiting = sim::Sim::new(&with_deck, 3);
+    for _ in 0..700 {
+        waiting.step(AgentAction::Walk);
+        if waiting.outcome().is_finished() {
+            break;
+        }
+    }
+    assert_eq!(
+        waiting.outcome(),
+        Outcome::Running,
+        "a body waiting on a deck's travel was ended at frame {} as {:?}",
+        waiting.stats().frames,
+        waiting.outcome()
+    );
+
+    let mut camping = sim::Sim::new(&without, 3);
+    for _ in 0..700 {
+        camping.step(AgentAction::Walk);
+        if camping.outcome().is_finished() {
+            break;
+        }
+    }
+    assert_eq!(
+        camping.outcome(),
+        Outcome::Stuck,
+        "the same body with nothing to wait for is still a camper"
+    );
+    assert!(
+        camping.stats().frames >= sim::NO_PROGRESS_FRAMES,
+        "and it was ended by the anti-camper timer, not something else (frame {})",
+        camping.stats().frames
+    );
+}
+
 /// **A rider is carried, not dragged through a wall.**
 ///
 /// The shelf slides towards a wall tile in its own row; the body standing on it must stop at

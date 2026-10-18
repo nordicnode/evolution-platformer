@@ -119,15 +119,15 @@ fn patch_index(dx: i32, dy: i32) -> usize {
 
 #[test]
 fn the_vector_has_the_documented_named_layout() {
-    // 100 = the plan's 90 plus the three ability inputs appended by v2, v3's second goal
-    // axis, v4's second gap probe, v7's enemy heading, v8's two waypoint axes, and v10's two
-    // sub-tile phases. Every earlier index keeps its slot, which is what makes the diff between
-    // the layouts reviewable.
+    // 108 = the plan's 90 plus the three ability inputs appended by v2, v3's second goal
+    // axis, v4's second gap probe, v7's enemy heading, v8's two waypoint axes, v10's two
+    // sub-tile phases, and v13's eight time slots. Every earlier index keeps its slot, which is
+    // what makes the diff between the layouts reviewable.
     assert_eq!(
         sensors::N_INPUTS,
-        100,
-        "§7.2's 90 plus v2's three, v3's and v4's one each, v7's enemy_dir, v8's waypoint and \
-         v10's two phases"
+        108,
+        "§7.2's 90 plus v2's three, v3's and v4's one each, v7's enemy_dir, v8's waypoint, \
+         v10's two phases and v13's eight time slots"
     );
     // v5 bounded the enemy slots and v6 widened that bound; both moved the reading without
     // moving a slot. v7 and v8 are appends, which is why this number moved: the whole
@@ -143,7 +143,10 @@ fn the_vector_has_the_documented_named_layout() {
     // is being read a world it never saw.
     // v12 is v9's kind again, for three tiles at once: water, lava and a vine are their own values
     // in the patch, and a champion trained before it reads a pool as air.
-    assert_eq!(sensors::VERSION, 12);
+    // v13 appends eight slots (the episode clock, the next dangerous event's eta and position, a
+    // mover's velocity and cycle phase, and the body's ground/air ticks): a champion trained before
+    // it is blind to every timed mechanic in the pack, which is the whole reason for the bump.
+    assert_eq!(sensors::VERSION, 13);
 
     let names = sensors::input_names();
     assert_eq!(names.len(), sensors::N_INPUTS);
@@ -180,7 +183,20 @@ fn the_vector_has_the_documented_named_layout() {
         "v10 appends where the body is inside its own tile"
     );
     assert_eq!(names[99], "phase_y");
-    assert_eq!(names.len(), 90 + 3 + sensors::N_ABILITY_INPUTS + 2 + 2);
+    // v13 appends the clock, the next event's eta and position, the nearest mover's velocity and
+    // cycle phase, and the body's own press timing.
+    assert_eq!(names[100], "clock");
+    assert_eq!(names[101], "event_eta");
+    assert_eq!(names[102], "event_dx");
+    assert_eq!(names[103], "event_dy");
+    assert_eq!(names[104], "mover_vx");
+    assert_eq!(names[105], "mover_vy");
+    assert_eq!(names[106], "mover_phase");
+    assert_eq!(names[107], "ground_air");
+    assert_eq!(
+        names.len(),
+        90 + 3 + sensors::N_ABILITY_INPUTS + 2 + 2 + 8
+    );
 }
 
 /// **Where the goal vector is clamped, the phase slots are the only sub-tile position there is.**
@@ -761,9 +777,14 @@ fn the_ability_slots_report_the_wall_and_the_sprint() {
 /// The fixture is a one-crossing floor with the flag to the right, so both new slots are drawn
 /// non-zero here: an accidental change to which stand the route aims at, or to the waypoint's
 /// normaliser, lands on this number.
+///
+/// Re-pinned for **v13**, which appends slots 100-107. The fixture has no turret, vent or mover,
+/// so six of the eight read zero; the clock reads the settled frame count in its 64-frame buckets
+/// and `ground_air` reads the ticks the body has spent on its feet. Both are still drawn, so the
+/// hash pins them.
 #[test]
 fn golden_observation_hash_at_a_fixed_state() {
-    const GOLDEN_OBSERVATION_HASH: u64 = 13_055_861_740_400_240_297;
+    const GOLDEN_OBSERVATION_HASH: u64 = 12_842_302_117_604_028_991;
 
     let level = common::fixture("ground", GROUND, (5, 3), &[("walker", 9, 3), ("goal", 11, 3)]);
     let mut sim = sim::Sim::new(&level, 5);

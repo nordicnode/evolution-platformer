@@ -189,7 +189,7 @@ use crate::genome::{ActScratch, Genome};
 /// v8: the speed term below ([`SPEED_BONUS`]) — a win pays for the budget it did not spend —
 /// and the archive gained a finish-time axis, which changes what the search *keeps* without
 /// changing what it scores.
-pub const FITNESS_VERSION: u32 = 8;
+pub const FITNESS_VERSION: u32 = 9;
 
 /// Physics ticks between network queries (§7.3): 60 Hz sim → a decision every ~67 ms; the
 /// chosen action repeats in between. Exposed as a tuning knob; the plan's range is 3–6.
@@ -319,6 +319,16 @@ pub const SPEED_BONUS: f32 = 200.0;
 /// giving evolution a true geodesic gradient all the way to the top.
 pub const ROUTE_HOP_BONUS: f32 = 32.0;
 
+/// Fitness for each moving-platform deck the body has **stood on** (new in v9).
+///
+/// One tile of progress, the same size as a hazard checkpoint and for the same reason: it is
+/// an arrival, not a proxy, and it is one-shot per deck. On a level whose crossing is a chain
+/// of shuttles, the frontier and the route-hop ladder both only move once the crossing has
+/// already succeeded; this is the term that makes "get onto the first deck" a visible step.
+/// It cannot be farmed — the body has to be standing on the deck, and a deck pays once — and
+/// a level with no mover pays nothing, so no earlier landscape moves.
+pub const DECK_BONUS: f32 = 16.0;
+
 /// Knobs the evaluation depends on. Part of the champion metadata, because
 /// changing the cadence changes the trajectory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +357,7 @@ pub fn score(stats: &EpisodeStats, outcome: Outcome) -> f32 {
     f += stats.jumps as f32 * JUMP_PENALTY;
     f += stats.checkpoints as f32 * CHECKPOINT_BONUS;
     f += stats.route_hops_closed as f32 * ROUTE_HOP_BONUS;
+    f += stats.decks as f32 * DECK_BONUS;
     if outcome == Outcome::Died {
         f += DEATH_PENALTY;
     }
@@ -455,6 +466,9 @@ pub struct EpisodeResult {
     /// genome a cull removes.
     pub all_trials_won: bool,
     pub death_pos: Option<(f32, f32)>,
+    /// What ended a dying episode, when the stepper recorded one. Diagnostics only: it is not
+    /// scored and not part of the trajectory hash.
+    pub death_cause: Option<sim::DeathCause>,
     pub seed: u64,
     /// Hash of the decision trace and final state. Champion round-trip tests
     /// compare this, so a replay that diverges anywhere is caught.
@@ -587,6 +601,7 @@ impl EpisodeRunner {
             // its own outcome is the conservative answer. `SuiteTally::result` can only lower it.
             all_trials_won: outcome == Outcome::Won,
             death_pos: stats.death_pos,
+            death_cause: self.sim.death_cause(),
             seed: self.seed,
             trajectory_hash: self.trace.finish(),
         }
@@ -644,6 +659,7 @@ mod tests {
             checkpoints: 0,
             route_hops_closed: 0,
             best_stand: None,
+            decks: 0,
             death_pos: None,
         }
     }
@@ -728,6 +744,36 @@ mod tests {
         assert!(
             worst_win > best_without_goal,
             "touching the flag ({worst_win}) must outweigh a full-width run ({best_without_goal})"
+        );
+    }
+
+    /// **A deck is worth a rung, once.**
+    ///
+    /// The v9 term is an arrival, not a distance: the episode counts distinct decks stood on, so
+    /// two landings on the same deck pay one bonus and a second deck pays another. It is small
+    /// and one-shot because it is a shaping term, not a win: the flag is still the objective, and
+    /// a level with no mover must score exactly as it did before v9.
+    #[test]
+    fn a_deck_pays_once_and_only_when_it_was_stood_on() {
+        let none = stats(0.0, 100);
+        let one = EpisodeStats {
+            decks: 1,
+            ..stats(0.0, 100)
+        };
+        let two = EpisodeStats {
+            decks: 2,
+            ..stats(0.0, 100)
+        };
+        let base = score(&none, Outcome::Running);
+        assert_eq!(
+            score(&one, Outcome::Running) - base,
+            DECK_BONUS,
+            "the first deck pays its one bonus"
+        );
+        assert_eq!(
+            score(&two, Outcome::Running) - base,
+            2.0 * DECK_BONUS,
+            "each further deck is its own arrival"
         );
     }
 

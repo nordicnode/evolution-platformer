@@ -2303,6 +2303,18 @@ impl Mover {
         rect
     }
 
+    /// Where the cycle is at `tick`, in `0..1`: `0` at the home end, `0.5` at the far end.
+    ///
+    /// The observation's phase slot, and the planner's "when will this deck be here" question.
+    /// It is a function of the frame count, exactly as [`Mover::rect_at`] is.
+    pub fn phase_at(&self, tick: u32, ph: &Physics) -> f32 {
+        let span = self.limit.clamp(0.0, self.span.max(0.0));
+        let speed = ph.mover_speed.max(1e-6);
+        let half = span / speed;
+        let period = (2.0 * half).max(1.0);
+        (tick as f32 % period) / period
+    }
+
     /// Where it moved between `tick - 1` and `tick`, which is what a rider is carried by.
     pub fn delta_at(&self, tick: u32, ph: &Physics) -> (f32, f32) {
         if tick == 0 {

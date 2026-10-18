@@ -1898,14 +1898,24 @@ mod tests {
         .expect("a fresh generator starts")
     }
 
-    /// A population small enough that the hardest level stalls inside a test's patience:
-    /// two genomes of a level that needs a precise jump stop improving almost at once.
-    /// The terminal's own curriculum test uses the same recipe on the same level.
+    /// A population that **cannot move**: no mutation, no crossover, no immigrants, so the
+    /// best score is flat from generation 0 and the 25-generation stall rule is a fact about
+    /// the fixture rather than about how a sensor version happened to change the landscape.
+    /// The curriculum tests are about the stall *chain* — checkpoint, detour, return — not
+    /// about whether a tiny population gets lucky on `l5-tightrope`, which is exactly the
+    /// coupling a sensor bump used to break.
     fn stalling_config() -> GaConfig {
         GaConfig {
             pop_size: 2,
             elite: 1,
             tournament: 2,
+            mutation_sigma: 0.0,
+            mutation_rate: 0.0,
+            crossover_rate: 0.0,
+            fine_children: 0,
+            immigrants: 0,
+            archive_children: 0,
+            adaptive_sigma: false,
             ..tiny_config()
         }
     }
@@ -2484,12 +2494,22 @@ mod tests {
         // level from the furthest stand its best genome has made — and steps back to
         // it. The note, the checkpoint and the practice level all appear, and the
         // note names the spot: "this run changed shape" is the viewer's to read.
+        //
+        // The fixture needs a best genome that has *stood* somewhere, which a frozen
+        // population of random weights need not have done (`l5`'s did not, and the
+        // derived step correctly refused). So generation 0 is warmed from `l11`'s own
+        // route: the walker clone reaches the plateau before the movers and then, with
+        // the population frozen, stalls there — the exact shape this step exists for.
         let dir = scratch("practice");
         let mut generator = generator_with(
-            "l5-tightrope",
-            stalling_config(),
+            "l11-the-elements",
+            GaConfig {
+                pop_size: 8,
+                ..stalling_config()
+            },
             RunPlan {
                 cap: Some(60),
+                warm_from_route: true,
                 ..RunPlan::default()
             },
             "practice",
@@ -2514,11 +2534,11 @@ mod tests {
             "the note names the spot it practised from: {note:?}"
         );
         assert!(
-            dir.join("l5-tightrope.population.json").exists(),
+            dir.join("l11-the-elements.population.json").exists(),
             "the stuck population is checkpointed"
         );
         assert!(
-            dir.join("l5-tightrope.practice.json").exists(),
+            dir.join("l11-the-elements.practice.json").exists(),
             "the practice level is written beside the checkpoint"
         );
     }

@@ -139,7 +139,12 @@ fn golden_state_hash_after_ten_thousand_frames() {
     // has no vine to pull up over. The constant above was reproduced *exactly* with the mantle's
     // bytes taken back out of the stream before this one was recorded, so the episode is still
     // bit-identical and only the hash grew.
-    const GOLDEN_LONG_RUNWAY_HASH: u64 = 10_818_682_214_639_513_976;
+    //
+    // Re-recorded for 0.16.0: the episode counts the distinct moving-platform decks it has stood on
+    // (`EpisodeStats::decks`, fitness v9), and that count is folded in even when it is zero. This
+    // runway has no mover, so no deck is ever stood on and the episode is bit-identical — only the
+    // hash stream grew.
+    const GOLDEN_LONG_RUNWAY_HASH: u64 = 13_720_823_320_593_112_504;
 
     let level = common::long_runway();
     let mut sim = sim::Sim::new(&level, SEED);

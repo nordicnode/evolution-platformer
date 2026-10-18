@@ -7,10 +7,10 @@ use std::time::Instant;
 use evo::champion::replay as replay_champion;
 use evo::ga::MUTATION_SIGMA_RANGE;
 use evo::{
-    curriculum_step, from_route, practice_level_for_stall, practice_step, save_practice_level,
-    warm_population, ChampionFile, EsConfig, EsTrainer, EvalConfig, GaConfig, ImitateConfig,
-    ImitationReport, PopulationFile, RoutePlay, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
-    FITNESS_VERSION,
+    curriculum_step, from_plan, from_route, practice_level_for_stall, practice_step,
+    save_practice_level, warm_population, ChampionFile, EsConfig, EsTrainer, EvalConfig, GaConfig,
+    ImitateConfig, ImitationReport, PopulationFile, RoutePlay, Trainer,
+    DEFAULT_CURRICULUM_GENERATIONS, FITNESS_VERSION,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use sim::physics::{AgentAction, PHYSICS};
@@ -54,6 +54,9 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "resume",
     "from-champion",
     "from-route",
+    "from-plan",
+    "plan-depth",
+    "plan-beam",
     "warm",
     "clone-epochs",
     "route-seed",
@@ -84,7 +87,7 @@ const ES_OPTS: &[&str] = &[
     "stop-on-win",
     "quiet",
 ];
-const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose"];
+const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose", "timed", "seed"];
 const REPLAY_OPTS: &[&str] = &["champion", "level", "levels-dir"];
 const SCORE_OPTS: &[&str] = &["champion", "level", "suite", "levels-dir", "seed"];
 const PLAY_OPTS: &[&str] = &["level", "seed"];
@@ -769,17 +772,23 @@ pub(crate) fn seeded_trainer(
     let resume = a.opt("resume");
     let from_champion = a.opt("from-champion");
     let from_route = a.has_flag("from-route");
-    let named = usize::from(resume.is_some()) + usize::from(from_champion.is_some())
-        + usize::from(from_route);
+    let from_plan = a.has_flag("from-plan");
+    let named = usize::from(resume.is_some())
+        + usize::from(from_champion.is_some())
+        + usize::from(from_route)
+        + usize::from(from_plan);
     if named > 1 {
         return Err(
-            "usage: --resume, --from-champion and --from-route are alternatives: they are three \
-             answers to \"where does this run start from\""
+            "usage: --resume, --from-champion, --from-route and --from-plan are alternatives: \
+             they are four answers to \"where does this run start from\""
                 .into(),
         );
     }
     if from_route {
         return route_seeded_trainer(cfg, level, a);
+    }
+    if from_plan {
+        return plan_seeded_trainer(cfg, level, a);
     }
     if let Some(path) = resume {
         let checkpoint = PopulationFile::load(path)?;
@@ -889,6 +898,80 @@ fn route_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Traine
     );
     println!(
         "seeded  {warm} of {} genomes from the clone (1 clone + {} mutated relatives), {} random",
+        cfg.pop_size,
+        warm - 1,
+        cfg.pop_size.saturating_sub(warm)
+    );
+    Trainer::resume(cfg, pop, 0)
+}
+
+/// A run warmed from a **timed plan**: the planner searches the real sim at the policy's own
+/// decision cadence, its route is replayed to prove it wins, and the demonstration is cloned into
+/// a quarter of the population.
+///
+/// This is the half `--from-route` cannot do. A route-graph walk presses on ticks the policy does
+/// not have a decision on, so on a level whose answer is a schedule it walks into the first
+/// hazard; a plan is a sequence of block actions, so the clone is fitted on the control grid it
+/// will actually use. The planner is offline: once the clone exists, the runtime is still the
+/// same 1 931-gene net.
+fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer, String> {
+    let default_warm = (cfg.pop_size / 4).max(1);
+    let warm = usage(a.usize_opt("warm", default_warm))?.clamp(1, cfg.pop_size);
+    // **Ten times the route clone's budget, because one press is the whole plan.** A walk clone is a
+    // head start and a missed press costs a generation; a planned crossing is a script, and a missed
+    // press at its one timed jump costs the demonstration. Measured on l11: 300 epochs agree 88% and
+    // die at x 12, 3 000 agree 97% and reach the second deck. `--clone-epochs` overrides it.
+    let epochs = usage(
+        a.usize_opt("clone-epochs", ImitateConfig::default().epochs.saturating_mul(10)),
+    )?;
+    let route_seed = usage(a.u64_opt("route-seed", cfg.master_seed))?;
+    let shape = cfg.shape.clone();
+    let eval = EvalConfig {
+        action_repeat: cfg.action_repeat,
+    };
+    let icfg = ImitateConfig {
+        epochs,
+        ..ImitateConfig::default()
+    };
+    let plan_cfg = sim::plan::PlanConfig {
+        depth: usage(a.usize_opt("plan-depth", sim::plan::PlanConfig::default().depth as usize))?
+            as u32,
+        beam: usage(a.usize_opt("plan-beam", sim::plan::PlanConfig::default().beam))?,
+        ..sim::plan::PlanConfig::default()
+    };
+    let started = std::time::Instant::now();
+    let (play, report, route) = from_plan(level, route_seed, &eval, shape, &icfg, plan_cfg)?;
+    println!(
+        "plan    {} (seed {route_seed}, {:.2}s)",
+        route.note,
+        started.elapsed().as_secs_f32()
+    );
+    println!("replay  {}", play.note);
+    println!("clone   {}", report.line());
+    // The number that decides whether this is a seed or a solution: the clone on the plan's
+    // own episode, closed loop. Agreement is a fit statistic; this is the game.
+    let solo = evo::run_episode(level, &report.genome, &eval, route_seed);
+    println!(
+        "clone plays {} after {} frames (fitness {:.2}, best_x {:.1}{})",
+        solo.outcome.as_str(),
+        solo.frames,
+        solo.fitness,
+        solo.best_x,
+        solo.death_cause
+            .map(|c| format!(", killed by {}", c.as_str()))
+            .unwrap_or_default()
+    );
+    let mut rng = sim::rng::rng_from_seed(cfg.master_seed ^ 0x2E5E_ED2E_5EED_2E5E);
+    let pop = warm_population(
+        &report.genome,
+        cfg.pop_size,
+        warm - 1,
+        cfg.mutation_sigma,
+        cfg.mutation_rate,
+        &mut rng,
+    );
+    println!(
+        "seeded  {warm} of {} genomes from the planned clone (1 clone + {} mutated relatives), {} random",
         cfg.pop_size,
         warm - 1,
         cfg.pop_size.saturating_sub(warm)
@@ -1275,8 +1358,60 @@ pub fn reach(a: &Args) -> Result<(), String> {
     };
 
     let mut failures = 0usize;
+    let timed = a.has_flag("timed");
+    let seed = usage(a.u64_opt("seed", 1))?;
     for path in &paths {
         let level = load_level(&path.to_string_lossy())?;
+        if timed {
+            // The static oracle answers "is a crossing expressible"; this answers "is there a
+            // schedule that walks it". The planner is the only thing in the tree that can see
+            // a mover's phase and a turret's cooldown, so it is the honest second question.
+            let started = std::time::Instant::now();
+            let plan = sim::plan::plan_level(&level, seed, sim::plan::PlanConfig::default());
+            println!("{:?} {} ({}) [timed]", plan.route.is_some(), level.name, path.display());
+            println!(
+                "         {} ({} expansions, {:.2}s)",
+                plan.note,
+                plan.expanded,
+                started.elapsed().as_secs_f32()
+            );
+            if let Some(route) = &plan.route {
+                println!(
+                    "         route {} blocks, {} frames, {} rungs closed",
+                    route.actions.len(),
+                    route.frames,
+                    route.hops
+                );
+                let head: Vec<&str> = route.actions.iter().take(16).map(|a| a.name()).collect();
+                println!("         first blocks: {}", head.join(" "));
+                let mut trace_sim = sim::Sim::new(&level, route.seed);
+                let mut marks: Vec<String> = Vec::new();
+                for (i, action) in route.actions.iter().enumerate() {
+                    for _ in 0..sim::DECISION_TICKS {
+                        trace_sim.step(*action);
+                    }
+                    if i % 20 == 0 || trace_sim.outcome() == sim::Outcome::Won {
+                        marks.push(format!(
+                            "{i}:({:.1},{:.1})",
+                            trace_sim.player().x,
+                            trace_sim.player().y
+                        ));
+                    }
+                    if trace_sim.outcome().is_finished() {
+                        break;
+                    }
+                }
+                println!("         trace: {}", marks.join(" "));
+            } else {
+                println!(
+                    "         frontier x {:.2}, y {:.2} at {} frames",
+                    plan.best_x, plan.best_y, plan.frames
+                );
+                failures += 1;
+            }
+            println!();
+            continue;
+        }
         let report = reach::report(&level);
         let status = if report.goal_reached { "OK      " } else { "UNBEATABLE" };
         println!("{status} {} ({})", level.name, path.display());
@@ -1421,6 +1556,15 @@ pub fn replay(a: &Args) -> Result<(), String> {
         result.jumps,
         result.checkpoints
     );
+    if let Some(cause) = result.death_cause {
+        if let Some((x, y)) = result.death_pos {
+            println!(
+                "why      killed by {} at ({x:.2}, {y:.2}) on frame {}",
+                cause.as_str(),
+                result.frames
+            );
+        }
+    }
 
     if actual != expected {
         return Err(format!(

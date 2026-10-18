@@ -30,7 +30,7 @@ numbered findings, the verification detail and the deferred work are in
 | **M4** editor + content | pixel renderer, generated art, drag-and-drop editor with a browsable level shelf and a whole-document mirror, playtest, the two **trap tiles** (brittle ground and spring pads), and the whole watch mode inside the window. Not yet: a curated starter pack |
 | **M5** web/release | not started — except its stall chain, which was done early |
 
-Version trio: **sim 0.15.0 / sensors v12 / fitness v8**, on **level format v3**. Every champion file records all
+Version trio: **sim 0.16.0 / sensors v13 / fitness v9**, on **level format v3**. Every champion file records all
 three and is *refused* rather than replayed against different physics or a different
 objective. What each version changed, and why, is in
 [FINDINGS.md](FINDINGS.md#the-version-trio).
@@ -47,7 +47,7 @@ thing at stake is whether the artifact on disk still counts.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 672 tests
+cargo test --workspace                 # 692 tests
 cargo build --release
 
 # The game: draw a level, drag tiles out of a palette, play it yourself.
@@ -123,6 +123,7 @@ be started in one front-end and resumed in the other:
 
 ```bash
 ./target/release/train-cli reach --all --levels-dir levels --verbose   # beatable at all?
+./target/release/train-cli reach --level levels/l11-the-elements.json --timed  # and on a timetable?
 ./target/release/train-cli watch --level levels/l5-tightrope.json      # watch it learn
 ./target/release/train-cli train --level levels/l3-gauntlet.json \
     --generations 200 --pop 200 --stop-on-win --csv out/l3.csv         # headless
@@ -130,6 +131,22 @@ be started in one front-end and resumed in the other:
 ./target/release/train-cli play --level levels/l1-flat-run.json        # play it yourself
 ./target/release/train-cli render --level levels/l3-gauntlet.json --steps 400 --stride 40
 ./target/release/train-cli sensors      # the observation layout and the physics bible
+
+# The model-based teacher: a best-first search over whole sim snapshots at the policy's own
+# 4-tick block cadence. It is the only planner in the tree that sees a deck's phase and a
+# turret's cooldown, so it answers "is there a *schedule*" rather than "is there a crossing".
+# On l11-the-elements it finds a 240-block, 957-frame route through the three decks in ~3 s;
+# the gradient-free route oracle calls the same level reachable without ever proving it walkable.
+./target/release/train-cli reach --level levels/l11-the-elements.json --timed --seed 1
+
+# Turn that route into a policy: the plan is replayed to prove it wins, cloned into the
+# 1.7k-parameter net at the cadence the net actually uses, and repaired with DAgger against
+# the states the student really visits. A quarter of the population starts from the clone;
+# the rest stays random, because a teacher's basin is a plateau as much as any other.
+# Measured on l11: 97% agreement, and the clone alone dies at x 30, before the first deck — it
+# is a warm start, not a solution, and 2 000 generations from it reached x 62 of 68 without a win.
+./target/release/train-cli train --level levels/l11-the-elements.json --from-plan \
+    --generations 300 --pop 200 --clone-epochs 3000 --stop-on-win
 
 # One policy, several levels: `--suite` scores every generation on all of them and ranks a
 # genome by the level it is *worst* at, and `score` asks a saved champion the same question.
@@ -184,7 +201,7 @@ be started in one front-end and resumed in the other:
 
 Two knobs are worth knowing before reading a table, because they change what the search can be
 rather than how it steps. `--hidden 32` (or `--hidden 32,16`) widens the net — the shipped recipe
-is one layer of 16, 1 739 genes, and the run's header prints the net it is actually training.
+is one layer of 16, 1 931 genes at the current observation width, and the run's header prints the net it is actually training.
 `--rank-pessimism 0.5` changes what "best" means without changing anything that is recorded: the
 ranking sits between the mean of a genome's own trials (0.0, the default) and the worst of them
 (1.0), which is the knob that answers finding 14 — an elite re-rolled out of the run by a patrol

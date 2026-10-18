@@ -60,7 +60,7 @@ pub struct NetShape {
     pub feedback: usize,
 }
 
-/// The v1 recipe, at the sensor layout's current width: 96 → 16 (tanh) → 11 (tanh, argmax),
+/// The v1 recipe, at the sensor layout's current width: 108 → 16 (tanh) → 11 (tanh, argmax),
 /// memoryless (§7.5).
 pub fn default_shape() -> NetShape {
     NetShape {
@@ -91,7 +91,7 @@ pub const MAX_FEEDBACK: usize = 64;
 /// genes that exist and shrinking it would reinterpret them. 64 is twice the shipped width and
 /// the same size as the memory ceiling, which is where the arithmetic stops being cheap: layer 0
 /// of the shipped sensor vector is 96 inputs, so a 64-wide first layer is ~6 400 genes per
-/// layer — five times the whole 1 739-gene genome this project trains by default, and no more
+/// layer — five times the whole 1 931-gene genome this project trains by default, and no more
 /// than a typo away from a sweep that costs ten times what it reads as.
 pub const MAX_HIDDEN_WIDTH: usize = 64;
 
@@ -102,7 +102,7 @@ pub const MAX_HIDDEN_WIDTH: usize = 64;
 /// bounds exists to widen a layer, not to grow a tower. Four is the point past which "deep"
 /// becomes an experiment of its own, with its own measurement to make, rather than a capacity
 /// question — and a fourth layer through `tanh` is already a harder thing to search than the
-/// 1 739-gene flat genome every number in this repository was measured on.
+/// 1 931-gene flat genome this build trains.
 pub const MAX_HIDDEN_LAYERS: usize = 4;
 
 impl NetShape {
@@ -816,17 +816,18 @@ mod tests {
     #[test]
     fn default_shape_matches_the_plan() {
         let s = default_shape();
-        // v10: 100 inputs (the plan's 90, plus wall side/wall slide/sprint charge from v2,
+        // v13: 108 inputs (the plan's 90, plus wall side/wall slide/sprint charge from v2,
         // plus the goal's vertical component and the leftward gap probe, plus the nearest
-        // walker's heading, plus the route's next waypoint, plus the body's sub-tile phase)
+        // walker's heading, plus the route's next waypoint, plus the body's sub-tile phase,
+        // plus v13's clock, next-event eta/position, mover velocity/phase and press timing)
         // and eleven outputs
         // (the plan's six, plus sprint, sprint_jump, retreat_jump and the two leftward
         // sprinting arms). The pin is the *recipe* — one hidden layer of sixteen,
         // argument-max output — with the two ends read from the sim so this test cannot
         // disagree with the action table or the sensor layout.
         assert_eq!(s.inputs, N_INPUTS);
-        // The recipe's own width, written down: 81 patch cells plus nineteen scalars.
-        assert_eq!(s.inputs, 100);
+        // The recipe's own width, written down: 81 patch cells plus twenty-seven scalars.
+        assert_eq!(s.inputs, 108);
         assert_eq!(s.hidden, vec![16]);
         assert_eq!(s.outputs, N_OUTPUTS);
         assert_eq!(s.outputs, 11);
@@ -837,7 +838,7 @@ mod tests {
         assert_eq!(s.n_weights(), N_INPUTS * 16 + 16 * 11);
         assert_eq!(s.n_biases(), 16 + 11);
         assert_eq!(s.n_genes(), N_INPUTS * 16 + 16 * 11 + 16 + 11);
-        assert_eq!(s.n_genes(), 1803, "the recipe's own gene count, written down");
+        assert_eq!(s.n_genes(), 1931, "the recipe's own gene count, written down");
         s.validate().expect("shape is valid");
     }
 

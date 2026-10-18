@@ -96,11 +96,11 @@
 use sim::physics::AgentAction;
 use sim::rng::rng_from_seed;
 use sim::sensors::N_INPUTS;
-use sim::Level;
+use sim::{Level, Sim};
 
-use crate::fitness::EvalConfig;
-use crate::genome::{Genome, NetShape, GENE_CLAMP};
-use crate::route_play::{replay, RoutePlay};
+use crate::fitness::{run_episode, EvalConfig};
+use crate::genome::{ActScratch, Genome, NetShape, GENE_CLAMP};
+use crate::route_play::{replay, timed_play, RoutePlay};
 
 /// How much a single-action exemplar may outweigh a common one.
 ///
@@ -118,6 +118,12 @@ pub struct ImitateConfig {
     pub lr: f32,
     /// Seed for the **initial weights only** — see the module docs on determinism.
     pub init_seed: u64,
+    /// Keep the epoch that reproduces the **most decisions** rather than the one with the lowest
+    /// loss. Off for a route walk (where the loss-picked clone was measured to be at least as good
+    /// a warm start), on for a timed plan: a plan is a script, and one wrong block at a crossing
+    /// can end the episode before evolution ever sees it. It is a selection rule, not a different
+    /// objective — the epoch is still chosen from the epochs the same fit produced.
+    pub prefer_agreement: bool,
 }
 
 impl Default for ImitateConfig {
@@ -129,6 +135,7 @@ impl Default for ImitateConfig {
             epochs: 300,
             lr: 0.05,
             init_seed: 0x1CE_B007,
+            prefer_agreement: false,
         }
     }
 }
@@ -418,6 +425,7 @@ pub fn clone_from_play(
     let first_loss = best_loss;
     let mut best = g.clone();
     let mut best_epoch = 0usize;
+    let mut best_agreement = baseline_agreement;
 
     for epoch in 1..=cfg.epochs {
         gw.fill(0.0);
@@ -449,9 +457,15 @@ pub fn clone_from_play(
         // `crates/evo/tests/imitate.rs`, the decision-picked clone and the loss-picked one trade
         // places level by level. What actually decides whether a clone can play is the cadence, not
         // the fit: see this module's docs.
-        let (loss, _) = score_epoch(&g, &mut ctx, &mut t);
-        if loss < best_loss {
+        let (loss, agreement) = score_epoch(&g, &mut ctx, &mut t);
+        let improves = if cfg.prefer_agreement {
+            agreement > best_agreement
+        } else {
+            loss < best_loss
+        };
+        if improves {
             best_loss = loss;
+            best_agreement = agreement;
             best = g.clone();
             best_epoch = epoch;
         }
@@ -482,6 +496,133 @@ pub fn from_route(
     let play = replay(level, seed, eval);
     let report = clone_from_play(&play, shape.clone(), cfg)?;
     Ok((play, report))
+}
+
+/// Plan the level, walk the plan, and clone it: the whole of what `--from-plan` does.
+///
+/// Unlike [`from_route`], this demonstration is written in the policy's own decision blocks. The
+/// planner's scripts are already block actions, so a fit that agrees with the demonstration is a
+/// fit on the control grid the policy actually has — the cadence mismatch this module documents
+/// for [`from_route`] does not exist here.
+///
+/// A plan that the real stepper cannot walk is refused rather than cloned: a seed built from a
+/// failing demonstration is the one kind of warm start that is worse than random.
+pub fn from_plan(
+    level: &Level,
+    seed: u64,
+    eval: &EvalConfig,
+    shape: NetShape,
+    cfg: &ImitateConfig,
+    plan: sim::plan::PlanConfig,
+) -> Result<(RoutePlay, ImitationReport, sim::plan::TimedRoute), String> {
+    // **A plan is the only admissible demonstration, and it has to cover the whole level.** A
+    // route walk is not block-aligned: the oracle changes its held action on the tick a press comes
+    // due, while a policy only decides on a block boundary, so a prefix recorded from a walk can be
+    // played by the walk and not by the policy (the cadence mismatch [`from_route`] documents).
+    // Merging such a prefix in front of a plan was measured to produce a 95%-agreement clone that
+    // still died on the walk's first spike — and a plan from a mid-level snapshot cannot be cloned
+    // into a policy that starts at the spawn at all. So the search must cover the level end to end;
+    // if it cannot, there is nothing here a policy can be shown.
+    let outcome = sim::plan::plan_level(level, seed, plan);
+    let route = outcome
+        .route
+        .ok_or_else(|| format!("no timed route was found: {}", outcome.note))?;
+    let play = timed_play(level, &route, eval);
+    if !play.won() {
+        return Err(format!(
+            "the planner's route did not replay to the flag: {}",
+            play.note
+        ));
+    }
+    let fit = ImitateConfig {
+        prefer_agreement: true,
+        ..*cfg
+    };
+    let mut report = clone_from_play(&play, shape.clone(), &fit)?;
+    // **DAgger, with the plan as a time-indexed expert.** A closed-loop behaviour clone leaves
+    // the demonstration's corridor at its first mistake and then has no label for the states it
+    // actually visits. Each round rolls the *best* student out on the real sim, labels every state
+    // it reached with the plan's action for the nearest demonstrated state, appends that to the
+    // training set, and refits. The set only grows, so a round that produces a worse student still
+    // contributes the states that student had to recover from; the returned student is the best
+    // one the *closed loop* measured, not the one the fit liked.
+    let mut dataset = play.clone();
+    let mut best_solo = run_episode(level, &report.genome, eval, route.seed);
+    for _round in 0..6 {
+        let extra = rollout_states(level, &report.genome, &dataset, eval);
+        if extra.is_empty() {
+            break;
+        }
+        dataset.decisions.extend(extra);
+        let next = clone_from_play(&dataset, shape.clone(), &fit)?;
+        let solo = run_episode(level, &next.genome, eval, route.seed);
+        let better = solo.won()
+            || (!best_solo.won()
+                && (solo.progress_pixels > best_solo.progress_pixels
+                    || (solo.progress_pixels == best_solo.progress_pixels
+                        && solo.frames > best_solo.frames)));
+        if better {
+            best_solo = solo;
+            report = next;
+            if best_solo.won() {
+                break;
+            }
+        }
+    }
+    Ok((play, report, route))
+}
+
+/// The states a student actually visits while following a plan, labelled by the **nearest**
+/// expert state. Empty when the student never made a decision.
+///
+/// The plan is open loop, so labelling the student's block `i` with the plan's block `i` is only
+/// right while the student is on the route. It is not, by definition, after the first mistake:
+/// that is the compounding-error problem. Nearest-neighbour in observation space is the cheap
+/// trajectory-expert answer — the label is "what the plan did when it was where you are now"
+/// — and it uses the same 108-wide vector the student reads, so a body behind the route is
+/// labelled at the state it is actually in rather than at the clock it should have been at.
+fn rollout_states(
+    level: &Level,
+    genome: &Genome,
+    expert: &crate::route_play::RoutePlay,
+    eval: &EvalConfig,
+) -> Vec<crate::route_play::Decision> {
+    let repeat = eval.action_repeat.max(1);
+    let mut sim = Sim::new(level, expert.seed);
+    let mut scratch = ActScratch::new();
+    let mut out = Vec::new();
+    for _ in 0..expert.decisions.len() {
+        if sim.outcome().is_finished() {
+            break;
+        }
+        let observation = sim.observation();
+        let action = genome.act(&observation, &mut scratch);
+        // Nearest demonstrated state, by the observation the policy itself reads.
+        let mut best = expert.decisions[0].action;
+        let mut best_d = f32::INFINITY;
+        for d in &expert.decisions {
+            let mut dist = 0.0f32;
+            for (a, b) in observation.iter().zip(d.observation.iter()) {
+                let delta = a - b;
+                dist += delta * delta;
+            }
+            if dist < best_d {
+                best_d = dist;
+                best = d.action;
+            }
+        }
+        out.push(crate::route_play::Decision {
+            observation,
+            action: best,
+        });
+        for _ in 0..repeat {
+            sim.step(action);
+            if sim.outcome().is_finished() {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The **warm set** a run starts from: the clone plus `siblings` mutated relatives, ids 0..=siblings.
@@ -561,7 +702,10 @@ mod tests {
             decisions: Vec::new(),
             outcome: sim::Outcome::Stuck,
             frames: 0,
+            seed: 0,
             hops_closed: 0,
+            best_block: 0,
+            best_stand: None,
             route_hops: None,
             note: "test".into(),
             trace: Vec::new(),
@@ -581,7 +725,10 @@ mod tests {
             }],
             outcome: sim::Outcome::Stuck,
             frames: 1,
+            seed: 0,
             hops_closed: 0,
+            best_block: 0,
+            best_stand: None,
             route_hops: None,
             note: "test".into(),
             trace: Vec::new(),
@@ -608,7 +755,10 @@ mod tests {
             decisions,
             outcome: sim::Outcome::Stuck,
             frames: 24,
+            seed: 0,
             hops_closed: 0,
+            best_block: 0,
+            best_stand: None,
             route_hops: None,
             note: "test".into(),
             trace: Vec::new(),
@@ -643,7 +793,10 @@ mod tests {
                 .collect(),
             outcome: sim::Outcome::Stuck,
             frames: 16,
+            seed: 0,
             hops_closed: 0,
+            best_block: 0,
+            best_stand: None,
             route_hops: None,
             note: "test".into(),
             trace: Vec::new(),

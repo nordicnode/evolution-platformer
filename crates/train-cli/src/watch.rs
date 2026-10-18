@@ -2727,17 +2727,28 @@ mod tests {
         // for, which is exactly the trigger. L1 is the easier level: a random
         // population wins it at generation 0, so the detour is cheap to run.
         //
-        // Sixty rather than forty, and the extra twenty are a measurement: at pop 2 this run's
-        // last new best is generation 21, so the 25-flat window opens at 46 and a forty-
-        // generation cap ended the run before the stall the test exists to exercise could fire.
-        // (The trajectory moved when sensors v7 appended its input.) The window is what the panel
-        // uses (`render::chart::STALL_GENERATIONS`), not a flag, so the run has to be given room.
+        // The run is **frozen** — no mutation, crossover, fine children or immigrants — so its best
+        // score is flat from generation 0 and the 25-generation stall rule is a fact about the
+        // fixture, not about where a sensor version happened to put pop 2's luck on l5. (Before
+        // this it was a mutable pop 2 with a cap tuned to whenever its last new best fell; sensors
+        // v7 moved that number, and v13 moved it past the cap again.) The window is what the panel
+        // uses (`render::chart::STALL_GENERATIONS`), not a flag, so the run is given room anyway.
         let stalled_args = a(&[
             "watch",
             "--level",
             &stalled,
             "--pop",
             "2",
+            "--mut-sigma",
+            "0",
+            "--mut-rate",
+            "0",
+            "--crossover",
+            "0",
+            "--fine-children",
+            "0",
+            "--immigrants",
+            "0",
             "--generations",
             "60",
             "--curriculum",

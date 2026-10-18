@@ -168,7 +168,7 @@ use crate::physics::{AgentAction, Flyer, LavaBall, Physics, PlayerState, Shot, W
 ///
 /// v11 read the twin triple and the patch's one-way value for the new kinds; v12 is the same
 /// shape of change for the tiles themselves.
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 
 /// Tiles per side of the local patch (`9×9 = 81` inputs).
 pub const PATCH_RADIUS: i32 = 4;
@@ -189,7 +189,7 @@ pub const PATCH_RADIUS: i32 = 4;
 /// **v10 appends the body's sub-tile phase (`phase_x, phase_y`)** at indices 98 and 99: the part of
 /// the body's position inside its own tile, which is the one positional quantity no other slot
 /// carries once the goal vector is clamped. See [`VERSION`] for the measurement.
-pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1 + 1 + 2 + 2;
+pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1 + 1 + 2 + 2 + 8;
 
 /// Inputs appended in v2: wall side, wall slide, sprint charge.
 pub const N_ABILITY_INPUTS: usize = 3;
@@ -374,6 +374,13 @@ pub fn observe_from_stand(
             shots: &[],
             lava_balls: &[],
             movers: &[],
+            mover_vel: &[],
+            mover_phase: &[],
+            turrets: &[],
+            vents: &[],
+            air_ticks: 0,
+            ground_ticks: 0,
+            frames: 0,
         },
         ph,
         current_stand,
@@ -396,6 +403,19 @@ pub struct Scene<'a> {
     pub lava_balls: &'a [LavaBall],
     /// Moving platforms, as the boxes they occupy this frame.
     pub movers: &'a [Rect],
+    /// The same movers' velocity this frame, aligned with [`Scene::movers`].
+    pub mover_vel: &'a [(f32, f32)],
+    /// Where each mover is inside its cycle, in `0..1`, aligned with [`Scene::movers`].
+    pub mover_phase: &'a [f32],
+    /// The level's turrets, so the observation can say *when* the next shot leaves.
+    pub turrets: &'a [crate::physics::Turret],
+    /// The level's lava vents, so the observation can say when the next ball is thrown.
+    pub vents: &'a [(i32, i32)],
+    /// Ticks the body has been off the ground, and on it. Press timing is a function of both.
+    pub air_ticks: u32,
+    pub ground_ticks: u32,
+    /// The episode's own clock, in physics ticks.
+    pub frames: u32,
 }
 
 /// Build the observation vector from a whole frame.
@@ -534,6 +554,43 @@ pub fn observe_scene(
     out[98] = (2.0 * (cx - ctx as f32) - 1.0).clamp(-1.0, 1.0);
     out[99] = (2.0 * (cy - cty as f32) - 1.0).clamp(-1.0, 1.0);
 
+    // ---- v13: time ----------------------------------------------------
+    //
+    // The five mechanics added since v11 are all *timed*, and every sensor before this block
+    // described where a thing was rather than when it would act. That is a fact no amount of
+    // training can recover: a policy that cannot see the turret's cooldown cannot learn "wait
+    // for the gap", and a policy that cannot see the body's own clock cannot commit to a plan.
+    // These eight slots are the smallest bundle that makes the pack's timed crossings
+    // *expressible*: the body's clock, the next dangerous event (how long, and where), and the
+    // shelf under the body (how fast, and where in its cycle).
+    // The clock is **coarse on purpose**. A per-frame counter makes every state in an episode
+    // unique, so a memoryless fit can index the episode instead of the world: measured on
+    // `l2-first-gap` at the one-tick cadence, a fit that reproduced every old slot still lost the
+    // pit once the raw frame count was in the vector. Sixteen steps over 64 frames each keep a
+    // rough "how long have I been waiting" while the event eta carries the precision.
+    out[100] = (((scene.frames / 64) % 16) as f32 / 16.0).clamp(0.0, 1.0);
+    if let Some((eta, ex, ey)) = next_event(level, player, scene, ph) {
+        out[101] = (eta / 120.0).clamp(0.0, 1.0);
+        out[102] = ((ex - cx) / ENEMY_VIEW_DISTANCE).clamp(-1.0, 1.0);
+        out[103] = ((ey - cy) / ENEMY_VIEW_DISTANCE).clamp(-1.0, 1.0);
+    }
+
+    // The nearest shelf, as velocity and cycle phase. Chosen by distance so a body on a deck
+    // reads the deck it is standing on; the patch already says where it is.
+    if let Some((vx, vy, phase)) = nearest_mover(player, scene) {
+        out[104] = (vx / ph.mover_speed.max(1e-6)).clamp(-1.0, 1.0);
+        out[105] = (vy / ph.mover_speed.max(1e-6)).clamp(-1.0, 1.0);
+        out[106] = phase.clamp(0.0, 1.0);
+    }
+    // Which half of a press's timing the body is in: fresh on the ground, or falling, or rising.
+    // The signed form is deliberate — a policy that needs "release now" and one that needs
+    // "hold through the apex" can both read it, and it is one slot rather than two.
+    out[107] = if player.grounded {
+        -(scene.ground_ticks as f32 / 120.0).clamp(0.0, 1.0)
+    } else {
+        (scene.air_ticks as f32 / 120.0).clamp(0.0, 1.0)
+    };
+
     debug_assert!(out.iter().all(|v| v.is_finite()));
     out
 }
@@ -604,8 +661,107 @@ pub fn input_names() -> Vec<String> {
     names.push("waypoint_dy".into());
     names.push("phase_x".into());
     names.push("phase_y".into());
+    names.push("clock".into());
+    names.push("event_eta".into());
+    names.push("event_dx".into());
+    names.push("event_dy".into());
+    names.push("mover_vx".into());
+    names.push("mover_vy".into());
+    names.push("mover_phase".into());
+    names.push("ground_air".into());
     debug_assert_eq!(names.len(), N_INPUTS);
     names
+}
+
+/// The next dangerous event the observation can name, as `(ticks, x, y)`.
+///
+/// The best-effort answer, not a replay of the sim: a turret's ETA is its cooldown plus the
+/// shot's travel time, a vent's is the next tick of its own phase, and a ball's is how long
+/// its arc takes to reach the body's row. A shot or ball that is moving *away* is not an event.
+/// The point is to make "wait for the gap" expressible, not to duplicate `Sim::step`.
+fn next_event(
+    level: &Level,
+    player: &PlayerState,
+    scene: &Scene<'_>,
+    ph: &Physics,
+) -> Option<(f32, f32, f32)> {
+    let (cx, cy) = player.aabb().center();
+    let body = player.aabb();
+    let mut best: Option<(f32, f32, f32)> = None;
+    let mut consider = |eta: f32, x: f32, y: f32| {
+        if !eta.is_finite() || eta < 0.0 || eta > 600.0 {
+            return;
+        }
+        if best.is_none_or(|(b, _, _)| eta < b) {
+            best = Some((eta, x, y));
+        }
+    };
+    // A shot already in the air: only one travelling towards the body counts, and only if it
+    // shares the body's row.
+    for s in scene.shots.iter().filter(|s| s.alive) {
+        let sb = s.aabb();
+        if sb.bottom() < body.y - 0.35 || sb.y > body.bottom() + 0.35 || s.vx.abs() < 1e-6 {
+            continue;
+        }
+        let towards = if s.vx > 0.0 { sb.center().0 < cx } else { sb.center().0 > cx };
+        if towards {
+            consider(((sb.center().0 - cx) / s.vx).abs(), sb.center().0, sb.center().1);
+        }
+    }
+    // A turret that has not fired yet: cooldown plus the shot's flight time.
+    for t in scene.turrets.iter().filter(|t| t.alive) {
+        let tb = t.aabb();
+        if tb.bottom() < body.y - 0.35 || tb.y > body.bottom() + 0.35 {
+            continue;
+        }
+        let towards = if t.dir > 0 { cx > tb.right() } else { cx < tb.x };
+        if towards {
+            let dist = (cx - t.muzzle_x()).abs();
+            consider(t.cooldown as f32 + dist / ph.shot_speed.max(1e-6), t.muzzle_x(), tb.center().1);
+        }
+    }
+    // A lava ball in flight: its arc is vertical, so the ETA is the closing distance.
+    for b in scene.lava_balls.iter().filter(|b| b.alive) {
+        let bb = b.aabb();
+        if (bb.center().0 - cx).abs() > 0.9 {
+            continue;
+        }
+        if b.vy < -1e-6 && bb.y > body.bottom() - 0.2 {
+            consider((bb.y - body.bottom()) / -b.vy, bb.center().0, bb.center().1);
+        } else if b.vy > 1e-6 && bb.bottom() < body.y + 0.2 {
+            consider((body.y - bb.bottom()) / b.vy, bb.center().0, bb.center().1);
+        }
+    }
+    // The vent directly under the body: the next ball leaves on its own phase.
+    let period = ph.lava_period.max(1);
+    for (i, v) in scene.vents.iter().enumerate() {
+        if (v.0 as f32 + 0.5 - cx).abs() > 1.0 || cy >= v.1 as f32 || v.1 as f32 - cy > 4.5 {
+            continue;
+        }
+        if level.is_solid(v.0, v.1 - 1) {
+            continue;
+        }
+        let phase = (i as u32 * 37) % period;
+        let eta = (phase + period - scene.frames % period) % period;
+        consider(eta as f32, v.0 as f32 + 0.5, v.1 as f32);
+    }
+    best
+}
+
+/// The nearest moving platform's velocity and cycle phase, if one is within sight.
+fn nearest_mover(player: &PlayerState, scene: &Scene<'_>) -> Option<(f32, f32, f32)> {
+    let (cx, cy) = player.aabb().center();
+    let mut best: Option<(f32, f32, f32, f32)> = None;
+    for (i, m) in scene.movers.iter().enumerate() {
+        let d = ((m.center().0 - cx).powi(2) + (m.center().1 - cy).powi(2)).sqrt();
+        if d > 12.0 || best.is_some_and(|(bd, _, _, _)| d >= bd) {
+            continue;
+        }
+        let (vx, vy) = scene.mover_vel.get(i).copied().unwrap_or((0.0, 0.0));
+        let phase = scene.mover_phase.get(i).copied().unwrap_or(0.0);
+        best = Some((d, vx, vy, phase));
+    }
+    best.map(|(_, vx, vy, phase)| (vx, vy, phase))
 }
 
 /// Vector from the body to the next landing stand along the level's move graph, falling

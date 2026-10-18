@@ -62,9 +62,9 @@ by a cadence mismatch that wants a small sweep rather than a search (§2.9); and
 
 | Layer | Mechanism | Default | Where |
 |---|---|---|---|
-| Policy | fixed-topology MLP, 100 → 16 → 11, `tanh`, argmax | 1 803 genes | [genome.rs](crates/evo/src/genome.rs) |
+| Policy | fixed-topology MLP, 108 → 16 → 11, `tanh`, argmax | 1 931 genes | [genome.rs](crates/evo/src/genome.rs) |
 | Memory | first hidden layer fed back into the next observation | **off** (`feedback 0`) | `NetShape::feedback` |
-| Observation | 9×9 patch + 19 scalars (goal, enemy triple, gaps, wall, sprint, waypoint, sub-tile phase) | sensors v12 | [sensors.rs](crates/sim/src/sensors.rs) |
+| Observation | 9×9 patch + 27 scalars (goal, enemy triple, gaps, wall, sprint, waypoint, sub-tile phase, clock, next-event eta, mover velocity/phase, press timing) | sensors v13 | [sensors.rs](crates/sim/src/sensors.rs) |
 | Control | macro-action held for 4 ticks | `DECISION_TICKS 4` | [lib.rs](crates/sim/src/lib.rs) |
 | Search | tournament GA, uniform crossover, Gaussian mutation, 4 elites | sigma 0.30, rate 0.05 | [ga.rs](crates/evo/src/ga.rs) |
 | Second/third scale | 8 fine children of the best; 8 reheated immigrants after 20 flat generations | on | `Trainer::breed` |
@@ -473,6 +473,21 @@ the speedup this pass was after. `FINDINGS.md` records every measurement:
   coarse-children result. The fine step's own contribution was **not** established at eight seeds
   (p = 0.69 inside the archive, p = 1.0 on fine children alone), and is kept on mechanism rather than
   on that arm.
+* **The observation can now express time** (§2.7). Sensors v13 appends the episode clock, the next
+  dangerous event's eta and position, the nearest mover's velocity and cycle phase, and the body's
+  own ground/air ticks. On `l11-the-elements` the old vector described every deck's *position* and
+  none of its schedule; the new one makes "wait for the gap" a function of what the policy sees.
+* **A model-based teacher, and what it proves.** `sim::plan` searches whole sim snapshots at the
+  policy's 4-tick block cadence, over run/sprint/wait/jump-hold macros, keeping the best node per
+  `(rung, phase)` so a wait survives the beam. It finds a 240-block, 957-frame route through
+  `l11`'s three decks in ~3 s; the route oracle calls the level reachable only because it parks the
+  movers, so this is the first executable answer for that level. `reach --timed` is the protocol.
+* **The teacher is a seed, not a solution.** `train --from-plan` replays the plan, clones it at the
+  policy's cadence (97% agreement at 3 000 epochs) and runs DAgger against the student's own
+  states. The clone alone dies at x 30, before the first deck, and 2 000 generations at pop 200
+  from that seed reached x 62 of 68 without a win — the honest reading is that the timed crossing is
+  expressible and planned, while the last deck is still beyond this net's search from the plan's
+  basin.
 
 ---
 

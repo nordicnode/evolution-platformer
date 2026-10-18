@@ -27,6 +27,7 @@
 pub mod hash;
 pub mod level;
 pub mod physics;
+pub mod plan;
 pub mod reach;
 pub mod rng;
 pub mod sensors;
@@ -116,6 +117,32 @@ pub fn format_time(frames: u32) -> String {
     } else {
         let minutes = (seconds / 60.0).floor();
         format!("{}:{:05.2}", minutes as u64, seconds - minutes * 60.0)
+    }
+}
+
+/// What ended a dying episode. Diagnostics only: the score and the trajectory do not read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeathCause {
+    Spike,
+    /// A lava cell or a ball from one. The ball is folded in because both are the same tile's
+    /// attack and a reader asking "what killed me" wants the pool in either case.
+    Lava,
+    Shot,
+    Walker,
+    Flyer,
+    Pit,
+}
+
+impl DeathCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeathCause::Spike => "spike",
+            DeathCause::Lava => "lava",
+            DeathCause::Shot => "turret shot",
+            DeathCause::Walker => "walker",
+            DeathCause::Flyer => "flyer",
+            DeathCause::Pit => "fell out",
+        }
     }
 }
 
@@ -220,6 +247,9 @@ pub struct EpisodeStats {
     /// Best (deepest along the route) stand index the body has **stood on** during the
     /// episode, or `None` if it has not yet stood on a route stand.
     pub best_stand: Option<usize>,
+    /// Distinct moving-platform decks the body has stood on, in first-arrival order. Scored in
+    /// fitness v9: a shuttle crossing's first step is a landing, and the frontier cannot see it.
+    pub decks: u32,
     /// Where the agent died, if it did.
     pub death_pos: Option<(f32, f32)>,
 }
@@ -241,6 +271,7 @@ impl EpisodeStats {
             checkpoints: 0,
             route_hops_closed: 0,
             best_stand: spawn_stand,
+            decks: 0,
             death_pos: None,
         }
     }
@@ -313,6 +344,18 @@ pub struct Sim {
     movers: Vec<Mover>,
     /// The mover the body stood on last frame, so this frame's motion can carry it.
     riding: Option<usize>,
+    /// Deck ids the body has stood on at least once, in first-arrival order.
+    ///
+    /// A ride is a route hop and a landing, so it is worth crediting separately from a hazard
+    /// checkpoint: on a level whose crossing *is* a shuttle, arrival on the deck is the step
+    /// the frontier cannot see until the whole crossing is already made.
+    decks_stood: Vec<usize>,
+    /// Consecutive ticks on each side of a press: what a jump's timing is actually a function of.
+    air_ticks: u32,
+    ground_ticks: u32,
+    /// What ended a dying episode, for the `why` read. Not part of the score and not hashed:
+    /// two trajectories that reach the same state are the same episode whatever killed them.
+    death_cause: Option<DeathCause>,
     stats: EpisodeStats,
     outcome: Outcome,
     rng: Rng,
@@ -416,6 +459,10 @@ impl Sim {
             lava_vents: level.lava_vents(),
             movers,
             riding: None,
+            decks_stood: Vec::new(),
+            air_ticks: 0,
+            ground_ticks: 0,
+            death_cause: None,
             stats: EpisodeStats::new(&spawn_player, level),
             level: level.clone(),
             outcome: Outcome::Running,
@@ -483,6 +530,24 @@ impl Sim {
 
     pub fn outcome(&self) -> Outcome {
         self.outcome
+    }
+
+    /// What ended a dying episode, when the read is asked for after the fact.
+    pub fn death_cause(&self) -> Option<DeathCause> {
+        self.death_cause
+    }
+
+    /// The route stand the body is on (or last stood on), for the waypoint sensor and a
+    /// planner's `which rung is this` question.
+    pub fn route_stand(&self) -> Option<usize> {
+        self.current_route_stand
+    }
+
+    /// A copy of the whole episode state, for planning and frontier restarts. The sim is
+    /// deterministic, so a snapshot plus an action sequence is an episode; nothing else is
+    /// needed to fork a search or to restart a run at the state it stalled in.
+    pub fn snapshot(&self) -> Sim {
+        self.clone()
     }
 
     /// Advance exactly one physics tick (1/[`DT`] of a second).
@@ -571,6 +636,13 @@ impl Sim {
         if touched.jumped {
             self.stats.jumps += 1;
         }
+        if self.player.grounded {
+            self.ground_ticks = self.ground_ticks.saturating_add(1);
+            self.air_ticks = 0;
+        } else {
+            self.air_ticks = self.air_ticks.saturating_add(1);
+            self.ground_ticks = 0;
+        }
 
         // ---- springs: a pad throws a falling body back up -----------------
         // The rule itself — and the reasoning for every half of it — is `physics::spring_launch`,
@@ -610,10 +682,16 @@ impl Sim {
             }
         }
         self.riding = ride;
+        if let Some(id) = ride {
+            if !self.decks_stood.contains(&id) {
+                self.decks_stood.push(id);
+                self.stats.decks = self.decks_stood.len() as u32;
+            }
+        }
 
         // ---- hazards ------------------------------------------------------
         if touched.touched_spike {
-            self.die();
+            self.die(DeathCause::Spike);
             return;
         }
         // Lava kills twice: the pool a body steps into, and the ball it did not see coming.
@@ -624,7 +702,7 @@ impl Sim {
                 .iter()
                 .any(|b| b.alive && self.player.aabb().overlaps(&b.aabb()))
         {
-            self.die();
+            self.die(DeathCause::Lava);
             return;
         }
 
@@ -642,7 +720,7 @@ impl Sim {
                 self.player.grounded = false;
                 stomped = true;
             } else {
-                self.die();
+                self.die(DeathCause::Walker);
                 return;
             }
         }
@@ -663,7 +741,7 @@ impl Sim {
                 self.player.grounded = false;
                 self.stats.stomps += 1;
             } else {
-                self.die();
+                self.die(DeathCause::Flyer);
                 return;
             }
         }
@@ -689,7 +767,7 @@ impl Sim {
             .iter()
             .any(|s| s.alive && self.player.aabb().overlaps(&s.aabb()))
         {
-            self.die();
+            self.die(DeathCause::Shot);
             return;
         }
 
@@ -707,7 +785,7 @@ impl Sim {
 
         // ---- pit ---------------------------------------------------------
         if self.player.y > self.level.height as f32 {
-            self.die();
+            self.die(DeathCause::Pit);
             return;
         }
 
@@ -829,7 +907,7 @@ impl Sim {
             self.stats.progress_pixels =
                 self.stats.goal_distance_pixels - approach * PIXELS_PER_TILE;
             self.stats.no_progress_frames = 0;
-        } else if route_advanced {
+        } else if route_advanced || self.waiting_for_a_mover() {
             self.stats.no_progress_frames = 0;
         } else {
             self.stats.no_progress_frames += 1;
@@ -850,6 +928,55 @@ impl Sim {
     /// Frame cap for this level (§7.4.6), i.e. [`frame_budget`] of its terrain.
     pub fn max_frames(&self) -> u32 {
         frame_budget(&self.level)
+    }
+
+    /// Is the body waiting for a moving platform rather than camping?
+    ///
+    /// The anti-camper timer was written for a corridor, where standing still is always a
+    /// mistake: the way on is to the right and a body that has stopped moving is not going to
+    /// find it. A timed crossing breaks that premise. The correct move in front of a shuttle is
+    /// often to **stand exactly where you are** until the deck arrives, and the old rule killed
+    /// that body at frame 600 for doing the right thing — which is one of the reasons the pack's
+    /// mover levels are hard for a policy that already knows it has to wait.
+    ///
+    /// So patience is paused in the two states where waiting is the world's fault rather than the
+    /// body's: while it is riding a deck (the deck is moving it, even when its x does not fall),
+    /// and while it is standing on ground a deck's own travel can reach at its own foot level.
+    /// It is a pause, not an exemption: the episode's frame budget still ends a body that waits
+    /// forever, and a deck that can never reach the body does not pause anything.
+    fn waiting_for_a_mover(&self) -> bool {
+        if self.riding.is_some() {
+            return true;
+        }
+        if !self.player.grounded {
+            return false;
+        }
+        let p = &self.player;
+        let cx = p.x + p.w * 0.5;
+        let feet = p.y + p.h;
+        self.movers.iter().any(|m| {
+            let span = m.limit.clamp(0.0, m.span.max(0.0));
+            let reach = m.dir as f32 * span;
+            let (x0, x1, y0, y1) = if m.vertical {
+                (
+                    m.home.x,
+                    m.home.x + m.home.w,
+                    m.home.y.min(m.home.y + reach),
+                    m.home.y.max(m.home.y + reach) + m.home.h,
+                )
+            } else {
+                (
+                    m.home.x.min(m.home.x + reach),
+                    m.home.x.max(m.home.x + reach) + m.home.w,
+                    m.home.y,
+                    m.home.y + m.home.h,
+                )
+            };
+            // A deck whose travel passes over the body's column, at a height it could step onto
+            // from where it stands. The two-tile window is a jump's own reach: a deck further
+            // above is not a step this body is waiting for.
+            cx >= x0 - 1.0 && cx <= x1 + 1.0 && feet >= y0 - 2.0 && feet <= y1 + 2.0
+        })
     }
 
     /// **A turret is a solid box.** Stand on its lid; a side stops the body.
@@ -894,7 +1021,8 @@ impl Sim {
         }
     }
 
-    fn die(&mut self) {
+    fn die(&mut self, cause: DeathCause) {
+        self.death_cause = Some(cause);
         self.outcome = Outcome::Died;
         self.stats.death_pos = Some((self.player.x, self.player.y));
         self.finish();
@@ -922,6 +1050,16 @@ impl Sim {
     /// blind to exactly the two enemies added to make height and distance dangerous.
     pub fn observation(&self) -> [f32; sensors::N_INPUTS] {
         let movers = self.platforms();
+        let mover_vel: Vec<(f32, f32)> = self
+            .movers
+            .iter()
+            .map(|m| m.delta_at(self.stats.frames, &PHYSICS))
+            .collect();
+        let mover_phase: Vec<f32> = self
+            .movers
+            .iter()
+            .map(|m| m.phase_at(self.stats.frames, &PHYSICS))
+            .collect();
         sensors::observe_scene(
             &self.level,
             &self.player,
@@ -931,6 +1069,13 @@ impl Sim {
                 shots: &self.shots,
                 lava_balls: &self.lava_balls,
                 movers: &movers,
+                mover_vel: &mover_vel,
+                mover_phase: &mover_phase,
+                turrets: &self.turrets,
+                vents: &self.lava_vents,
+                air_ticks: self.air_ticks,
+                ground_ticks: self.ground_ticks,
+                frames: self.stats.frames,
             },
             &PHYSICS,
             self.current_route_stand,
@@ -954,6 +1099,7 @@ impl Sim {
         h.u32(self.stats.jumps);
         h.u32(self.stats.checkpoints);
         h.u32(self.stats.route_hops_closed);
+        h.u32(self.stats.decks);
         match self.stats.best_stand {
             Some(s) => {
                 h.u8(1);

@@ -848,6 +848,55 @@ fn a_vine_under_a_lid_with_no_room_above_it_is_a_dead_end() {
     );
 }
 
+/// **The elements are solvable on a timetable, and this is the benchmark.**
+///
+/// `l11-the-elements` is the pack's stress test: a lava lake crossed on three moving decks, under
+/// two dozen vents and a turret whose shot line covers the decks. The route oracle answers "a
+/// crossing exists" by parking every mover at the ends of its travel, which is why the level read
+/// as unbeatable in practice long after it read as reachable in principle. The planner steps the
+/// real sim at the policy's own block cadence, so its answer is the executable one: this test
+/// walks the returned action list back through a fresh sim and requires the flag.
+///
+/// Ignored by default because it is a benchmark, not a unit: a few seconds in release and much
+/// slower in a debug build. Run it with
+/// `cargo test -p sim --release --test elements -- --ignored timed_plan`.
+#[test]
+#[ignore = "the l11 benchmark: seconds in release, much slower in debug"]
+fn a_timed_plan_crosses_the_elements() {
+    let level = sim::Level::from_json_str(include_str!("../../../levels/l11-the-elements.json"))
+        .expect("the shipped level parses");
+    let route = sim::plan::solve(&level, 1, sim::plan::PlanConfig::default())
+        .expect("the timed planner should find a schedule across the lake");
+    assert!(
+        route.frames > 600,
+        "the route has to be longer than the anti-camper timer to be a timed crossing ({} frames)",
+        route.frames
+    );
+    assert!(
+        route.hops >= 10,
+        "the plan should close most of the route's rungs, closed {}",
+        route.hops
+    );
+
+    let mut sim = sim::Sim::new(&level, route.seed);
+    for action in &route.actions {
+        for _ in 0..sim::DECISION_TICKS {
+            if sim.outcome().is_finished() {
+                break;
+            }
+            sim.step(*action);
+        }
+    }
+    assert_eq!(
+        sim.outcome(),
+        Outcome::Won,
+        "the planner's own actions must win when replayed (ended at ({:.2}, {:.2}) after {} frames)",
+        sim.player().x,
+        sim.player().y,
+        sim.stats().frames
+    );
+}
+
 /// **The oracle gives the vine's block as a route.** The verdict is the claim that matters to a
 /// level designer: before the pull-up this level read as unreachable, because the only way to the
 /// flag is over the block the vine hangs from.

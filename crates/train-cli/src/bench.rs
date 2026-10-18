@@ -166,6 +166,14 @@ pub const PROTOCOLS: &[Protocol] = &[
         note: "the shipped pack's tightest obstacle course",
     },
     Protocol {
+        name: "elements",
+        level: "levels/l11-the-elements.json",
+        pop: 200,
+        generations: 2000,
+        seeds: 12,
+        note: "the timed crossing: three moving decks over lava, under vents and a turret",
+    },
+    Protocol {
         name: "marathon",
         level: "levels/l6-marathon.json",
         pop: 200,

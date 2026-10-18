@@ -308,6 +308,16 @@ TRAIN OPTIONS:
                           reproduces every one of the walk's decisions still walks into the pit
                           (at a one-tick cadence the same clone solves the level on every seed).
                           The run reports the replay's own verdict (`route ...`) before it starts.
+    --from-plan           Warm the population from a **timed plan**: a best-first search over whole
+                          sim snapshots at the policy's own decision cadence, with the deck phases
+                          and turret cooldowns the reachability oracle cannot see. The plan is
+                          replayed to prove it wins, cloned at that cadence, and repaired with
+                          DAgger against the states the clone actually visits. Unlike --from-route,
+                          the demonstration is already written in block actions, so a missed press
+                          is a fit failure rather than an unrepresentable one. It is still a seed,
+                          not a solver: on l11 a 97%-agreement clone dies before the first deck.
+    --plan-depth <N>      Expansions the timed planner may make.                    [default 32]
+    --plan-beam <N>       Nodes carried into each expansion.                        [default 64]
     --warm <N>            How many of the population's slots the clone fills; the rest are random,
                           and that remainder is the design rather than slack. Measured, six
                           seeds at pop 64 per arm: a quarter of the population solves every
@@ -315,7 +325,7 @@ TRAIN OPTIONS:
                           than random, and warming *every* slot is the **worst** arm — the
                           clone's basin is a plateau with no win on it.   [default pop/4]
     --clone-epochs <N>    Gradient passes over the replay's demonstration when cloning it.
-                                                                [default 300]
+                          [default 300; 3 000 with --from-plan, where one press is the plan]
     --route-seed <N>      Episode seed of the replay that produces the demonstration: the walk is
                           deterministic, so this is what makes a warm start reproducible.
                                                                     [default --seed]
@@ -437,6 +447,13 @@ REACH OPTIONS:
     --all                 Check every level in --levels-dir.
     --levels-dir <DIR>    Directory to sweep with --all.              [default levels]
     --verbose             List every platform and every edge.
+    --timed               Ask the second question: is there a **schedule** that walks it? The
+                          planner steps the real sim at the policy's 4-tick cadence over whole
+                          snapshots, so it sees mover phases and turret cooldowns that the
+                          static oracle parks. A level that is reachable in principle can fail
+                          here (a climb or a vine is outside the planner's macro set), and that
+                          is the honest answer rather than a contradiction.
+    --seed <N>            Episode seed the timed plan is searched against.      [default 1]
 
 REPLAY OPTIONS:
     --champion <PATH>     Champion JSON to replay.                      [required]
