@@ -511,7 +511,8 @@ impl<'a> Sheet<'a> {
     /// exact: an agent facing the way it is travelling is worth a second set of sprites
     /// to a hand-drawn game, and worth nothing at all to a texture sampler.
     pub fn image_facing(&self, rect: Rect, uv: Rect, flip: bool, tint: Color32) {
-        self.painter.image(self.texture, rect, facing(uv, flip), tint);
+        self.painter
+            .image(self.texture, rect, facing(uv, flip), tint);
     }
 
     /// Draw an agent sprite in a physics box, keeping the *sprite's* proportions.
@@ -1097,6 +1098,17 @@ fn draw_seams(sheet: Sheet<'_>, level: &Level, tx: i32, ty: i32, rect: Rect, min
     }
 }
 
+/// How much of a one-way shelf's cell the deck is, measured down from the top, in tiles.
+///
+/// The shelf is not a ceiling along the *bottom* of its cell: it is a thin deck across the
+/// top of it — three of the sixteen rows a cell is drawn in — with iron brackets below that
+/// and open air under those (`tools/art/terrain.py::oneway`). Keeping the deck thin is the
+/// whole point of the art, and it is also why anything hanging from a shelf has to be
+/// measured from the deck rather than from the cell boundary below it: that boundary is most
+/// of a tile under the wood, and a vine whose stem starts there dangles in the air beneath
+/// the platform it is supposed to be growing out of ([`Prop::hangs`], [`Tile::Vine`]).
+pub(crate) const ONEWAY_PLANK: f32 = 3.0 / 16.0;
+
 /// A prop to draw: which sprite, and the cell it goes in.
 ///
 /// The two are one decision, so they travel together. A prop is drawn in the **open** tile
@@ -1131,6 +1143,15 @@ pub struct Prop {
     /// it stands three tiles and a bit with a canopy a tile and a half across, and the
     /// daisies beside it are a third of a tile wide.
     pub size: f32,
+    /// Does this prop hang from the ceiling of its cell rather than stand on the floor of it?
+    ///
+    /// Every prop in the game is planted except the vine: a bush's feet are on the ground
+    /// line and [`Prop::size`] measures it up from there, while a vine's **top** is what has
+    /// to touch the thing it grows out of. Under a solid ceiling the two are the same line —
+    /// the bottom of the cell above is the top of this one — so the flag changes nothing
+    /// there. Under a one-way shelf it is the difference between a vine growing out of the
+    /// wood and one floating most of a tile below it ([`ONEWAY_PLANK`]).
+    pub hangs: bool,
 }
 
 /// The scenery for a surface tile: its sprite, and the cell above the tile it stands on.
@@ -1212,6 +1233,7 @@ pub fn scenery_sprite(
         sprite: sprites.first_of(&[name, fallback_for(name, instead)]),
         crown: None,
         size: prop_size(name),
+        hangs: false,
     })
 }
 
@@ -1315,6 +1337,7 @@ fn tree_prop(sprites: &Sprites, level: &Level, tx: i32, ty: i32) -> Option<Prop>
         sprite: sprites.first_of(&["bush_c", "bush_a"]),
         crown: None,
         size: prop_size("bush"),
+        hangs: false,
     };
     for above in 2..=TREE_CELLS {
         if level.tile(tx, ty - above) != Some(Tile::Empty) {
@@ -1334,6 +1357,7 @@ fn tree_prop(sprites: &Sprites, level: &Level, tx: i32, ty: i32) -> Option<Prop>
             sprite: lower,
             crown: Some(upper),
             size: TREE_SIZE,
+            hangs: false,
         }),
         _ => Some(bush()),
     }
@@ -1377,6 +1401,7 @@ pub fn hanging_sprite(
         // A vine is one cell: nothing hangs off the bottom of one.
         crown: None,
         size: 1.0,
+        hangs: true,
     })
 }
 
@@ -1399,34 +1424,68 @@ fn placed_prop(sprites: &Sprites, s: &sim::Scenery) -> Option<Prop> {
         sprite,
         crown,
         size: prop_size(&s.sprite),
+        hangs: hangs_from_ceiling(&s.sprite),
     })
 }
 
-/// One prop, drawn at its own size with its feet on the bottom of its own cell.
+/// Does this scenery sprite hang from a ceiling rather than stand on a floor?
+///
+/// Asked of the *family*, the way [`prop_size`] is: the palette offers the vine by name and
+/// the scatter rule picks one of two frames of it, and both are the same plant hung the same
+/// way. Nothing else in the vocabulary hangs — a banner is pinned to a wall and still stands
+/// on the ground line — so the one family is the whole of the rule.
+fn hangs_from_ceiling(sprite: &str) -> bool {
+    sprite.split('_').next() == Some("vine")
+}
+
+/// One prop, drawn at its own size, with its feet on the bottom of its own cell — or, for a
+/// hanging one, its head on the underside of the ceiling above.
 ///
 /// `size` rather than the cell is what the art is measured in, and the bottom of the cell is
 /// the ground line: a prop stands on the tile it belongs to with air above it, whatever its
 /// picture is worth. So a third-of-a-tile daisy patch and a three-tile tree are placed by
 /// the same rule, and nothing here has to know which one it is holding.
 ///
+/// [`Prop::hangs`] turns that upside down, and the level is needed to answer it because the
+/// ceiling is not always the cell boundary: under a one-way shelf the thing to touch is the
+/// plank, a fraction of a cell into the shelf's own tile ([`ONEWAY_PLANK`]).
+///
 /// The canopy is the trunk's own rectangle lifted by exactly the height the trunk was drawn
 /// at, and not the cell above: a tree at [`TREE_SIZE`] grows past the cell it stands in, and
 /// the two halves only meet if the one is placed off the other. Cell-relative halves were
 /// right while every prop was one cell and are the first thing to break when one is not.
-fn draw_prop(sheet: Sheet<'_>, prop: &Prop) {
+fn draw_prop(sheet: Sheet<'_>, level: &Level, prop: &Prop) {
     let cell = sheet.tile(prop.cell.0, prop.cell.1);
     // Whole points, like every other sprite in the view: a prop drawn at 22.4 points a side
     // has rows of three pixels and rows of two, which shimmers as the camera moves.
     let side = (cell.height() * prop.size).round().max(2.0);
+    // Where the picture lands, measured by its bottom edge. Standing, that is the ground
+    // line; hanging, it is the ceiling's underside plus the prop's own height, and the
+    // ceiling's underside is the *plank* when the shelf above is a one-way one — the shelf's
+    // cell is mostly air, so the cell boundary is most of a tile below the wood.
+    let bottom = if prop.hangs {
+        let ceiling = sheet.tile(prop.cell.0, prop.cell.1 - 1);
+        let under = if level
+            .tile(prop.cell.0, prop.cell.1 - 1)
+            .is_some_and(Tile::is_one_way)
+        {
+            ceiling.top() + (ceiling.height() * ONEWAY_PLANK).round()
+        } else {
+            ceiling.bottom()
+        };
+        under + side
+    } else {
+        cell.bottom()
+    };
     let foot = |bottom: f32| {
         Rect::from_min_size(
             Pos2::new((cell.center().x - side * 0.5).round(), bottom - side),
             Vec2::splat(side),
         )
     };
-    sheet.image(foot(cell.bottom()), prop.sprite);
+    sheet.image(foot(bottom), prop.sprite);
     if let Some(crown) = prop.crown {
-        sheet.image(foot(cell.bottom() - side), crown);
+        sheet.image(foot(bottom - side), crown);
     }
 }
 
@@ -1653,11 +1712,7 @@ fn draw_sunbeams(painter: &Painter, viewport: Rect, camera: &Camera, level: &Lev
         sky_line(camera, level, viewport) - SUN_ALTITUDE * camera.scale(),
     );
     let mut mesh = Mesh::default();
-    let rays = [
-        (-0.55, 0.10, 14_u8),
-        (-0.28, 0.14, 18),
-        (0.02, 0.09, 12),
-    ];
+    let rays = [(-0.55, 0.10, 14_u8), (-0.28, 0.14, 18), (0.02, 0.09, 12)];
     let length = viewport.height() * 1.15;
     for (i, (angle_offset, spread, base_alpha)) in rays.iter().enumerate() {
         let sway = (clock * 0.4 + i as f32 * 1.7).sin() * 0.03;
@@ -2336,7 +2391,7 @@ pub fn draw_level(
             let prop = scenery_sprite(sheet.sprites, level, tx, ty, clock)
                 .or_else(|| hanging_sprite(sheet.sprites, level, tx, ty, clock));
             if let Some(prop) = prop {
-                draw_prop(sheet, &prop);
+                draw_prop(sheet, level, &prop);
             }
         }
     }
@@ -2426,9 +2481,15 @@ pub fn draw_level(
                     draw_fluid_edges(sheet, level, tx, ty, rect, Tile::Lava);
                 }
                 // A vine is one cell of stem, drawn to meet the cells above and below it, so a
-                // shaft of them reads as one vine rather than as a stack of cuttings.
+                // shaft of them reads as one vine rather than as a stack of cuttings. The one
+                // ceiling it cannot meet is a shelf's: that cell is mostly air, so the stem
+                // above a shaft is carried up to the wood by hand ([`draw_vine_to_shelf`]).
                 Some(Tile::Vine) => {
-                    sheet.image(rect, sheet.sprites.get("vine"));
+                    let uv = sheet.sprites.get("vine");
+                    sheet.image(rect, uv);
+                    if level.tile(tx, ty - 1) == Some(Tile::OneWay) {
+                        draw_vine_to_shelf(sheet, tx, ty, rect, uv);
+                    }
                 }
                 Some(Tile::Empty) | Some(Tile::Goal) | None => {}
             }
@@ -2459,7 +2520,7 @@ pub fn draw_level(
                 };
                 painter.circle_filled(cell.center(), cell.width() * 0.95 * pulse, glow_colour);
             }
-            draw_prop(sheet, &prop);
+            draw_prop(sheet, level, &prop);
         }
     }
 
@@ -2597,14 +2658,26 @@ const FLUID_BLOCK: i32 = 4;
 /// Spelled out rather than formatted: a name built with `format!` would allocate once per
 /// fluid cell per frame, and this pass runs over every tile of every level every frame.
 const WATER_BODIES: [&str; 16] = [
-    "water_b0", "water_b1", "water_b2", "water_b3", "water_b4", "water_b5", "water_b6",
-    "water_b7", "water_b8", "water_b9", "water_b10", "water_b11", "water_b12", "water_b13",
-    "water_b14", "water_b15",
+    "water_b0",
+    "water_b1",
+    "water_b2",
+    "water_b3",
+    "water_b4",
+    "water_b5",
+    "water_b6",
+    "water_b7",
+    "water_b8",
+    "water_b9",
+    "water_b10",
+    "water_b11",
+    "water_b12",
+    "water_b13",
+    "water_b14",
+    "water_b15",
 ];
 const LAVA_BODIES: [&str; 16] = [
     "lava_b0", "lava_b1", "lava_b2", "lava_b3", "lava_b4", "lava_b5", "lava_b6", "lava_b7",
-    "lava_b8", "lava_b9", "lava_b10", "lava_b11", "lava_b12", "lava_b13", "lava_b14",
-    "lava_b15",
+    "lava_b8", "lava_b9", "lava_b10", "lava_b11", "lava_b12", "lava_b13", "lava_b14", "lava_b15",
 ];
 
 /// A fluid body cell's texture: which cell of the fluid's block this tile falls on.
@@ -2684,6 +2757,33 @@ fn oneway_part(level: &Level, tx: i32, ty: i32) -> &'static str {
     }
 }
 
+/// The stem between a one-way shelf's deck and the vine cell under it: the top of the vine's
+/// own picture, drawn in the strip of the shelf's cell the deck leaves empty.
+///
+/// A [vine tile](Tile::Vine) is continuous down its whole cell and tiles vertically — that is
+/// what makes a shaft of ten cells one plant rather than ten cuttings — so the same picture,
+/// cropped to the strip, is the stem continuing up to the wood. Cropped and not stretched,
+/// in the cell's own columns: the drawn rows are then the same height as the cell's below and
+/// the join is invisible, which is the only thing this has to be true about.
+fn draw_vine_to_shelf(sheet: Sheet<'_>, tx: i32, ty: i32, cell: Rect, uv: Rect) {
+    let shelf = sheet.tile(tx, ty - 1);
+    let strip = Rect::from_min_max(
+        Pos2::new(
+            cell.left(),
+            shelf.top() + (shelf.height() * ONEWAY_PLANK).round(),
+        ),
+        Pos2::new(cell.right(), shelf.bottom()),
+    );
+    // Nothing to fill when the cell is only a few points tall and the deck rounds to all of
+    // it; the crop below would be empty or NaN.
+    if strip.height() <= 0.0 {
+        return;
+    }
+    let shown = (strip.height() / cell.height()).clamp(0.0, 1.0);
+    let cropped = Rect::from_min_max(uv.min, Pos2::new(uv.max.x, uv.min.y + uv.height() * shown));
+    sheet.image(strip, cropped);
+}
+
 /// The colour of a platform's travel guide: a warm, pale gold, because it is a hint rather
 /// than a thing in the level and has to read over sky, hills and soil alike.
 const TRAVEL_LINE: Color32 = Color32::from_rgba_premultiplied(190, 173, 125, 190);
@@ -2700,17 +2800,16 @@ const TRAVEL_DASH: (f32, f32) = (5.0, 4.0);
 /// The far end is [`sim::physics::clear_travel`], not the authored `span`, on purpose: a shelf
 /// written through a wall turns at the wall, and a guide that promised the authored span would
 /// be promising a route the sim refuses. The editor, the playtest and the evolve view all draw
-/// the same answer because it is the same function the episode builds from.
-pub(crate) fn mover_travel(
-    spec: &sim::PlatformSpec,
-    level: &Level,
-) -> (sim::Rect, sim::Rect) {
-    let clear = sim::physics::clear_travel(spec.rect, spec.span, spec.vertical, level);
+/// the same answer because it is the same function the episode builds from — and the direction
+/// is the spec's own, so a shelf that travels left is drawn travelling left.
+pub(crate) fn mover_travel(spec: &sim::PlatformSpec, level: &Level) -> (sim::Rect, sim::Rect) {
+    let clear = sim::physics::clear_travel(spec.rect, spec.span, spec.vertical, spec.dir, level);
+    let step = clear * f32::from(spec.dir);
     let mut far = spec.rect;
     if spec.vertical {
-        far.y -= clear;
+        far.y -= step;
     } else {
-        far.x += clear;
+        far.x += step;
     }
     (spec.rect, far)
 }
@@ -2786,10 +2885,7 @@ fn draw_mover(sheet: Sheet<'_>, rect: sim::Rect) {
     // what "rigid" means here, and it is what makes the shelf and the body standing on it move
     // in step on the pixel grid.
     for (piece, x) in mover_pieces(rect) {
-        sheet.image(
-            sheet.world(x, rect.y, 1.0, 1.0),
-            sheet.sprites.get(piece),
-        );
+        sheet.image(sheet.world(x, rect.y, 1.0, 1.0), sheet.sprites.get(piece));
     }
 }
 
@@ -3104,25 +3200,11 @@ impl AgentAnim {
             self.landed = true;
             self.squash_x = 1.18;
             self.squash_y = 0.84;
-            self.spawn_burst(
-                p.x + p.w * 0.5,
-                p.y + p.h,
-                [236, 224, 202],
-                4,
-                1.8,
-                -1.2,
-            );
+            self.spawn_burst(p.x + p.w * 0.5, p.y + p.h, [236, 224, 202], 4, 1.8, -1.2);
         } else if jumped {
             self.squash_x = 0.86;
             self.squash_y = 1.16;
-            self.spawn_burst(
-                p.x + p.w * 0.5,
-                p.y + p.h,
-                [220, 210, 190],
-                3,
-                1.4,
-                -0.8,
-            );
+            self.spawn_burst(p.x + p.w * 0.5, p.y + p.h, [220, 210, 190], 3, 1.4, -0.8);
         }
         self.airborne = !grounded;
 
@@ -3137,14 +3219,7 @@ impl AgentAnim {
             self.prev_stomps = stomps;
             self.squash_x = 1.15;
             self.squash_y = 0.86;
-            self.spawn_burst(
-                p.x + p.w * 0.5,
-                p.y + p.h,
-                [222, 168, 244],
-                6,
-                2.8,
-                -2.2,
-            );
+            self.spawn_burst(p.x + p.w * 0.5, p.y + p.h, [222, 168, 244], 6, 2.8, -2.2);
         }
         let outcome = sim.outcome();
         if self.prev_outcome != Some(outcome) {
@@ -3848,7 +3923,11 @@ mod tests {
         for x in [35.0, 35.02, 35.25, 35.5, 35.75, 35.99, 36.0, 36.31] {
             let rect = sim::Rect::new(x, 12.5, 3.0, 0.5);
             let pieces: Vec<(&str, f32)> = mover_pieces(rect).collect();
-            assert_eq!(pieces.len(), 3, "a three-tile shelf is three cells at x={x}");
+            assert_eq!(
+                pieces.len(),
+                3,
+                "a three-tile shelf is three cells at x={x}"
+            );
             assert_eq!(pieces[0].0, "mover_l");
             assert_eq!(pieces[2].0, "mover_r");
 
@@ -3863,11 +3942,9 @@ mod tests {
                 );
                 if let Some(before) = previous {
                     assert_eq!(
-                        cell.min.x,
-                        before.max.x,
+                        cell.min.x, before.max.x,
                         "a seam between two pieces at x={x}: {} then {}",
-                        before.max.x,
-                        cell.min.x
+                        before.max.x, cell.min.x
                     );
                     assert_eq!(cell.min.y, before.min.y, "the shelf is not level at x={x}");
                 }
@@ -3896,13 +3973,16 @@ mod tests {
     #[test]
     fn a_platforms_travel_guide_ends_where_the_shelf_can_reach() {
         let mut level = Level::starter("travel-guide", 30, 10);
-        assert!(level.add_platform_tile(4, 6, 3, 4, false));
+        assert!(level.add_platform_tile(4, 6, 3, 4, false, 1));
         let spec = level.platforms[0];
 
         let (home, far) = mover_travel(&spec, &level);
         assert_eq!(home, spec.rect, "the near end is the box as authored");
         assert_eq!(far.y, home.y, "a slider stays in its row");
-        assert!((far.x - (home.x + 4.0)).abs() < 1e-4, "a clear span is drawn whole");
+        assert!(
+            (far.x - (home.x + 4.0)).abs() < 1e-4,
+            "a clear span is drawn whole"
+        );
 
         // A wall in the shelf's row stops it — and the guide with it.
         let mut walled = level.clone();
@@ -3920,7 +4000,7 @@ mod tests {
 
         // A lift moves up, so the far box is above the near one by its clear travel.
         let mut lift = Level::starter("travel-lift", 30, 10);
-        assert!(lift.add_platform_tile(4, 6, 3, 3, true));
+        assert!(lift.add_platform_tile(4, 6, 3, 3, true, 1));
         let lift_spec = lift.platforms[0];
         let (lift_home, lift_far) = mover_travel(&lift_spec, &lift);
         assert!((lift_far.y - (lift_home.y - 3.0)).abs() < 1e-4);
@@ -6431,8 +6511,14 @@ mod tests {
                 let here = fluid_body_sprite(&sprites, Tile::Water, tx, ty);
                 let across = fluid_body_sprite(&sprites, Tile::Water, tx + FLUID_BLOCK, ty);
                 let down = fluid_body_sprite(&sprites, Tile::Water, tx, ty - FLUID_BLOCK);
-                assert_eq!(here, across, "the block must wrap at {FLUID_BLOCK} across ({tx}, {ty})");
-                assert_eq!(here, down, "the block must wrap at {FLUID_BLOCK} down ({tx}, {ty})");
+                assert_eq!(
+                    here, across,
+                    "the block must wrap at {FLUID_BLOCK} across ({tx}, {ty})"
+                );
+                assert_eq!(
+                    here, down,
+                    "the block must wrap at {FLUID_BLOCK} down ({tx}, {ty})"
+                );
             }
         }
         // And the cells are sixteen different pictures, not one pasted sixteen times: an index
@@ -6517,6 +6603,152 @@ mod tests {
         );
     }
 
+    /// **A scattered vine under a one-way shelf grows out of the wood, not out of the empty
+    /// cell below it.**
+    ///
+    /// The report: a shelf sometimes has a vine under it and the vine does not touch the
+    /// platform, so it floats. The art is not at fault. A one-way shelf is a thin deck across
+    /// the *top* of its cell with air under it ([`ONEWAY_PLANK`]), so a vine tied to the top of
+    /// the cell below begins most of a tile under the plank it is supposed to be hanging from.
+    /// The same level carries an ordinary rock ceiling beside it, because the rule has to
+    /// leave the vines that already looked right where they were.
+    #[test]
+    fn a_scattered_vine_hangs_from_the_shelf_it_is_tied_to() {
+        let mut level = Level::starter("shelf-hang", 40, 12);
+        for tx in 2..38 {
+            assert!(
+                level.set_tile(tx, 4, Tile::OneWay),
+                "the test laid its own shelf"
+            );
+            assert!(
+                level.set_tile(tx, 8, Tile::Solid),
+                "and a rock ceiling to compare with"
+            );
+        }
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let camera = Camera::fit(&level, viewport, 24.0);
+        let atlas = atlas();
+        let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
+        let vines = [
+            atlas.uv("vine_a").expect("vine_a is in the atlas"),
+            atlas.uv("vine_b").expect("vine_b is in the atlas"),
+        ];
+        let quads = headless_sprite_quads(&level, RenderOpts::editing());
+
+        let mut under_shelf = 0;
+        let mut under_solid = 0;
+        for ty in [5, 9] {
+            for tx in 2..38 {
+                if hanging_sprite(&sprites, &level, tx, ty, 0.0).is_none() {
+                    continue;
+                }
+                let cell = camera.tile_rect(tx, ty, viewport);
+                // Where the top of the picture has to be: the plank's underside when the
+                // vine hangs from a shelf, and the bottom of the ceiling cell when it hangs
+                // from rock, which is the edge it has always been drawn from.
+                let top = if level.tile(tx, ty - 1) == Some(Tile::OneWay) {
+                    under_shelf += 1;
+                    let shelf = camera.tile_rect(tx, ty - 1, viewport);
+                    shelf.top() + (shelf.height() * ONEWAY_PLANK).round()
+                } else {
+                    under_solid += 1;
+                    cell.top()
+                };
+                let drawn = quads
+                    .iter()
+                    .find(|(rect, uv)| {
+                        vines.contains(uv)
+                            && (rect.left() - cell.left()).abs() < 1.0
+                            && (rect.right() - cell.right()).abs() < 1.0
+                    })
+                    .unwrap_or_else(|| panic!("no vine was drawn at ({tx},{ty})"));
+                assert!(
+                    (drawn.0.top() - top).abs() < 1.0,
+                    "the vine at ({tx},{ty}) starts at {} but its ceiling's underside is at \
+                     {top}",
+                    drawn.0.top()
+                );
+            }
+        }
+        assert!(
+            under_shelf > 0,
+            "no vine under the shelf: the fixture proves nothing"
+        );
+        assert!(
+            under_solid > 0,
+            "no vine under the rock ceiling: the fixture proves nothing"
+        );
+    }
+
+    /// **A painted shaft of vine under a shelf reaches the wood too.**
+    ///
+    /// The vine *tile* is continuous down its cell, so it meets another vine cell above it
+    /// with no seam — but above a shaft there is usually a ceiling, and a shelf's cell is
+    /// mostly air. The stem is carried up the rest of the shelf's cell by hand, cropped from
+    /// the top of the vine's own picture so the two pieces are the same stem at the same
+    /// scale.
+    #[test]
+    fn a_painted_vine_under_a_shelf_reaches_the_plank() {
+        let mut level = Level::starter("shelf-shaft", 20, 12);
+        for tx in 4..9 {
+            assert!(
+                level.set_tile(tx, 4, Tile::OneWay),
+                "the test laid its own shelf"
+            );
+        }
+        for ty in 5..8 {
+            assert!(
+                level.set_tile(6, ty, Tile::Vine),
+                "and a shaft of vine under it"
+            );
+        }
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let camera = Camera::fit(&level, viewport, 24.0);
+        let vine = atlas().uv("vine").expect("vine is in the atlas");
+        let quads = headless_sprite_quads(&level, RenderOpts::editing());
+        let shelf = camera.tile_rect(6, 4, viewport);
+        let cell = camera.tile_rect(6, 5, viewport);
+        let deck = shelf.top() + (shelf.height() * ONEWAY_PLANK).round();
+
+        // The cell under the shelf is still drawn whole, in its own square.
+        assert!(
+            quads.iter().any(|(rect, uv)| *uv == vine
+                && (rect.top() - cell.top()).abs() < 0.5
+                && (rect.left() - cell.left()).abs() < 0.5),
+            "the vine cell under the shelf is not drawn where it belongs"
+        );
+
+        // And one cropped piece fills the strip of the shelf's cell between the plank and
+        // the top of that cell, in the same columns.
+        let strips: Vec<Rect> = quads
+            .iter()
+            .filter(|(_, uv)| {
+                (uv.min.x - vine.min.x).abs() < 1e-4
+                    && (uv.min.y - vine.min.y).abs() < 1e-4
+                    && (uv.max.x - vine.max.x).abs() < 1e-4
+                    && uv.height() < vine.height() - 1e-4
+            })
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(strips.len(), 1, "one strip above the shaft: {strips:?}");
+        let strip = strips[0];
+        assert!(
+            (strip.top() - deck).abs() < 0.5,
+            "the stem starts at {} but the plank ends at {deck}",
+            strip.top()
+        );
+        assert!(
+            (strip.bottom() - cell.top()).abs() < 0.5,
+            "the strip stops at {} short of the cell below it at {}",
+            strip.bottom(),
+            cell.top()
+        );
+        assert!(
+            (strip.left() - cell.left()).abs() < 0.5 && (strip.right() - cell.right()).abs() < 0.5,
+            "the strip is not in the shaft's own column: {strip:?} against {cell:?}"
+        );
+    }
+
     /// **A pull-up is drawn as a climb, not as a fall.**
     ///
     /// The renderer has one pose for an airborne body that is not rising, and it is the *falling* one
@@ -6530,7 +6762,10 @@ mod tests {
         // geometry the pull-up exists for.
         let mut level = Level::starter("mantle-probe", 20, 10);
         for ty in 5..9 {
-            assert!(level.set_tile(1, ty, Tile::Vine), "the test laid its own vine");
+            assert!(
+                level.set_tile(1, ty, Tile::Vine),
+                "the test laid its own vine"
+            );
         }
         assert!(level.set_tile(1, 4, Tile::Solid), "and the block above it");
         let mut sim = Sim::new(&level, 3);
@@ -6990,7 +7225,11 @@ mod tests {
         }
         let (ax, ay) = level.goal_tiles()[0];
         assert_eq!(cells[1], (ax, ay), "the pole's foot stands on the anchor");
-        assert_eq!(cells[0], (ax, ay - 1), "and the cloth hangs one cell above it");
+        assert_eq!(
+            cells[0],
+            (ax, ay - 1),
+            "and the cloth hangs one cell above it"
+        );
         assert!(
             !level.goal_covers(ax, ay - 2),
             "a third cell up is open air, not the goal"

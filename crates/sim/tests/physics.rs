@@ -152,7 +152,10 @@ fn landing_settles_the_body_flush_on_the_surface() {
     common::step_n(&mut sim, AgentAction::Walk, 8);
 
     let player = sim.player();
-    assert!(player.grounded, "the body should be standing after settling");
+    assert!(
+        player.grounded,
+        "the body should be standing after settling"
+    );
     assert_eq!(
         player.vy, 0.0,
         "a resting body must have zero vertical velocity"
@@ -303,7 +306,14 @@ fn running_into_a_wall_stops_the_body_flush_against_the_wall_face() {
 fn hop_carry(hold_blocks: u32, tail: AgentAction) -> f32 {
     let sky = ".".repeat(30);
     let ground = "#".repeat(30);
-    let rows = vec![sky.clone(), sky.clone(), sky.clone(), sky.clone(), ground.clone(), ground];
+    let rows = vec![
+        sky.clone(),
+        sky.clone(),
+        sky.clone(),
+        sky.clone(),
+        ground.clone(),
+        ground,
+    ];
     let level = fixture("hop-runway", &rows, (1, 3), &[("goal", 28, 3)]);
     let mut sim = sim::Sim::new(&level, 7);
     common::settle(&mut sim);
@@ -427,7 +437,11 @@ fn a_landing_zone_is_a_checkpoint_only_when_something_had_to_be_crossed() {
     // landscape is untouched by the term.
     let flat = fixture("flat", FLAT, (1, 3), &[("goal", 11, 3)]);
     for col in 0..12 {
-        assert_eq!(flat.checkpoint_zone(col, 4), None, "flat ground, column {col}");
+        assert_eq!(
+            flat.checkpoint_zone(col, 4),
+            None,
+            "flat ground, column {col}"
+        );
     }
 
     // And the far side of a pit is one, for the same reason a spike's far side is.
@@ -504,7 +518,11 @@ fn a_checkpoint_is_credited_on_arrival_and_not_for_flying_over_the_zone() {
     while sim.player().x < 6.0 && !sim.outcome().is_finished() {
         sim.step(AgentAction::Sprint);
     }
-    assert_eq!(sim.outcome(), sim::Outcome::Running, "the approach must survive");
+    assert_eq!(
+        sim.outcome(),
+        sim::Outcome::Running,
+        "the approach must survive"
+    );
     sim.step(AgentAction::SprintJump);
 
     // Fly. Every airborne frame above the far zone is a frame *inside* the zone's columns
@@ -544,7 +562,10 @@ fn a_checkpoint_is_credited_on_arrival_and_not_for_flying_over_the_zone() {
     );
     // Guard the mechanism, not just the outcome: the count came from standing, so it must
     // not have been there while airborne.
-    assert!(sim.player().grounded, "the body should be on the ground here");
+    assert!(
+        sim.player().grounded,
+        "the body should be on the ground here"
+    );
 }
 
 /// A zone pays once. Walking the same stretch of ground again is not a second arrival.
@@ -570,11 +591,19 @@ fn a_checkpoint_zone_pays_once_however_often_the_body_stands_on_it() {
         "the sprint jump should have landed on the far ledge, at x = {}",
         sim.player().x
     );
-    assert_eq!(sim.stats().checkpoints, 1, "the far ledge is one checkpoint");
+    assert_eq!(
+        sim.stats().checkpoints,
+        1,
+        "the far ledge is one checkpoint"
+    );
 
     // Walk right, then left again along the ledge it landed on. Same zone throughout.
     common::step_n(&mut sim, AgentAction::Run, 40);
-    assert_eq!(sim.stats().checkpoints, 1, "walking further along a zone is not a new one");
+    assert_eq!(
+        sim.stats().checkpoints,
+        1,
+        "walking further along a zone is not a new one"
+    );
     common::step_n(&mut sim, AgentAction::Retreat, 12);
     assert_eq!(
         sim.stats().checkpoints,
@@ -589,7 +618,11 @@ fn a_checkpoint_zone_pays_once_however_often_the_body_stands_on_it() {
 fn a_failed_pit_leap_keeps_its_frontier_and_earns_no_checkpoint() {
     let level = fixture("sprint-gap", SPRINT_GAP, (1, 3), &[("goal", 24, 3)]);
 
-    fn attempt(level: &sim::Level, run: AgentAction, jump: AgentAction) -> (sim::Outcome, f32, u32) {
+    fn attempt(
+        level: &sim::Level,
+        run: AgentAction,
+        jump: AgentAction,
+    ) -> (sim::Outcome, f32, u32) {
         let mut sim = sim::Sim::new(level, 107);
         common::settle(&mut sim);
         let mut jumped = false;
@@ -607,7 +640,8 @@ fn a_failed_pit_leap_keeps_its_frontier_and_earns_no_checkpoint() {
         (sim.outcome(), sim.stats().best_x, sim.stats().checkpoints)
     }
 
-    let (run_outcome, run_x, run_checkpoints) = attempt(&level, AgentAction::Run, AgentAction::RunJump);
+    let (run_outcome, run_x, run_checkpoints) =
+        attempt(&level, AgentAction::Run, AgentAction::RunJump);
     assert_eq!(run_outcome, sim::Outcome::Died);
     assert!(
         run_x > SPRINT_GAP_EDGE,
@@ -681,12 +715,7 @@ fn a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips() {
     );
 
     // A resting body placed by its bottom edge, as `PlayerState::spawn` would put it.
-    fn placed(
-        level: &sim::Level,
-        ph: &sim::physics::Physics,
-        x: f32,
-        bottom: f32,
-    ) -> PlayerState {
+    fn placed(level: &sim::Level, ph: &sim::physics::Physics, x: f32, bottom: f32) -> PlayerState {
         let mut p = PlayerState::spawn(level, ph);
         p.x = x;
         p.y = bottom - ph.player_h;
@@ -708,7 +737,9 @@ fn a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips() {
     // at the end of the tick), so it is still above every drawn pixel when it is tested.
     let mut in_the_band = placed(&level, ph, SPIKE_COLUMN as f32 + 0.2, drawn_top - 0.02);
     assert!(
-        !in_the_band.tick(&level, ph, AgentAction::Walk).touched_spike,
+        !in_the_band
+            .tick(&level, ph, AgentAction::Walk)
+            .touched_spike,
         "a body that never reaches down to the topmost drawn pixel has cleared the spike"
     );
 
@@ -971,7 +1002,10 @@ fn a_press_just_before_touchdown_is_remembered_and_an_old_one_is_not() {
         "a press inside the {} tick buffer must fire on landing, but the body just landed",
         PHYSICS.jump_buffer_ticks
     );
-    assert!(!sim.player().grounded, "and the buffered jump left the ground");
+    assert!(
+        !sim.player().grounded,
+        "and the buffered jump left the ground"
+    );
 }
 
 /// Sprint is a gear with a price: it clears a gap a run cannot, and it needs the runway.
@@ -1193,7 +1227,8 @@ fn walking_into_a_pit_is_still_fatal() {
         sim.player().y
     );
     assert_eq!(
-        cling_ticks, 0,
+        cling_ticks,
+        0,
         "and it must not have touched the pit wall on the way: the turn costs more ground \
          than {} ticks of fall allow",
         sim.stats().frames
@@ -1214,7 +1249,10 @@ fn ticks_to_reverse(level: &sim::Level, airborne: bool) -> u32 {
     );
     if airborne {
         sim.step(AgentAction::RunJump);
-        assert!(!sim.player().grounded, "the body should have left the ground");
+        assert!(
+            !sim.player().grounded,
+            "the body should have left the ground"
+        );
     } else {
         assert!(sim.player().grounded, "this half is the one on the ground");
     }
@@ -1319,7 +1357,11 @@ fn a_body_that_jumps_off_the_lip_can_turn_around_and_land_back() {
         sim.player().x,
         sim.player().y
     );
-    assert_ne!(sim.outcome(), sim::Outcome::Died, "turning around is not a death");
+    assert_ne!(
+        sim.outcome(),
+        sim::Outcome::Died,
+        "turning around is not a death"
+    );
     assert_eq!(
         sim.stats().jumps,
         1,

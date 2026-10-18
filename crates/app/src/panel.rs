@@ -159,6 +159,10 @@ pub struct RunSummary {
     pub target: Option<u32>,
     pub pop_size: usize,
     pub wins: usize,
+    /// Genomes that won **every** episode they were judged on this generation — the conservative
+    /// reading of [`RunSummary::wins`], and the one that is not a coin flip on a level where a
+    /// patrol phase is drawn per episode.
+    pub solved: usize,
     pub max_fitness: f32,
     pub avg_fitness: f32,
     pub min_fitness: f32,
@@ -239,6 +243,7 @@ impl RunSummary {
             target: packet.target,
             pop_size: packet.pop_size,
             wins: packet.wins,
+            solved: packet.solved,
             max_fitness: packet.max_fitness,
             avg_fitness: packet.avg_fitness,
             min_fitness: packet.min_fitness,
@@ -292,9 +297,15 @@ impl RunSummary {
         self
     }
 
-    /// Whether any generation has reached the flag.
+    /// Whether the run has **solved** the level — a genome that won every episode it was judged
+    /// on, not one that touched the flag on the phase it happened to draw.
+    ///
+    /// The colour this drives is the run's answer rather than its standing fact, so it reads the
+    /// conservative census ([`RunSummary::solved`]); a walker level whose `wins` are all
+    /// single-phase draws stays dim, which is the honest reading. The champion's own episode is
+    /// still accepted, because a record whose episode is a win is by construction solved.
     pub fn solved(&self) -> bool {
-        self.wins > 0 || self.best.as_ref().is_some_and(|b| b.outcome == "won")
+        self.solved > 0 || self.best.as_ref().is_some_and(|b| b.outcome == "won")
     }
 }
 
@@ -742,7 +753,15 @@ pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
             // same shape as the solved case, so the line is comparable from generation to generation
             // and a run's first win is the same three characters changing colour.
             value: format!("{} / {}", summary.wins, summary.pop_size),
-            unit: "reached the flag".to_string(),
+            // The strict reading is named only when it differs, which is exactly when the level
+            // draws its world per episode: "3 / 200 reached the flag" and "1 of them on every
+            // trial" are two different claims, and the second is the one that survives the next
+            // patrol phase. On a deterministic level the clause never appears.
+            unit: if summary.solved < summary.wins {
+                format!("reached the flag — {} on every trial", summary.solved)
+            } else {
+                "reached the flag".to_string()
+            },
             colour: if summary.solved() { GOOD } else { TEXT_DIM },
         },
         Reading {
@@ -1988,6 +2007,9 @@ mod tests {
             avg_fitness: history.last().map(|h| h.avg_fitness).unwrap_or(0.0),
             min_fitness: -40.0,
             wins: if won { 3 } else { 0 },
+            // A deterministic level's fixture: every genome that touched the flag also won every
+            // trial of it, which is the invariant the panel's strict reading exists to keep.
+            solved: if won { 3 } else { 0 },
             genius: false,
             pop_size: 200,
             // A quiet, fixed-sigma run: the panel's search line then has nothing to say

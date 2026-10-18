@@ -4421,13 +4421,542 @@ the direction of travel. `stats.stomps` no longer counts a turret because nothin
 Docs corrected in the same pass: the README's enemy table, the editor's turret tooltip and the
 `TurretSpec` comment all said "stompable", and the platform row now documents the travel guide.
 
+## The vine let go of a body that was running at it
+
+Reported from a run rather than a test: on a custom level whose only way across a lava pit is a vine
+hanging from the ledge above its lip, the best agents kept failing **at the vine**. Their own episodes
+show the shape of it — the population runs right, jumps at the pit, catches the vine and then slides
+back out of the column into the lava.
+
+**The trace is the finding.** The champion of that run, replayed against the level it was trained on,
+was caught by the vine at `x = 20.62` carrying `vx = 0.09`, climbed **one tile**, and left the vine at
+`x = 22.15` with nothing under it. Four of eight seeds died in the lava at `x ≈ 26.9` with **zero**
+checkpoints; the other four only crossed when the policy happened to stop pressing right for long
+enough on the climb. That is the whole bug: the grab caught `vy` and nothing else. The physics
+comment has said since the elements pass that "arriving at a vine at speed catches the body on the
+first tick", and that was true vertically and false horizontally — a body arriving at a run kept the
+run's speed, the column is one tile and the body 0.8 tiles wide, so the hold band is 1.8 tiles and a
+direction held for a dozen decisions carried it out. And the direction a policy holds *is* right:
+every other part of every level rewards it, so the vine was the one place where the locally correct
+action was fatal.
+
+**The fix is that the vine holds.** The grab spends the body's horizontal speed, the same way it
+already spent the vertical one, and while the climb is held below the top of the run the vine owns
+`x`: a direction is not a walk. "Hold jump and keep running" climbs now. The last
+`physics::VINE_EXIT_REACH` (0.9 tiles) below the top is the **exit window** — the sideways press that
+carries a body onto the ledge beside the run, which is also exactly where
+`reach::vine_action` presses — so stepping off onto a ledge is unchanged, and releasing the climb
+(below the window) still lets a side press step off mid-shaft, which is how a body drops out of a
+vine it no longer wants.
+
+**The oracle is untouched, and that is the check that the change is in the right place.** The
+scripted vine climb presses no direction until the exit window, so every route the oracle walks is
+bit-identical: `reach`, `evo::route_play` and the ten-level verdict table all pass without a number
+moving, and the custom level still answers "reachable". What changed is only what a *policy* does
+when it presses into a vine. The version trio moves to **sim 0.15.0** because a champion's physics
+is not the same any more; sensors v12 and fitness v8 are untouched (the patch already said where the
+vine is, and the reward already paid for ground).
+
+Tests: `a_vine_catches_a_running_body_and_holds_it_while_the_climb_is_pressed` (sim) is the reported
+case as a fixture — a vine over a lava pit, the run button held the whole way, the body caught at the
+lip, the column held to the top, the pull-up ending standing on the ledge; on the old rule it fails as
+soon as the body slides, which is the second tick of the climb. The existing vine tests (climb and
+slide rates, the sideways exit, the pull-up,
+the two-tile lid, the oracle) pass unchanged, and `route_play`'s vine fixture still walks.
+
+**Measured on the level that produced the report**, pop 200, `--stop-on-win`, 200 generations, the
+same command and seed either side of the change:
+
+| | first win | detours needed to get there | clock |
+|---|---|---|---|
+| vine let go (before) | **generation 141** | **3** — the first at the vine itself: spawn tile 17, flag on the ledge at `(21, 3)`, 38 generations to learn one climb | 5.7 s of search |
+| vine holds (after) | **generation 13** | **0** | 0.2 s of search |
+
+The first detour in the before arm is the whole finding in the machine's own words: the stall chain
+derived a practice level whose only move is the vine, and spent 38 generations on it. That detour no
+longer exists. The 10× is a reading of this level rather than a law — a first win is a threshold and
+an easy one at that — but it is the difference between a level whose only route is a trap and one
+whose route is a move.
+
+**What this does not fix.** The level that produced the report still has a turret on the ledge at
+`(28, 3)` firing back along the row the body stands in after the pull-up, so the climb can end in a
+shot rather than a fall. That is a level-design note rather than an engine one — a turret covering
+the only landing is a decision the author makes — and the fresh population above solves the level
+anyway (8.25 s at the flag on its first win). What it does mean is that the champion saved from the
+*old* run is no better after the fix than before it: its policy was trained on a vine that let go,
+and it alternates climb and brake at the top instead of pulling up.
+
+## A custom copy of a shipped level was writing over the pack's champion
+
+The second report from the same run, found while reading the files it left: the pack's
+`champions/l1-flat-run.json` had been replaced by a champion whose level hash is the *custom* level's.
+The chain is three files that each did the reasonable thing: `protect_shipped_path` saves a copy of a
+shipped level as `custom-<stem>.json` while keeping the shipped level's **name** (that is what a copy
+is), the shelf and the title screen look for a champion beside the level under the **file's** stem,
+and `train-cli` names its output after the file's stem — but the window's `Lab::stem()` slugged the
+level's *display name*. The two spellings agree for every shipped level and for every level somebody
+names by hand; they disagree exactly when a level is a copy of another, which is the commonest way a
+person starts one. A run on `custom-l1-flat-run.json` therefore wrote `champions/l1-flat-run.json`,
+and `ChampionFile::load_for_level` then refused that file for the shipped level it now disagreed with.
+
+`lab::artifact_stem` is the one statement of the rule: **the document's file stem when it has one, and
+the slugged display name only for a document that has never been saved** (where the first save will
+wear that name anyway). `Lab::start` and `Lab::restart` take it, the app computes it from
+`editor.path`, and the run's champion, practice level and checkpoint all wear it, so the window and
+the terminal now name the same artifacts for the same file. Test:
+`a_custom_copy_of_a_shipped_level_names_its_artifacts_after_its_own_file`.
+
+The clobbered file is not restored: it was already committed, and under sim 0.15.0 every champion on
+disk is refused anyway. The next run on the copy writes `champions/custom-l1-flat-run.json` and the
+pack's own champion is retrained or left alone, which is the same bill the version bump sends to every
+other file in the directory.
+
+## The window kept three copies of the level, and New only replaced one
+
+The report from the window: *"the levels buttons show the levels, but does not let me select/load
+them"* and *"when clicking New … it keeps whatever you were working on before"*. Both were
+reproduced through real presses, in a harness that did not exist before: `EvoApp::build` now takes a
+bare `egui::Context` instead of an `eframe::CreationContext`, and the frame half of
+`eframe::App::update` is `EvoApp::frame`, so a test can run the real window — the dock, the shelf, the
+fade, the canvas — and click it with real pointer events. (The frame helper advances `time` a
+sixtieth per frame; a harness that fed every frame `time = 0` makes egui treat every click as the
+second half of a double click.)
+
+The measurement is three presses:
+
+| press | before | after |
+|---|---|---|
+| **New** on a clean document | works | works |
+| **New** inside a playtest | `mode=Play session=true drawn_is_old=true` — the old level still running | `mode=Edit`, no session, canvas on the new document |
+| a card on the shelf | opens it | opens it |
+
+**The cause of the first is that a document is not the only copy of a level in this window.** A
+playtest session, a replayed episode and a running population each hold their own copy of the terrain
+they started on, and while one of those views is up it is *that* copy the canvas draws (`viewed_level`
+and the Play arm of `canvas`). **New** swapped `editor` and left all three in place, so in Play or
+Evolve the level on screen did not change at all — only the plaque did. `open_level` dropped the
+session but not the run or the replay. One path now does both (`EvoApp::apply_replace`): install the
+document, drop the run (its worker joined on its own thread, so New does not freeze the window for
+the length of a generation), drop the session, the replay, the lanes and the packet, return to Edit,
+refit the camera, and reset the rename buffer.
+
+**The cause of the second is that a refusal was a whisper.** The two-press rule for a dirty document
+is unchanged and still pinned by `discard_guard`'s test, but its only voice was a sentence in the
+status line at the bottom of the window — which is why a card that asked a question and a card that
+did nothing looked the same. The same refusal now also puts a card above the status bar, naming what
+was asked for (*Opening l2-first-gap.json would throw away this level's unsaved edits.*) with the two
+answers on it: **Discard** and **Keep editing**. The card is placed *below* the middle of the window
+on purpose, so it never covers the card that is being asked about — pressing it again is still the
+other answer — and a save clears the question, because the work it was protecting is on disk.
+
+Two more defects fell out of driving the real controls:
+
+* **A double click was the pointer's, not the card's.** egui's `double_clicked` tests the clock and
+  nothing else, so *any* click within 0.3 s of another reports a double click on whatever it landed
+  on — and the shelf turns a double click into a playtest. Clicking **Levels** and then a card at
+  speed dropped the viewer into the playtest instead of the editor. The shelf remembers `(card,
+  time)` itself now.
+* **The dock moved on the first stroke.** The plaque is as wide as its own words, and its second line
+  grew from `file` to `● file — not on disk` when the document became dirty, pushing every tool to
+  its right sideways and pulling them back on the save. Both states are two columns and a file name
+  now — `● ` or two blanks — and the sentence lives on the plaque's hover.
+
+Tests: `the_new_button_clears_the_level_and_every_view_of_it`,
+`a_card_on_the_shelf_opens_its_level_and_a_dirty_document_is_asked_first`,
+`the_discard_buttons_answer_the_question_they_are_asked`,
+`the_dock_does_not_move_when_the_document_becomes_dirty`, and
+`a_quick_second_click_opens_a_different_card_and_double_click_plays_the_same_one`.
+
+## A vine under a one-way shelf was hanging off nothing
+
+Reported from the editor: a shelf sometimes has a vine under it and the vine does not reach the
+platform, so it reads as a cutting stuck in mid-air rather than a plant growing out of the shelf.
+
+**The art is not at fault, and its own notes say so.** A one-way platform is a thin timber deck
+across the *top* of its cell — three of the sixteen rows a cell is drawn in, with iron brackets
+under those and open air below them (`tools/art/terrain.py::oneway`) — while everything that hangs
+in this game was drawn to start at the top of its own cell, which it assumed was the underside of a
+ceiling. `tools/art/props.py::vine` puts that rule in words: *"Its row 0 is opaque on purpose: a vine
+whose stem began a pixel below the top of the cell would look like it was floating under the
+platform rather than growing out of it."* A shelf breaks the assumption, because its cell is mostly
+air: the cell boundary is 13/16 of a tile below the wood. Both vines in the level were therefore
+drawn one deck too low, and both are fixed in the view, with the drawing untouched:
+
+* **The scattered hanging vine** (`hanging_sprite`, one column in six under a ceiling) is a `Prop`
+  with a new `hangs` flag. A standing prop is placed by its feet on the ground line; a hanging one is
+  placed by its *top*, on the underside of what it grows out of — which `draw_prop` now reads off the
+  level, because under a shelf that underside is the plank and not the cell boundary. Under a solid
+  ceiling the two lines are the same, so those vines are drawn exactly where they were.
+* **A painted shaft of `Tile::Vine`** has no cell to spare above it — the shaft already fills its own
+  cells and tiles vertically, which is what makes ten of them one plant — so the missing strip of the
+  shelf's cell is filled with a crop of the vine's top rows (`draw_vine_to_shelf`), in the same
+  columns and at the same pixel scale as the cell below. Cropped rather than stretched: the stem is
+  continuous from row 0 to row 15 by design, so the join is invisible.
+
+`ONEWAY_PLANK` (3/16 of a cell) is the number both paths need, and it is pinned to the shipped
+atlas rather than trusted: three of the sixteen rows of every `oneway_*` sprite fill the cell, and
+the next one does not, which is where the brackets start.
+
+**What this does not change**: the deck stays thin (a one-way platform that filled its cell would
+look like a wall the body walks through — the thing the tile exists to avoid looking like), and a
+vine keeps its own length. It is attached higher, not stretched longer. Placed scenery obeys the same
+rule, so an author who drops `vine_a` under a shelf gets the same connection the scatter gives them.
+
+Tests: `a_scattered_vine_hangs_from_the_shelf_it_is_tied_to` and
+`a_painted_vine_under_a_shelf_reaches_the_plank` (app, drawn through the headless frame harness and
+measured against the shelf's own quad), and `a_one_way_shelf_deck_is_the_top_rows_of_its_cell`
+(atlas, which pins `ONEWAY_PLANK` to the drawing). The scattered test carries a rock ceiling beside
+the shelf in the same level, so the vines that already looked right are asserted to have stayed put.
+
+## The verdict called a level with a shuttle in it unbeatable
+
+Reported from a custom level: *"the oracle doesn't class the level as finishable because it doesn't
+properly account for the moving platforms"*. It was right on both halves. The level is a sixty-tile
+run over a lava floor with two shuttles carrying the body across it, and `reach` answered
+**UNBEATABLE — no canonical move from platform 3 reaches the next surface**: the spawn stand is the
+four-column ledge at the left, every move off it lands in the lava, and the shelf that crosses the
+lava was not in the sweep at all.
+
+**Why it was not, and why the reason did not survive contact with a level.** A mover is not terrain.
+Its phase is a fact about the *episode* — a shelf is at a different place on frame 0 than on frame
+90 — and the oracle's move set is a statement about the level, so the sweep simulated the level as
+if no platform existed and the level file's own note was where the author said what that meant.
+That is a defensible position about a *route*, and it is the wrong answer to the question a verdict
+is asked. "Can this level be beaten?" is true of a level whose only crossing is a shelf, and the
+person who drew one is entitled to hear yes.
+
+**The fix is a ride, modelled as a ride.** A mover's travel has two ends, and both are stands: the
+deck parked at the near end and the deck parked at the far end, each at the deck's own half-cell
+height (`Platform::surface_y`, which is why that field is a float — a deck's top is mid-cell, and
+rounding it to a tile edge would be a half-tile lie in every jump off it). Between the two there is
+one edge the sweep cannot simulate and does not need to: *wait for the cycle*, which is always
+available because the cycle never stops. `reach_platforms` therefore answers the verdict's question
+with the terrain **plus both ends of every mover**, and `Platform::ride` names the partner stand.
+The level now answers OK with 11 surfaces, all reachable, where it previously answered with 5 and a
+sealed spawn.
+
+The route graph deliberately still does not model it (`goal_routes` keeps the terrain table). A
+*plan* has no way to press a clock, and the waypoint sensor would steer a body that is already
+riding at the far end of the travel, which is the one place it must not walk. The consequence is
+recorded below rather than papered over.
+
+## The editor could not say which way a shelf leaves
+
+A turret has carried a firing direction since it existed, in the level file, in the palette row and
+in the mirror; a shelf carried only its width, its travel and its axis. So a level whose only ride
+*arrives from the right* could not be drawn, and the two shelves that differ only in direction were
+the same three numbers in a file. `PlatformSpec::dir` is that field now — `+1` right (or up, for a
+lift), `-1` left (or down) — and it is threaded through everything a direction has to reach: the
+loader (`axis: "down"` still means what it always meant, and a file with no `dir` is the rightward
+shelf it always was), the writer, `Mover`'s travel and its state hash, `clear_travel`'s probe, the
+whole-document mirror (**a slider's direction turns with the level; a lift's does not**, because
+up/down is not the mirrored axis), the palette row (`goes: left | right`, or `down | up` for a
+lift), the eyedropper, and the placement call.
+
+Tests: `a_shelf_travels_the_way_the_file_says_it_does` (both spellings, through the real loader and
+the real stepper), `a_mirrored_shelf_travels_the_mirrored_way` (the slider turns, the lift does not),
+and the writer round-trip in `every_new_entity_round_trips_through_the_writer`.
+
+## The agent stalls at the shuttle, and the three things that did not fix it
+
+The same level, trained: **5 seeds x 200 generations x pop 400 solved it 0 times**, best `x` between
+40.9 and 52.4 — past the first shuttle, dead on the second. A first fix pass moved the goal posts
+(respaced spikes, below) and one of five seeds then won at generation 133. At **600 generations x
+pop 600, 0 of 5** — so this is not a budget problem.
+
+**The arithmetic is the finding.** A mover travels at `mover_speed` = 0.0625 tiles a tick, so a
+twelve-tile crossing takes **192 ticks each way**; the deck is three tiles wide and a body walks at
+0.10, so a policy that holds right — the correct press on every other piece of ground in the game,
+and the press this one has learned — walks off the front of it in **30 ticks**. Crossing the level's
+two channels therefore means standing still for roughly 56% of a winning episode, and the
+observation cannot say so: a deck is drawn into the patch as `ENC_ONEWAY`, the same value as a fixed
+one-way shelf, and nothing in the vector says the ground is moving.
+
+**Two sensor changes were built, measured and reverted.** v13 gave a deck its own patch value and two
+slots for the velocity of the deck under the feet; at 200 x 400, five seeds, that arm won **0 / 5**
+(best `x` 46.3, 42.3, 37.2, 46.4, 41.8) against the unadorned build's **1 / 5**. The same slots with
+the patch value left alone: **0 / 5** (40.1, 46.1, 43.7, 44.7, 37.1). A wider vector is a larger
+search space and two extra inputs were not worth eight generations of progress on this level, so
+neither arm shipped. What the numbers say is narrower than "the sensor is wrong": the information is
+real, and at this budget its cost is larger than its value.
+
+**What the run is actually starved of is the curriculum.** Every stall in every seed logged the same
+sentence:
+
+```
+curriculum: no crossing toward the flag from tile (31, 11) in L1-flat-run; the run stays where it is
+```
+
+Tiles (31, 11) and (32, 11) are the ledge the shuttle leaves from. `practice_level_for_stall` derives
+its practice level from `next_stand`, which asks the *route graph* for the next stand toward the flag
+— and the graph was terrain-only, so from that ledge the answer was "there is no route at all". The
+one mechanism in this project built to rescue a stalled run was switched off for exactly the levels
+the verdict had just been taught to trust. The ride went into the graph first, and the flag it
+derives went to the wrong crossing second; that story is the next section.
+
+## The practice flag went to the crossing the run had already made
+
+**The ride is in the route graph now.** `goal_routes` builds a stand for each end of every mover's
+travel and links the pair with `Stand::ride` — the one edge in the graph nobody presses, because the
+cycle makes it true — so `next_stand` from the ledge a shuttle leaves answers the deck instead of
+"no route", and `GoalRoutes::aim` answers a ride with a waypoint on the body itself, which is the
+only honest way to say *hold still* in a vector whose two slots are a direction.
+
+**The flag still went backwards, and the reason is a spawn is not a stand.** `stall_spots` returns
+two answers, because a stall can happen on a deck and only one of them is a tile a spawn may be
+placed on: the deepest stand the genome has **stood** on (terrain or deck) and the deepest *ground*
+tile. The practice level took the tile and asked `next_stand` about **it**, so a run that had ridden
+a shuttle and died on the deck past it was measured from the ledge two decks back. Observed chain,
+on the reported level:
+
+```
+curriculum: 40 generations on L1-flat-run practice at tile (16, 12) to tile (18, 12) ...
+curriculum: 40 generations on L1-flat-run practice at tile (16, 12) to tile (18, 12) ...
+```
+
+— the spike jump the champion made fifty frames before it died, twice, while its death was at `x`
+35.8, two decks along. `practice_level_from(main, tile, Some(stand))` is the flag measured from the
+deck while the **spawn stays on ground**; `practice_level` is that with `None`, unchanged. Then one
+more candidate was removed on measurement: the far end of the *same* deck's travel. The graph
+over-approximates a same-deck hop (a take-off platform is static and a landing deck is at both
+ends), so from a deck's near end the flag landed on its own far end — a "crossing" that is just the
+ride it is already on, and the practice level taught nothing.
+
+The chain on a seed that solves the level is the whole argument, and it is why the fix is worth its
+three lines: every one of those generations is inside an excursion, and the last flag is the finish.
+
+```
+practice (18, 12) to (19, 12)   flag reached at its generation  35
+practice (18, 12) to (19, 12)   flag reached at its generation  36
+practice (16, 12) to (18, 12)   flag reached at its generation  76
+practice (16, 12) to (34, 12)   flag reached at its generation  90   <- the deck crossing
+practice (18, 12) to (50, 12)   flag reached at its generation 269   <- the run's own flag
+```
+
+**Measured, and the honest half of it.** 8 seeds, pop 300, 600 generations, memoryless,
+`--stop-on-win`: **2 / 8** with the flag measured from the frontier stand (seeds 1 and 2, first wins
+at generations 269 and 311) against **2 / 8** with the flag measured from the spawn's stand at the
+same budget (seeds 2 and 7, at 168 and 382). So this is a correctness fix and not yet a win-rate one
+at eight seeds — which seeds win moved, and the chain above is the case it repairs. The two obvious
+next things were measured and are not the answer: `--feedback 8` won **0 / 8** and `--feedback 16`
+**0 / 8**, agreeing with the reverted v13 arms that a wider vector or a recurrent state costs more
+search on this level than the information is worth at this budget.
+
+**A solved champion sits beside the run's own** (`champions/` is ignored, like every champion file).
+`champions/custom-l1-flat-run-solved.json` — the
+seed-1 genome above, won in 845 frames with 12 jumps and 1 checkpoint, `1 of 1 trials won`, and
+`replay` verifies its trajectory bit for bit. The level's own champion, trained for 93 generations
+before any of this, dies at `x` 35.8.
+
+**What is left is the trigger, not the flag — and the obvious trigger is a loss.** The chain above
+only moves at a stall (twenty-five generations of no new best, `render::chart::STALL_GENERATIONS`),
+and every win above arrives inside an excursion, so the next thing tried was to make practice fire
+sooner. `STALL_GENERATIONS` at **8**, same eight seeds and budget: **0 / 8**, with the best `x`
+*better* than the baseline arm's on five of the eight seeds (33.9, 31.8, 48.4, 48.4, 35.7 against
+29.4, 29.4, 32.4, 33.2, 32.3) and every one of them still short of the flag. More excursions is not
+more learning — a run that stops every eight generations to rehearse has fewer generations on the
+level to use the rehearsal in — so the constant went back to 25 and the frontier trigger (practise
+the link the moment it *is* the frontier, REVIEW.md item 6) stays an unmeasured idea rather than the
+next fix. Measured and rejected in the same pass:
+`--novelty 16` (1 / 8) and `--archive-on-diversity` (2 / 8, the gate never firing on a level that
+keeps finding new niches).
+
+Tests: `a_practice_crossing_off_a_deck_is_measured_from_the_deck` — a shuttle between two ledges, with
+the same run asked twice: from the ground the flag is the jump onto the deck, from the deck it is the
+ground past the ride, and the spawn is ground both times because a deck is not a tile a spawn may be
+placed on.
+
+## A one-tile landing pad is not a crossing, and the oracle cannot see that
+
+The level's finish was a sand shelf with `^.^.^` on it: three spikes two columns apart, leaving
+**one tile of safe ground between each pair**. Every seed died there or just past it — best `x`
+50.4 and 52.4, which is standing on the first pad. Respaced to two-tile pads (`^..^`), the same
+seeds reach the flag.
+
+The probe that explains it: a spike at the body's own standing height has to be cleared by a full
+tile of rise, and a canonical trajectory holds one horizontal input for the whole flight. The body
+needs 3.5 tiles of travel by the tick its feet come back down to `11.0` — and at that tick it has
+flown 3.53 tiles, so the arc into a one-tile pad clips the *next* spike with the body's trailing
+corner by a tenth of a tile. Two tiles of pad is comfortable; one is not, for a straight-line jump.
+
+**A policy can do it, because a policy has air control** — it releases the direction mid-flight and
+drops on the pad, which is why `scratch-spike-tight` (spikes two columns apart across a whole floor)
+is solved 11 times in 24 by the population while the oracle's move set cannot take a single pad. So
+splitting the verdict's surface table at spikes — which looks like the honest fix, and was built —
+**turns a solvable level into a false negative**: `scratch-spike-tight` came back unbeatable and two
+`train-cli` tests failed on it. That split is reverted, with the reasoning left on
+`extract_platforms`, and the gap is the deferred item below. The level was respaced for the
+*agent*, not to make a verdict agree.
+
+Tests: `a_shuttle_across_lava_is_the_crossing_the_verdict_reports` — the fixture is the reported
+level in miniature: two ledges, a lava channel too wide to jump, one shuttle. The verdict must say
+yes **with** the platform and no **without** it, so the first answer cannot pass by some other
+route.
+
+# Solved, then validated: what a champion is worth, and how a verification set can lie
+
+`EpisodeResult::won()` asked one question — did the *representative* episode reach the flag — and
+everything downstream inherited it: the generation's `wins`, `--stop-on-win`, the panel's solve
+claim, and the champion a run saves. On a walker level the representative episode is trial 0, one
+drawn patrol phase out of a continuous family, so the run could stop on a quiet phase and save a
+policy that loses the next one. The conservative reading existed (`suite_wins`, every level won) but
+was gated on `levels > 1`, so a *single* walker level had no such signal at all.
+
+The fix is a second reading on the same tally. `SuiteTally` already folds every trial it records,
+so it now also sets `EpisodeResult::all_trials_won`, exposed as `solved()`: **every episode this
+genome was actually judged on reached the flag.** `won()` keeps its narrow meaning because a
+champion file records one episode and `replay` reproduces it; `solved()` is what the generation
+report, `--stop-on-win`, `bench` and the panel's strict line read. On a deterministic level the two
+are the same value by construction — one episode is its own whole — so no flat-level number moved.
+
+That alone was not enough, and the measurement says so. Four seeds of `chain` (`l9-wait-and-climb`,
+pop 200, 400 generations, `--stop-on-win`), then each saved champion re-scored on twelve fresh
+master seeds (101–112):
+
+| seed | solved at (generation) | champion won, fresh episodes |
+|---|---|---|
+| 1 | 44 | 4 / 12 |
+| 2 | 48 | 12 / 12 |
+| 3 | 33 | 4 / 12 |
+| 4 | 42 | 2 / 12 |
+| | | **22 / 48 (46 %)** |
+
+The champion is `best_ever`, and `best_ever` was still the generation's **best score** over draws.
+The first repair tried was the obvious one: four fixed validation episodes (`validation_seed`), and
+the challenger kept the record when its mean was higher. It made things *worse*, and the failure is
+worth recording because it is a trap a validation set sets:
+
+* seeds 1, 3 and 4 saved a champion whose own recorded episode was a **death** (gen 42, frame 109,
+  `best_x` 17.3) while the generation that stopped the run had a genome that won all three of its
+  trials;
+* the fresh-episode count stayed at 22 / 48, so the held-out set bought nothing;
+* a four-episode mean cannot rank a genome that won three and died on one above one that reached
+  mid-level on four — and with enough challenges the maximum over four-episode means is itself a
+  luckiest-draw statistic.
+
+Two changes fixed it, and both are about **what a champion is**:
+
+1. **`BestEver::validated` is a `Validation { wins, episodes, mean }`**, not a mean. Records are
+   compared on `(solved, wins, mean)`, lexicographically (`Validation::beats`), so a genome that
+   won the set beats one that merely scored well. Twelve episodes became the default
+   (from four) — still only paid when a record is challenged, and still skipped on a level with
+   nothing stochastic in it.
+2. **Solved first, always** (`supersedes`): a record whose own episode is a win may not be replaced
+   by one whose episode is a loss, whatever the score or the held-out mean. This is the invariant
+   the `replay` command has always implied — the champion is a demonstration — and it was the
+   thing the stop/save pair was quietly breaking.
+
+And then the stop itself. `train --stop-on-win --stop-on-validated` stops when the **record** has
+won every validation episode, not when a generation has won its own three trials. Measured on the
+same four seeds and the same twelve fresh episodes:
+
+| seed | solved at | held-out reading | champion won, fresh episodes |
+|---|---|---|---|
+| 1 | 70 | 12 / 12 | 12 / 12 |
+| 2 | 48 | 12 / 12 | 12 / 12 |
+| 3 | 61 | 12 / 12 | 12 / 12 |
+| 4 | 62 | 12 / 12 | 12 / 12 |
+| | | | **48 / 48** |
+
+The cost is a median of 23 extra generations per seed (44→70, 33→61, 42→62; seed 2 was already
+validated at its first solve) and 1.3–2.6 s of wall clock. The validation seeds cannot coincide
+with the scoring seeds: `validation_seed` draws on generation `u32::MAX` and genome id `u32::MAX`,
+which no issued genome and no generation reaches, while `score --seed m` draws on generation 0.
+
+What is deliberately **not** changed: `bench`'s first-win stop and every table measured with it. An
+arm that uses the strict stop records `stop_on_validated` in its file, the header says what it
+stops on, and `--compare` refuses two arms that differ there — a three-phase draw and a
+twelve-world verdict are different measurements, and a table that mixed them would be the kind of
+quiet inconsistency this file exists to prevent.
+
+Tests: `solved_requires_every_trial_where_won_asks_only_the_representative_one` (the two readings,
+including a single-episode evaluation where they must agree);
+`a_solved_reading_supersedes_a_higher_scoring_unsolved_one` (the ordering, including the regression
+above); `the_record_carries_a_held_out_reading_only_where_the_world_moves`;
+`validation_episodes_are_fixed_and_belong_to_no_generation`; `the_validated_stop_needs_the_win_stop_and_a_validation_set`.
+
+# The archive earns its place when its children stay local
+
+The archive was measured as a loss and shipped off by default. That measurement was taken with
+coarse children: eight archive children per generation bred with the ordinary move (~86 genes at
+`--mut-rate 0.05`, sigma 0.30), which is exactly the perturbation that destroys the behaviour the
+incumbent was kept for. Breeding them with the fine step — one to three genes, `fine_sigma` — turns
+the mechanism from "a below-average parent with a random child" into a hill climb inside a niche.
+
+Eight seeds of `chain`, pop 200, 400 generations, `--stop-on-win`, each arm one `bench` run and
+compared against the default by seed:
+
+```text
+train-cli bench --protocol chain --seeds 8 --arm plain --out /tmp/arms
+train-cli bench --protocol chain --seeds 8 --arm archive-fine --archive-children 8 --out /tmp/arms
+train-cli bench --compare /tmp/arms/chain-plain.json,/tmp/arms/chain-archive-fine.json
+```
+
+| arm | solved | median first win |
+|---|---|---|
+| no archive (default) | 4 / 8 | 238.0 |
+| `--archive-children 8`, fine children | **6 / 8** | **147.0** |
+| `--archive-children 8`, `--fine-sigma-scale 1.0` | 5 / 8 | 99.0 |
+
+The paired comparison of archive-on against archive-off is **6 gains, 0 losses, 2 ties, p = 0.031**
+(two-sided exact sign test). The fine step inside the archive is *not* established at this size
+(4 wins to 2, p = 0.69), and neither is the fine step on ordinary fine children on its own
+(5 / 8 vs 4 / 8, 3–4, p = 1.0, median 150 against 238). So the honest claim is: **the archive is
+worth its eight slots once its children are local**, and the fine step is kept for the reason it
+was introduced — a niche's behaviour survives a step and does not survive a jump — not because
+this arm proves it. Twenty-four seeds would be needed to say more, which is the bar the review set
+for a default and this pass did not meet.
+
+Two control readings worth keeping: two arms with identical configurations produced identical
+per-seed rows (the trainer is reproducible through `bench`), and `--fine-sigma-scale 1.0` is the
+pre-fix behaviour, recorded in the arm file so the old measurement can be reproduced rather than
+remembered.
+
+# Four rows at a time, at the same bits
+
+The forward pass was a chain of dependent adds: `acc += w*x` waits for the previous `acc`, so a
+row costs its length in add latencies however fast the multiplier is. `dense` now computes four
+output rows side by side (`DENSE_ROW_BLOCK`), each with its own accumulator and its own
+left-to-right order.
+
+Measured on the baseline machine, `96 → 16 → 11` (1 712 multiplies), 200 000 forwards, release
+build, three runs each:
+
+| loop | ns/forward | cycles/MAC at 2.9 GHz |
+|---|---|---|
+| one row at a time | 1 778–1 788 | 2.90–2.92 |
+| four rows blocked | 706–716 | 1.15–1.17 |
+
+That is **2.5×**, and the reason it is allowed in a repository whose determinism is a contract is
+that it is a *throughput* change only: each row's sum is untouched, so every score is bit-identical
+and no champion, table or version moves. The test that carries it
+(`the_blocked_layer_is_bit_identical_to_one_row_at_a_time`) keeps the pre-change loop as the
+*definition* and compares `to_bits()` over five shapes — four full blocks plus a three-row tail
+(the shipped 11 outputs), all blocks (32 → 16), and 1, 3 and 5 hidden units, which are all tail. A
+mis-sized block or an off-by-one in the tail is a test failure rather than a champion that stops
+replaying.
+
+What this does **not** say: the end-to-end generation speedup. The forward pass is about half of a
+generation (review §2.5), so the expected saving is in that range, but it was not re-measured here
+and the number to quote is the microbenchmark above.
+
 # Deliberately deferred
+
+**A hop in the canonical move set.** A policy clears a one-tile pad by releasing its direction
+mid-flight; a canonical trajectory holds one input for the whole flight, so the oracle cannot express
+it and must keep treating a spiked run as one surface. The missing move is a second hold stage — fly,
+then release (or oppose) — which multiplies the sweep by the release tick and would change
+`MOVE_SET_VERSION` again. Until then the verdict over-claims on a spike run and the honest statement
+is the note on `extract_platforms`.
 
 NEAT/speciation, survival-analysis difficulty estimation, online champion
 sharing, sound, mobile, powerups, achievements/tutorial, threaded WASM, and the
 web build. See the plan's §12 for the gates.
 
-No longer deferred: the pixel renderer, the editor and the watch mode. All three
+No longer deferred: the pixel renderer, the editor and the watch mode, and **the ride in the route
+graph** — deck stands, `Stand::ride`, the hold-still waypoint and a practice flag measured from the
+deck all landed with the finding above. Still deferred inside it is the *trigger*: practice fires at
+a stall, not at the frontier. All three
 existed as a terminal view and hand-written JSON through M1–M3, and are now a real
 window (`crates/app`) — which means a non-developer can build a level, validate it,
 play it and **evolve a solver on it without touching JSON** (the last third of M4's

@@ -203,7 +203,11 @@ impl Plan {
     /// The identity a failed attempt is remembered by: which stand, which take-off position (to a
     /// twentieth of a tile, the grid's own granularity) and which move.
     fn key(self) -> (usize, i32, RouteMove) {
-        (self.stand, (self.target_x * 20.0).round() as i32, self.move_)
+        (
+            self.stand,
+            (self.target_x * 20.0).round() as i32,
+            self.move_,
+        )
     }
 
     /// The arm that starts this move.
@@ -339,7 +343,7 @@ fn press_lands(
             return traj.landed_at.and_then(|(c, r)| routes.zone_at(c, r)) == plan.to;
         }
     };
-    let traj = simulate_jump_at(level, platforms, x, surface_row, &takeoff);
+    let traj = simulate_jump_at(level, platforms, x, surface_row as f32, &takeoff);
     if traj.hit_spike || traj.fell_out {
         return false;
     }
@@ -433,7 +437,9 @@ fn choose_plan(
         return None;
     }
     let preferred = if hops == 1 {
-        routes.flag_edge(stand).or_else(|| routes.next_hop(stand, x, goal))
+        routes
+            .flag_edge(stand)
+            .or_else(|| routes.next_hop(stand, x, goal))
     } else {
         routes.next_hop(stand, x, goal)
     };
@@ -453,7 +459,10 @@ fn choose_plan(
             to: edge.to,
             touches_flag: edge.touches_flag,
         };
-        if candidates.iter().any(|(_, _, _, _, p)| p.key() == plan.key()) {
+        if candidates
+            .iter()
+            .any(|(_, _, _, _, p)| p.key() == plan.key())
+        {
             return;
         }
         candidates.push((
@@ -571,13 +580,9 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                     }
                     RouteMove::Climb { dir } => climb_action(dir, a.ticks, ph),
                     RouteMove::Swim { dir, dive } => swim_action(dir, dive, in_water, a.ticks),
-                    RouteMove::Vine { exit } => vine_action(
-                        exit,
-                        on_vine,
-                        feet,
-                        a.vine_top.unwrap_or(0),
-                        &mut a.exiting,
-                    ),
+                    RouteMove::Vine { exit } => {
+                        vine_action(exit, on_vine, feet, a.vine_top.unwrap_or(0), &mut a.exiting)
+                    }
                 };
                 a.ticks += 1;
             }
@@ -595,8 +600,8 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                 // (`l8-long-jump`, where the aim sits close enough to the stand's edge that the
                 // block carrying the body past it is airborne). A climb is exempt: its script walks
                 // *into* a wall and the body is on the ground for it by construction.
-                let ready = matches!(p.move_, RouteMove::Climb { .. })
-                    || (grounded && vy.abs() <= VY_TOL);
+                let ready =
+                    matches!(p.move_, RouteMove::Climb { .. }) || (grounded && vy.abs() <= VY_TOL);
                 let due = ready
                     && press_due(p, x, vx, tol, &mut closest_dx)
                     && (vx - desired).abs() <= VX_TOL;

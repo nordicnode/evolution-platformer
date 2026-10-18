@@ -114,7 +114,8 @@ fn warm_seed_from_route(level: &Level, cfg: &GaConfig) -> Option<(Vec<Genome>, S
     let started = Instant::now();
     let eval = cfg.eval_config();
     let imit = ImitateConfig::default();
-    let (play, report) = from_route(level, cfg.master_seed, &eval, cfg.shape.clone(), &imit).ok()?;
+    let (play, report) =
+        from_route(level, cfg.master_seed, &eval, cfg.shape.clone(), &imit).ok()?;
     if profiling() {
         eprintln!(
             "lab warm route+clone {:?} ({} decisions, {:.0}% agreement)",
@@ -136,7 +137,10 @@ fn warm_seed_from_route(level: &Level, cfg: &GaConfig) -> Option<(Vec<Genome>, S
     let walked = if play.won() {
         format!("walked the whole route ({:?} hops)", play.route_hops)
     } else {
-        format!("walked part of the route ({} hops closed)", play.hops_closed)
+        format!(
+            "walked part of the route ({} hops closed)",
+            play.hops_closed
+        )
     };
     Some((
         pop,
@@ -291,8 +295,12 @@ pub struct Packet {
     pub max_fitness: f32,
     pub avg_fitness: f32,
     pub min_fitness: f32,
-    /// Agents that touched the flag.
+    /// Agents that touched the flag on the episode they were judged on.
     pub wins: usize,
+    /// Agents that won **every** episode they were judged on — the conservative reading of the same
+    /// census, and the one that is not a coin flip where a patrol phase is drawn. Equal to `wins`
+    /// on a level with nothing stochastic in it.
+    pub solved: usize,
     /// `max > 1.5 × previous max` — the "genius agent" splash (§10 Tier 1.3).
     pub genius: bool,
     pub pop_size: usize,
@@ -559,12 +567,17 @@ pub fn ticks_for(dt: f32, speed: u32) -> f32 {
 pub struct Generator {
     trainer: Trainer,
     level: Level,
+    /// The name the run's artifacts wear ([`artifact_stem`]), carried here because the
+    /// checkpoint a detour writes is named on this thread. The app's saved champion and this
+    /// checkpoint have to agree with the shelf and the terminal, and a copy of a shipped level
+    /// must not write over the shipped level's files.
+    stem: String,
     cfg: GaConfig,
     eval: EvalConfig,
     /// How this run was asked for. A restart edits this rather than replacing it: a
     /// fresh population is not a fresh set of settings.
     plan: RunPlan,
-    /// Where a curriculum step writes its checkpoint — the level's own stem in the run's
+    /// Where a curriculum step writes its checkpoint — `<stem>.population.json` in the run's
     /// output directory, which is the file `train-cli watch --resume` reads.
     out_dir: PathBuf,
     /// The checkpoint this run started from, as a note for the viewer.
@@ -633,6 +646,7 @@ impl Generator {
         random_k: usize,
         plan: RunPlan,
         out_dir: PathBuf,
+        stem: impl Into<String>,
     ) -> Result<Generator, String> {
         let mut cfg = cfg.sanitized(None);
         if cfg.trials <= 1 && !level.walkers.is_empty() {
@@ -651,7 +665,10 @@ impl Generator {
             }
             // A fresh run warms itself from the level's own route when it has one. See
             // [`warm_seed_from_route`] and [`RunPlan::warm_from_route`].
-            None => match plan.warm_from_route.then(|| warm_seed_from_route(&level, &cfg)).flatten()
+            None => match plan
+                .warm_from_route
+                .then(|| warm_seed_from_route(&level, &cfg))
+                .flatten()
             {
                 Some((pop, note)) => (Trainer::resume(cfg.clone(), pop, 0)?, Some(note)),
                 None => (Trainer::new(cfg.clone()), None),
@@ -661,6 +678,7 @@ impl Generator {
             eval: cfg.eval_config(),
             trainer,
             level,
+            stem: stem.into(),
             cfg,
             plan,
             out_dir,
@@ -709,7 +727,14 @@ impl Generator {
     /// Everything the run accumulated is dropped on purpose: the chart is a claim about
     /// *this* population on *this* level, and continuing it across a level change would
     /// draw a cliff that no agent ever experienced.
-    pub fn start_over(&mut self, level: Level, seed: u64, mutation_rate: f32) {
+    pub fn start_over(
+        &mut self,
+        level: Level,
+        seed: u64,
+        mutation_rate: f32,
+        stem: impl Into<String>,
+    ) {
+        self.stem = stem.into();
         let mut cfg = self.cfg.clone();
         cfg.master_seed = seed;
         cfg.mutation_rate = mutation_rate;
@@ -779,9 +804,7 @@ impl Generator {
         let mut trainer = self.trainer.clone();
         let main = self.level.clone();
         let authored = self.plan.curriculum.clone();
-        let path = self
-            .out_dir
-            .join(format!("{}.population.json", slug(&self.level.name)));
+        let path = self.out_dir.join(format!("{}.population.json", self.stem));
         let rate = self.cfg.mutation_rate;
         let main_name = self.level.name.clone();
         let spawned = thread::Builder::new()
@@ -902,9 +925,9 @@ impl Generator {
                     }
                 }
             }
-            Err(_) => self.push_note(
-                "curriculum step failed: the practice thread panicked".to_string(),
-            ),
+            Err(_) => {
+                self.push_note("curriculum step failed: the practice thread panicked".to_string())
+            }
         }
     }
 
@@ -962,11 +985,11 @@ impl Generator {
             .collect(); // The whole population, not only the eight lanes: the replay ghosts all of it, and
                         // the pairing that makes a ghost faithful is (genome, the seed it was scored on),
                         // which is exactly what the report's index-aligned results hold.
-        // By value, because `population` is this function's own copy and nothing below reads it
-        // again: cloning every genome a second time to build this vector cost a full population's
-        // worth of allocation per generation (~1.2 MB at pop 200) for a vector that is then the
-        // only owner of the same data. The `report.results` are borrowed-into by clone instead,
-        // because the report itself is still needed for the history and the deaths below.
+                        // By value, because `population` is this function's own copy and nothing below reads it
+                        // again: cloning every genome a second time to build this vector cost a full population's
+                        // worth of allocation per generation (~1.2 MB at pop 200) for a vector that is then the
+                        // only owner of the same data. The `report.results` are borrowed-into by clone instead,
+                        // because the report itself is still needed for the history and the deaths below.
         let t = Instant::now();
         let agents: Vec<Agent> = population
             .into_iter()
@@ -1047,7 +1070,11 @@ impl Generator {
         }
 
         if profiling() {
-            eprintln!("lab packet total {:?} (generation {})", t_packet.elapsed(), report.generation);
+            eprintln!(
+                "lab packet total {:?} (generation {})",
+                t_packet.elapsed(),
+                report.generation
+            );
         }
         Packet {
             generation: report.generation,
@@ -1055,6 +1082,7 @@ impl Generator {
             avg_fitness: report.avg_fitness,
             min_fitness: report.min_fitness,
             wins: report.wins,
+            solved: report.solved,
             genius: report.genius,
             pop_size: self.cfg.pop_size,
             // Read off the generation the trainer just produced, not recomputed here: the
@@ -1125,9 +1153,9 @@ fn record_trace(
         x: p.x,
         y: p.y,
     };
-    let already_recorded = points.last().is_some_and(|q| {
-        q.frame == end.frame && q.x == end.x && q.y == end.y
-    });
+    let already_recorded = points
+        .last()
+        .is_some_and(|q| q.frame == end.frame && q.x == end.x && q.y == end.y);
     if !already_recorded {
         points.push(end);
     }
@@ -1172,8 +1200,8 @@ struct State {
     /// the whole reason the run cannot train ahead of the viewer.
     want_next: bool,
     quit: bool,
-    /// A level to start a fresh run on, with its seed.
-    restart: Option<(Level, u64)>,
+    /// A restart request: the level as it stands, the seed, and the stem its artifacts wear.
+    restart: Option<(Level, u64, String)>,
     mutation_rate: Option<f32>,
     finished: bool,
     /// A worker thread died of a panic rather than of `quit`.
@@ -1233,12 +1261,7 @@ fn training_threads() -> usize {
 }
 
 /// The worker loop: one generation per request, parked in between.
-fn work(
-    hub: Arc<Hub>,
-    mut generator: Generator,
-    initial_rate: f32,
-    pool: rayon::ThreadPool,
-) {
+fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon::ThreadPool) {
     // Armed before the first generation and disarmed by neither branch: the guard reports a
     // *panic*, and the loop's own exits already say what they are.
     let _guard = WorkerGuard { hub: hub.clone() };
@@ -1255,8 +1278,8 @@ fn work(
             (state.restart.take(), state.mutation_rate)
         };
 
-        if let Some((level, seed)) = restart {
-            generator.start_over(level, seed, rate.unwrap_or(initial_rate));
+        if let Some((level, seed, stem)) = restart {
+            generator.start_over(level, seed, rate.unwrap_or(initial_rate), stem);
         } else if let Some(rate) = rate {
             generator.set_mutation_rate(rate);
         }
@@ -1304,9 +1327,30 @@ pub(crate) fn scored_packet(level: &Level, tag: &str) -> Packet {
         DEFAULT_RANDOM_LANES,
         RunPlan::default(),
         std::env::temp_dir().join(format!("evo-scored-packet-{tag}")),
+        "scored-packet",
     )
     .expect("the generator starts");
     generator.next_packet()
+}
+
+/// The stem a run names its files with.
+///
+/// **The document's file stem first, its display name only as a fallback.** A level's name is what
+/// the shelf card says and what a new save is called, but the file it lives in is what the rest of
+/// the workspace is keyed on: the shelf looks for a champion beside the level under the level
+/// file's stem, the title screen tries that stem before the name, and `train-cli` names its outputs
+/// after it. Deriving the champion from the *name* instead was a real loss of data rather than an
+/// inconsistency: a custom copy of a shipped level keeps the shipped level's name
+/// ([`crate::editor::protect_shipped_path`] writes `custom-<stem>.json` for exactly that case), so
+/// a run on the copy wrote `champions/<shipped stem>.json` and replaced the pack's own champion
+/// with a policy trained on somebody else's geometry.
+///
+/// A document that has never been saved has no file to be keyed on, and its slugged name is the
+/// name its first save will wear, so the two agree from the moment there is a file at all.
+pub fn artifact_stem(level: &Level, path: Option<&Path>) -> String {
+    path.and_then(|path| path.file_stem())
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| slug(&level.name))
 }
 
 /// The window's handle on a running evolution.
@@ -1321,6 +1365,9 @@ pub struct Lab {
     level: Level,
     level_hash: String,
     level_name: String,
+    /// The name this run's artifacts wear, from [`artifact_stem`]: the document's file stem when
+    /// it has one, so a custom copy of a shipped level cannot overwrite the pack's champion.
+    stem: String,
     pop_size: usize,
     /// The window has already asked for the generation it is waiting for, so it does not
     /// ask again every frame.
@@ -1340,6 +1387,9 @@ pub struct Lab {
 impl Lab {
     /// Start a run on `level`. `target` caps the generations, for a scripted or
     /// screenshot run; `None` runs until the window stops it.
+    /// `stem` is what the run's artifacts are called — see [`artifact_stem`]. It is passed in
+    /// rather than derived here because it comes from the *document's path*, which is the app's
+    /// knowledge and not the level's.
     pub fn start(
         level: &Level,
         cfg: GaConfig,
@@ -1347,6 +1397,7 @@ impl Lab {
         random_k: usize,
         plan: RunPlan,
         out_dir: PathBuf,
+        stem: impl Into<String>,
     ) -> Result<Lab, String> {
         let mut cfg = cfg.sanitized(None);
         if cfg.trials <= 1 && !level.walkers.is_empty() {
@@ -1354,6 +1405,7 @@ impl Lab {
         }
         // A checkpoint that cannot be loaded is a startup error, not a run that quietly
         // trains something else: it is the same refusal the terminal's `--resume` makes.
+        let stem = stem.into();
         let generator = Generator::new(
             level.clone(),
             cfg.clone(),
@@ -1361,6 +1413,7 @@ impl Lab {
             random_k,
             plan,
             out_dir.clone(),
+            stem.clone(),
         )?;
         let origin = generator.origin().map(str::to_string);
         let rate = cfg.mutation_rate;
@@ -1394,6 +1447,7 @@ impl Lab {
             level: level.clone(),
             level_hash: level.scene_hash_string(),
             level_name: level.name.clone(),
+            stem,
             pop_size: cfg.pop_size,
             asked: true,
             config: cfg,
@@ -1407,12 +1461,12 @@ impl Lab {
         &self.out_dir
     }
 
-    /// The stem this run names its files with.
+    /// The stem this run names its files with (see [`artifact_stem`]).
     ///
-    /// Derived from the level's name rather than stored, so a run restarted onto another
-    /// level names its artifacts after the level it is actually training on.
+    /// Set at start and on every restart, so a run moved onto another level names its artifacts
+    /// after the level it is actually training on rather than the one it opened with.
     pub fn stem(&self) -> String {
-        slug(&self.level_name)
+        self.stem.clone()
     }
 
     /// The checkpoint this run started from, when it was resumed rather than started
@@ -1532,13 +1586,14 @@ impl Lab {
     }
 
     /// Start a fresh run — a new population — on `level`.
-    pub fn restart(&mut self, level: &Level, seed: u64) {
+    pub fn restart(&mut self, level: &Level, seed: u64, stem: impl Into<String>) {
         self.level = level.clone();
         self.level_hash = level.scene_hash_string();
         self.level_name = level.name.clone();
+        self.stem = stem.into();
         self.config.master_seed = seed;
         let mut state = self.hub.state.lock().unwrap();
-        state.restart = Some((level.clone(), seed));
+        state.restart = Some((level.clone(), seed, self.stem.clone()));
         // A restart is also a request: the window wants to see the new run's first
         // generation without having to press something else.
         state.want_next = true;
@@ -1644,7 +1699,9 @@ mod tests {
         let capped = hub();
         {
             capped.state.lock().unwrap().finished = true;
-            let _guard = WorkerGuard { hub: capped.clone() };
+            let _guard = WorkerGuard {
+                hub: capped.clone(),
+            };
         }
         assert!(!capped.state.lock().unwrap().panicked);
     }
@@ -1663,11 +1720,15 @@ mod tests {
             2,
             RunPlan::default(),
             scratch("lab-panic"),
+            "lab-panic",
         )
         .expect("thread starts");
         assert!(!lab.panicked(), "a run that has just started is not dead");
         let _ = lab.wait_for_first(Duration::from_secs(60));
-        assert!(!lab.panicked(), "a run that has scored a generation is not dead");
+        assert!(
+            !lab.panicked(),
+            "a run that has scored a generation is not dead"
+        );
         lab.stop();
         assert!(!lab.panicked(), "stopping a run on purpose is not a death");
     }
@@ -1677,6 +1738,43 @@ mod tests {
             .join("../../levels")
             .join(format!("{slug}.json"));
         Level::from_json_file(&path).unwrap_or_else(|e| panic!("{slug}: {e}"))
+    }
+
+    /// **A custom copy of a shipped level wears its own file's stem, not the shipped name.**
+    ///
+    /// The bug this pins cost a real file: a run on `custom-l1-flat-run.json` — a copy of the pack's
+    /// first level, which keeps the name `L1-flat-run` because that is what a copy is — wrote its
+    /// champion to `champions/l1-flat-run.json`, replacing the pack's champion with a policy trained
+    /// on different geometry. The level's display name is the shelf's word for the card; the file is
+    /// what every other artifact in the workspace is keyed on, and the run has to agree with them.
+    #[test]
+    fn a_custom_copy_of_a_shipped_level_names_its_artifacts_after_its_own_file() {
+        let level = shipped("l1-flat-run");
+        assert_eq!(level.name, "L1-flat-run");
+        assert_eq!(
+            artifact_stem(&level, Some(Path::new("levels/custom-l1-flat-run.json"))),
+            "custom-l1-flat-run"
+        );
+        // A document that has never been saved has no file to be keyed on yet, and its first save
+        // is named after the slugged display name — so that is the stem until there is a file.
+        assert_eq!(artifact_stem(&level, None), "l1-flat-run");
+
+        // And the run wears what it was handed: the champion the window saves is
+        // `<stem>.json`, and the checkpoint and practice level a detour writes share it.
+        let lab = Lab::start(
+            &level,
+            tiny_config(),
+            1,
+            1,
+            RunPlan {
+                cap: Some(1),
+                ..RunPlan::default()
+            },
+            scratch("lab-copy-stem"),
+            artifact_stem(&level, Some(Path::new("levels/custom-l1-flat-run.json"))),
+        )
+        .expect("the run starts");
+        assert_eq!(lab.stem(), "custom-l1-flat-run");
     }
 
     /// Take the packet the worker has ready, waiting for it.
@@ -1690,7 +1788,10 @@ mod tests {
             if let Some(lanes) = lab.take() {
                 return lanes;
             }
-            assert!(Instant::now() < deadline, "the worker never produced a generation");
+            assert!(
+                Instant::now() < deadline,
+                "the worker never produced a generation"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -1706,6 +1807,7 @@ mod tests {
             DEFAULT_RANDOM_LANES,
             RunPlan::default(),
             scratch("lookahead"),
+            "l3-gauntlet",
         )
         .expect("the run starts");
 
@@ -1791,6 +1893,7 @@ mod tests {
             DEFAULT_RANDOM_LANES,
             plan,
             scratch(tag),
+            slug,
         )
         .expect("a fresh generator starts")
     }
@@ -1897,7 +2000,7 @@ mod tests {
         assert_eq!(generator.history.len(), 2);
 
         let other = shipped("l3-gauntlet");
-        generator.start_over(other.clone(), 99, 0.10);
+        generator.start_over(other.clone(), 99, 0.10, "other");
         assert_eq!(generator.level().name, other.name);
         let fresh = generator.next_packet();
         assert_eq!(
@@ -2096,6 +2199,7 @@ mod tests {
                 ..RunPlan::default()
             },
             scratch("lab-run"),
+            "lab-run",
         )
         .expect("thread starts");
         assert!(lab.trained_on(&level));
@@ -2132,11 +2236,12 @@ mod tests {
             2,
             RunPlan::default(),
             scratch("lab-fresh"),
+            "lab-fresh",
         )
         .expect("thread starts");
         // A restart does not wait for the animation to finish: the window may want to
         // abandon a run it has already seen the first generation of.
-        lab.restart(&shipped("l3-gauntlet"), 7);
+        lab.restart(&shipped("l3-gauntlet"), 7, "l3-gauntlet");
         assert!(lab.trained_on(&shipped("l3-gauntlet")));
         let first = wait_for(&mut lab, Duration::from_secs(30)).expect("the fresh run reports");
         assert_eq!(first.packet().generation, 0);
@@ -2163,6 +2268,7 @@ mod tests {
                 ..RunPlan::default()
             },
             scratch("lab-stale-entity"),
+            "lab-stale-entity",
         )
         .expect("thread starts");
         assert!(lab.trained_on(&level), "the run starts on the document");
@@ -2436,6 +2542,7 @@ mod tests {
                 ..RunPlan::default()
             },
             dir.clone(),
+            "l3-gauntlet",
         )
         .expect("a fresh generator starts");
         let mut packet = source.next_packet();
@@ -2469,6 +2576,7 @@ mod tests {
                 ..RunPlan::default()
             },
             dir.clone(),
+            "l3-gauntlet",
         )
         .expect("a checkpoint this build wrote loads");
 
@@ -2506,6 +2614,7 @@ mod tests {
                 ..RunPlan::default()
             },
             dir,
+            "l3-gauntlet",
         );
         assert!(
             missing.is_err(),
@@ -2552,6 +2661,7 @@ mod tests {
                 ..RunPlan::default()
             },
             dir.clone(),
+            "l2-first-gap",
         )
         .expect("a warmed run starts");
         let note = warm
@@ -2567,15 +2677,8 @@ mod tests {
         assert!(note.contains("2 of 8 genomes"), "{note}");
 
         // The same level, unwarmed, is the control: same seeds, same budget, a random population.
-        let cold = Generator::new(
-            level,
-            cfg,
-            2,
-            2,
-            RunPlan::default(),
-            dir,
-        )
-        .expect("a plain run starts");
+        let cold = Generator::new(level, cfg, 2, 2, RunPlan::default(), dir, "l2-first-gap")
+            .expect("a plain run starts");
         assert!(
             cold.origin().is_none(),
             "nothing to declare about a population nobody handed over"
@@ -2613,10 +2716,11 @@ mod tests {
                 ..RunPlan::default()
             },
             dir,
+            "l1-flat-run",
         )
         .expect("the checkpoint loads");
 
-        generator.start_over(shipped("l3-gauntlet"), 5, 0.05);
+        generator.start_over(shipped("l3-gauntlet"), 5, 0.05, "l3-gauntlet");
         assert!(
             generator.plan().resume.is_none(),
             "a restart reproduces nothing: it starts a fresh population"
@@ -2655,6 +2759,7 @@ mod tests {
             DEFAULT_RANDOM_LANES,
             RunPlan::default(),
             scratch("profile"),
+            "scratch-tower",
         )
         .expect("a fresh generator starts");
         eprintln!("lab Generator::new (warm start) {:?}", started.elapsed());
@@ -2678,6 +2783,7 @@ mod tests {
             4,
             RunPlan::default(),
             scratch("lab-drop"),
+            "lab-drop",
         )
         .expect("thread starts");
         let started = Instant::now();

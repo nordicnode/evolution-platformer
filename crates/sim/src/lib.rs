@@ -391,12 +391,14 @@ impl Sim {
                 home: spec.rect,
                 span: spec.span,
                 vertical: spec.vertical,
+                dir: spec.dir,
                 // Where the clear part of the travel ends. A platform authored through a
                 // wall/ceiling turns early rather than passing through it.
                 limit: crate::physics::clear_travel(
                     spec.rect,
                     spec.span,
                     spec.vertical,
+                    spec.dir,
                     level,
                 ),
             })
@@ -591,10 +593,9 @@ impl Sim {
         for (i, m) in self.movers.iter().enumerate() {
             let rect = m.rect_at(frame, ph);
             let feet = self.player.y + self.player.h;
-            let horiz = self.player.x + self.player.w > rect.x
-                && self.player.x < rect.x + rect.w;
-            let crossed = prev_bottom <= rect.y + ph.enemy_stomp_tol
-                && feet >= rect.y - ph.enemy_stomp_tol;
+            let horiz = self.player.x + self.player.w > rect.x && self.player.x < rect.x + rect.w;
+            let crossed =
+                prev_bottom <= rect.y + ph.enemy_stomp_tol && feet >= rect.y - ph.enemy_stomp_tol;
             // A body that was *already* riding keeps riding while it is still over the deck and
             // still standing on it, and this is not a refinement — it is what makes the ride
             // continuous. The crossing test alone re-asks "did the feet just arrive?" on every
@@ -602,8 +603,7 @@ impl Sim {
             // wall, a lift that outran the tolerance, the one frame after a stoppped jump —
             // dropped the ride and left the body in the air a tick later, to be re-caught by the
             // snap. A rider is a *state*, and `self.riding` is where it is kept.
-            let stayed = self.riding == Some(i)
-                && (feet - rect.y).abs() <= ph.enemy_stomp_tol;
+            let stayed = self.riding == Some(i) && (feet - rect.y).abs() <= ph.enemy_stomp_tol;
             if horiz && self.player.vy >= 0.0 && (crossed || stayed) {
                 self.player.land_on(rect.y);
                 ride = Some(i);
@@ -684,7 +684,11 @@ impl Sim {
         self.resolve_turret_solidity(prev_bottom);
 
         // ---- shots: there is no stomping a bullet ----------------------------
-        if self.shots.iter().any(|s| s.alive && self.player.aabb().overlaps(&s.aabb())) {
+        if self
+            .shots
+            .iter()
+            .any(|s| s.alive && self.player.aabb().overlaps(&s.aabb()))
+        {
             self.die();
             return;
         }
@@ -1067,7 +1071,9 @@ mod tests {
         // column of them is ordered by frames whatever shape each one is in. Sixty frames to the
         // hundredth is exactly why hundredths are the right resolution — a frame is 0.0167 s, so
         // two episodes a frame apart still read as two times.
-        for frames in [0u32, 1, 2, 59, 60, 505, 3598, 3599, 3600, 3725, 20_000, 727_000] {
+        for frames in [
+            0u32, 1, 2, 59, 60, 505, 3598, 3599, 3600, 3725, 20_000, 727_000,
+        ] {
             assert_eq!(
                 frames_of(&format_time(frames)),
                 frames as i64,

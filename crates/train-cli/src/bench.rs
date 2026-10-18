@@ -36,6 +36,13 @@
 //! flag asks for the rule the command already follows; it is accepted (and the header
 //! says so), unlike the four above, which would change *what* is measured.
 //!
+//! **`--stop-on-validated` is accepted as a stricter protocol**, and recorded in the arm
+//! (`BenchArm::stop_on_validated`): the seed stops at the first generation whose *record* won every
+//! fixed validation episode, not at the first generation whose best genome won its three drawn
+//! trials. On `l9-wait-and-climb` that moved four seeds from a champion winning 22 of 48 fresh
+//! episodes to 48 of 48, at a median cost of 20 generations — the measurement `FINDINGS.md`
+//! records under "Solved, then validated". Two arms are not comparable across this field.
+//!
 //! ## What the sign test does and does not say
 //!
 //! For each seed the winner is the arm that solved where the other did not, or — when
@@ -168,6 +175,12 @@ pub const PROTOCOLS: &[Protocol] = &[
     },
 ];
 
+/// An arm recorded before `fine_sigma_scale` existed bred its fine children at the coarse step,
+/// which is a fraction of 1.0.
+fn unscaled_fine_sigma() -> f32 {
+    1.0
+}
+
 /// The `start` of an arm file written before the field existed: a fresh random population is what
 /// every arm recorded before it was (the seeded arms came with the field), and saying so is more
 /// useful than an empty string.
@@ -214,6 +227,14 @@ pub struct BenchArm {
     pub feedback: usize,
     pub mutation_sigma: f32,
     pub fine_children: usize,
+    /// The fine scale's step as a fraction of `mutation_sigma` (`GaConfig::fine_sigma_scale`).
+    ///
+    /// Recorded because it is a *second* sigma and the one the archive's children use: an arm
+    /// taken at 1.0 is the pre-fix behaviour (fine in count, coarse in size) and is not the same
+    /// search as the default 0.25. Defaulted to 1.0 on load, which is what every arm recorded
+    /// before the field existed actually ran.
+    #[serde(default = "unscaled_fine_sigma")]
+    pub fine_sigma_scale: f32,
     pub immigrants: usize,
     pub archive_children: usize,
     pub archive_on_diversity: bool,
@@ -254,6 +275,13 @@ pub struct BenchArm {
     #[serde(default)]
     pub race_episodes: bool,
     pub action_repeat: u32,
+    /// **What "solved" meant for this arm's stop**: `false` is the first generation whose best
+    /// genome won every episode it was judged on (three patrol phases on a walker level), `true` is
+    /// the first generation whose *record* won every fixed validation episode. Recorded because the
+    /// two are different measurements of the same level, and a table that mixed them would be
+    /// comparing a three-phase draw with a twelve-world verdict.
+    #[serde(default)]
+    pub stop_on_validated: bool,
     /// **Where each seed's population began**, as one of `noise`, `champion <path>` or
     /// `checkpoint <path>`.
     ///
@@ -313,6 +341,14 @@ pub fn bench(a: &Args) -> Result<(), String> {
     }
 
     let quiet = a.has_flag("quiet");
+    // `--stop-on-validated` is accepted here rather than refused: it changes *when* an arm stops,
+    // which is a protocol question the arm records, not a run shape that has no meaning in a sweep.
+    let stop_on_validated = a.has_flag("stop-on-validated");
+    if stop_on_validated && a.has_flag("no-validation") {
+        return Err(
+            "usage: --stop-on-validated reads the validation set that --no-validation switches off".into(),
+        );
+    }
 
     if let Some(list) = a.opt("compare") {
         // `--compare` runs nothing, so a run flag beside it would be accepted and then
@@ -380,13 +416,22 @@ pub fn bench(a: &Args) -> Result<(), String> {
             level.name, level.width, level.height
         );
         println!("hash    {}", level.content_hash_string());
-        println!("budget  pop {pop}  generations {generations}  seeds {first_seed}..={}  (stops at the first win)", first_seed + seeds as u64 - 1);
         println!(
-            "recipe  hidden [{}]  feedback {}  sigma {:.2}  fine {}  immigrants {}  qd {}{}  novelty {:.1}  rank {:.2}  trials {} ({})  episodes {}  action_repeat {}",
+            "budget  pop {pop}  generations {generations}  seeds {first_seed}..={}  (stops at the {})",
+            first_seed + seeds as u64 - 1,
+            if stop_on_validated {
+                "first validated solve"
+            } else {
+                "first win"
+            }
+        );
+        println!(
+            "recipe  hidden [{}]  feedback {}  sigma {:.2}  fine {} x{:.2}  immigrants {}  qd {}{}  novelty {:.1}  rank {:.2}  trials {} ({})  episodes {}  action_repeat {}",
             join_usize(&cfg.shape.hidden),
             cfg.shape.feedback,
             cfg.mutation_sigma,
             cfg.fine_children,
+            cfg.fine_sigma_scale,
             cfg.immigrants,
             cfg.archive_children,
             if cfg.archive_on_diversity {
@@ -450,7 +495,19 @@ pub fn bench(a: &Args) -> Result<(), String> {
             if report.max_fitness > best_fitness {
                 best_fitness = report.max_fitness;
             }
-            if report.wins > 0 {
+            // `solved`, not `wins`: a seed counts as solved when a genome won **every** episode it
+            // was judged on. On a deterministic level the two are the same number; on a walker
+            // level `wins` is a single patrol phase, and a sweep "solving" 12 of 12 seeds on one
+            // phase per genome is a statement about the phases rather than about the search.
+            //
+            // With `--stop-on-validated` the bar is the record's fixed validation set instead: the
+            // first generation whose *champion* has been shown to win twelve unseen worlds.
+            let solved_now = if stop_on_validated {
+                report.record_solved
+            } else {
+                report.solved > 0
+            };
+            if solved_now {
                 first_win = Some(report.generation);
                 break;
             }
@@ -483,6 +540,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
         feedback: cfg.shape.feedback,
         mutation_sigma: cfg.mutation_sigma,
         fine_children: cfg.fine_children,
+        fine_sigma_scale: cfg.fine_sigma_scale,
         immigrants: cfg.immigrants,
         archive_children: cfg.archive_children,
         archive_on_diversity: cfg.archive_on_diversity,
@@ -498,6 +556,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
         common_episodes: cfg.common_episodes,
         race_episodes: cfg.race_episodes,
         action_repeat: cfg.action_repeat,
+        stop_on_validated,
         start,
         rows,
     };
@@ -689,6 +748,17 @@ fn compare(paths: &[String], quiet: bool) -> Result<(), String> {
             right.fitness_version
         ));
     }
+    if left.stop_on_validated != right.stop_on_validated {
+        return Err(format!(
+            "cannot compare {} (stop: {}) with {} (stop: {}): the first-win generation of an arm \
+             that stops on a validated solve is not the same measurement as one that stops on a \
+             generation's own trials",
+            paths[0],
+            stop_label(left.stop_on_validated),
+            paths[1],
+            stop_label(right.stop_on_validated)
+        ));
+    }
     if left.seed_list() != right.seed_list() {
         return Err(format!(
             "cannot compare {} (seeds {:?}) with {} (seeds {:?}): bench pairs two arms by seed, so \
@@ -814,6 +884,15 @@ fn compare(paths: &[String], quiet: bool) -> Result<(), String> {
 
 /// The label a paired row shows when neither arm has an opinion to read.
 const TIE: &str = "tie";
+
+/// What an arm's stop was, for the refusal above and the comparison header.
+fn stop_label(validated: bool) -> &'static str {
+    if validated {
+        "validated"
+    } else {
+        "first win"
+    }
+}
 
 fn label(first_win: Option<u32>) -> String {
     match first_win {

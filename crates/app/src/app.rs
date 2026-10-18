@@ -168,6 +168,37 @@ impl Default for LabOptions {
     }
 }
 
+/// What a document-replacing control was asked to do.
+///
+/// One type for **New** and for a card on the shelf because they are one act — the document on
+/// the canvas is thrown away — and because the question a dirty document asks has to be answered
+/// about *a* replacement rather than about whichever control happened to ask it. It is kept
+/// rather than performed when the answer is "not while there is unsaved work", which is what
+/// lets the notice under the dock offer the same replacement again ([`EvoApp::discard_notice`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Replace {
+    /// A blank level.
+    New,
+    /// The level at this path.
+    Open(PathBuf),
+}
+
+impl Replace {
+    /// How the question and the status line name this replacement.
+    fn label(&self) -> String {
+        match self {
+            Replace::New => "New".to_string(),
+            Replace::Open(path) => {
+                let file = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                format!("Opening {file}")
+            }
+        }
+    }
+}
+
 /// Whether a document-replacing control should refuse this press, and what to remember about it.
 ///
 /// The rule behind [`EvoApp::refuses_to_discard`], split out as a pure function so the pair of
@@ -330,6 +361,12 @@ struct EvoApp {
     /// `Some(hash)` means the last press was *refused* because the document was edited, and
     /// this is what it looked like at the time (see [`EvoApp::refuses_to_discard`]).
     discard_armed: Option<u64>,
+    /// The replacement a dirty document refused, while the question is on screen.
+    ///
+    /// `None` means there is nothing to ask: either no replacement was attempted, or the one
+    /// that was has been answered. It is a *pending act* rather than a flag so the notice's
+    /// own button can perform exactly what was asked for.
+    discard_wanted: Option<Replace>,
     /// The string currently on the OS window's title bar. Held so the title is only ever set
     /// when it actually changes (see [`EvoApp::sync_window_title`]).
     os_title: String,
@@ -353,6 +390,15 @@ struct EvoApp {
     /// another level entirely) can never leave this field showing the previous document's name.
     rename_buf: String,
     rename_focused: bool,
+    /// Where *Levels* and *New* were drawn, for the tests that press them.
+    ///
+    /// Test-only, and deliberately so: a running window reaches these controls through
+    /// their own responses, and nothing here is read outside `#[cfg(test)]`. It exists
+    /// because the alternative is a test that guesses at the dock's layout — and the row is
+    /// as wide as the document's name and the mode switch, so the guess would be wrong the
+    /// first time somebody renamed a level.
+    #[cfg(test)]
+    tool_rects: Vec<(&'static str, Rect)>,
 }
 
 impl EvoApp {
@@ -364,7 +410,31 @@ impl EvoApp {
         options: LabOptions,
         splash: Option<bool>,
     ) -> Result<EvoApp, String> {
-        let ctx = &cc.egui_ctx;
+        EvoApp::build(
+            &cc.egui_ctx,
+            level_path,
+            assets,
+            screenshot,
+            options,
+            splash,
+        )
+    }
+
+    /// The window, built from a context rather than from a creation event.
+    ///
+    /// Split out so the whole window can be **driven without a window**: a creation context
+    /// exists only inside `eframe`, which left every control in the dock and every card on the
+    /// shelf untested at the one thing they are for — being pressed and changing the document.
+    /// The tests below run real frames and click real buttons through this, so "New clears the
+    /// level" is a fact about the window rather than a fact about `Editor::fresh`.
+    fn build(
+        ctx: &Context,
+        level_path: PathBuf,
+        assets: PathBuf,
+        screenshot: Option<PathBuf>,
+        options: LabOptions,
+        splash: Option<bool>,
+    ) -> Result<EvoApp, String> {
         // The window's own look, installed once: every panel, button and slider after this
         // line draws itself in the game's palette rather than egui's stock one.
         theme::apply(ctx);
@@ -458,9 +528,12 @@ impl EvoApp {
             shelf_open: false,
             shelf: Vec::new(),
             discard_armed: None,
+            discard_wanted: None,
             os_title: String::new(),
             rename_buf: String::new(),
             rename_focused: false,
+            #[cfg(test)]
+            tool_rects: Vec::new(),
             help_open: false,
             mode_fade: 0.0,
             // The editor, always — and the comparison in `update` does the rest: a `--play` or
@@ -543,8 +616,7 @@ impl EvoApp {
     /// ([`Lab::trained_on`]), and a ghost replayed on the wrong level would be a second player
     /// rather than a record.
     fn attach_champion_ghost(&mut self) {
-        let (Some(lab), Some(packet), Some(session)) =
-            (&self.lab, &self.packet, &mut self.session)
+        let (Some(lab), Some(packet), Some(session)) = (&self.lab, &self.packet, &mut self.session)
         else {
             return;
         };
@@ -720,6 +792,7 @@ impl EvoApp {
                     return;
                 }
             };
+            let stem = self.run_stem();
             match Lab::start(
                 &self.editor.level,
                 cfg,
@@ -727,6 +800,7 @@ impl EvoApp {
                 lab::DEFAULT_RANDOM_LANES,
                 plan,
                 self.options.champions.clone(),
+                stem,
             ) {
                 Ok(lab) => {
                     // A run handed a population from somewhere else says so once: the
@@ -783,6 +857,19 @@ impl EvoApp {
         })
     }
 
+    /// The stem this run's artifacts wear: the document's file stem when it has one, and the
+    /// slugged display name only for a document that has never been saved.
+    ///
+    /// The file wins because it is what the rest of the workspace is keyed on — the shelf looks
+    /// for a champion beside the level under the *file's* stem, `train-cli` writes
+    /// `<file stem>.json`, and the title screen looks there first. A custom copy of a shipped
+    /// level keeps the shipped level's name, so naming the champion after the name put a policy
+    /// trained on one level over the pack's own champion for another (see
+    /// [`lab::artifact_stem`]).
+    fn run_stem(&self) -> String {
+        lab::artifact_stem(&self.editor.level, self.editor.path.as_deref())
+    }
+
     /// Start a fresh population on the level as it stands, on the next seed up.
     ///
     /// The seed is bumped rather than reused: a Restart that reproduced the identical
@@ -790,10 +877,11 @@ impl EvoApp {
     /// the number the status bar shows.
     fn restart_run(&mut self, why: &str) {
         self.seed = self.seed.wrapping_add(1);
+        let stem = self.run_stem();
         let Some(lab) = &mut self.lab else {
             return;
         };
-        lab.restart(&self.editor.level, self.seed);
+        lab.restart(&self.editor.level, self.seed, stem);
         lab.set_mutation_rate(self.view.mutation_rate);
         self.lanes = None;
         self.packet = None;
@@ -1006,9 +1094,7 @@ impl EvoApp {
         }
         // The key card is one key in every view, and it is *not* mode-split: the question it
         // answers — "what can I press here?" — is the same question in all four.
-        if ctx.input(|i| {
-            i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1)
-        }) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1)) {
             self.help_open = !self.help_open;
         }
         let (undo, redo, grid, play, evolve, fit, save, restart, watch) = ctx.input(|i| {
@@ -1495,22 +1581,80 @@ impl EvoApp {
     /// one thing: a document, a camera fitted to it, and no session left over from whatever
     /// was on screen before.
     fn open_level(&mut self, path: &std::path::Path) {
-        // The shelf is the other control that throws the document away, and it is the easier
-        // one to hit by accident: a card is a click, and the palette of brushes is right
-        // beside it.
-        if self.refuses_to_discard("opening that level") {
+        self.replace(Replace::Open(path.to_path_buf()));
+    }
+
+    /// Ask to replace the document with `want`, and do it unless the old one has unsaved edits.
+    ///
+    /// One door for **New** and every card on the shelf, because they are the same act: the
+    /// document on the canvas is thrown away and another one takes its place. Two copies of
+    /// that rule is how one of them ends up forgetting to drop a playtest session — which is
+    /// exactly what **New** used to do.
+    fn replace(&mut self, want: Replace) {
+        if self.refuses_to_discard(want.clone()) {
             return;
         }
-        match Editor::open(path) {
-            Ok(editor) => {
-                self.editor = editor;
-                self.pending_size = (self.editor.level.width, self.editor.level.height);
-                self.fit_pending = true;
-                self.session = None;
-                self.mode = Mode::Edit;
+        self.apply_replace(want);
+    }
+
+    /// Do the replacement: install the document *and* take every view of the old one down.
+    ///
+    /// **A document is not the only copy of a level in this window.** A playtest session, a
+    /// replayed episode and a running population each hold their own copy of the terrain they
+    /// started on, and while one of those views is up it is *that* copy the canvas draws.
+    /// Swapping only `editor` therefore left **New** — and a card on the shelf — looking like it
+    /// had done nothing at all whenever the window was in Play or Evolve: the old level stayed on
+    /// screen with its clock still running, and the new document was only visible in the dock's
+    /// title. (Measured through real clicks: `mode=Play session=true drawn_is_old=true`.)
+    ///
+    /// So the whole window moves: the run is dropped (joining its worker, [`lab::Lab`]'s own
+    /// `Drop`), the playtest and the replay go with it, the mode returns to the editor, and the
+    /// camera is fitted to the level that is actually on the canvas now.
+    fn apply_replace(&mut self, want: Replace) {
+        let editor = match want {
+            Replace::New => {
+                // A new document starts with a name the pack does not already hold, because the
+                // name *is* the file it will be saved as (AUDIT.md B2).
+                let name = free_level_name(&self.levels_dir, "untitled");
+                Editor::fresh(&name, 60, 15)
             }
-            Err(err) => self.editor.message = err,
+            Replace::Open(path) => match Editor::open(&path) {
+                Ok(editor) => editor,
+                Err(err) => {
+                    self.editor.message = err;
+                    return;
+                }
+            },
+        };
+        self.editor = editor;
+        self.pending_size = (self.editor.level.width, self.editor.level.height);
+        self.fit_pending = true;
+        // Every view that was about the old document, dropped rather than left drawing it.
+        self.session = None;
+        self.replay = None;
+        // The run is *stopped*, and on a thread of its own: dropping a `Lab` joins its worker,
+        // which can be the better part of a generation away — a window that froze for a second
+        // after New would read as the button having hung, which is the same complaint in another
+        // shape. The worker is told to quit before it is dropped, so nothing is left training a
+        // level nobody is looking at.
+        if let Some(lab) = self.lab.take() {
+            std::thread::spawn(move || drop(lab));
         }
+        self.lanes = None;
+        self.packet = None;
+        self.summary = None;
+        self.saved_end = false;
+        self.primed = false;
+        self.note = None;
+        self.applied_rate = None;
+        self.view.scrub = None;
+        self.mode = Mode::Edit;
+        self.discard_armed = None;
+        self.discard_wanted = None;
+        // The rename field is a buffer over the document, so a document that is gone takes the
+        // half-typed name with it: reseeded from the new level on the next frame.
+        self.rename_focused = false;
+        self.rename_buf.clear();
     }
 
     /// Write the document, naming an unnamed one first.
@@ -1524,11 +1668,107 @@ impl EvoApp {
             self.editor.message = format!("not saved: {err}");
             return;
         }
+        // The write answered any question the document was holding: there is nothing left to
+        // lose, so a notice that was waiting on a replacement goes away with the edit.
+        self.discard_wanted = None;
+        self.discard_armed = None;
         // A save can *create* a level, so the shelf's copy of the pack is now stale. It is
         // refreshed where the write happened rather than when the shelf is opened, so the
         // card for the level just written is there the first time it is looked for.
         if self.shelf_open {
             self.shelf = shelf::scan(&self.levels_dir, Some(&self.options.champions));
+        }
+    }
+
+    /// The question a dirty document asks before a replacement throws it away.
+    ///
+    /// It is a card under the dock rather than a modal dialog, and it is *the same two presses*
+    /// the rule has always been: pressing **New** (or the card) again is still the answer, and
+    /// the notice's own button is that press with a name on it. What changed is that the question
+    /// is now somewhere a person is looking. It used to be a sentence in the status line only,
+    /// which made a refused **New** and a shelf card that would not open look like controls that
+    /// did nothing at all: the report that started this was "the levels buttons show the levels
+    /// but do not let me load them", and the window had in fact asked, quietly, at the bottom.
+    ///
+    /// Nothing here can answer itself: with no press, the card stays until **Keep** is chosen or
+    /// the document is saved.
+    fn discard_notice(&mut self, ctx: &Context) {
+        let Some(want) = self.discard_wanted.clone() else {
+            return;
+        };
+        let sentence = format!(
+            "{} would throw away this level's unsaved edits.",
+            want.label()
+        );
+        let mut discard = false;
+        let mut keep = false;
+        egui::Area::new(egui::Id::new("discard-notice"))
+            .order(egui::Order::Foreground)
+            // Above the status bar, rather than over the middle of the window: the card has
+            // to be answerable *while the shelf is open* — pressing the same card again is
+            // the other answer — so it must not sit on top of the cards it is asking about.
+            .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -46.0))
+            // A question that is being asked *now* arrives now: a card that fades in over a
+            // quarter of a second is a card a person has already clicked past.
+            .fade_in(false)
+            .show(ctx, |ui| {
+                theme::card_frame().show(ui, |ui| {
+                    ui.set_max_width(430.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("This level has unsaved edits")
+                                .strong()
+                                .color(theme::WARN_INK),
+                        );
+                        ui.label(
+                            egui::RichText::new(&sentence)
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let d = ui::icon_button(
+                                ui,
+                                Some(&self.atlas),
+                                None,
+                                "Discard",
+                                ui::TOOL_SIZE,
+                                false,
+                                true,
+                            );
+                            if d.on_hover_text("throw the edits away and continue")
+                                .clicked()
+                            {
+                                discard = true;
+                            }
+                            if ui::icon_button(
+                                ui,
+                                Some(&self.atlas),
+                                None,
+                                "Keep editing",
+                                ui::TOOL_SIZE,
+                                false,
+                                true,
+                            )
+                            .on_hover_text("back to the level — Ctrl+S writes it")
+                            .clicked()
+                            {
+                                keep = true;
+                            }
+                        });
+                    });
+                });
+            });
+        if discard {
+            // The press that was already answered once: clear the arming so the guard does not
+            // ask about the same document a second time, then do what was asked.
+            self.discard_armed = None;
+            self.discard_wanted = None;
+            self.apply_replace(want);
+        } else if keep {
+            self.discard_wanted = None;
+            self.discard_armed = None;
+            self.editor.message.clear();
         }
     }
 
@@ -1564,7 +1804,7 @@ impl EvoApp {
     /// between the two presses re-arms the warning instead of being discarded by it, which is
     /// exactly what a person who *is* paying attention produces — look at the level, touch it,
     /// click the card again.
-    fn refuses_to_discard(&mut self, what: &str) -> bool {
+    fn refuses_to_discard(&mut self, want: Replace) -> bool {
         let (refused, armed) = discard_guard(
             self.editor.dirty,
             self.discard_armed,
@@ -1573,9 +1813,17 @@ impl EvoApp {
         self.discard_armed = armed;
         if refused {
             self.editor.message = format!(
-                "{what} would throw away the unsaved edits to this level — do it again to \
-                 discard them, or Ctrl+S to save first"
+                "{} would throw away the unsaved edits to this level — press again to \
+                 discard them, or Ctrl+S to save first",
+                want.label()
             );
+            // The status line is a whisper at the bottom of the window, and a card that does
+            // nothing where the pointer is standing reads as a broken card rather than as a
+            // question. The same refusal is therefore also a card under the dock, with both
+            // answers on it (see [`Self::discard_notice`]).
+            self.discard_wanted = Some(want);
+        } else {
+            self.discard_wanted = None;
         }
         refused
     }
@@ -1626,7 +1874,8 @@ impl EvoApp {
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                 let (title, subtitle) = self.dock_title();
                 let _ = ui::plaque(ui, &title, &subtitle).on_hover_text(format!(
-                    "{} — a save writes this file; the details window renames the level",
+                    "{}\n● marks a canvas the disk has not caught up with — a save writes this \
+                     file; the details window renames the level",
                     self.editor.title()
                 ));
                 ui.add_space(2.0);
@@ -1645,6 +1894,13 @@ impl EvoApp {
     /// second line, where it reads as the *where* rather than as the what. The dot on that line is
     /// the one fact the window cannot recover for a person who misses it: the disk has fallen behind
     /// the canvas, and a closed window loses the difference.
+    ///
+    /// **The two states are the same width, on purpose.** The line used to read `● file — not on
+    /// disk` when edited and `file` otherwise, and a plaque is as wide as the words on it — so the
+    /// first stroke of a session widened the sign by a hundred points and shoved every tool in the
+    /// dock sideways, and the save that followed shoved them back. A mark is the fact either way:
+    /// a filled dot when the canvas is ahead of the disk, the same two columns of blank when it is
+    /// not, and the sentence on the plaque's hover.
     fn dock_title(&self) -> (String, String) {
         let file = self
             .editor
@@ -1654,9 +1910,9 @@ impl EvoApp {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("{}.json", self.editor.level.name));
         let subtitle = if self.editor.dirty {
-            format!("● {file} — not on disk")
+            format!("● {file}")
         } else {
-            file
+            format!("  {file}")
         };
         (self.editor.level.name.clone(), subtitle)
     }
@@ -1677,6 +1933,8 @@ impl EvoApp {
     /// somebody who has not memorised six pictures yet — see [`ui::icon_button`]. What is on the
     /// hovers is the sentence a word cannot hold.
     fn dock_tools(&mut self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        self.tool_rects.clear();
         let levels = ui::icon_button(
             ui,
             Some(&self.atlas),
@@ -1685,9 +1943,11 @@ impl EvoApp {
             ui::TOOL_SIZE,
             self.shelf_open,
             true,
-        )
-        .on_hover_text("the pack, as pictures: click to open, double-click to playtest")
-        .clicked();
+        );
+        self.remember_tool("Levels", levels.rect);
+        let levels = levels
+            .on_hover_text("the pack, as pictures: click to open, double-click to playtest")
+            .clicked();
         let new = ui::icon_button(
             ui,
             Some(&self.atlas),
@@ -1696,9 +1956,9 @@ impl EvoApp {
             ui::TOOL_SIZE,
             false,
             true,
-        )
-        .on_hover_text("a fresh 60 × 15 level")
-        .clicked();
+        );
+        self.remember_tool("New", new.rect);
+        let new = new.on_hover_text("a fresh 60 × 15 level").clicked();
         let save = ui::icon_button(
             ui,
             Some(&self.atlas),
@@ -1770,13 +2030,10 @@ impl EvoApp {
         if levels {
             self.open_shelf();
         }
-        if new && !self.refuses_to_discard("New") {
-            // A new document starts with a name the pack does not already hold, because the
-            // name *is* the file it will be saved as (AUDIT.md B2).
-            let name = free_level_name(&self.levels_dir, "untitled");
-            self.editor = Editor::fresh(&name, 60, 15);
-            self.pending_size = (60, 15);
-            self.fit_pending = true;
+        if new {
+            // The same door the shelf's cards use, so New and "open that level" cannot drift
+            // apart about what replacing a document means (`EvoApp::apply_replace`).
+            self.replace(Replace::New);
         }
         if save {
             self.save(None);
@@ -1798,6 +2055,16 @@ impl EvoApp {
             self.details_open = !self.details_open;
         }
     }
+
+    /// Remember where a dock tool was drawn, for the tests that press it.
+    #[cfg(test)]
+    fn remember_tool(&mut self, name: &'static str, rect: Rect) {
+        self.tool_rects.push((name, rect));
+    }
+
+    /// Nothing, in the window: a real press reaches the control's own response.
+    #[cfg(not(test))]
+    fn remember_tool(&mut self, _name: &'static str, _rect: Rect) {}
 
     /// The mode switch, and the two controls that belong to the mode it selects.
     ///
@@ -1821,13 +2088,8 @@ impl EvoApp {
         // Replay is offered once there is something to replay: a mode that opens on an empty field
         // would be a cell that cannot do what it says.
         let enabled = [true, true, true, self.can_replay()];
-        let (chosen, _) = ui::segmented(
-            ui,
-            Some(&self.atlas),
-            &OPTIONS,
-            self.mode.index(),
-            &enabled,
-        );
+        let (chosen, _) =
+            ui::segmented(ui, Some(&self.atlas), &OPTIONS, self.mode.index(), &enabled);
         if self.mode == Mode::Play {
             let restart = ui::icon_button(
                 ui,
@@ -1953,26 +2215,30 @@ impl EvoApp {
                 };
                 (session.race_line(record), lamp)
             }),
-            Mode::Replay => self.replay.as_ref().map(|replay| {
-                let star = replay.star();
-                (
-                    format!(
-                        "replay  {} ({} frames)  best {:.1}  seed {}",
-                        sim::format_time(star.frames),
-                        star.frames,
-                        star.fitness,
-                        self.seed
-                    ),
-                    theme::GOOD,
-                )
-            }).or_else(|| {
-                self.packet.as_ref().map(|packet| {
+            Mode::Replay => self
+                .replay
+                .as_ref()
+                .map(|replay| {
+                    let star = replay.star();
                     (
-                        format!("replay  best {:.1}  seed {}", packet.max_fitness, self.seed),
+                        format!(
+                            "replay  {} ({} frames)  best {:.1}  seed {}",
+                            sim::format_time(star.frames),
+                            star.frames,
+                            star.fitness,
+                            self.seed
+                        ),
                         theme::GOOD,
                     )
                 })
-            }),
+                .or_else(|| {
+                    self.packet.as_ref().map(|packet| {
+                        (
+                            format!("replay  best {:.1}  seed {}", packet.max_fitness, self.seed),
+                            theme::GOOD,
+                        )
+                    })
+                }),
         }
     }
 
@@ -2106,9 +2372,12 @@ impl EvoApp {
                 // a cracked cell read as "the floor above this one, about to go" rather than as a
                 // scratch on the palette. Every other brush has no base layer and is unchanged.
                 let (icon, flip) = self.brush_icon(brush);
-                for (name, flip) in [Self::brush_base(brush).map(|n| (n, false)), Some((icon, flip))]
-                    .into_iter()
-                    .flatten()
+                for (name, flip) in [
+                    Self::brush_base(brush).map(|n| (n, false)),
+                    Some((icon, flip)),
+                ]
+                .into_iter()
+                .flatten()
                 {
                     if let Ok(uv) = self.atlas.uv(name) {
                         painter.image(
@@ -2150,14 +2419,8 @@ impl EvoApp {
             .iter()
             .position(|shape| *shape == self.editor.shape)
             .unwrap_or(0);
-        let (picked, row) = ui::segmented_sized(
-            ui,
-            None,
-            &shapes,
-            chosen,
-            &[true; 3],
-            Vec2::new(52.0, 30.0),
-        );
+        let (picked, row) =
+            ui::segmented_sized(ui, None, &shapes, chosen, &[true; 3], Vec2::new(52.0, 30.0));
         // The row's own sentence, on the row rather than repeated under it: what the three cells
         // are for is the question a person has once, and the answer belongs where the question is.
         row.on_hover_text(format!(
@@ -2185,7 +2448,8 @@ impl EvoApp {
             ui.horizontal(|ui| {
                 if self.editor.brush == Some(Brush::Turret) {
                     let right = self.editor.turret_dir > 0;
-                    let options: [(Option<&str>, &str); 2] = [(None, "fire left"), (None, "fire right")];
+                    let options: [(Option<&str>, &str); 2] =
+                        [(None, "fire left"), (None, "fire right")];
                     let (picked, row) = ui::segmented_sized(
                         ui,
                         None,
@@ -2209,7 +2473,10 @@ impl EvoApp {
                 } else {
                     ui.label(egui::RichText::new("travel").small().color(theme::TEXT_DIM));
                     ui.add(egui::DragValue::new(&mut self.editor.platform_span).range(1..=12))
-                        .on_hover_text("How far the platform travels, from where it is placed.");
+                        .on_hover_text(
+                            "How far the platform travels, from where it is placed, in the \
+                             direction chosen below.",
+                        );
                 }
                 if self.editor.brush == Some(Brush::Platform) {
                     ui.label(egui::RichText::new("width").small().color(theme::TEXT_DIM));
@@ -2225,10 +2492,44 @@ impl EvoApp {
                         &[true; 2],
                         Vec2::new(58.0, 28.0),
                     );
-                    row.on_hover_text("Slide right, or rise like a lift.");
+                    row.on_hover_text("Slide along the level, or lift through it.");
                     if let Some(cell) = picked {
                         self.editor.platform_vertical = cell == 1;
                     }
+                }
+            });
+        }
+
+        // A platform's **direction**, on its own line beneath the row that holds its travel,
+        // its width and its axis: the palette is one column wide and a fourth control does not
+        // fit beside three. It is the same two-cell switch a turret's facing uses, with the
+        // words the axis makes true — a slider goes left or right, a lift goes down or up — so
+        // the one thing a person has to learn is that the switch means "which way".
+        if self.editor.brush == Some(Brush::Platform) {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("goes").small().color(theme::TEXT_DIM));
+                let vertical = self.editor.platform_vertical;
+                let (back, forward) = if vertical {
+                    ("down", "up")
+                } else {
+                    ("left", "right")
+                };
+                let options: [(Option<&str>, &str); 2] = [(None, back), (None, forward)];
+                let (picked, row) = ui::segmented_sized(
+                    ui,
+                    None,
+                    &options,
+                    usize::from(self.editor.platform_dir > 0),
+                    &[true; 2],
+                    Vec2::new(62.0, 28.0),
+                );
+                row.on_hover_text(
+                    "Which way the platform travels from where it is placed. A lift goes up \
+                     or down; a slider goes left or right.",
+                );
+                if let Some(cell) = picked {
+                    self.editor.platform_dir = if cell == 0 { -1 } else { 1 };
                 }
             });
         }
@@ -2238,7 +2539,11 @@ impl EvoApp {
         // choice only matters to the one brush that needs it.
         if self.editor.brush == Some(Brush::Scenery) {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("Scenery").small().color(theme::TEXT_DIM));
+            ui.label(
+                egui::RichText::new("Scenery")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
             ui.horizontal_wrapped(|ui| {
                 for name in crate::editor::SCENERY_SPRITES {
                     let selected = self.editor.scene_sprite == *name;
@@ -2311,7 +2616,10 @@ impl EvoApp {
             .max_height((ctx.screen_rect().height() - 140.0).max(160.0))
             // Sits where the panel used to, so the muscle memory still lands — and it is dragged
             // from there like any window.
-            .default_pos(Pos2::new((ctx.screen_rect().right() - 320.0).max(12.0), 76.0))
+            .default_pos(Pos2::new(
+                (ctx.screen_rect().right() - 320.0).max(12.0),
+                76.0,
+            ))
             .show(ctx, |ui| self.details(ui));
         self.details_open = open;
     }
@@ -2333,7 +2641,11 @@ impl EvoApp {
         let painter = ui.painter_at(rect);
         let centre = rect.center();
         painter.circle_filled(centre, 5.0, colour);
-        painter.circle_stroke(centre, 5.0, Stroke::new(1.0_f32, colour.gamma_multiply(0.6)));
+        painter.circle_stroke(
+            centre,
+            5.0,
+            Stroke::new(1.0_f32, colour.gamma_multiply(0.6)),
+        );
         ui.colored_label(colour, self.editor.verdict());
     }
 
@@ -2419,7 +2731,11 @@ impl EvoApp {
                 ui.add(egui::DragValue::new(cap).range(1..=100_000));
                 ui.label("generations");
             } else {
-                ui.label(egui::RichText::new("until the window closes").small().color(theme::TEXT_DIM));
+                ui.label(
+                    egui::RichText::new("until the window closes")
+                        .small()
+                        .color(theme::TEXT_DIM),
+                );
             }
         });
         ui.horizontal(|ui| {
@@ -2477,10 +2793,7 @@ impl EvoApp {
             // keeping is a number worth reading off the screen (the same bargain the Restart
             // button makes).
             self.note = Some((
-                format!(
-                    "new run: pop {} seed {}",
-                    self.options.pop_size, self.seed
-                ),
+                format!("new run: pop {} seed {}", self.options.pop_size, self.seed),
                 6.0,
             ));
         }
@@ -2591,20 +2904,24 @@ impl EvoApp {
         ui::stat_row(
             ui,
             "episode cap",
-            format!("{} frames ({})", sim::frame_budget(level), sim::format_time(sim::frame_budget(level))),
+            format!(
+                "{} frames ({})",
+                sim::frame_budget(level),
+                sim::format_time(sim::frame_budget(level))
+            ),
         );
-        ui::stat_row(ui, "goal", match level.goal_tiles().first() {
-            Some((gx, gy)) => format!("({gx}, {gy})"),
-            // A level has one flag, or none at all for the moment between deleting the flag
-            // and placing it again — and a flag-less document is one the writer refuses, which
-            // is worth knowing here rather than at Save.
-            None => "none — place one before saving".into(),
-        });
         ui::stat_row(
             ui,
-            "walkers",
-            level.walkers.len().to_string(),
+            "goal",
+            match level.goal_tiles().first() {
+                Some((gx, gy)) => format!("({gx}, {gy})"),
+                // A level has one flag, or none at all for the moment between deleting the flag
+                // and placing it again — and a flag-less document is one the writer refuses, which
+                // is worth knowing here rather than at Save.
+                None => "none — place one before saving".into(),
+            },
         );
+        ui::stat_row(ui, "walkers", level.walkers.len().to_string());
         // Every solid tile counts as ground, including the brittle ones — they hold a body up
         // exactly as their material does, and it is the *level* the row is describing. Two of the
         // readings are named out loud when a level has any, in the existing voice: sand, because
@@ -2796,9 +3113,7 @@ impl EvoApp {
                     // The champion beside the player, translucent so it never hides them:
                     // the best band's own tint, because that is what a ghost looks like
                     // everywhere else in this window.
-                    if let (Some(gsim), Some(ganim)) =
-                        (session.ghost_sim(), session.ghost_anim())
-                    {
+                    if let (Some(gsim), Some(ganim)) = (session.ghost_sim(), session.ghost_anim()) {
                         view::draw_agent_body_at(
                             sheet,
                             gsim,
@@ -2872,16 +3187,9 @@ impl EvoApp {
         let widths: Vec<f32> = cells
             .iter()
             .map(|(label, value)| {
-                let l = painter.layout_no_wrap(
-                    label.to_string(),
-                    label_font.clone(),
-                    theme::RIBBON,
-                );
-                let v = painter.layout_no_wrap(
-                    value.clone(),
-                    value_font.clone(),
-                    theme::OUTLINE,
-                );
+                let l =
+                    painter.layout_no_wrap(label.to_string(), label_font.clone(), theme::RIBBON);
+                let v = painter.layout_no_wrap(value.clone(), value_font.clone(), theme::OUTLINE);
                 l.size().x.max(v.size().x) + 26.0
             })
             .collect();
@@ -2899,11 +3207,7 @@ impl EvoApp {
             CornerRadius::same(theme::RADIUS_LG),
             Color32::from_rgba_unmultiplied(74, 52, 32, 90),
         );
-        painter.rect_filled(
-            panel,
-            CornerRadius::same(theme::RADIUS_LG),
-            theme::CARD,
-        );
+        painter.rect_filled(panel, CornerRadius::same(theme::RADIUS_LG), theme::CARD);
         painter.rect_stroke(
             panel,
             CornerRadius::same(theme::RADIUS_LG),
@@ -2929,17 +3233,13 @@ impl EvoApp {
                     theme::EDGE,
                 );
             }
-            let l = painter.layout_no_wrap(
-                label.to_string(),
-                label_font.clone(),
+            let l = painter.layout_no_wrap(label.to_string(), label_font.clone(), theme::RIBBON);
+            painter.galley(
+                Pos2::new(cell.left() + 13.0, cell.top() + 7.0),
+                l,
                 theme::RIBBON,
             );
-            painter.galley(Pos2::new(cell.left() + 13.0, cell.top() + 7.0), l, theme::RIBBON);
-            let v = painter.layout_no_wrap(
-                value.clone(),
-                value_font.clone(),
-                theme::OUTLINE,
-            );
+            let v = painter.layout_no_wrap(value.clone(), value_font.clone(), theme::OUTLINE);
             painter.galley(
                 Pos2::new(cell.left() + 13.0, cell.bottom() - 7.0 - v.size().y),
                 v,
@@ -3216,9 +3516,12 @@ impl EvoApp {
             // The same two layers the palette cell draws, for the same reason: the ghost of a
             // cracked brush has to promise a *cracked tile* on the level, not a bare crack.
             let (icon, flip) = self.brush_icon(brush);
-            for (name, flip) in [Self::brush_base(brush).map(|n| (n, false)), Some((icon, flip))]
-                .into_iter()
-                .flatten()
+            for (name, flip) in [
+                Self::brush_base(brush).map(|n| (n, false)),
+                Some((icon, flip)),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if let Ok(uv) = self.atlas.uv(name) {
                     painter.image(
@@ -3238,14 +3541,7 @@ impl EvoApp {
         painter.rect_stroke(
             footprint,
             egui::CornerRadius::ZERO,
-            Stroke::new(
-                1.5_f32,
-                if placeable {
-                    theme::ACCENT
-                } else {
-                    theme::BAD
-                },
-            ),
+            Stroke::new(1.5_f32, if placeable { theme::ACCENT } else { theme::BAD }),
             egui::StrokeKind::Inside,
         );
     }
@@ -3487,6 +3783,17 @@ fn slow_frame_log() -> bool {
 
 impl eframe::App for EvoApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl EvoApp {
+    /// One frame of the window.
+    ///
+    /// Split from [`eframe::App::update`] only so a test can run a frame: `eframe::Frame` can
+    /// only be made by `eframe`, and a harness that needs one cannot exist. Everything else is
+    /// the frame a person sees, drawn in the same order by the same code.
+    fn frame(&mut self, ctx: &Context) {
         let frame_started = Instant::now();
         // The title bar follows the document from the first frame, splash or not: a window
         // that named itself once and never again is how two open levels came to look like one
@@ -3638,6 +3945,8 @@ impl eframe::App for EvoApp {
         // The level's numbers float over the canvas rather than holding a column of their own, so
         // they are drawn after it and end up in front of it — which is where a window belongs.
         self.details_window(ctx);
+        // ...and so does the one question the window asks about the document itself.
+        self.discard_notice(ctx);
 
         // A scripted frame has to contain a real run, and `--replay` needs something
         // scored to replay: both paths prime the run with actual generations first, and
@@ -3706,10 +4015,312 @@ impl eframe::App for EvoApp {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// A levels directory of our own, holding copies of two shipped levels.
+    ///
+    /// A temp directory rather than `levels/`: these tests press *Save*, *New* and the
+    /// shelf, and a test that can write into the pack is a test that can corrupt it.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("evo-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("levels")).unwrap();
+        std::fs::create_dir_all(root.join("champions")).unwrap();
+        let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../levels");
+        for slug in ["l1-flat-run", "l2-first-gap"] {
+            std::fs::copy(
+                pack.join(format!("{slug}.json")),
+                root.join(format!("levels/{slug}.json")),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    fn app_on(ctx: &Context, level: &Path) -> EvoApp {
+        let options = LabOptions {
+            champions: level.parent().unwrap().join("../champions"),
+            ..Default::default()
+        };
+        EvoApp::build(
+            ctx,
+            level.to_path_buf(),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets"),
+            None,
+            options,
+            Some(false),
+        )
+        .expect("the window builds")
+    }
+
+    /// Run one real frame of the window, with `events` delivered to it.
+    ///
+    /// `time` advances by a sixtieth per frame, as a real window's does: egui decides whether two
+    /// presses are a double-click from the clock, and a harness that fed every frame `time = 0`
+    /// would make every click in a test the second half of one.
+    fn frame(ctx: &Context, app: &mut EvoApp, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0))),
+            time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.frame(ctx));
+    }
+
+    /// Press and release at `at` over three frames, the way a hand does.
+    fn click(ctx: &Context, app: &mut EvoApp, at: Pos2) {
+        // Hover first: egui decides what a press lands on from the pass before it, so a
+        // press that arrives in the same frame as the movement that aimed it hits nothing.
+        frame(ctx, app, vec![egui::Event::PointerMoved(at)]);
+        frame(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+        );
+        frame(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+    }
+
+    fn centre_of(app: &EvoApp, name: &str) -> Pos2 {
+        app.tool_rects
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("{name} was not drawn; have {:?}", app.tool_rects))
+    }
+
+    /// A window on a scratch pack, with a context of its own.
+    ///
+    /// A context per scenario rather than one per test: egui remembers a window's position, its
+    /// size and its scroll *by id*, so two scenarios sharing a context would be two windows with
+    /// one memory, and the second would be clicking wherever the first left the frame.
+    fn window(tag: &str) -> (Context, PathBuf, EvoApp) {
+        let root = scratch(tag);
+        let level = root.join("levels/l1-flat-run.json");
+        let ctx = egui::Context::default();
+        let mut app = app_on(&ctx, &level);
+        frame(&ctx, &mut app, vec![]);
+        (ctx, root, app)
+    }
+
+    /// A point on the shelf's second card.
+    ///
+    /// The cards start a known distance below the window's title bar (the title, the directory
+    /// line and its *Rescan* button, a separator, then the cards), each about 150 points tall,
+    /// and the whole card is the control — so a point in the second one is enough. Named as
+    /// "the card that is not the document already open", because that is the card whose click
+    /// has a visible result.
+    fn second_card(ctx: &Context) -> Pos2 {
+        let area = ctx
+            .memory(|m| m.area_rect(egui::Id::new("Levels")))
+            .expect("the shelf is up");
+        Pos2::new(area.left() + 60.0, area.top() + 230.0)
+    }
+
+    /// **New clears the level — and every view that was drawing the old one.**
+    ///
+    /// Two facts, and the second is the bug this pins: pressing New inside a playtest swapped
+    /// the document but left the session (and so the canvas, and its clock) on the level that
+    /// had just been thrown away, so the button looked like it did nothing. The same was true
+    /// of a run, whose population keeps its own copy of the terrain it was started on.
+    #[test]
+    fn the_new_button_clears_the_level_and_every_view_of_it() {
+        let (ctx, root, mut app) = window("new-button");
+
+        // A clean document: one press is the whole interaction.
+        let before = app.editor.level.content_hash();
+        let at = centre_of(&app, "New");
+        click(&ctx, &mut app, at);
+        assert_ne!(
+            app.editor.level.content_hash(),
+            before,
+            "New left the old level on the canvas"
+        );
+        assert_eq!(app.editor.path, None, "a new document has no file yet");
+        assert_eq!((app.editor.level.width, app.editor.level.height), (60, 15));
+        assert_eq!(app.mode, Mode::Edit);
+
+        // In a playtest: the session, the mode and the canvas all move to the new document.
+        let (ctx, _root, mut app) = window("new-button-play");
+        app.enter_play();
+        assert!(app.session.is_some(), "the playtest has a session");
+        let at = centre_of(&app, "New");
+        click(&ctx, &mut app, at);
+        assert_eq!(app.mode, Mode::Edit, "New left the window in the playtest");
+        assert!(
+            app.session.is_none(),
+            "the playtest session outlived the level it was playing"
+        );
+        assert!(
+            app.replay.is_none() && app.lab.is_none(),
+            "a run or a replay survived the document it was about"
+        );
+        assert_eq!(
+            app.viewed_level().content_hash(),
+            app.editor.level.content_hash(),
+            "the canvas is still drawing the old level"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A card on the shelf opens its level**, and a dirty document is asked about first.
+    ///
+    /// The report was that the shelf "shows the levels but does not let me load them". Both
+    /// halves are pinned here: a click on a card really does replace the document, and the
+    /// press that does *not* is the one a dirty document refused — which now says so on a card
+    /// under the dock instead of only in the status line, and which the second press (or the
+    /// card's own button) answers.
+    #[test]
+    fn a_card_on_the_shelf_opens_its_level_and_a_dirty_document_is_asked_first() {
+        let (ctx, root, mut app) = window("shelf-card");
+        let levels_at = centre_of(&app, "Levels");
+        click(&ctx, &mut app, levels_at);
+        assert!(app.shelf_open, "the Levels button did not open the shelf");
+        let card = second_card(&ctx);
+        click(&ctx, &mut app, card);
+        assert!(
+            app.editor
+                .path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("l2-first-gap.json")),
+            "a click on the second card opened {:?}",
+            app.editor.path
+        );
+        assert_eq!(app.mode, Mode::Edit);
+
+        // The same click on a document with unsaved edits is a question, not a no-op: the
+        // document stays, the notice is up, and the press *again* is the answer.
+        let (ctx, _root2, mut app) = window("shelf-card-dirty");
+        app.editor.dirty = true;
+        let levels_at = centre_of(&app, "Levels");
+        click(&ctx, &mut app, levels_at);
+        let card = second_card(&ctx);
+        click(&ctx, &mut app, card);
+        assert!(
+            app.editor
+                .path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("l1-flat-run.json")),
+            "a refused press replaced the document anyway: {:?}",
+            app.editor.path
+        );
+        assert!(
+            app.editor.message.contains("l2-first-gap.json"),
+            "the refusal does not name the level that was asked for: {:?}",
+            app.editor.message
+        );
+        assert!(
+            ctx.memory(|m| m.area_rect(egui::Id::new("discard-notice")))
+                .is_some(),
+            "the refusal was a whisper: no notice was drawn"
+        );
+        assert_eq!(
+            app.discard_wanted,
+            Some(Replace::Open(app.levels_dir.join("l2-first-gap.json")))
+        );
+
+        click(&ctx, &mut app, card);
+        assert!(
+            app.editor
+                .path
+                .as_ref()
+                .is_some_and(|p| p.ends_with("l2-first-gap.json")),
+            "the second press did not open the level: {:?}",
+            app.editor.path
+        );
+        assert!(
+            app.discard_wanted.is_none(),
+            "the question outlived its answer"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The notice's own **Discard** button performs the replacement that was asked for.
+    #[test]
+    fn the_discard_buttons_answer_the_question_they_are_asked() {
+        let (ctx, root, mut app) = window("discard-button");
+        app.editor.dirty = true;
+        let level = app.levels_dir.join("l2-first-gap.json");
+        app.replace(Replace::Open(level.clone()));
+        assert!(app.discard_wanted.is_some(), "no question was asked");
+        // Two frames: an anchored area is placed from its own remembered size, so the first
+        // frame it is up is drawn wherever the cursor was.
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        let notice = ctx
+            .memory(|m| m.area_rect(egui::Id::new("discard-notice")))
+            .expect("the notice is drawn");
+        // The first plate on the notice's bottom row is *Discard*.
+        click(
+            &ctx,
+            &mut app,
+            Pos2::new(notice.left() + 34.0, notice.bottom() - 26.0),
+        );
+        assert_eq!(
+            app.editor.path.as_deref(),
+            Some(level.as_path()),
+            "Discard did not perform the replacement it was asked about"
+        );
+        assert!(app.discard_wanted.is_none());
+
+        // And Keep editing leaves the document exactly where it was.
+        let (ctx, _root2, mut app) = window("keep-button");
+        app.editor.dirty = true;
+        let before = app.editor.level.content_hash();
+        app.replace(Replace::Open(app.levels_dir.join("l2-first-gap.json")));
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        let notice = ctx
+            .memory(|m| m.area_rect(egui::Id::new("discard-notice")))
+            .expect("the notice is drawn");
+        click(
+            &ctx,
+            &mut app,
+            Pos2::new(notice.left() + 130.0, notice.bottom() - 26.0),
+        );
+        assert_eq!(
+            app.editor.level.content_hash(),
+            before,
+            "Keep editing threw the work away"
+        );
+        assert!(app.discard_wanted.is_none(), "the question stayed up");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The dock's tools do not move when the document becomes dirty.**
+    ///
+    /// The plaque is as wide as its own words, and its second line used to grow by
+    /// `● … — not on disk` at the first stroke, shoving every tool to its right sideways and
+    /// pulling them back on the save. Two states of one sign have to be one width.
+    #[test]
+    fn the_dock_does_not_move_when_the_document_becomes_dirty() {
+        let (ctx, root, mut app) = window("dock-jump");
+        let clean = app.tool_rects.clone();
+        app.editor.dirty = true;
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(
+            clean, app.tool_rects,
+            "the first edit moved the tools in the dock"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The discard guard asks twice, and an edit between the two presses starts the question over.
     ///

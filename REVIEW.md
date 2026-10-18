@@ -1500,8 +1500,12 @@ a level being easy.
 
 **Status after this pass: 1 and 2 are landed and measured (and they re-price every walker-level
 number in this file, which is now taken under `common_episodes + race_episodes` unless it says
-otherwise); 3 was built, measured and reverted; 4, 5, 6 and 7 are untouched, with 5's probe still
-the one measurement that would re-rank the list.**
+otherwise); 3 was built, measured and reverted; 4, 5 and 7 are untouched, with 5's probe still the
+one measurement that would re-rank the list. 6's *flag* half landed with the shuttle finding
+(`FINDINGS.md`, "The practice flag went to the crossing the run had already made") and bought
+correctness rather than win rate; 6's *trigger* half was measured by firing practice after eight flat
+generations instead of twenty-five and **lost** — 0 of 8 seeds against 2 of 8 at the same budget — so
+the frontier rule stays an idea with a reading against its cheapest version.**
 
 ### Items 1 and 2, done and measured: one world for the generation, extra trials for the contenders
 
@@ -2563,9 +2567,18 @@ only support rather than settle.
 | A broken level is a card that says why | `app::shelf::tests::a_broken_level_is_a_card_that_says_why` |
 | A thumbnail draws the floor and not the sky | `app::shelf::tests::the_thumbnail_draws_the_floor_and_not_the_sky` |
 | A long level is downsampled into the thumbnail's grid | `app::shelf::tests::a_long_level_is_downsampled_to_the_thumbnails_grid` |
+| A quick second click on another card opens it; two on one card playtest it | `app::shelf::tests::a_quick_second_click_opens_a_different_card_and_double_click_plays_the_same_one` |
+| New clears the level *and* the playtest/replay/run that were drawing the old one | `app::tests::the_new_button_clears_the_level_and_every_view_of_it` |
+| A shelf card loads its level; a dirty document is asked first, and asks again | `app::tests::a_card_on_the_shelf_opens_its_level_and_a_dirty_document_is_asked_first` |
+| The notice's Discard and Keep editing do what they say | `app::tests::the_discard_buttons_answer_the_question_they_are_asked` |
+| The dock's tools do not move when the document becomes dirty | `app::tests::the_dock_does_not_move_when_the_document_becomes_dirty` |
 | Brick and timber are paints of their own | `app::editor::tests::the_brick_and_timber_brushes_paint_their_own_tiles` |
 | A rectangle drag fills the box and is one undo step | `app::editor::tests::a_rect_drag_fills_the_box_and_is_one_undo_step` |
 | A line drag leaves a connected run | `app::editor::tests::a_line_drag_leaves_a_connected_run` |
+| The shelf brush places the width, travel, axis **and direction** the palette says, and the eyedropper takes all four back | `app::editor::tests::picking_takes_the_brush_from_whatever_is_under_the_pointer` |
+| A shelf travels the way the file says, and a missing `dir` is the rightward shelf it always was | `sim::tests::entities::a_shelf_travels_the_way_the_file_says_it_does` |
+| A mirrored slider turns; a mirrored lift does not | `sim::tests::entities::a_mirrored_shelf_travels_the_mirrored_way` |
+| A level crossed only by a shuttle is beatable, and the same channel with no shuttle is not | `sim::tests::levels::a_shuttle_across_lava_is_the_crossing_the_verdict_reports` |
 | The spawn refuses a cell with nothing under it | `app::editor::tests::the_spawn_refuses_a_cell_with_no_ground_under_it`, `sim::level::editing_tests::a_spawn_needs_an_empty_cell_with_ground_under_it` |
 | A fresh document starts on ground | `app::editor::tests::a_fresh_document_starts_on_ground` |
 | A walker is out of sight beyond the view distance and legible inside it | `sim::tests::levels::an_off_grid_or_distant_walker_is_out_of_sight_until_approached` |

@@ -628,11 +628,17 @@ mod tests {
             generation: packet.generation,
             result: quickest.result.clone(),
             genome: quickest.genome.clone(),
+            // A clock is one episode: the seeded validation set answers a different question than
+            // the race this record is quoted in.
+            validated: None,
         });
         packet.best = Some(evo::BestEver {
             generation: packet.generation,
             result: champion.result.clone(),
             genome: champion.genome.clone(),
+            // The run's validated reading belongs to the trainer that measured it; a replay
+            // rebuilt from a champion file is one episode and says so.
+            validated: None,
         });
         packet
     }

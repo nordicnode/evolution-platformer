@@ -956,6 +956,24 @@ enum Medium {
     Vine,
 }
 
+/// How far below a vine's top a body may be for a sideways press to be the way **off** it.
+///
+/// The last stretch of a climb is the exit: a press there carries the body out of the column and
+/// onto the ledge beside the run, while it is still rising at `vine_climb` (which is why the
+/// window is most of a tile — a press made on the decision cadence still has room to cross).
+/// Below it the vine owns the body's x while the climb is held: see [`PlayerState::tick`].
+///
+/// One constant rather than a number in two places: [`crate::reach::vine_action`] presses the side
+/// at exactly this height, and the physics has to answer the same question the oracle's script
+/// assumes, or the route would promise an exit the body cannot take.
+pub const VINE_EXIT_REACH: f32 = 0.9;
+
+/// Whether a body whose feet are at `feet` is high enough on a vine whose top cell is `top_row`
+/// to leave it sideways.
+pub fn vine_exit_open(feet: f32, top_row: i32) -> bool {
+    feet <= top_row as f32 + VINE_EXIT_REACH
+}
+
 /// The block a vine hangs from, when a body can stand on top of it: the anchor row, given a column
 /// and a row of that column's vine.
 ///
@@ -1097,12 +1115,7 @@ impl PlayerState {
     }
 
     /// Advance one tick: intent, gravity, then per-axis AABB resolution.
-    pub fn tick(
-        &mut self,
-        level: &Level,
-        ph: &Physics,
-        action: AgentAction,
-    ) -> TickContact {
+    pub fn tick(&mut self, level: &Level, ph: &Physics, action: AgentAction) -> TickContact {
         let mut contact = TickContact::default();
 
         // ---- a pull-up owns the body until it ends -----------------------
@@ -1262,13 +1275,45 @@ impl PlayerState {
             self.speed_cap = (self.speed_cap - ph.sprint_ramp).max(target_cap);
         }
 
+        // ---- the vine owns the body's x while the climb is held --------
+        //
+        // A grip, not a brush. A body that arrives at a vine **at a run** is caught: its
+        // horizontal speed is spent on the hold instead of carrying it past the column, and
+        // below the top of the run a direction does not push it out of the column at all. That
+        // is what makes a vine a route a policy can find: "hold jump and keep running" climbs,
+        // where before it was thrown off after a tile and a half. That was not a theory — it is
+        // exactly how the window's best agents failed a vine hanging over a lava pit (the body
+        // grabbed, climbed a tile, drifted out of the column and fell in), and it is why the
+        // level's route was walkable by the oracle and not by the population.
+        //
+        // The last [`VINE_EXIT_REACH`] tiles below the top are the exit, the same window
+        // [`crate::reach::vine_action`] presses in, so stepping off onto a ledge still works.
+        // Releasing the climb below that also lets a side press step off, because a body that is
+        // sliding down is no longer being held up by the vine.
+        let on_vine = matches!(medium, Medium::Vine);
+        let held = on_vine
+            && want_jump
+            && self
+                .vine_top_row(level)
+                .is_some_and(|top| !vine_exit_open(self.y + self.h, top));
+        if on_vine && (held || !self.on_vine) {
+            self.vx = 0.0;
+        }
+
         // ---- horizontal intent ------------------------------------------
         let input = action.input_x();
-        if self.wall_lock > 0 {
+        if held {
+            // The vine has the body: a direction is not a walk while the climb is held below
+            // the exit window.
+        } else if self.wall_lock > 0 {
             // The wall jump owns the body's horizontal velocity for a few ticks.
             self.wall_lock -= 1;
         } else if input != 0.0 {
-            let scale = if self.grounded { 1.0 } else { ph.air_accel_scale };
+            let scale = if self.grounded {
+                1.0
+            } else {
+                ph.air_accel_scale
+            };
             // A grounded turn is not an acceleration. `input * vx < 0` is "pressing against
             // the way the body is already going"; on the ground that gets
             // [`Physics::turn_accel_scale`], and in the air it deliberately does not — the
@@ -1284,7 +1329,11 @@ impl PlayerState {
             // Water drags: the cap is the water's, not the body's gear, so a pool is crossed
             // at half a run whatever the body was doing when it went in. Sprinting through
             // water is not a thing, and the clamp is what says so.
-            let cap = if in_water { ph.water_speed } else { self.speed_cap };
+            let cap = if in_water {
+                ph.water_speed
+            } else {
+                self.speed_cap
+            };
             self.vx = self.vx.clamp(-cap, cap);
         } else {
             // Brake is the one neutral action that is *not* a coast, and it decelerates in
@@ -1534,16 +1583,36 @@ impl PlayerState {
             if self.y < underside - 0.05 || self.y > underside + 0.35 {
                 continue;
             }
-            return Some((
-                col as f32 + (1.0 - self.w) * 0.5,
-                anchor as f32 - self.h,
-            ));
+            return Some((col as f32 + (1.0 - self.w) * 0.5, anchor as f32 - self.h));
         }
         None
     }
+    /// The top row of the vine run the body is holding, if it is holding one.
+    ///
+    /// The run is walked up from the cell the body overlaps, so a body halfway up a shaft reads
+    /// the same top as a body at its foot. `None` for a body that is not on a vine, which is the
+    /// question the hold rule asks before it takes the body's x away.
+    fn vine_top_row(&self, level: &Level) -> Option<i32> {
+        let (tx0, tx1) = tile_span(self.x, self.w);
+        let (ty0, ty1) = row_span(self.y, self.h);
+        let mut top: Option<i32> = None;
+        for tx in tx0..=tx1 {
+            for ty in ty0..=ty1 {
+                if !level.is_vine(tx, ty) {
+                    continue;
+                }
+                let mut run_top = ty;
+                while run_top > 0 && level.is_vine(tx, run_top - 1) {
+                    run_top -= 1;
+                }
+                top = Some(top.map_or(run_top, |held| held.min(run_top)));
+            }
+        }
+        top
+    }
 
-/// Does the body's box overlap a vine cell?
-fn overlaps_vine(&self, level: &Level) -> bool {
+    /// Does the body's box overlap a vine cell?
+    fn overlaps_vine(&self, level: &Level) -> bool {
         let (tx0, tx1) = tile_span(self.x, self.w);
         let (ty0, ty1) = row_span(self.y, self.h);
         (ty0..=ty1).any(|ty| (tx0..=tx1).any(|tx| level.is_vine(tx, ty)))
@@ -1704,7 +1773,11 @@ impl Walker {
         ph: &Physics,
         rng: &mut crate::rng::Rng,
     ) -> Walker {
-        let dir: i8 = if crate::rng::next_f32(rng) < 0.5 { -1 } else { 1 };
+        let dir: i8 = if crate::rng::next_f32(rng) < 0.5 {
+            -1
+        } else {
+            1
+        };
         let offset = crate::rng::next_signed_f32(rng) * ph.walker_spawn_jitter;
         let row = row_span(rect.y, ph.walker_h).1;
         let supported = |x: f32| {
@@ -1896,7 +1969,11 @@ impl Flyer {
         rng: &mut crate::rng::Rng,
     ) -> Flyer {
         let mut flyer = Flyer::new(id, spec, ph);
-        flyer.dir = if crate::rng::next_f32(rng) < 0.5 { -1 } else { 1 };
+        flyer.dir = if crate::rng::next_f32(rng) < 0.5 {
+            -1
+        } else {
+            1
+        };
         let span = (flyer.max_x - flyer.min_x).max(0.0);
         let phase = crate::rng::next_f32(rng) * span;
         flyer.x = (flyer.min_x + phase).min(flyer.max_x);
@@ -2021,7 +2098,11 @@ pub struct Shot {
 impl Shot {
     pub fn from_turret(t: &Turret, ph: &Physics) -> Shot {
         Shot {
-            x: if t.dir > 0 { t.muzzle_x() } else { t.muzzle_x() - ph.shot_w },
+            x: if t.dir > 0 {
+                t.muzzle_x()
+            } else {
+                t.muzzle_x() - ph.shot_w
+            },
             y: t.y + (t.h - ph.shot_h) * 0.5,
             w: ph.shot_w,
             h: ph.shot_h,
@@ -2180,12 +2261,14 @@ impl LavaBall {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mover {
     pub id: u32,
-    /// The box at the low end of its travel.
+    /// The box where its travel **starts**.
     pub home: Rect,
-    /// How far it was authored to travel, in tiles.
+    /// How far it was authored to travel, in tiles. Never negative.
     pub span: f32,
-    /// True for a lift (rises), false for a slider (moves right).
+    /// True for a lift (travels vertically), false for a slider (travels horizontally).
     pub vertical: bool,
+    /// Which way it leaves `home`: `+1` right (or up), `-1` left (or down).
+    pub dir: i8,
     /// How much of `span` is actually **clear of terrain**: the shelf stops at the first wall
     /// or ceiling on its path and turns there.
     ///
@@ -2211,10 +2294,11 @@ impl Mover {
             (span - (phase - half) * speed).max(0.0)
         };
         let mut rect = self.home;
+        let step = travelled * self.dir as f32;
         if self.vertical {
-            rect.y -= travelled;
+            rect.y -= step;
         } else {
-            rect.x += travelled;
+            rect.x += step;
         }
         rect
     }
@@ -2235,6 +2319,7 @@ impl Mover {
         h.f32(self.home.y);
         h.f32(self.span);
         h.u8(self.vertical as u8);
+        h.i8(self.dir);
     }
 }
 
@@ -2246,18 +2331,19 @@ impl Mover {
 ///
 /// The consequence an author can rely on: **a mover never passes through a wall or a
 /// ceiling, and never needs a wall on the far end of its travel** — it simply turns early.
-pub fn clear_travel(home: Rect, span: f32, vertical: bool, level: &Level) -> f32 {
+pub fn clear_travel(home: Rect, span: f32, vertical: bool, dir: i8, level: &Level) -> f32 {
     let span = span.max(0.0);
     let step = 0.25_f32;
+    let sign = if dir < 0 { -1.0 } else { 1.0 };
     let mut clear = 0.0;
     let mut travelled = 0.0;
     while travelled < span {
         travelled = (travelled + step).min(span);
         let mut probe = home;
         if vertical {
-            probe.y -= travelled;
+            probe.y -= travelled * sign;
         } else {
-            probe.x += travelled;
+            probe.x += travelled * sign;
         }
         if rect_hits_opaque(level, probe) {
             break;
@@ -2513,10 +2599,9 @@ mod tests {
         // Each direction has exactly one running jump and exactly one sprinting jump —
         // the two arms a climb and a long leap are built from.
         for (dir, moves) in [("right", &right), ("left", &left)] {
-            for (what, want_jump, want_sprint) in [
-                ("running jump", true, false),
-                ("sprint jump", true, true),
-            ] {
+            for (what, want_jump, want_sprint) in
+                [("running jump", true, false), ("sprint jump", true, true)]
+            {
                 let n = moves
                     .iter()
                     .filter(|(j, s)| *j == want_jump && *s == want_sprint)
@@ -2527,7 +2612,11 @@ mod tests {
         // Nothing neutral asks for the raised cap: a sprint is a gear of a *direction*.
         for a in AgentAction::ALL.iter() {
             if a.input_x() == 0.0 {
-                assert!(!a.wants_sprint(), "{} has no direction to sprint in", a.name());
+                assert!(
+                    !a.wants_sprint(),
+                    "{} has no direction to sprint in",
+                    a.name()
+                );
             }
         }
     }

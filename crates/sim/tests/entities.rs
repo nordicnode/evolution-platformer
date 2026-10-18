@@ -61,7 +61,11 @@ fn a_one_way_shelf_is_ground_from_above_and_air_from_below() {
         "############",
     ];
     let level = level("one-way", &rows, (5, 1), &[goal(10, 3)]);
-    assert_eq!(level.tile(4, 2), Some(Tile::OneWay), "the shelf is authored");
+    assert_eq!(
+        level.tile(4, 2),
+        Some(Tile::OneWay),
+        "the shelf is authored"
+    );
     assert!(
         level.is_solid(4, 2),
         "a one-way is ground for every question that asks for a surface"
@@ -286,7 +290,10 @@ fn a_turret_shot_ends_the_episode() {
         Outcome::Died,
         "a standing body in a firing row is hit"
     );
-    assert!(saw_shot, "and it is a shot that hit it, not the turret's body");
+    assert!(
+        saw_shot,
+        "and it is a shot that hit it, not the turret's body"
+    );
 }
 
 /// **A turret is solid: a lid to stand on, a wall to bump, never a stomp.**
@@ -321,9 +328,16 @@ fn a_turret_is_a_solid_box_not_a_stompable_enemy() {
         "the body should be standing on the turret's lid at {lid}, feet are {feet}"
     );
     assert!(sim.player().grounded, "its lid is ground");
-    assert!(sim.turrets()[0].alive, "landing on a turret must not destroy it");
+    assert!(
+        sim.turrets()[0].alive,
+        "landing on a turret must not destroy it"
+    );
     assert_eq!(sim.stats().stomps, 0, "and it is not a stomp");
-    assert_eq!(sim.outcome(), Outcome::Running, "nor is touching it a death");
+    assert_eq!(
+        sim.outcome(),
+        Outcome::Running,
+        "nor is touching it a death"
+    );
 
     // Walked into from the side: the body is stopped at the barrel.
     let wall_level = level("turret-wall", &rows, (1, 3), &entities);
@@ -337,7 +351,11 @@ fn a_turret_is_a_solid_box_not_a_stompable_enemy() {
         body.x + body.w,
         turret.x
     );
-    assert_eq!(sim.outcome(), Outcome::Running, "bumping a turret is not fatal");
+    assert_eq!(
+        sim.outcome(),
+        Outcome::Running,
+        "bumping a turret is not fatal"
+    );
     assert_eq!(sim.stats().stomps, 0);
     assert!(sim.turrets()[0].alive, "and it is still there");
 }
@@ -535,7 +553,7 @@ fn every_new_entity_round_trips_through_the_writer() {
     assert!(level.add_chaser_tile(3, 3));
     assert!(level.add_flyer_tile(9, 2, 3));
     assert!(level.add_turret_tile(13, 3, -1));
-    assert!(level.add_platform_tile(6, 2, 3, 2, true));
+    assert!(level.add_platform_tile(6, 2, 3, 2, true, 1));
 
     let json = level.to_json_pretty().expect("the document is writable");
     let back = Level::from_json_str(&json).expect("and readable");
@@ -547,6 +565,11 @@ fn every_new_entity_round_trips_through_the_writer() {
     assert_eq!(back.platforms.len(), 1);
     assert_eq!(back.platforms[0].rect.w, 3.0, "the width is kept");
     assert!(back.platforms[0].vertical, "the axis is kept");
+    assert_eq!(
+        back.platforms[0].dir, level.platforms[0].dir,
+        "and the direction it travels, which is a fact about the level and not about the box"
+    );
+    assert_eq!(level.platforms[0].dir, 1, "the fixture's lift goes up");
     // The travel, not the distance between the ends: the ends name the box's edges, so the gap
     // between them is the beat *plus the flyer's own width*. Reading it back the other way is
     // how a save/load round trip makes a flyer's path grow by 0.7 tiles per save.
@@ -710,8 +733,7 @@ fn a_lift_carries_its_rider_up_and_down() {
         "############",
     ];
     let entities = [
-        "{\"type\":\"platform\",\"x\":4,\"y\":6,\"tiles\":2,\"span\":3,\"axis\":\"y\"}"
-            .to_string(),
+        "{\"type\":\"platform\",\"x\":4,\"y\":6,\"tiles\":2,\"span\":3,\"axis\":\"y\"}".to_string(),
         goal(10, 5),
     ];
     // The spawn is half a tile above the deck, so the first few ticks are a landing.
@@ -771,7 +793,9 @@ fn every_placeable_entity_changes_the_scene_hash_but_not_the_terrain_hash() {
     });
 
     let mut platform = base.clone();
-    platform.platforms.push(sim::PlatformSpec::at(10, 6, 3, 4, false));
+    platform
+        .platforms
+        .push(sim::PlatformSpec::at(10, 6, 3, 4, false, 1));
 
     for (kind, level) in [
         ("chaser", &chaser),
@@ -820,4 +844,89 @@ fn the_route_oracle_stands_on_a_one_way_shelf() {
         "the flag across the shelf should be reachable: {:?}",
         report.diagnosis
     );
+}
+
+/// **A shelf travels the way the file says it does.**
+///
+/// The level format has carried a platform's *axis* since movers existed and its **direction** since
+/// a level whose only ride arrived from the right could not be written down. The box alone cannot
+/// say it — a two-tile shelf at column 8 is the same box whether it slides left or right — so the
+/// direction is a field, exactly as a turret's facing is, and this is the pin that the file, the
+/// loader and the stepper all read the same one. A file written before the field existed has none
+/// and must still read as the rightward shelf it always was.
+#[test]
+fn a_shelf_travels_the_way_the_file_says_it_does() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    // The same box and the same travel, stated twice: once leftward, once with no direction at all.
+    for (json, name, going_left) in [
+        (
+            "{\"type\":\"platform\",\"x\":8,\"y\":4,\"tiles\":3,\"span\":5,\"axis\":\"x\",\"dir\":-1}",
+            "leftward",
+            true,
+        ),
+        (
+            "{\"type\":\"platform\",\"x\":8,\"y\":4,\"tiles\":3,\"span\":5,\"axis\":\"x\"}",
+            "unstated",
+            false,
+        ),
+    ] {
+        let entities = [json.to_string(), goal(19, 4)];
+        let level = level(name, &rows, (1, 4), &entities);
+        let mut sim = sim::Sim::new(&level, 3);
+        let start = sim.platforms()[0].x;
+        assert_eq!(start, 8.0, "{name}: the shelf starts where it was placed");
+        common::step_n(&mut sim, AgentAction::Walk, 60);
+
+        let now = sim.platforms()[0].x;
+        if going_left {
+            assert!(
+                now < start - 0.5,
+                "{name}: a shelf told to go left must go left, it is at {now} from {start}"
+            );
+        } else {
+            assert!(
+                now > start + 0.5,
+                "{name}: a shelf with no direction is a rightward shelf, it is at {now} from {start}"
+            );
+        }
+    }
+}
+
+/// **A mirrored level's shelves travel the mirrored way, and its lifts still lift.**
+///
+/// The mirror flips the level's x axis, so a slider that used to leave to the right now leaves to
+/// the left — otherwise the mirror of a level whose only ride arrives from the left would be a
+/// level whose ride leaves, and the mirror claim in `levels.rs` would be checking a different
+/// course. A lift's up/down is *not* the mirrored axis, so it does not turn: the same shelf that
+/// rises in the original rises in the mirror.
+#[test]
+fn a_mirrored_shelf_travels_the_mirrored_way() {
+    let mut level = Level::starter("mirror-shelf", 24, 8);
+    assert!(level.add_platform_tile(6, 5, 3, 4, false, -1), "a leftward slider");
+    assert!(level.add_platform_tile(14, 5, 3, 4, true, -1), "a downward lift");
+
+    let mirrored = level.mirrored_horizontal();
+    assert_eq!(mirrored.platforms.len(), 2);
+    let sliders: Vec<_> = mirrored.platforms.iter().filter(|p| !p.vertical).collect();
+    let lifts: Vec<_> = mirrored.platforms.iter().filter(|p| p.vertical).collect();
+    assert_eq!(sliders.len(), 1, "the slider is still a slider");
+    assert_eq!(
+        sliders[0].dir, 1,
+        "a leftward slider mirrored is a rightward one"
+    );
+    assert_eq!(lifts.len(), 1);
+    assert_eq!(
+        lifts[0].dir, -1,
+        "a lift's up/down is not the mirrored axis, so it does not turn"
+    );
+    // And the home box moved to the reflected column: a 3-wide shelf at 6 in a 24-wide level is at
+    // 24 - (6 + 3) = 15.
+    assert_eq!(sliders[0].rect.x, 15.0);
 }

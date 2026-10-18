@@ -434,6 +434,26 @@ pub struct EpisodeResult {
     /// being close. It is the number that makes "the suite fell" a statement a reader can
     /// check — the run's own solve signal is every level won, not one.
     pub suite_wins: u32,
+    /// **Every** episode this genome was judged on reached the flag, over every level and every
+    /// trial — the conservative reading of "solved", and the one a run's success signal uses.
+    ///
+    /// [`EpisodeResult::won`] answers a narrower question: did the *representative* episode (trial
+    /// 0 of the first level) win. That is the right question for a champion file, because a
+    /// champion is a claim about one replayable episode — but it is the wrong question for "has
+    /// this run solved the level", and on a walker level the difference is not academic. A patrol's
+    /// phase is drawn per episode, so a genome can win the one phase it was scored on and be a
+    /// coin flip on the next; `won` calls that solved and this field does not.
+    ///
+    /// A single-episode evaluation is its own whole, so this equals [`EpisodeResult::won`] wherever
+    /// a level is deterministic. Only [`crate::ga::suite_score`] can set it to anything else, and it
+    /// folds every recorded episode's outcome — a suite's `won` is level 0, trial 0, while this is
+    /// every level and every trial.
+    ///
+    /// One caveat, and it is a property of racing rather than a bug: a genome culled before its
+    /// second trial was never judged on one, so its flag describes the episodes that exist. Racing
+    /// culls on the score, and a trial-0 winner scores the goal bonus, so a winner is never the
+    /// genome a cull removes.
+    pub all_trials_won: bool,
     pub death_pos: Option<(f32, f32)>,
     pub seed: u64,
     /// Hash of the decision trace and final state. Champion round-trip tests
@@ -442,8 +462,16 @@ pub struct EpisodeResult {
 }
 
 impl EpisodeResult {
+    /// Did the **representative** episode reach the flag? The champion's own claim: trial 0 of the
+    /// first level, which is the episode `replay` reproduces.
     pub fn won(&self) -> bool {
         self.outcome == Outcome::Won
+    }
+
+    /// Did **every** episode this genome was judged on reach the flag? The run's solve signal —
+    /// see [`EpisodeResult::all_trials_won`] for why the two questions are different.
+    pub fn solved(&self) -> bool {
+        self.all_trials_won
     }
 }
 
@@ -555,6 +583,9 @@ impl EpisodeRunner {
             // One level was played, so no suite was solved: `evaluate_suite` is the only
             // thing that raises this, and it raises it after this episode is finished.
             suite_wins: 0,
+            // One episode was played, so it is the whole of what this genome is judged on, and
+            // its own outcome is the conservative answer. `SuiteTally::result` can only lower it.
+            all_trials_won: outcome == Outcome::Won,
             death_pos: stats.death_pos,
             seed: self.seed,
             trajectory_hash: self.trace.finish(),

@@ -80,6 +80,22 @@ pub struct GaConfig {
     /// genome: one to [`FINE_GENE_MAX`] genes, against the coarse
     /// `mutation_rate × n_genes` a normal child gets. 0 disables the second scale.
     pub fine_children: usize,
+    /// The fine scale's **step**, as a multiple of [`GaConfig::mutation_sigma`]. `0.25` at the
+    /// shipped sigma is 0.075, which is the size a "fine" child was always meant to be.
+    ///
+    /// A fine child moves *one to three genes* and nothing else, so it is local in **count** — but
+    /// until this field existed it used the coarse `sigma` for those genes too, and that made it a
+    /// re-roll rather than a step. Xavier initialisation puts a gene's own scale at about 0.13
+    /// (`sqrt(6/(fan_in+fan_out))/sqrt(3)` for the shipped 100 → 16 layer), so the old fine step of
+    /// `N(0, 0.30)` moved each chosen gene by ~2.3 of its own standard deviations: the boundary the
+    /// child was supposed to nudge was redrawn instead. Measured on `l9-wait-and-climb`, pop 200,
+    /// 200 generations, eight seeds, the second scale still earns its place (median first win 44.5
+    /// generations with fine children, 51.0 without), which is why this is a *temperature* fix and
+    /// not an argument for removing the scale.
+    ///
+    /// The same step is used by the archive's children ([`GaConfig::archive_children`]), for the
+    /// same reason and one more: a niche incumbent bred coarsely is not preserving a behaviour.
+    pub fine_sigma_scale: f32,
     /// Offspring per generation bred from the **quality-diversity archive** rather than from
     /// the population's own ranking: [`Trainer::archive`] holds the best genome found in each
     /// `(progress, checkpoints)` niche, and these children are perturbations of those
@@ -260,6 +276,32 @@ pub struct GaConfig {
     /// six-generation lottery; `false` pins every level to the literal `trials`, which is what
     /// the measurements taken before this lock existed can be reproduced with.
     pub auto_trials: bool,
+    /// Episodes, drawn from seeds no generation ever sees, on which a **record candidate** and the
+    /// record it would replace are compared ([`validation_seed`], [`BestEver::validated`]).
+    ///
+    /// The noise this exists for is the one pairing cannot remove: `episode_seed_for` mixes in the
+    /// generation, so even under `common_episodes` the *world* is re-rolled every generation. Every
+    /// record the trainer keeps — `best_ever`, and through it the champion a run saves and the
+    /// genome a reheat is anchored on — is therefore a maximum over draws, and a maximum over draws
+    /// is optimistically biased: it keeps the genome that met a quiet patrol, not the genome that
+    /// handles patrols.
+    ///
+    /// Validation episodes are a function of `master_seed` and their own index only, so two
+    /// candidates meet the same worlds and the comparison is a comparison of policies. They are run
+    /// **only when a candidate beats the record on its generation score**, which is rare once a run
+    /// has settled, so the cost is a handful of episodes per run rather than per generation.
+    ///
+    /// **Twelve by default**, because a mean over four episodes could not separate a genome that
+    /// won three and died on one from a genome that reached mid-level on four, and comparing means
+    /// is how a small set hands the record to a policy that never solved the level (the spot check
+    /// in `FINDINGS.md`, "Solved, then validated": 4-episode validation was *worse* than none).
+    /// The comparison is on solve count first for the same reason.
+    ///
+    /// `0` switches it off and restores the pre-validation behaviour exactly. It is also skipped on
+    /// its own on a level with nothing stochastic in it (`GaConfig::recommended_trials_for` is 1):
+    /// there the generation's own episode already *is* a held-out reading, and a dozen copies of it
+    /// would cost a dozen episodes to learn nothing.
+    pub validation_episodes: u32,
     /// Judge every genome of a generation on the **same** episodes: common random numbers.
     ///
     /// On, episodes are derived from `(master_seed, generation, trial)` alone
@@ -344,6 +386,7 @@ impl Default for GaConfig {
             mutation_rate: 0.05,
             crossover_rate: 0.75,
             fine_children: 8,
+            fine_sigma_scale: 0.25,
             archive_children: 0,
             archive_on_diversity: false,
             novelty_weight: 0.0,
@@ -354,6 +397,7 @@ impl Default for GaConfig {
             reheat_factor: 3.0,
             trials: 1,
             auto_trials: true,
+            validation_episodes: 12,
             common_episodes: true,
             race_episodes: true,
             master_seed: 1,
@@ -431,6 +475,17 @@ impl GaConfig {
             .clamp(MUTATION_SIGMA_RANGE[0], MUTATION_SIGMA_RANGE[1])
     }
 
+    /// The step the **fine** scale moves a gene by: the run's own mutation size times
+    /// [`GaConfig::fine_sigma_scale`], held inside the documented sigma band.
+    ///
+    /// The floor is the same one the self-tuning rule uses (`0.05` would be a step the search can
+    /// still measure); the ceiling is the run's own, so a `--fine-sigma-scale 4` cannot make the
+    /// fine scale coarser than the coarse one by more than the band allows.
+    pub fn fine_sigma(&self) -> f32 {
+        (self.mutation_sigma * self.fine_sigma_scale)
+            .clamp(MUTATION_SIGMA_RANGE[0] * 0.2, MUTATION_SIGMA_RANGE[1])
+    }
+
     /// Clamp every field into the range the plan documents, so a stray CLI
     /// argument cannot produce a degenerate run (zero population, no elites,
     /// tournament larger than the population, and so on).
@@ -442,6 +497,12 @@ impl GaConfig {
         self.tournament = self.tournament.clamp(2, self.pop_size);
         self.elite = self.elite.min(self.pop_size.saturating_sub(1));
         self.mutation_sigma = self.mutation_sigma.clamp(0.0, 2.0);
+        // A *fraction* of the run's step, so above 1.0 would mean a "fine" child that moves
+        // further than a coarse one — a different search wearing the same name.
+        self.fine_sigma_scale = self.fine_sigma_scale.clamp(0.0, 1.0);
+        // A record comparison, not a training run: past sixteen episodes it is measuring a level's
+        // patrol distribution rather than two genomes, and the cost stops being a rounding error.
+        self.validation_episodes = self.validation_episodes.min(16);
         self.mutation_rate = self.mutation_rate.clamp(0.0, 1.0);
         self.crossover_rate = self.crossover_rate.clamp(0.0, 1.0);
         // Neither extra may swamp the population it is mixed into. Both are *nudges*:
@@ -568,8 +629,15 @@ pub struct GenRow {
     pub max_fitness: f32,
     pub avg_fitness: f32,
     pub min_fitness: f32,
-    /// Agents that touched the flag this generation.
+    /// Agents that touched the flag on the episode they were *judged* on.
     pub wins: usize,
+    /// Agents that won **every** episode they were judged on — the conservative solve signal a run
+    /// stops on (`--stop-on-win`), and the one that is not a coin flip on a walker level.
+    ///
+    /// Equal to `wins` on a level with nothing stochastic in it, and smaller wherever a patrol
+    /// phase is drawn: a genome that won its representative phase but died on the second is a win
+    /// and not a solve.
+    pub solved: usize,
     /// Genome id of the generation's best agent.
     pub best_id: u32,
     /// `max > 1.5 × previous max` — the "genius agent" splash condition (§10 Tier 1.3).
@@ -611,6 +679,88 @@ pub struct BestEver {
     pub generation: u32,
     pub result: EpisodeResult,
     pub genome: Genome,
+    /// Mean fitness over the run's **fixed validation episodes**, when it was measured.
+    ///
+    /// `result` is the episode the record was *found* on, and it is the number a champion file
+    /// records and `replay` reproduces — it must stay exactly that episode.
+    ///
+    /// This is the other half, and the one that makes the record honest on a stochastic level. The
+    /// generation that found a genome also drew its patrol phase, so the score that *selected* a
+    /// record is one draw of a lottery the record is then advertised as winning. Validation runs
+    /// the genome on episodes no generation ever drew ([`validation_seed`]), so two candidates are
+    /// compared on the same worlds and the survivor is the better *policy* rather than the luckier
+    /// draw. `None` on a level with nothing stochastic in it, where the generation's own episode is
+    /// already a held-out reading, and on runs that switched validation off.
+    pub validated: Option<Validation>,
+}
+
+/// A record's reading on the run's **fixed validation episodes** ([`validation_seed`]).
+///
+/// Two numbers rather than a mean, because the question a champion answers is not "how far did it
+/// get on average" but "does it win". A mean over four episodes cannot tell a genome that won
+/// three and died on one from a genome that reached mid-level on four, and comparing means is how
+/// a validation set can hand the champion to a policy that never solved the level — the failure
+/// that made a 4-episode validation set *worse* than no validation at all in a spot check (see
+/// `FINDINGS.md`, "Solved, then validated").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Validation {
+    /// Episodes of the set that reached the flag.
+    pub wins: u32,
+    /// Episodes in the set. Never 0 for a reading that exists.
+    pub episodes: u32,
+    /// Mean fitness over the set, kept for the number a reader compares between runs.
+    pub mean: f32,
+}
+
+impl Validation {
+    /// Did the genome win **every** episode of the set? The conservative reading, and the first
+    /// thing two readings are compared on.
+    pub fn solved(&self) -> bool {
+        self.episodes > 0 && self.wins == self.episodes
+    }
+
+    /// Lexicographic `self > other` over `(solved, wins, mean)`.
+    ///
+    /// `total_cmp` rather than `partial_cmp` for the last term so a NaN cannot panic the trainer;
+    /// a NaN then sorts above every finite mean, which is the direction that keeps a broken genome
+    /// out of the record only if it was actually measured — and `fitness` never yields one.
+    fn beats(&self, other: &Validation) -> bool {
+        (self.solved(), self.wins) > (other.solved(), other.wins)
+            || ((self.solved(), self.wins) == (other.solved(), other.wins)
+                && self.mean.total_cmp(&other.mean) == std::cmp::Ordering::Greater)
+    }
+}
+
+/// **Does a candidate take the record?** The one place the answer is decided.
+///
+/// Three readings, in this order and no other:
+///
+/// 1. **A solved generation episode beats an unsolved one, always.** The champion is a claim a
+///    viewer can replay, so a record whose own episode is a loss may not stand beside a solve —
+///    otherwise `--stop-on-win` stops on a solve and saves a near-miss.
+/// 2. **Between two readings of the same solved-ness, the validated one decides**: solved first,
+///    then episodes won, then the mean ([`Validation::beats`]). Those are worlds no generation
+///    drew, so they are the reading that is not a lottery.
+/// 3. **With no validation** (a deterministic level, or `validation_episodes: 0`) the generation
+///    score decides, exactly as it did before validation existed.
+fn supersedes(
+    candidate_result: &EpisodeResult,
+    candidate: Option<Validation>,
+    held: Option<(&EpisodeResult, Option<Validation>)>,
+) -> bool {
+    let Some((held_result, held_reading)) = held else {
+        return true;
+    };
+    // Rule 1 first and alone: the record's own episode is what a champion file records and
+    // `replay` reproduces, so a solved record may never be replaced by an unsolved one, whatever
+    // the latter's mean or held-out reading says.
+    if candidate_result.solved() != held_result.solved() {
+        return candidate_result.solved();
+    }
+    match (candidate, held_reading) {
+        (Some(c), Some(h)) => c.beats(&h),
+        _ => candidate_result.mean_fitness > held_result.mean_fitness,
+    }
 }
 
 /// The run's fastest **winning** episode: the clock, and whose it was.
@@ -654,10 +804,23 @@ pub struct GenerationReport {
     pub avg_fitness: f32,
     pub min_fitness: f32,
     pub wins: usize,
+    /// Genomes that won every episode they were judged on (see [`GenRow::solved`]) — the number
+    /// `--stop-on-win` reads, on one level or on a suite.
+    pub solved: usize,
     /// Genomes that solved **every** level of the suite this generation was judged on; always
-    /// `0` on a single-level run, where [`GenerationReport::wins`] is the solve signal. This is
+    /// `0` on a single-level run, where [`GenerationReport::solved`] is the solve signal. This is
     /// the number a suite run stops on, because one level won is not the suite.
     pub suite_solved: usize,
+    /// **The run's record is solved** — on its validation set when the run took one, on its own
+    /// episodes otherwise.
+    ///
+    /// This is the run-level claim rather than the generation-level one: `solved` above says *this
+    /// generation drew a genome that won every episode it was judged on*, while this says *the
+    /// genome a champion file would save has been shown to win*. On a walker level the difference
+    /// is the whole lottery — a `solved` generation is three patrol phases, a `record_solved` one is
+    /// twelve fixed worlds no generation drew — and `train --stop-on-validated` is the flag that
+    /// asks for the second. Zero-cost to compute: the reading is already on [`BestEver`].
+    pub record_solved: bool,
     pub genius: bool,
     /// The generation's best genome, already scored (so it has a champion-ready
     /// fitness). By **recorded** fitness: with `novelty_weight` set, the ranking is the
@@ -861,6 +1024,28 @@ pub fn episode_seed_for(cfg: &GaConfig, generation: u32, genome_id: u32, trial: 
     }
 }
 
+/// The generation sentinel the **validation** episodes are drawn on.
+///
+/// No run reaches it (four billion generations), and it is what makes validation episodes fixed: a
+/// validation seed is a function of the run's master seed and the episode's index only, so the same
+/// genome is always judged on the same worlds, every generation, whatever the episode policy is.
+/// The genome id is fixed too, under both policies — a validation episode exists to compare two
+/// genomes, and handing them different worlds would be the noise it is there to remove.
+pub const VALIDATION_GENERATION: u32 = u32::MAX;
+
+/// Seed of validation episode `index` for this run (see [`VALIDATION_GENERATION`]).
+///
+/// The synthetic genome id is also `u32::MAX`: under `common_episodes` it is unused, and under the
+/// per-genome policy it is the one id no issued genome has (`next_id` would have to wrap).
+pub fn validation_seed(cfg: &GaConfig, index: u32) -> u64 {
+    episode_seed(
+        cfg.master_seed,
+        VALIDATION_GENERATION,
+        u32::MAX,
+        index,
+    )
+}
+
 /// How many contenders survive one round of a race: half of them, rounded up.
 ///
 /// Successive halving with a keep-half rule is the version whose arithmetic is worth writing down:
@@ -983,6 +1168,16 @@ impl SuiteTally {
             .representative
             .take()
             .expect("a suite has at least one level and one trial of it");
+        // **The conservative reading of "solved": every recorded episode reached the flag.**
+        // `won` (already set from the representative) answers a narrower question, and this is the
+        // one a run's success signal reads. On a deterministic level the two are the same value by
+        // construction — one episode is its own whole — so nothing about a walker-free run moves.
+        //
+        // `won` is folded per level and per trial as the episodes arrive, so a level counts only
+        // when **every** trial of it won; a culled genome was never judged on the trials it did
+        // not run, and its flag describes the episodes that exist. A trial-0 winner scores the goal
+        // bonus, so a cull (which ranks on score) never removes one.
+        result.all_trials_won = self.won.iter().all(|w| *w);
         // One level is not a suite: `suite_wins` stays 0, so a single-level run's report cannot be
         // misread as "this genome solved the suite".
         if levels > 1 {
@@ -1702,6 +1897,35 @@ impl Trainer {
         self.advance(levels, true)
     }
 
+    /// Mean fitness of `genome` over the run's **fixed validation episodes**.
+    ///
+    /// The seeds are a function of the master seed and the episode index only
+    /// ([`validation_seed`]): no generation, no genome id, so two genomes meet the same worlds and
+    /// the same genome meets them every time it is asked. That is the whole property — a record
+    /// comparison needs a reading that does not move when the world does.
+    ///
+    /// Cost is `validation_episodes` episodes, paid only when a record is challenged. On a
+    /// deterministic level the caller does not ask at all.
+    fn validate(&self, level: &Level, genome: &Genome) -> Validation {
+        let episodes = self.config.validation_episodes.min(16).max(1);
+        let eval = self.config.eval_config();
+        let mut sum = 0.0f32;
+        let mut wins = 0u32;
+        for index in 0..episodes {
+            let seed = validation_seed(&self.config, index);
+            let r = fitness::run_episode(level, genome, &eval, seed);
+            sum += r.fitness;
+            if r.won() {
+                wins += 1;
+            }
+        }
+        Validation {
+            wins,
+            episodes,
+            mean: sum / episodes as f32,
+        }
+    }
+
     fn advance(&mut self, levels: &[Level], keep_population: bool) -> (GenerationReport, Vec<Genome>) {
         let results = evaluate_suite(levels, &self.genomes, &self.config, self.generation);
 
@@ -1728,6 +1952,11 @@ impl Trainer {
         let min_fitness = results.iter().map(metric).fold(f32::INFINITY, f32::min);
         let avg_fitness = results.iter().map(metric).sum::<f32>() / results.len() as f32;
         let wins = results.iter().filter(|r| r.won()).count();
+        // The conservative half of the same census: genomes that won **every** episode they were
+        // judged on. On a deterministic level the two numbers are equal; on a walker level this is
+        // the one that is not a coin flip, and it is what `--stop-on-win` and the panel's solve
+        // claim read.
+        let solved = results.iter().filter(|r| r.solved()).count();
 
         // The run's fastest **win**, which is a different record from the best-ever genome: the
         // champion is the highest-scoring genome, and since fitness v8 quickness is part of that
@@ -1762,6 +1991,9 @@ impl Trainer {
                     generation: self.generation,
                     result: results[idx].clone(),
                     genome: self.genomes[idx].clone(),
+                    // A clock is an episode, not a record about a policy: the seeded validation
+                    // set would answer a different question than the race this is quoted in.
+                    validated: None,
                 });
             }
         }
@@ -1815,16 +2047,70 @@ impl Trainer {
         let mut best = self.genomes[winner].clone();
 
         let best_result = results[winner].clone();
-        if self
-            .best_ever
-            .as_ref()
-            .is_none_or(|b| best_result.mean_fitness > b.result.mean_fitness)
+
+        // ---- the run's record, settled on worlds no generation drew --------------------------
+        //
+        // The generation score is a fine *trigger* and a bad *verdict* on a stochastic level: the
+        // world is re-rolled every generation, so a maximum over generation scores keeps whichever
+        // genome met the quietest patrol. So the trigger stays cheap and the verdict is validated:
+        // when a candidate beats the record on its generation score, both it and the held record
+        // are played on the same fixed episodes ([`validation_seed`]) and the survivor is the
+        // better policy rather than the luckier draw.
+        //
+        // `record_improved` is what the stagnation rule now watches, so "the run has stopped
+        // moving" means the record has stopped moving rather than that one generation drew an
+        // easy phase. On a deterministic level validation is skipped (the generation's own episode
+        // is already a held-out reading) and the two are the same statement.
+        let mut record_improved = false;
+        // A candidate is *considered* when it solves where the record did not, or when it beats the
+        // record's generation score. The first half is not an optimisation: a run whose record is a
+        // high-scoring genome that fell over on the last patrol would otherwise never consider the
+        // genome that actually solved the level — and since `--stop-on-win` saves the record, that
+        // is the difference between shipping a champion and shipping a near-miss.
+        let record_solved = self.best_ever.as_ref().is_some_and(|b| b.result.solved());
+        if self.best_ever.is_none()
+            || (best_result.solved() && !record_solved)
+            || self
+                .best_ever
+                .as_ref()
+                .is_some_and(|b| best_result.mean_fitness > b.result.mean_fitness)
         {
-            self.best_ever = Some(BestEver {
-                generation: self.generation,
-                result: best_result,
-                genome: best.clone(),
-            });
+            let candidate = self.genomes[winner].clone();
+            // Many copies of one deterministic episode would cost episodes to learn nothing
+            // (`recommended_trials_for` is the project's own "is this level stochastic" test).
+            let validates = self.config.validation_episodes > 0
+                && GaConfig::recommended_trials_for(&levels[0]) > 1;
+            let candidate_reading = validates.then(|| self.validate(&levels[0], &candidate));
+            // The incumbent's reading, cached the first time it is asked for: a record can stand
+            // for hundreds of generations, and re-measuring it every time it is challenged would
+            // turn a cheap mechanism into a per-generation cost.
+            let held_reading = match (self.best_ever.as_ref(), candidate_reading) {
+                (Some(held), Some(_)) => Some(match held.validated {
+                    Some(v) => v,
+                    None => self.validate(&levels[0], &held.genome),
+                }),
+                _ => None,
+            };
+            let keep = supersedes(
+                &best_result,
+                candidate_reading,
+                self.best_ever
+                    .as_ref()
+                    .map(|b| (&b.result, held_reading.or(b.validated))),
+            );
+            if keep {
+                self.best_ever = Some(BestEver {
+                    generation: self.generation,
+                    result: best_result,
+                    genome: best.clone(),
+                    validated: candidate_reading,
+                });
+                record_improved = true;
+            } else if let Some(h) = held_reading {
+                if let Some(held) = self.best_ever.as_mut() {
+                    held.validated = Some(h);
+                }
+            }
         }
 
         // The archive keys on the **first** level of the suite rather than on every level at once:
@@ -1836,7 +2122,11 @@ impl Trainer {
             .observe(&levels[0], &self.genomes, &results, self.generation);
 
         // ---- the search's own bookkeeping: stagnation, then the 1/5th rule -----
-        if max_fitness > self.last_max {
+        //
+        // Watched on the **record**, not on this generation's maximum: a phase the population did
+        // not draw last generation can make the maximum rise and fall without anything having been
+        // learned, and a stall counter that resets on that never fires when it should.
+        if record_improved {
             self.stagnation = 0;
         } else {
             self.stagnation = self.stagnation.saturating_add(1);
@@ -1845,14 +2135,12 @@ impl Trainer {
             self.tune_sigma(&results);
         }
 
-        // The suite's own solve signal: a genome that won **every** level, which is the only thing
-        // "the suite fell" can mean. Zero on a single-level run by construction (`suite_wins` is
-        // only raised for a suite of more than one level), so `wins` keeps its old meaning there.
+        // The suite's own solve signal: a genome that won **every** level and every trial of it,
+        // which is the only thing "the suite fell" can mean. Zero on a single-level run by
+        // construction (`suite_wins` is only raised for a suite of more than one level), so `wins`
+        // keeps its old meaning there. On a suite this is exactly `solved`.
         let suite_solved = if levels.len() > 1 {
-            results
-                .iter()
-                .filter(|r| r.suite_wins as usize == levels.len())
-                .count()
+            solved
         } else {
             0
         };
@@ -1861,12 +2149,22 @@ impl Trainer {
         let archive_bits = self.archive.occupied();
         let archive_time_bits = self.archive.time_bands();
 
+        // The champion-shaped reading: held-out when there is one, its own episode otherwise. A
+        // record that is still `None` (an empty population cannot be, but a suite run reports before
+        // it breeds) is not solved.
+        let record_solved = self.best_ever.as_ref().is_some_and(|b| {
+            b.validated
+                .map(|v| v.solved())
+                .unwrap_or_else(|| b.result.solved())
+        });
+
         let row = GenRow {
             generation: self.generation,
             max_fitness,
             avg_fitness,
             min_fitness,
             wins,
+            solved,
             best_id: best.id,
             genius,
             mutation_sigma: self.config.mutation_sigma,
@@ -1888,7 +2186,9 @@ impl Trainer {
                 avg_fitness,
                 min_fitness,
                 wins,
+                solved,
                 suite_solved,
+                record_solved,
                 genius,
                 best,
                 mutation_sigma: row.mutation_sigma,
@@ -2056,6 +2356,7 @@ impl Trainer {
         let elite = self.config.elite.min(pop_size.saturating_sub(1));
         let crossover_rate = self.config.crossover_rate;
         let sigma = self.config.mutation_sigma;
+        let fine_sigma = self.config.fine_sigma();
         let rate = self.config.mutation_rate;
         let shape = self.config.shape.clone();
 
@@ -2080,7 +2381,10 @@ impl Trainer {
             for _ in 0..fine {
                 let mut child = self.genomes[best_slot].clone();
                 let genes = 1 + (next_f32(&mut self.rng) * FINE_GENE_MAX as f32) as usize;
-                mutate_few(&mut child, genes, sigma, &mut self.rng);
+                // The **fine** step, not the coarse one: a fine child is local in count *and* in
+                // size (see `GaConfig::fine_sigma_scale`), which is what makes it a step from a
+                // lineage rather than a re-roll of three of its genes.
+                mutate_few(&mut child, genes, fine_sigma, &mut self.rng);
                 child.id = self.next_id;
                 child.fitness = 0.0;
                 child.shape = shape.clone();
@@ -2161,7 +2465,15 @@ impl Trainer {
                 .min(budget.saturating_sub(1));
             for incumbent in self.archive_parents(slots) {
                 let mut child = incumbent;
-                mutate(&mut child, sigma, rate, &mut self.rng);
+                // A **fine** step, for the reason the archive exists: an incumbent is the best
+                // genome in a behavioural niche, and the coarse move (~86 genes at the default
+                // rate) is exactly the perturbation that destroys the behaviour it was kept for.
+                // Breeding it fine is what makes the archive a stepping stone rather than a
+                // below-average parent with a random child. This is a change to *how* the
+                // mechanism breeds, not to what it costs — the measurement that carries it is a
+                // 24-seed arm (`AI_REVIEW.md` §2.4).
+                let genes = 1 + (next_f32(&mut self.rng) * FINE_GENE_MAX as f32) as usize;
+                mutate_few(&mut child, genes, fine_sigma, &mut self.rng);
                 child.id = self.next_id;
                 child.fitness = 0.0;
                 child.shape = shape.clone();
@@ -2934,6 +3246,7 @@ mod tests {
             route_hops_closed: 0,
             best_stand: None,
             suite_wins: 0,
+            all_trials_won: false,
             death_pos: None,
             seed: 0,
             trajectory_hash: 0,
@@ -2993,6 +3306,263 @@ mod tests {
         let half = selection_scores(&level, &results, 0.0, 0.5);
         assert!((half[0] - 95.0).abs() < 1e-4, "{:?}", half[0]);
         assert!((half[1] - 70.0).abs() < 1e-4, "{:?}", half[1]);
+    }
+
+    /// **`won` is one episode; `solved` is all of them.** The distinction the trial rule exists for,
+    /// made on a tally rather than on a run so the arithmetic is checkable by eye.
+    ///
+    /// The representative episode is trial 0, and `won` answers for it because that is the episode a
+    /// champion file records and `replay` reproduces. `solved` answers for every episode the genome
+    /// was actually judged on, and it is what `--stop-on-win`, `bench` and the panel's strict
+    /// reading use — a genome that won the phase it was drawn against and died on the next one is a
+    /// win and not a solve.
+    #[test]
+    fn solved_requires_every_trial_where_won_asks_only_the_representative_one() {
+        let win = || {
+            let mut r = episode(100.0);
+            r.outcome = sim::Outcome::Won;
+            r
+        };
+        let loss = || {
+            let mut r = episode(-20.0);
+            r.outcome = sim::Outcome::Died;
+            r
+        };
+
+        // A genome judged on three phases, two of which it won.
+        let mut split = SuiteTally::new(1);
+        split.record(0, 0, win());
+        split.record(0, 1, loss());
+        split.record(0, 2, win());
+        let r = split.result(1);
+        assert!(
+            r.won(),
+            "the representative episode (trial 0) did reach the flag"
+        );
+        assert!(!r.solved(), "...but the second patrol phase killed it");
+
+        // Every phase won: both readings agree, which is what makes a deterministic level's
+        // numbers unshifted by this distinction.
+        let mut clean = SuiteTally::new(1);
+        for trial in 0..3 {
+            clean.record(0, trial, win());
+        }
+        let r = clean.result(1);
+        assert!(r.won() && r.solved());
+
+        // And a single-episode evaluation is its own whole — the case every shipped level is.
+        let mut single = SuiteTally::new(1);
+        single.record(0, 0, win());
+        let r = single.result(1);
+        assert!(r.won() && r.solved());
+        assert_eq!(r.suite_wins, 0, "one level is not a suite");
+    }
+
+    /// **A solved reading beats a higher-scoring unsolved one** — the rule that keeps the champion
+    /// a demonstration rather than a near-miss.
+    ///
+    /// The regression this pins is real and was measured: with a 4-episode validation set comparing
+    /// *means*, four seeds of `l9-wait-and-climb` under `--stop-on-win` saved a gen-42 genome that
+    /// died at frame 109 while the gen-44 generation had a genome that won all three of its trials.
+    /// The saved champions then won 22 of 48 fresh episodes (46 %), worse than the 58 % the review
+    /// measured without validation at all. Ordering on solved-ness first is the repair.
+    #[test]
+    fn a_solved_reading_supersedes_a_higher_scoring_unsolved_one() {
+        let win = || {
+            let mut r = episode(11_000.0);
+            r.outcome = sim::Outcome::Won;
+            r.all_trials_won = true;
+            r
+        };
+        let near_miss = || episode(12_000.0);
+        let reading = |wins, episodes, mean| Validation {
+            wins,
+            episodes,
+            mean,
+        };
+
+        // A candidate that solved all twelve held-out episodes beats a record that won nine of
+        // them with a larger mean: the mean is not the question a champion answers.
+        assert!(supersedes(
+            &win(),
+            Some(reading(12, 12, 9_000.0)),
+            Some((&near_miss(), Some(reading(9, 12, 12_000.0))))
+        ));
+        // ...while at the same solve count the mean does decide, in the other direction. The
+        // recorded result is a win on both sides here — a record cannot be a win and an unsolved
+        // candidate at once — so `win()` stands in for both episodes' outcome.
+        assert!(!supersedes(
+            &win(),
+            Some(reading(12, 12, 9_000.0)),
+            Some((&win(), Some(reading(12, 12, 9_500.0))))
+        ));
+        // A record that solved its recorded episode is not replaced by a genome that only won
+        // half of the held-out set, even one that solved its own three trials: `--stop-on-win`
+        // would otherwise save a champion whose own episode is a loss.
+        assert!(!supersedes(
+            &win(),
+            Some(reading(6, 12, 9_000.0)),
+            Some((&win(), Some(reading(12, 12, 8_000.0))))
+        ));
+        // More episodes won is better even when neither solved the set.
+        assert!(supersedes(
+            &near_miss(),
+            Some(reading(9, 12, 8_000.0)),
+            Some((&near_miss(), Some(reading(8, 12, 9_000.0))))
+        ));
+        // And an unsolved candidate cannot take a solved record by validation alone.
+        let unsolved = episode(12_500.0);
+        assert!(!supersedes(
+            &unsolved,
+            Some(reading(12, 12, 12_000.0)),
+            Some((&win(), Some(reading(11, 12, 11_000.0))))
+        ));
+
+        // A record that never solved its own episodes loses to a candidate that did, even when the
+        // candidate's generation score is lower — this is the `--stop-on-win` case.
+        assert!(supersedes(&win(), None, Some((&near_miss(), None))));
+        // With no validation, an unsolved candidate still has to beat the record's score.
+        assert!(supersedes(
+            &near_miss(),
+            None,
+            Some((&episode(11_000.0), None))
+        ));
+        assert!(!supersedes(
+            &episode(10_000.0),
+            None,
+            Some((&near_miss(), None))
+        ));
+        // The first candidate always takes an empty record.
+        assert!(supersedes(&near_miss(), None, None));
+    }
+
+    /// A validated record is compared on worlds **no generation drew**, and the seeds do not move
+    /// when the generation or the genome does — which is the whole property a validation set needs.
+    #[test]
+    fn validation_episodes_are_fixed_and_belong_to_no_generation() {
+        let cfg = GaConfig::default();
+        let first = validation_seed(&cfg, 0);
+        assert_eq!(
+            first,
+            validation_seed(&cfg, 0),
+            "the same episode every time"
+        );
+        assert_ne!(
+            first,
+            validation_seed(&cfg, 1),
+            "each index is its own world"
+        );
+        let mut other_run = cfg.clone();
+        other_run.master_seed += 1;
+        assert_ne!(
+            first,
+            validation_seed(&other_run, 0),
+            "runs do not share a set"
+        );
+        // It is not any generation's training episode, and it does not depend on which genome is
+        // being compared — both halves are what make the comparison a comparison of policies.
+        for generation in 0..8u32 {
+            for id in [0u32, 7, 1_000] {
+                for trial in 0..3u32 {
+                    assert_ne!(
+                        first,
+                        episode_seed_for(&cfg, generation, id, trial),
+                        "validation episode 0 collided with a training episode"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fine scale's step is a **fraction** of the run's own, not the coarse step wearing a
+    /// smaller gene count — the defect `fine_sigma_scale` exists for.
+    #[test]
+    fn the_fine_step_is_smaller_than_the_coarse_step_and_stays_inside_the_band() {
+        let cfg = GaConfig::default();
+        assert!(
+            (cfg.fine_sigma() - cfg.mutation_sigma * 0.25).abs() < 1e-6,
+            "the default is a quarter of the run's step: {}",
+            cfg.fine_sigma()
+        );
+        assert!(cfg.fine_sigma() < cfg.mutation_sigma);
+        // Xavier puts a gene's own scale near 0.13 at the shipped fan-in, so the fine step has to be
+        // inside that to be a nudge rather than a redraw.
+        let gene_scale = (6.0f32 / (crate::N_INPUTS + 16) as f32).sqrt() / 3.0f32.sqrt();
+        assert!(
+            cfg.fine_sigma() < gene_scale,
+            "the fine step ({}) must be smaller than a gene's own scale ({gene_scale})",
+            cfg.fine_sigma()
+        );
+        // A scale above one would make a "fine" child coarser than a coarse one.
+        let mut greedy = cfg.clone();
+        greedy.fine_sigma_scale = 4.0;
+        assert_eq!(greedy.sanitized(None).fine_sigma_scale, 1.0);
+        let mut tiny = cfg.clone();
+        tiny.mutation_sigma = 0.0;
+        assert!(
+            tiny.fine_sigma() > 0.0,
+            "a zero step would freeze the fine scale"
+        );
+    }
+
+    /// **The record is settled on held-out worlds**, and only where that means anything: a walker
+    /// level takes a validated reading, a level with nothing stochastic in it does not (there the
+    /// generation's own episode is already the held-out reading, and re-running it would cost four
+    /// episodes to learn nothing).
+    #[test]
+    fn the_record_carries_a_held_out_reading_only_where_the_world_moves() {
+        let cfg = GaConfig {
+            pop_size: 12,
+            elite: 2,
+            ..GaConfig::default()
+        };
+
+        let walker = crate::fixture::walker_runway("validated-record", 24, 22, 12);
+        let mut trainer = Trainer::new(cfg.clone());
+        trainer.step(&walker);
+        let best = trainer
+            .best_ever()
+            .expect("the first generation sets a record");
+        assert!(
+            best.validated.is_some(),
+            "a walker level's record has to be validated: the generation's episode was one draw"
+        );
+        // The recorded episode is untouched — it is what `replay` reproduces — so the validated
+        // number is a second reading beside it rather than a replacement for it.
+        assert_eq!(best.result.genome_id, best.genome.id);
+
+        let flat = crate::fixture::flat_runway("validated-record-flat", 24, 22);
+        let mut trainer = Trainer::new(cfg);
+        trainer.step(&flat);
+        let best = trainer
+            .best_ever()
+            .expect("the first generation sets a record");
+        assert!(
+            best.validated.is_none(),
+            "a deterministic level's episode is already a held-out reading"
+        );
+    }
+
+    /// With validation switched off the record is decided exactly as it was before the mechanism
+    /// existed — the arm a reader needs to reproduce an old number.
+    #[test]
+    fn switching_validation_off_restores_the_generation_score() {
+        let walker = crate::fixture::walker_runway("validated-off", 24, 22, 12);
+        let cfg = GaConfig {
+            pop_size: 12,
+            elite: 2,
+            validation_episodes: 0,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg);
+        trainer.step(&walker);
+        let best = trainer.best_ever().expect("a record either way");
+        assert!(best.validated.is_none());
+        assert_eq!(
+            best.result.mean_fitness,
+            trainer.history()[0].max_fitness,
+            "the record is the generation's best, as it was before validation"
+        );
     }
 
     /// **The invariant that keeps the pack's ladder valid.** On a level with no walkers a genome is
@@ -4628,6 +5198,7 @@ mod tests {
             route_hops_closed: 0,
             best_stand: None,
             suite_wins: 0,
+            all_trials_won: false,
             death_pos: None,
             seed: 1,
             trajectory_hash: 0,

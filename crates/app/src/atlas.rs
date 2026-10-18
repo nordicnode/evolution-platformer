@@ -409,7 +409,10 @@ mod tests {
         // the vermilion of the body. *Present* is the claim — the crop is of the sprite that was
         // asked for — and it is the one thing a size assertion cannot see.
         let has = |rgb: [u8; 3]| icon.rgba.chunks(4).any(|p| p[..3] == rgb && p[3] > 0);
-        assert!(has([44, 24, 36]), "the runner's outline ink is not in the icon");
+        assert!(
+            has([44, 24, 36]),
+            "the runner's outline ink is not in the icon"
+        );
         assert!(has([186, 74, 30]), "the runner's body is not in the icon");
 
         // And the name picks the cell: a transparent tile scales up to a transparent icon.
@@ -1108,7 +1111,10 @@ mod tests {
         for name in names {
             let crack = pixels.sprite(name);
             let drawn = crack.px.iter().filter(|p| p[3] > 0).count();
-            assert!(drawn > 8, "{name} draws {drawn} pixels, which is not a crack");
+            assert!(
+                drawn > 8,
+                "{name} draws {drawn} pixels, which is not a crack"
+            );
             assert!(
                 drawn < 64,
                 "{name} draws {drawn} of {} pixels: a mark that thick is the tile, not a crack \
@@ -1439,6 +1445,40 @@ mod tests {
             assert!(
                 sprite.has_transparency(),
                 "{name} is a filled square, not a hanging plant"
+            );
+        }
+    }
+
+    /// The view hangs every vine from a shelf's *deck*, and the deck is the top rows of the
+    /// shelf's own cell: the two numbers are one decision about one drawing, so they are
+    /// pinned together the way the fluid block's size is. If the plank were drawn deeper, a
+    /// vine would be hung from the middle of the wood; if it were shallower, the stem would
+    /// still float under it.
+    #[test]
+    fn a_one_way_shelf_deck_is_the_top_rows_of_its_cell() {
+        let pixels = Pixels::load();
+        let deck = (crate::view::ONEWAY_PLANK * pixels.cell as f32).round() as i32;
+        assert!(
+            deck > 0 && deck < pixels.cell,
+            "a deck of {deck} rows in a {} row cell",
+            pixels.cell
+        );
+        for name in ["oneway_l", "oneway_m", "oneway_r"] {
+            let sprite = pixels.sprite(name);
+            for y in 0..deck {
+                let width = (0..sprite.cell).filter(|x| sprite.at(*x, y)[3] > 0).count() as i32;
+                assert_eq!(
+                    width, sprite.cell,
+                    "{name} row {y} is not deck: the plank does not fill its cell"
+                );
+            }
+            let brackets = (0..sprite.cell)
+                .filter(|x| sprite.at(*x, deck)[3] > 0)
+                .count() as i32;
+            assert!(
+                brackets < sprite.cell,
+                "{name}: row {deck} still fills the cell, so ONEWAY_PLANK stops short of \
+                 the wood's underside"
             );
         }
     }

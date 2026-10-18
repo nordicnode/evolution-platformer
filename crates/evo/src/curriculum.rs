@@ -491,6 +491,29 @@ pub fn stuck_point(
     eval: &EvalConfig,
     seed: u64,
 ) -> Option<(i32, i32)> {
+    stall_spots(level, genome, eval, seed).map(|(_, tile)| tile)
+}
+
+/// Where a stalled run is, as **both** the route stand it has got furthest on and a tile it can be
+/// spawned at.
+///
+/// Two answers because a stall can happen on a moving platform, and only one of the two is a tile a
+/// spawn may be placed on. The **stand** is the deepest rung of the route the genome has actually
+/// stood on — terrain or a deck — and it is what the next practice flag is measured from; the
+/// **tile** is the deepest one of those that is *ground*, because [`Level::set_spawn_tile`] refuses
+/// a spawn with nothing solid under it and a deck is not a tile.
+///
+/// Splitting them is what makes the stall chain work on a level whose route crosses a shuttle. With
+/// one answer (the ground tile), a body that had ridden a deck and died on the next one was reported
+/// as stalled at the ledge it left from, so every practice excursion re-taught the crossing the run
+/// had already made — measured on the level in this finding: two excursions of 40 generations each,
+/// both "tile (16, 12) to tile (18, 12)", while the champion was dying at `x` 35.8, two decks along.
+fn stall_spots(
+    level: &Level,
+    genome: &Genome,
+    eval: &EvalConfig,
+    seed: u64,
+) -> Option<(Option<usize>, (i32, i32))> {
     let mut runner = EpisodeRunner::new(level, genome.clone(), eval, seed);
     let routes = level.routes();
     // The episode opens on the spawn, so the first reading is the spawn's own: the
@@ -510,8 +533,10 @@ pub fn stuck_point(
             hops: u32::MAX,
             approach_bits: start_approach.to_bits(),
         });
-    // `(rank, tile)`, lower rank wins.
-    let mut best: Option<(StandRank, (i32, i32))> = None;
+    // `(rank, stand)`, lower rank wins — the route frontier, decks included.
+    let mut best: Option<(StandRank, usize)> = None;
+    // And the deepest *ground* tile, which is what a spawn may be placed on.
+    let mut best_tile: Option<(StandRank, (i32, i32))> = None;
     while !runner.is_finished() {
         runner.step();
         let sim = runner.sim();
@@ -524,10 +549,7 @@ pub fn stuck_point(
         // surface it stands on (`Level::set_spawn_tile`).
         let col = Level::tile_x(p.x + p.w * 0.5);
         let surface = Level::tile_y(p.y + p.h + 0.05);
-        let Some(tile) = standable_spawn(level, col, surface - 1) else {
-            continue;
-        };
-        let Some(stand) = routes.zone_at(tile.0, surface) else {
+        let Some(stand) = routes.zone_at(col, surface) else {
             continue;
         };
         let rank = route_rank(routes, stand, sim.goal_approach());
@@ -535,10 +557,17 @@ pub fn stuck_point(
             continue;
         }
         if best.is_none_or(|(b, _)| rank < b) {
-            best = Some((rank, tile));
+            best = Some((rank, stand));
+        }
+        // A deck is a stand and not a tile: `standable_spawn` asks the grid, which has nothing
+        // solid at a deck's row or above it.
+        if let Some(tile) = standable_spawn(level, col, surface - 1) {
+            if best_tile.is_none_or(|(b, _)| rank < b) {
+                best_tile = Some((rank, tile));
+            }
         }
     }
-    best.map(|(_, tile)| tile)
+    Some((best.map(|(_, s)| s), best_tile.map(|(_, t)| t)?))
 }
 
 /// How close a body **standing** at `(col, surface_row)` is to the flag, in tiles.
@@ -595,55 +624,76 @@ fn stand_approach(goal: &Rect, col: i32, surface_row: i32) -> f32 {
 /// not a crossing to practise), a stand with no route to the flag left (the honest
 /// answer when the level cannot be won from here), or a level with no flag at all.
 pub fn next_stand(main: &Level, from: (i32, i32)) -> Option<(i32, i32)> {
-    let goal = main.goals.first()?;
-    let (fx, fy) = from;
-    let from_surface = fy + 1;
-    let from_approach = stand_approach(goal, fx, from_surface);
     let routes = sim::reach::goal_routes(main);
-    let stuck = routes.zone_at(fx, from_surface)?;
+    let stuck = routes.zone_at(from.0, from.1 + 1)?;
+    next_after(main, &routes, stuck)
+}
+
+/// [`next_stand`] asked from a **stand** rather than a tile.
+///
+/// The difference is a moving platform: a deck's stand has no tile that names it, because there is
+/// nothing solid at its row, so a caller that has just been told "the deepest stand this genome stood
+/// on is a deck" cannot express that as `(col, row)`. [`practice_level_for_stall`] needs exactly
+/// that: the frontier of a run that has ridden a shuttle is a deck, and the crossing it has to
+/// practise next is measured from it.
+pub fn next_stand_from(main: &Level, stand: usize) -> Option<(i32, i32)> {
+    next_after(main, &sim::reach::goal_routes(main), stand)
+}
+
+fn next_after(main: &Level, routes: &sim::reach::GoalRoutes, stuck: usize) -> Option<(i32, i32)> {
+    let goal = main.goals.first()?;
+    let (from_surface, from_x0, from_x1) = routes.zone_bounds(stuck);
+    let fx = ((from_x0 + from_x1) as f32 * 0.5).floor() as i32;
+    let from_approach = stand_approach(goal, fx, from_surface);
     let from_hops = routes.hops_to_flag(stuck)?;
 
-    // `(distance to the stand the body is on, approach, tile)`: among the route's
-    // forward crossings the nearest wins, with the approach breaking a tie the way the
-    // ordering above is broken.
+    // Every stand the graph knows, not every standable tile of the terrain: since `MOVE_SET_VERSION`
+    // 10 that set includes **both ends of a moving platform's travel**, and a stall at a shuttle's
+    // ledge is the case this loop was blind to. The decks are not standable tiles — nothing solid is
+    // drawn at their row — so a scan of the grid could never find the one stand the run has to
+    // practise reaching, and `practice_level_for_stall` answered "no crossing toward the flag" on
+    // every stall in front of a platform.
+    //
+    // `(distance to the stand the body is on, approach, tile)`: among the route's forward steps the
+    // nearest wins, with the approach breaking a tie the way the ordering above is broken. A step is
+    // a **crossing**: the one edge that is not (the ride, below) is skipped, because there is nothing
+    // to press and the practice level would be a walk up a deck the body is already standing on.
     let mut best: Option<(f32, f32, (i32, i32))> = None;
-    for surface in 1..main.height {
-        let mut col = 0;
-        while col < main.width {
-            if !main.is_standable(col, surface) {
-                col += 1;
-                continue;
-            }
-            let (start, end) = main.landing_zone_bounds(col, surface);
-            col = end + 1;
-            let Some(zone) = routes.zone_at(start, surface) else {
-                continue;
-            };
-            if zone == stuck {
-                continue;
-            }
-            if !routes.crossing_stands_from(stuck).any(|j| j == zone) {
-                continue;
-            }
-            let Some(hops) = routes.hops_to_flag(zone) else {
-                continue;
-            };
-            // Progress in the route's own units: strictly fewer crossings left to the
-            // flag, or the same count and a stand that reads closer — a stepping stone
-            // forward, never one back the way the run came.
-            let forward = hops < from_hops
-                || (hops == from_hops
-                    && (start..=end).any(|c| stand_approach(goal, c, surface) < from_approach));
-            if !forward {
-                continue;
-            }
-            for c in start..=end {
-                let tile = (c, surface - 1);
-                let d = (((c - fx) as f32).powi(2) + ((tile.1 - fy) as f32).powi(2)).sqrt();
-                let a = stand_approach(goal, c, surface);
-                if best.is_none_or(|(bd, ba, _)| (d, a) < (bd, ba)) {
-                    best = Some((d, a, tile));
-                }
+    for zone in 0..routes.len() {
+        if zone == stuck {
+            continue;
+        }
+        // The other end of this stand's own ride is not a move to practise. Nothing is pressed to
+        // get there (it is the cycle), and if it is the same deck the practice level would ask the
+        // excursion to walk up a run of platform it is already standing on — measured on the
+        // shuttle in this finding, the flag from a deck landed on the *same deck's* far end and the
+        // level the run needed to practise was never built.
+        if routes.ride_from(stuck) == Some(zone) {
+            continue;
+        }
+        if !routes.crossing_stands_from(stuck).any(|j| j == zone) {
+            continue;
+        }
+        let Some(hops) = routes.hops_to_flag(zone) else {
+            continue;
+        };
+        let (surface, start, end) = routes.zone_bounds(zone);
+        // Progress in the route's own units: strictly fewer crossings left to the
+        // flag, or the same count and a stand that reads closer — a stepping stone
+        // forward, never one back the way the run came.
+        let forward = hops < from_hops
+            || (hops == from_hops
+                && (start..=end).any(|c| stand_approach(goal, c, surface) < from_approach));
+        if !forward {
+            continue;
+        }
+        for c in start..=end {
+            let tile = (c, surface - 1);
+            let d =
+                (((c - fx) as f32).powi(2) + ((tile.1 - (from_surface - 1)) as f32).powi(2)).sqrt();
+            let a = stand_approach(goal, c, surface);
+            if best.is_none_or(|(bd, ba, _)| (d, a) < (bd, ba)) {
+                best = Some((d, a, tile));
             }
         }
     }
@@ -677,6 +727,23 @@ pub fn next_stand(main: &Level, from: (i32, i32)) -> Option<(i32, i32)> {
 /// The caller's reaction to either is the old behaviour — a stall with no fallback,
 /// said out loud and left alone.
 pub fn practice_level(main: &Level, spawn_tile: (i32, i32)) -> Result<Level, String> {
+    practice_level_from(main, spawn_tile, None)
+}
+
+/// [`practice_level`] measured from the stand the run is **on**, which need not be the
+/// stand the spawn tile is on.
+///
+/// The spawn has to be ground and the frontier need not be: a run that has ridden a
+/// shuttle and died on the deck past it is stuck on a deck, and the crossing to practise is
+/// the one off *that* deck. Asking [`next_stand`] about the spawn tile instead answers the
+/// crossing it made two decks ago — the practice flag lands behind the champion, the
+/// excursion wins trivially, and the excursion teaches nothing (the stall chain repeated
+/// `(16, 12) to (18, 12)` while the champion died at `x` 35.8; see [`stall_spots`]).
+pub fn practice_level_from(
+    main: &Level,
+    spawn_tile: (i32, i32),
+    from_stand: Option<usize>,
+) -> Result<Level, String> {
     let (tx, ty) = spawn_tile;
     if !main.spawn_stands_on_ground(tx, ty) {
         return Err(format!(
@@ -684,7 +751,11 @@ pub fn practice_level(main: &Level, spawn_tile: (i32, i32)) -> Result<Level, Str
             main.name
         ));
     }
-    let Some((gx, gy)) = next_stand(main, spawn_tile) else {
+    let next = match from_stand {
+        Some(stand) => next_stand_from(main, stand),
+        None => next_stand(main, spawn_tile),
+    };
+    let Some((gx, gy)) = next else {
         return Err(format!(
             "no crossing toward the flag from tile ({tx}, {ty}) in {}",
             main.name
@@ -760,10 +831,11 @@ pub fn practice_level_for_stall(trainer: &Trainer, main: &Level) -> Result<Level
         "no generation has scored yet, so there is nowhere to practise from".to_string()
     })?;
     let eval = trainer.config.eval_config();
-    let spot = stuck_point(main, &best.genome, &eval, best.result.seed).ok_or_else(|| {
-        "the best genome has never stood anywhere it did not start from".to_string()
-    })?;
-    practice_level(main, spot)
+    let (stand, spot) =
+        stall_spots(main, &best.genome, &eval, best.result.seed).ok_or_else(|| {
+            "the best genome has never stood anywhere it did not start from".to_string()
+        })?;
+    practice_level_from(main, spot, stand)
 }
 
 #[cfg(test)]
@@ -1366,6 +1438,74 @@ mod tests {
             next_stand(&main, (2, 5)),
             Some((4, 5)),
             "the practice flag goes on the far side of the spike"
+        );
+    }
+
+    /// A level whose only crossing is a **moving platform**, written the way the editor writes
+    /// one: two ledges and a shuttle between them.
+    fn shuttle_runway() -> Level {
+        let json = r#########"{
+          "format": "evo-platformer-level",
+          "level_format_version": 3,
+          "name": "shuttle",
+          "width": 24,
+          "height": 8,
+          "spawn": { "x": 1, "y": 5 },
+          "tiles": [
+            "........................",
+            "........................",
+            "........................",
+            "........................",
+            "........................",
+            "........................",
+            "########........########",
+            "########........########"
+          ],
+          "entities": [
+            { "type": "platform", "x": 9, "y": 6, "tiles": 3, "span": 5, "axis": "x", "dir": 1 },
+            { "type": "goal", "x": 22, "y": 5 }
+          ]
+        }"#########;
+        Level::from_json_str(json).expect("the shuttle parses")
+    }
+
+    #[test]
+    fn a_practice_crossing_off_a_deck_is_measured_from_the_deck() {
+        // The stall chain on a level whose route crosses a shuttle. The frontier is a deck, and a
+        // deck has no tile a spawn may be placed on, so the run is reported as stalled on the
+        // ground behind it. Measuring the practice flag off *that ground* answers the crossing the
+        // run already made — the flag lands on the deck it has just ridden, the excursion wins
+        // trivially, and the crossing it actually died on is never practised. Measuring it off the
+        // deck answers the move after the ride.
+        let main = shuttle_runway();
+        let routes = main.routes();
+        let deck = (0..routes.len())
+            .find(|&s| routes.ride_from(s).is_some())
+            .expect("the shuttle's decks are stands");
+
+        let behind = practice_level_from(&main, (1, 5), None).expect("ground behind the pit");
+        assert_eq!(
+            behind.goal_tiles(),
+            vec![(9, 5)],
+            "the spawn's own stand practises the jump onto the deck"
+        );
+
+        let off_the_deck =
+            practice_level_from(&main, (1, 5), Some(deck)).expect("the deck's next crossing");
+        assert_eq!(
+            off_the_deck.goal_tiles(),
+            vec![(16, 5)],
+            "measured from the deck, the flag is past the ride, on the ground it has not reached"
+        );
+        assert_eq!(
+            off_the_deck.spawn_tile(),
+            (1, 5),
+            "the spawn stays on the ground: a deck is not a tile a spawn may be placed on"
+        );
+        assert_eq!(
+            next_stand_from(&main, deck),
+            Some((16, 5)),
+            "and the crossing is read off the deck's own route, not the spawn's"
         );
     }
 

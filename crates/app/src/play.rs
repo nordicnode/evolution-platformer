@@ -286,7 +286,8 @@ impl Session {
     /// player's own first input: it steps on the player's ticks, so the two share
     /// a clock and the ghost is the time to beat made visible.
     pub fn attach_ghost(&mut self, spec: GhostSpec) {
-        let runner = EpisodeRunner::new(self.sim.level(), spec.genome.clone(), &spec.eval, spec.seed);
+        let runner =
+            EpisodeRunner::new(self.sim.level(), spec.genome.clone(), &spec.eval, spec.seed);
         self.ghost = Some(Ghost {
             runner,
             spec,
@@ -786,7 +787,12 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(session.sim().outcome(), sim::Outcome::Won, "{}", session.summary());
+        assert_eq!(
+            session.sim().outcome(),
+            sim::Outcome::Won,
+            "{}",
+            session.summary()
+        );
         let frames = session.frames();
         (session, frames)
     }
@@ -819,7 +825,10 @@ mod tests {
             (elapsed / TICK).floor() as u32,
             "{elapsed} s of play is the ticks it holds, and no more"
         );
-        assert!(session.frames() > 0, "and it is a running clock, not a stopped one");
+        assert!(
+            session.frames() > 0,
+            "and it is a running clock, not a stopped one"
+        );
         assert!(
             session.best().is_none(),
             "nothing has been won yet, so there is no time to remember"
@@ -947,7 +956,8 @@ mod tests {
         let (mut won, frames) = a_won_playthrough();
         assert_eq!(won.best(), Some(frames), "the win is the session's record");
         assert!(
-            won.summary().contains(&format!("your best {}", sim::format_time(frames))),
+            won.summary()
+                .contains(&format!("your best {}", sim::format_time(frames))),
             "{}",
             won.summary()
         );
@@ -1002,7 +1012,9 @@ mod tests {
             session.summary()
         );
         assert!(
-            session.race_line(None).contains("the clock starts on your first input"),
+            session
+                .race_line(None)
+                .contains("the clock starts on your first input"),
             "{}",
             session.race_line(None)
         );
@@ -1105,6 +1117,7 @@ mod tests {
             crate::lab::DEFAULT_RANDOM_LANES,
             crate::lab::RunPlan::default(),
             std::env::temp_dir().join("evo-play-ghost-record"),
+            "l1-flat-run",
         )
         .expect("the generator starts");
         // A random population wins this level, so one generation is normally enough; the cap is
@@ -1248,7 +1261,8 @@ mod tests {
         );
         let still = steps.iter().filter(|s| **s <= 0.0).count();
         assert_eq!(
-            still, 0,
+            still,
+            0,
             "{} of {} frames drew the body standing still; the drawn position is the tick's, not \
              a point between two ticks",
             still,

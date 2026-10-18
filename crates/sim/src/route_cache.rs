@@ -52,7 +52,11 @@ const FORMAT: &str = "evo-route-cache";
 /// is not the same graph. `evo::route_play` walks routes and would fail every hop of a stale file
 /// with nothing to press, which is the one failure mode a cache must never invent: a miss costs a
 /// recomputation, and a misread costs a run.
-const VERSION: u32 = 2;
+/// v3: a stand carries the **height of its surface** and, for a moving platform's deck, the stand
+/// at the other end of its travel ([`crate::reach::Platform`]). A v2 report says nothing about a
+/// shelf, and a v2 platform has no `surface_y` to deserialize at all — a misread rather than a
+/// miss, which is exactly what this number is for.
+const VERSION: u32 = 3;
 
 /// The suffix the sidecar takes, appended to the level file's **whole** name.
 ///

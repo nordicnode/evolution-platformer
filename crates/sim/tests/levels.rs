@@ -402,8 +402,8 @@ fn malformed_levels_are_refused() {
         "a second goal entity must be refused, not silently dropped"
     );
 
-    let goal_entity_and_tile = common::fixture_src("goal-and-G", &rows, (1, 0), &goal, 1)
-        .replace("\"....\"", "\"G...\"");
+    let goal_entity_and_tile =
+        common::fixture_src("goal-and-G", &rows, (1, 0), &goal, 1).replace("\"....\"", "\"G...\"");
     assert!(
         sim::Level::from_json_str(&goal_entity_and_tile).is_err(),
         "a 'G' tile beside a goal entity is a second goal"
@@ -505,7 +505,10 @@ fn a_route_table_is_shared_by_every_clone_of_one_terrain_and_dropped_by_an_edit(
     // An edit is a different terrain: it gets its own graph, and the copies that still hold the
     // terrain the first graph was built for keep it.
     let mut edited = level.clone();
-    assert!(edited.set_tile(1, 1, sim::Tile::Solid), "the edit lands on the grid");
+    assert!(
+        edited.set_tile(1, 1, sim::Tile::Solid),
+        "the edit lands on the grid"
+    );
     assert!(
         !std::ptr::eq(built, edited.routes()),
         "an edited level must not answer with a graph built for the ground it used to have"
@@ -563,7 +566,10 @@ fn sand_is_a_material_and_not_a_mechanic() {
         assert!(tile.is_solid(), "{tile:?} is ground while it lasts");
         assert!(tile.is_cracked(), "{tile:?} is brittle");
         assert_ne!(tile.glyph(), tile.base_material().glyph());
-        assert!(tile.base_material().is_solid(), "and its material is ground");
+        assert!(
+            tile.base_material().is_solid(),
+            "and its material is ground"
+        );
     }
     assert!(!sim::Tile::Spring.is_solid(), "a pad is not ground");
     assert!(sim::Tile::Spring.is_spring());
@@ -577,10 +583,9 @@ fn sand_is_a_material_and_not_a_mechanic() {
     assert_eq!(level.tile(1, 2), Some(sim::Tile::Sand));
     assert_eq!(level.tile(2, 2), Some(sim::Tile::Brick));
     assert_eq!(level.tile(3, 2), Some(sim::Tile::Plank));
-    let round_tripped = sim::Level::from_json_str(
-        &level.to_json_pretty().expect("a level serializes"),
-    )
-    .expect("and reads back");
+    let round_tripped =
+        sim::Level::from_json_str(&level.to_json_pretty().expect("a level serializes"))
+            .expect("and reads back");
     assert_eq!(
         round_tripped.content_hash(),
         level.content_hash(),
@@ -588,10 +593,30 @@ fn sand_is_a_material_and_not_a_mechanic() {
     );
 
     // And the same level, with only the floor's material changed.
-    let soil = common::fixture("soil-floor", &[sky.clone(), sky.clone(), "####".into()], (1, 1), &[("goal", 3, 1)]);
-    let sand = common::fixture("sand-floor", &[sky.clone(), sky.clone(), "SSSS".into()], (1, 1), &[("goal", 3, 1)]);
-    let brick = common::fixture("brick-floor", &[sky.clone(), sky.clone(), "BBBB".into()], (1, 1), &[("goal", 3, 1)]);
-    let plank = common::fixture("plank-floor", &[sky.clone(), sky.clone(), "WWWW".into()], (1, 1), &[("goal", 3, 1)]);
+    let soil = common::fixture(
+        "soil-floor",
+        &[sky.clone(), sky.clone(), "####".into()],
+        (1, 1),
+        &[("goal", 3, 1)],
+    );
+    let sand = common::fixture(
+        "sand-floor",
+        &[sky.clone(), sky.clone(), "SSSS".into()],
+        (1, 1),
+        &[("goal", 3, 1)],
+    );
+    let brick = common::fixture(
+        "brick-floor",
+        &[sky.clone(), sky.clone(), "BBBB".into()],
+        (1, 1),
+        &[("goal", 3, 1)],
+    );
+    let plank = common::fixture(
+        "plank-floor",
+        &[sky.clone(), sky.clone(), "WWWW".into()],
+        (1, 1),
+        &[("goal", 3, 1)],
+    );
     let mut a = sim::Sim::new(&soil, 1);
     let mut b = sim::Sim::new(&sand, 1);
     let mut c = sim::Sim::new(&brick, 1);
@@ -607,8 +632,16 @@ fn sand_is_a_material_and_not_a_mechanic() {
             b.state_hash(),
             "the two floors diverge at tick {tick}: sand is not behaving as soil"
         );
-        assert_eq!(a.state_hash(), c.state_hash(), "brick diverges at tick {tick}");
-        assert_eq!(a.state_hash(), d.state_hash(), "plank diverges at tick {tick}");
+        assert_eq!(
+            a.state_hash(),
+            c.state_hash(),
+            "brick diverges at tick {tick}"
+        );
+        assert_eq!(
+            a.state_hash(),
+            d.state_hash(),
+            "plank diverges at tick {tick}"
+        );
         assert_eq!(
             a.observation(),
             b.observation(),
@@ -619,7 +652,10 @@ fn sand_is_a_material_and_not_a_mechanic() {
         assert_eq!(a.observation(), d.observation());
     }
     assert_eq!(a.outcome(), b.outcome());
-    assert!(a.player().grounded, "the body should be standing on the floor");
+    assert!(
+        a.player().grounded,
+        "the body should be standing on the floor"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -759,9 +795,7 @@ fn a_changed_level_is_not_answered_by_the_cache_it_left_behind() {
     let path = dir.join("edited.json");
     let original = cache_fixture("edited");
     let src = original.to_json_pretty().expect("the level serializes");
-    original
-        .to_json_file(&path)
-        .expect("the level is written");
+    original.to_json_file(&path).expect("the level is written");
     let sidecar = sidecar_of(&path);
 
     let warm = sim::Level::from_json_file(&path).expect("the level loads");
@@ -805,7 +839,9 @@ fn a_changed_level_is_not_answered_by_the_cache_it_left_behind() {
 
         let reopened = sim::Level::from_json_file(&path).expect("the changed level loads");
         let expected = sim::Level::from_json_str(
-            &changed.to_json_pretty().expect("the changed level serializes"),
+            &changed
+                .to_json_pretty()
+                .expect("the changed level serializes"),
         )
         .expect("and parses back");
         assert_ne!(
@@ -892,9 +928,21 @@ fn an_unusable_route_cache_is_a_miss_rather_than_a_failure() {
         ),
     ];
     for (what, field, value) in [
-        ("another tool's format", "format", serde_json::json!("someone-elses-cache")),
-        ("a format version from the future", "version", serde_json::json!(9999)),
-        ("another sim build", "sim_version", serde_json::json!("0.0.1")),
+        (
+            "another tool's format",
+            "format",
+            serde_json::json!("someone-elses-cache"),
+        ),
+        (
+            "a format version from the future",
+            "version",
+            serde_json::json!(9999),
+        ),
+        (
+            "another sim build",
+            "sim_version",
+            serde_json::json!("0.0.1"),
+        ),
         ("another move set", "move_set", serde_json::json!(9999)),
         (
             "another level's hash",
@@ -996,3 +1044,73 @@ fn an_edited_document_neither_answers_from_nor_writes_its_files_cache() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **A shuttle across lava is a crossing, and the verdict says so — and says it is the shuttle.**
+///
+/// Reported from a custom level: *"the oracle doesn't class the level as finishable because it
+/// doesn't properly account for the moving platforms"*. It did not, and the reason was principled
+/// rather than a slip — a mover is not terrain, its phase is a fact about the episode, and the sweep
+/// simulated the level as if the shelf were not there — but the answer was wrong about a level whose
+/// only way across is a shelf, which is the one question a verdict exists to answer.
+///
+/// The fixture is two ledges over a lava channel too wide to jump, one shuttle across it, and the
+/// flag on the far ledge. The verdict has to be **yes**, and it has to be yes *because of the
+/// shuttle*: with the same terrain and no platform the same level is a gap no move clears, and the
+/// test asks both so the first answer cannot pass by some other route.
+#[test]
+fn a_shuttle_across_lava_is_the_crossing_the_verdict_reports() {
+    /// Ground at row 6, a channel at columns 4..=15, and the far ledge at 16..=19.
+    const ROWS: &[&str] = &[
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####LLLLLLLLLLLL####",
+        "####LLLLLLLLLLLL####",
+    ];
+    fn build(platform: Option<&str>) -> sim::Level {
+        let tiles = ROWS
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let ents = match platform {
+            Some(p) => format!("{p},{{\"type\":\"goal\",\"x\":18,\"y\":5}}"),
+            None => "{\"type\":\"goal\",\"x\":18,\"y\":5}".to_string(),
+        };
+        let src = format!(
+            "{{\"format\":\"evo-platformer-level\",\"level_format_version\":1,\"name\":\"shuttle\",\
+             \"width\":20,\"height\":8,\"spawn\":{{\"x\":2,\"y\":5}},\
+             \"tiles\":[{tiles}],\"entities\":[{ents}]}}"
+        );
+        sim::Level::from_json_str(&src).expect("shuttle fixture parses")
+    }
+
+    // A two-tile shelf at the near lip, sliding twelve tiles across the channel to the far one.
+    let with = build(Some(
+        "{\"type\":\"platform\",\"x\":3,\"y\":5,\"tiles\":2,\"span\":13,\"axis\":\"x\"}",
+    ));
+    let report = sim::reach::report(&with);
+    assert!(
+        report.goal_reached,
+        "a level crossed by a shuttle is beatable, but the verdict says: {:?}",
+        report.diagnosis
+    );
+    assert_eq!(
+        report.reachable_platforms(),
+        report.platforms.len(),
+        "every deck of the shuttle is reached: {:?}",
+        report.platforms
+    );
+
+    let without = build(None);
+    let report = sim::reach::report(&without);
+    assert!(
+        !report.goal_reached,
+        "the same channel with no shuttle is a gap, and the verdict must say so — otherwise the \
+         answer above was not about the shuttle"
+    );
+}
+

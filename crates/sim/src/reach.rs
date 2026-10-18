@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::level::{Level, Rect};
 use crate::physics::{
-    vine_mantle_anchor, AgentAction, Physics, PlayerState, TickContact, PHYSICS,
+    vine_exit_open, vine_mantle_anchor, AgentAction, Physics, PlayerState, TickContact, PHYSICS,
 };
 
 /// How long a single canonical jump trajectory may run.
@@ -177,7 +177,19 @@ impl Default for ReachOptions {
 /// shares the column, so a body under a vine was told it was already home and the route walked it
 /// to the flag's x instead of up the vine. No canonical move changed; the graph's own answer did,
 /// and a cached route is an answer about exactly that, so the stamp moves with it.
-pub const MOVE_SET_VERSION: u32 = 8;
+/// v9: **a moving platform is a stand.** The verdict's table now carries both ends of every
+/// shelf's travel, each at the deck's own (mid-cell) height, with a ride edge between them, so a
+/// level whose only crossing is a lift or a slider is answered as beatable instead of as a gap
+/// no jump can clear. No canonical move changed — the report gained two kinds of stand and an
+/// edge the cycle makes true — but an answer about a level with a mover in it is a different
+/// answer, so every cached verdict and route graph from v8 is a miss.
+/// v10: **a moving platform is a stand, and its travel is a ride.** The route graph now carries both
+/// ends of every shelf's travel as stands of its own, with a `ride` edge between them that the BFS
+/// counts and no replay can press. The nodes moved and every hop count on a level with a mover in it
+/// changed, which is exactly what a cached answer is keyed on — and the reason is not cosmetic: a
+/// stall at a shuttle's ledge used to answer "the flag cannot be reached from here", so the stall
+/// curriculum refused to derive a practice level and the run was left with nothing.
+pub const MOVE_SET_VERSION: u32 = 10;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -198,15 +210,29 @@ pub const TAKEOFF_OFFSETS: [f32; 20] = [
     0.80, 0.85, 0.90, 0.95,
 ];
 
-/// A maximal horizontal run of solid tiles with open space above it.
+/// A standable surface: a maximal horizontal run of solid tiles with open space above it, or the
+/// deck of a moving platform at one end of its travel.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Platform {
     pub id: usize,
     /// Inclusive tile column range of the surface.
     pub x0: i32,
     pub x1: i32,
-    /// Tile row of the solid surface. Its top edge is at world `y = surface_row`.
+    /// Tile row of the surface's cell. Its top edge is at world `y = surface_row` — except for a
+    /// mover, whose deck is half a tile up inside the cell ([`Self::surface_y`]).
     pub surface_row: i32,
+    /// The **top edge of the surface**, in world y. Ground: `surface_row as f32`. A moving
+    /// platform: the deck's own top, which is mid-cell by [`crate::level::PlatformSpec`]'s design.
+    ///
+    /// A float because a shelf's deck is half a tile above the floor it is authored on, and the
+    /// oracle's whole promise is that it only ever disagrees with the sim about *which* move is
+    /// expressible — never about how far one goes. Rounding the deck to the nearest tile edge to
+    /// keep this an integer would be a half-tile lie in every jump off it.
+    pub surface_y: f32,
+    /// For a moving platform's deck: the id of its deck at the **other end** of the travel. A
+    /// rider can wait for the shelf and be carried between the two, so the report treats the pair
+    /// as one edge of its own ([`ride`]). `None` for ground.
+    pub ride: Option<usize>,
 }
 
 impl Platform {
@@ -218,9 +244,9 @@ impl Platform {
     pub fn surface_rect(&self) -> Rect {
         Rect::new(
             self.x0 as f32,
-            self.surface_row as f32,
+            self.surface_y,
             (self.x1 - self.x0 + 1) as f32,
-            1.0,
+            crate::physics::PHYSICS.platform_h,
         )
     }
 
@@ -373,7 +399,13 @@ impl Takeoff {
     }
 
     /// A take-off from a platform that offers `runway` tiles behind it.
-    pub fn with_runway(dir: TakeoffDir, hold: JumpHold, speed: LaunchSpeed, runway: f32, ph: &Physics) -> Takeoff {
+    pub fn with_runway(
+        dir: TakeoffDir,
+        hold: JumpHold,
+        speed: LaunchSpeed,
+        runway: f32,
+        ph: &Physics,
+    ) -> Takeoff {
         Takeoff {
             dir,
             hold,
@@ -476,6 +508,17 @@ pub(crate) struct CachedVerdict {
 ///
 /// Ground counts as one long platform. Spikes are not platforms: they are lethal
 /// and non-solid, so you can neither stand on one nor be carried by one.
+///
+/// **A spike does not cut the run in this table, and that asymmetry with the route graph is
+/// deliberate.** The graph splits a spiked run at the spike (its stands come from
+/// `landing_zone_bounds`) because a *plan* is made of landings; this table does not, because a spike
+/// is not solid and a run of ground with spikes on it is still one surface the body can leave from
+/// and land on. Splitting here was tried and reverted: `scratch-spike-tight` — a floor of spikes two
+/// columns apart, which the population solves 11 times in 24 — came back **unbeatable**, because a
+/// canonical trajectory holds its direction for the whole flight and so cannot take the one-tile pad
+/// a policy takes by releasing mid-air. The verdict's move set is coarser than the body's, and where
+/// it is coarser it must not invent a wall; the honest statement of that gap is the note on
+/// [`simulate_jump_with`] and the deferred item in `FINDINGS.md`, not a false negative here.
 pub fn extract_platforms(level: &Level) -> Vec<Platform> {
     let mut out = Vec::new();
     for row in 0..level.height {
@@ -499,6 +542,8 @@ pub fn extract_platforms(level: &Level) -> Vec<Platform> {
                 x0: start,
                 x1: end,
                 surface_row: row,
+                surface_y: row as f32,
+                ride: None,
             });
             x = end + 1;
         }
@@ -511,6 +556,92 @@ fn platform_at(platforms: &[Platform], surface_row: i32, col: i32) -> Option<usi
         .iter()
         .find(|p| p.surface_row == surface_row && p.contains_col(col))
         .map(|p| p.id)
+}
+
+/// Every surface the oracle may stand on: the tile grid's own platforms, plus **both decks of
+/// every moving platform**.
+///
+/// A mover is two stands, not one band. Its deck is a real box at two places a body can be —
+/// parked at the near end and parked at the far end — and a body that can reach either can wait
+/// for the cycle and be carried to the other ([`Platform::ride`]). Modelling the swept band as one
+/// long surface instead would hand every take-off on it the runway of a fifteen-tile floor, which
+/// is the sort of generous answer this oracle exists not to give.
+///
+/// The ids continue after the terrain's, so a report's own indices still address one table.
+pub fn reach_platforms(level: &Level) -> Vec<Platform> {
+    let mut out = extract_platforms(level);
+    for spec in &level.platforms {
+        let clear =
+            crate::physics::clear_travel(spec.rect, spec.span, spec.vertical, spec.dir, level);
+        let step = clear * f32::from(spec.dir);
+        let mut far = spec.rect;
+        if spec.vertical {
+            far.y -= step;
+        } else {
+            far.x += step;
+        }
+        if clear <= 1e-4 {
+            // A shelf with nowhere to go is a deck: one stand, no ride.
+            let id = out.len();
+            out.push(deck_platform(id, spec.rect, None));
+            continue;
+        }
+        let near = out.len();
+        let away = near + 1;
+        out.push(deck_platform(near, spec.rect, Some(away)));
+        out.push(deck_platform(away, far, Some(near)));
+    }
+    out
+}
+
+/// One end of a moving platform's travel, as a standable surface.
+fn deck_platform(id: usize, rect: Rect, ride: Option<usize>) -> Platform {
+    let x0 = rect.x.round() as i32;
+    Platform {
+        id,
+        x0,
+        x1: x0 + rect.w.round().max(1.0) as i32 - 1,
+        surface_row: rect.y.floor() as i32,
+        surface_y: rect.y,
+        ride,
+    }
+}
+
+/// The stand a body has just landed on by *crossing a deck's top*, if any.
+///
+/// A moving platform is not terrain, so the real stepper does not ground a body on it — the sim's
+/// own landing rule lives in the episode loop. The oracle's canonical trajectories therefore have
+/// to ask the question themselves, and they ask it the way the sim does: **a crossing**, feet at
+/// or above the deck last tick and at or below it now, with the body over the deck's columns. A
+/// position test instead would snap a body falling three tiles above a deck onto it.
+fn deck_landing(
+    platforms: &[Platform],
+    prev_feet: f32,
+    player: &PlayerState,
+    ticks: u32,
+) -> Option<Trajectory> {
+    if player.vy < 0.0 {
+        return None;
+    }
+    let feet = player.y + player.h;
+    let (c0, c1) = crate::physics::tile_span(player.x, player.w);
+    platforms
+        .iter()
+        .find(|p| {
+            p.ride.is_some()
+                && c0 <= p.x1
+                && c1 >= p.x0
+                && prev_feet <= p.surface_y + 1e-3
+                && feet >= p.surface_y - 1e-3
+        })
+        .map(|p| Trajectory {
+            landed_on: Some(p.id),
+            landed_at: Some((c0.max(p.x0), p.surface_row)),
+            touched_goal: false,
+            hit_spike: false,
+            fell_out: false,
+            ticks,
+        })
 }
 
 /// The action a canonical trajectory issues on tick `t`.
@@ -598,7 +729,7 @@ pub fn simulate_jump(
         level,
         platforms,
         takeoff_x as f32 + (1.0 - PHYSICS.player_w) * 0.5,
-        surface_row,
+        surface_row as f32,
         &Takeoff::full(dir, hold, speed, &PHYSICS),
     )
 }
@@ -637,14 +768,14 @@ pub fn simulate_jump_at(
     level: &Level,
     platforms: &[Platform],
     takeoff_x: f32,
-    surface_row: i32,
+    surface_y: f32,
     takeoff: &Takeoff,
 ) -> Trajectory {
     simulate_jump_with(
         level,
         platforms,
         takeoff_x,
-        surface_row,
+        surface_y,
         takeoff,
         ReachOptions::default(),
     )
@@ -655,7 +786,7 @@ fn simulate_jump_with(
     level: &Level,
     platforms: &[Platform],
     takeoff_x: f32,
-    surface_row: i32,
+    surface_y: f32,
     takeoff: &Takeoff,
     options: ReachOptions,
 ) -> Trajectory {
@@ -664,7 +795,7 @@ fn simulate_jump_with(
     player.w = ph.player_w;
     player.h = ph.player_h;
     player.x = takeoff_x;
-    player.y = surface_row as f32 - ph.player_h;
+    player.y = surface_y - ph.player_h;
     player.vx = takeoff.launch_vx;
     // The cap has to come along with the speed: a body launched at sprint speed with a
     // running cap would have its launch clamped away on the very first tick, and the
@@ -683,9 +814,11 @@ fn simulate_jump_with(
     // walking off an edge is not misreported as landing on the take-off platform
     // during the ticks it takes to clear the edge.
     let mut airborne = false;
+    let mut prev_feet = player.y + player.h;
     for t in 0..MAX_TRAJECTORY_TICKS {
         let action = trajectory_action(takeoff, hover, t, ph);
         let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        let feet = player.y + player.h;
         // A pad's throw is not a button, so there is nothing left to hold: `bounce` spends the jump
         // cut, and a trajectory that went on claiming a held jump would be asking for an action the
         // body has no reason to be making.
@@ -715,6 +848,12 @@ fn simulate_jump_with(
                 ticks: t + 1,
             };
         }
+        if airborne && !launched {
+            if let Some(deck) = deck_landing(platforms, prev_feet, &player, t + 1) {
+                return deck;
+            }
+        }
+        prev_feet = feet;
         if contact.landed && airborne && !launched {
             // Landing back on the take-off platform with no forward progress is
             // not an edge; it is reported as "landed here" and filtered by BFS.
@@ -1006,7 +1145,7 @@ fn swim_starts(level: &Level, p: &Platform) -> Vec<(f32, TakeoffDir)> {
     for (col, dir) in [(p.x1, TakeoffDir::Right), (p.x0, TakeoffDir::Left)] {
         for &offset in &TAKEOFF_OFFSETS {
             let x = col as f32 + offset;
-            if !takeoff_fits(level, x, p.surface_row, &PHYSICS) {
+            if !takeoff_fits(level, x, p.surface_row as f32, &PHYSICS) {
                 continue;
             }
             let lead = match dir {
@@ -1030,9 +1169,7 @@ fn swim_starts(level: &Level, p: &Platform) -> Vec<(f32, TakeoffDir)> {
 fn water_ahead(level: &Level, lead_x: f32, surface_row: i32, dir: TakeoffDir) -> bool {
     let sign = dir.sign() as i32;
     let col = lead_x.floor() as i32;
-    (0..=4).any(|step| {
-        (-1..=3).any(|dy| level.is_water(col + sign * step, surface_row + dy))
-    })
+    (0..=4).any(|step| (-1..=3).any(|dy| level.is_water(col + sign * step, surface_row + dy)))
 }
 
 /// The tick-by-tick action of a canonical **swim**, as both the oracle and a replayed route
@@ -1179,7 +1316,7 @@ fn vine_starts(level: &Level, p: &Platform) -> Vec<f32> {
     let mut out = Vec::new();
     for col in p.x0..=p.x1 {
         let x = col as f32 + (1.0 - PHYSICS.player_w) * 0.5;
-        if !takeoff_fits(level, x, p.surface_row, &PHYSICS) {
+        if !takeoff_fits(level, x, p.surface_y, &PHYSICS) {
             continue;
         }
         if let Some((_, top)) = vine_run(level, col, p.surface_row, &PHYSICS) {
@@ -1218,7 +1355,9 @@ pub fn vine_action(
     if *exiting {
         return arm(exit, true);
     }
-    if on_vine && feet <= top_row as f32 + 0.9 {
+    // The same window the physics holds the body in ([`crate::physics::vine_exit_open`]): the
+    // press has to happen while the vine still lets go, and no earlier.
+    if on_vine && vine_exit_open(feet, top_row) {
         *exiting = true;
         return arm(exit, true);
     }
@@ -1322,12 +1461,15 @@ fn simulate_vine_climb_with(
 /// is one thousandth of a tile so that a body flush against a wall — which is exactly how
 /// [`wall_climb_starts`] places one — counts as fitting rather than as overlapping by a rounding
 /// error.
-fn takeoff_fits(level: &Level, x: f32, surface_row: i32, ph: &Physics) -> bool {
+fn takeoff_fits(level: &Level, x: f32, surface_y: f32, ph: &Physics) -> bool {
     const SLACK: f32 = 1e-3;
     let (c0, c1) = crate::physics::tile_span(x + SLACK, ph.player_w - 2.0 * SLACK);
-    let top = surface_row as f32 - ph.player_h + SLACK;
-    let bottom = surface_row as f32 - SLACK;
-    let (r0, r1) = (Level::tile_y(top), Level::tile_y(bottom - SLACK).max(Level::tile_y(top)));
+    let top = surface_y - ph.player_h + SLACK;
+    let bottom = surface_y - SLACK;
+    let (r0, r1) = (
+        Level::tile_y(top),
+        Level::tile_y(bottom - SLACK).max(Level::tile_y(top)),
+    );
     for tx in c0..=c1 {
         for ty in r0..=r1 {
             if level.is_solid(tx, ty) {
@@ -1645,7 +1787,7 @@ fn edges_at_column(
         // `l2-first-gap`'s three-tile staircase with `evo::route_play`: the graph offered a *still*
         // jump from inside the step as the cheapest way up, and a body that pressed it there just
         // bounced. See `takeoff_fits`.
-        if !takeoff_fits(level, x, p.surface_row, ph) {
+        if !takeoff_fits(level, x, p.surface_y, ph) {
             continue;
         }
         for dir in TakeoffDir::ALL {
@@ -1666,7 +1808,7 @@ fn edges_at_column(
                 for speed in speeds {
                     let takeoff = Takeoff::with_runway(dir, *hold, *speed, runway, ph);
                     let traj =
-                        simulate_jump_with(level, platforms, x, p.surface_row, &takeoff, *options);
+                        simulate_jump_with(level, platforms, x, p.surface_y, &takeoff, *options);
                     out.push(MoveEdge {
                         traj,
                         jump: CulpritJump {
@@ -1687,9 +1829,9 @@ fn edges_at_column(
             // Walking off the edge, only from the ends.
             let at_edge = col == p.x0 || col == p.x1;
             if at_edge && dir != TakeoffDir::Still {
-                let takeoff = Takeoff::with_runway(dir, JumpHold::None, LaunchSpeed::Run, runway, ph);
-                let traj =
-                    simulate_jump_with(level, platforms, x, p.surface_row, &takeoff, *options);
+                let takeoff =
+                    Takeoff::with_runway(dir, JumpHold::None, LaunchSpeed::Run, runway, ph);
+                let traj = simulate_jump_with(level, platforms, x, p.surface_y, &takeoff, *options);
                 out.push(MoveEdge {
                     traj,
                     jump: CulpritJump {
@@ -1745,7 +1887,11 @@ pub fn report_with(level: &Level, options: ReachOptions) -> ReachReport {
 
 /// [`report_with`] with no cache in the way: the sweep, the BFS and the diagnosis.
 fn compute_report(level: &Level, options: ReachOptions) -> ReachReport {
-    let platforms = extract_platforms(level);
+    // The verdict's own table: the terrain, and both ends of every moving platform's travel
+    // ([`reach_platforms`]). The route graph keeps the terrain-only table on purpose — a ride
+    // is a move with a clock in it and a route plan has no way to press it — but a *verdict* is
+    // a statement that the level can be beaten, and a level whose only crossing is a shelf can.
+    let platforms = reach_platforms(level);
 
     let spawn_col = (level.spawn.x + level.spawn.w * 0.5).floor() as i32;
     let spawn_surface_row = (level.spawn.y + level.spawn.h).floor() as i32;
@@ -1762,7 +1908,7 @@ fn compute_report(level: &Level, options: ReachOptions) -> ReachReport {
     let goal_platform = goal.and_then(|(g, col)| {
         platforms
             .iter()
-            .find(|p| p.contains_col(col) && (p.surface_row as f32) >= g.y)
+            .find(|p| p.contains_col(col) && p.surface_y >= g.y)
             .map(|p| p.id)
     });
 
@@ -1784,6 +1930,16 @@ fn compute_report(level: &Level, options: ReachOptions) -> ReachReport {
                 if q != p.id && !adjacency[p.id].contains(&q) {
                     adjacency[p.id].push(q);
                 }
+            }
+        }
+        // The ride: a body standing on a moving platform can wait for the cycle and be carried
+        // to the other end of its travel, in either direction. It is an edge rather than a
+        // simulated move because the phase is a fact about the episode, not the terrain — and
+        // it is sound for the question this report answers: the cycle never stops, so "stand on
+        // the deck and hold still" is always available.
+        if let Some(partner) = p.ride {
+            if !adjacency[p.id].contains(&partner) {
+                adjacency[p.id].push(partner);
             }
         }
     }
@@ -2035,11 +2191,11 @@ pub enum RouteMove {
     /// Swim this way from the take-off position; `dive` is a jump into the pool rather than a
     /// walk off the lip.
     Swim { dir: TakeoffDir, dive: bool },
-/// Grab the vine overhead and climb it, leaving toward `exit`.
-///
-/// [`TakeoffDir::Still`] is the third exit: a vine that hangs from a **block** with air above it is
-/// climbed straight up and pulled over, and the body ends on the block rather than beside it.
-Vine { exit: TakeoffDir },
+    /// Grab the vine overhead and climb it, leaving toward `exit`.
+    ///
+    /// [`TakeoffDir::Still`] is the third exit: a vine that hangs from a **block** with air above it is
+    /// climbed straight up and pulled over, and the body ends on the block rather than beside it.
+    Vine { exit: TakeoffDir },
 }
 
 impl RouteEdge {
@@ -2119,14 +2275,48 @@ fn better_plan(candidate: &RouteEdge, held: &RouteEdge, landing: (i32, i32, i32)
     candidate
         .demand()
         .cmp(&held.demand())
-        .then(held.landing_margin(landing).cmp(&candidate.landing_margin(landing)))
+        .then(
+            held.landing_margin(landing)
+                .cmp(&candidate.landing_margin(landing)),
+        )
         .is_lt()
+}
+
+/// One standable surface in the route graph: ground, or one end of a moving platform's travel.
+///
+/// `row` and `x0..x1` are what [`GoalRoutes::zone_at`] is keyed on and what a landing reports; the
+/// two extra fields are what a deck needs and ground does not. `surface_y` is the top edge — the
+/// cell's own top for terrain, **mid-cell** for a deck, because a platform's box is half a tile tall
+/// and sits on the bottom of its row ([`crate::level::PlatformSpec`]). `ride` names the deck at the
+/// other end of the travel, which is the one edge of this graph that is not a move: nobody presses
+/// it, the cycle makes it true.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stand {
+    pub row: i32,
+    pub x0: i32,
+    pub x1: i32,
+    pub surface_y: f32,
+    pub ride: Option<usize>,
+}
+
+impl Stand {
+    /// Ground: a cell row, its top edge on the cell's own boundary, no ride.
+    fn ground(row: i32, x0: i32, x1: i32) -> Stand {
+        Stand {
+            row,
+            x0,
+            x1,
+            surface_y: row as f32,
+            ride: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GoalRoutes {
-    /// `(surface_row, x0, x1)` per stand, in scan order.
-    stands: Vec<(i32, i32, i32)>,
+    /// Every stand in the level, in scan order: the terrain's first, then a moving platform's
+    /// decks. See [`Stand`].
+    stands: Vec<Stand>,
     /// Index-aligned with `stands`: the canonical crossings that leave the stand, each with the
     /// take-off that makes it. At most one entry per landing stand.
     crossings: Vec<Vec<RouteEdge>>,
@@ -2146,15 +2336,35 @@ impl GoalRoutes {
     }
 
     /// The stand containing the ground at `(col, surface_row)`.
+    ///
+    /// Terrain is searched first, so a body whose tile is over both a floor and a deck that has
+    /// slid across it reads the floor: the deck is a place to be *carried*, and a stand that moves
+    /// is only ever the honest answer when there is nothing fixed under the feet.
     pub fn zone_at(&self, col: i32, surface_row: i32) -> Option<usize> {
         self.stands
             .iter()
-            .position(|&(r, x0, x1)| r == surface_row && col >= x0 && col <= x1)
+            .position(|s| s.row == surface_row && col >= s.x0 && col <= s.x1)
     }
 
     /// The stand's `(surface_row, x0, x1)`.
     pub fn zone_bounds(&self, stand: usize) -> (i32, i32, i32) {
-        self.stands[stand]
+        let s = self.stands[stand];
+        (s.row, s.x0, s.x1)
+    }
+
+    /// The world `y` of the stand's top edge — mid-cell for a moving platform's deck, the cell's own
+    /// top for ground. A jump off a deck starts half a tile above the row its stand is named for.
+    pub fn zone_surface(&self, stand: usize) -> f32 {
+        self.stands[stand].surface_y
+    }
+
+    /// The stand at the other end of this stand's ride, when the stand is a moving platform's deck.
+    ///
+    /// A ride is not a crossing and has no [`RouteEdge`]: there is nothing to press. It says "wait
+    /// for the cycle", which is the one move in this game whose action is not in the action set and
+    /// the reason [`Self::next_waypoint`] aims at the body itself for it.
+    pub fn ride_from(&self, stand: usize) -> Option<usize> {
+        self.stands[stand].ride
     }
 
     /// The canonical crossings that leave `from`, with the move that makes each one. A jump that
@@ -2190,7 +2400,7 @@ impl GoalRoutes {
     ///
     /// `None` when the stand is the flag's own ground (`hops == 0`) or has no route at all.
     pub fn next_hop(&self, stand: usize, from_x: f32, goal: Option<Rect>) -> Option<&RouteEdge> {
-        self.aim(stand, from_x, goal).map(|(_, edge)| edge)
+        self.aim(stand, from_x, goal).and_then(|(_, edge)| edge)
     }
 
     /// The world-space `(x, y)` waypoint the route aims at next from `stand`, when one
@@ -2202,7 +2412,12 @@ impl GoalRoutes {
     /// that strictly decreases `hops_to_flag` (with tie-breaking on proximity to `from_x`
     /// and then to `goal`), and returns the world centre of the landing tile in `j` closest
     /// to `from_x`.
-    pub fn next_waypoint(&self, stand: usize, from_x: f32, goal: Option<Rect>) -> Option<(f32, f32)> {
+    pub fn next_waypoint(
+        &self,
+        stand: usize,
+        from_x: f32,
+        goal: Option<Rect>,
+    ) -> Option<(f32, f32)> {
         self.aim(stand, from_x, goal).map(|(point, _)| point)
     }
 
@@ -2214,17 +2429,45 @@ impl GoalRoutes {
     /// waypoint sensor that steers at a landing the replay does not jump to. The tie-break keeps the
     /// *first* candidate on equal keys, which is what makes the answer independent of insertion
     /// order in the map iteration below it.
-    fn aim(&self, stand: usize, from_x: f32, goal: Option<Rect>) -> Option<((f32, f32), &RouteEdge)> {
+    fn aim(
+        &self,
+        stand: usize,
+        from_x: f32,
+        goal: Option<Rect>,
+    ) -> Option<((f32, f32), Option<&RouteEdge>)> {
         let from_hops = self.hops.get(stand).copied().flatten()?;
         if from_hops == 0 {
             return None;
         }
-        let (from_row, fx0, fx1) = self.stands[stand];
+        let (from_row, fx0, fx1) = self.zone_bounds(stand);
         let from_col = (from_x.floor() as i32).clamp(fx0, fx1);
         // `(hops, distance from the body, distance to the goal, aim point, edge)`: the sort key is
         // the first three and the rest is what the caller asked for, kept together so the loop
         // updates one binding rather than three parallel ones.
-        type Aim<'a> = (u32, f32, f32, (f32, f32), &'a RouteEdge);
+        type Aim<'a> = (u32, f32, f32, (f32, f32), Option<&'a RouteEdge>);
+        // A free function rather than a closure: the aim point is a reference to an edge of
+        // `self.crossings`, and a closure that stores one has to name the borrow it is storing.
+        fn consider<'a>(
+            best: &mut Option<Aim<'a>>,
+            from_hops: u32,
+            goal: Option<Rect>,
+            hops: u32,
+            d_from: f32,
+            point: (f32, f32),
+            edge: Option<&'a RouteEdge>,
+        ) {
+            if hops >= from_hops {
+                return;
+            }
+            let d_goal = goal.map_or(0.0, |g| {
+                let (gx, gy) = g.center();
+                (point.0 - gx).hypot(point.1 - gy)
+            });
+            let key = (hops, d_from, d_goal);
+            if best.is_none_or(|(bh, bf, bg, _, _)| key < (bh, bf, bg)) {
+                *best = Some((hops, d_from, d_goal, point, edge));
+            }
+        }
         let mut best: Option<Aim> = None;
         for edge in &self.crossings[stand] {
             let Some(j) = edge.to else {
@@ -2233,21 +2476,36 @@ impl GoalRoutes {
             let Some(hops) = self.hops[j] else {
                 continue;
             };
-            if hops >= from_hops {
-                continue;
-            }
-            let (row, x0, x1) = self.stands[j];
+            let (row, x0, x1) = self.zone_bounds(j);
             let target_col = from_col.clamp(x0, x1);
-            let wx = target_col as f32 + 0.5;
-            let wy = row as f32 - 0.5;
+            let point = (target_col as f32 + 0.5, self.zone_surface(j) - 0.5);
             let d_from = ((target_col - from_col) as f32).hypot((row - from_row) as f32);
-            let d_goal = goal.map_or(0.0, |g| {
-                let (gx, gy) = g.center();
-                (wx - gx).hypot(wy - gy)
-            });
-            let key = (hops, d_from, d_goal);
-            if best.is_none_or(|(bh, bf, bg, _, _)| key < (bh, bf, bg)) {
-                best = Some((hops, d_from, d_goal, (wx, wy), edge));
+            consider(
+                &mut best,
+                from_hops,
+                goal,
+                hops,
+                d_from,
+                point,
+                Some(edge),
+            );
+        }
+        // The ride: a stand whose next step is being carried waits where it stands, so its aim
+        // point is the body itself — a zero waypoint, which is the only honest way to say "hold
+        // still" in a vector whose two waypoint slots are a direction. Distance zero also means a
+        // ride wins a tie against a crossing at the same hop count, which is right: a body that is
+        // already on the deck has nothing to press.
+        if let Some(partner) = self.ride_from(stand) {
+            if let Some(hops) = self.hops[partner] {
+                consider(
+                    &mut best,
+                    from_hops,
+                    goal,
+                    hops,
+                    0.0,
+                    (from_x, self.zone_surface(stand) - 0.5),
+                    None,
+                );
             }
         }
         best.map(|(_, _, _, pt, edge)| (pt, edge))
@@ -2260,7 +2518,7 @@ impl GoalRoutes {
 /// from the one it stands on: a flag floating over a pit is won in flight, and a route
 /// graph that only knew how to land under it would call such a level unrouteable.
 pub fn goal_routes(level: &Level) -> GoalRoutes {
-    let mut stands: Vec<(i32, i32, i32)> = Vec::new();
+    let mut stands: Vec<Stand> = Vec::new();
     for row in 0..level.height {
         let mut x = 0;
         while x < level.width {
@@ -2269,35 +2527,85 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
                 continue;
             }
             let (x0, x1) = level.landing_zone_bounds(x, row);
-            stands.push((row, x0, x1));
+            stands.push(Stand::ground(row, x0, x1));
             x = x1 + 1;
         }
     }
+
+    // **A moving platform is two stands and a ride.** The terrain's stands are built first, so a
+    // body whose tile is over both floor and deck reads the floor; then each deck at the near end of
+    // a travel and each deck at the far end are added, with `ride` pointing at each other. That pair
+    // is what lets the compass say "jump onto the deck, then wait", and — the reason it is here at
+    // all — what lets `curriculum::next_stand` answer a stall on a shuttle's ledge instead of
+    // reporting that the flag cannot be reached. Before this, a run that stalled at a deck was left
+    // with no practice level and no plan: the population that produced this graph's first finding
+    // logs that sentence fifty generations in a row.
+    //
+    // The landing table is [`reach_platforms`] for the same reason the verdict's is: a jump onto a
+    // deck has to be a crossing this graph can see, or the first stand after the ledge is
+    // unreachable and nothing downstream matters.
+    let landing = reach_platforms(level);
+    let mut landing_stand: Vec<Option<usize>> = vec![None; landing.len()];
+    for p in landing.iter().filter(|p| p.ride.is_none()) {
+        landing_stand[p.id] = stands.iter().position(|s| {
+            s.ride.is_none()
+                && s.row == p.surface_row
+                && p.x0 >= s.x0
+                && p.x1 <= s.x1
+                && s.x0 >= p.x0 - 1
+                && s.x1 <= p.x1 + 1
+        });
+    }
+    let decks: Vec<usize> = landing
+        .iter()
+        .filter(|p| p.ride.is_some())
+        .map(|p| p.id)
+        .collect();
+    for &id in &decks {
+        let p = landing[id];
+        landing_stand[id] = Some(stands.len());
+        stands.push(Stand {
+            row: p.surface_row,
+            x0: p.x0,
+            x1: p.x1,
+            surface_y: p.surface_y,
+            ride: None,
+        });
+    }
+    for &id in &decks {
+        let mine = landing_stand[id];
+        let partner = landing[id].ride.and_then(|r| landing_stand[r]);
+        if let (Some(mine), Some(partner)) = (mine, partner) {
+            stands[mine].ride = Some(partner);
+        }
+    }
+
     let stand_of = |c: i32, lrow: i32| -> Option<usize> {
         stands
             .iter()
-            .position(|&(r, x0, x1)| r == lrow && c >= x0 && c <= x1)
+            .position(|s| s.row == lrow && c >= s.x0 && c <= s.x1)
     };
 
     // Every edge is one [`edges_from_all`] trajectory — the report's own move set — swept from
     // each stand's own columns (the synthetic take-off platform *is* the stand; its id only feeds
-    // `CulpritJump`, which this graph has no use for), while `platforms` is what a trajectory can
+    // `CulpritJump`, which this graph has no use for), while `landing` is what a trajectory can
     // land on.
-    let platforms = extract_platforms(level);
     let options = ReachOptions::default();
     let mut crossings: Vec<Vec<RouteEdge>> = vec![Vec::new(); stands.len()];
     let mut touches_flag = vec![false; stands.len()];
     let takeoffs: Vec<Platform> = stands
         .iter()
         .enumerate()
-        .map(|(i, &(row, x0, x1))| Platform {
+        .map(|(i, s)| Platform {
             id: i,
-            x0,
-            x1,
-            surface_row: row,
+            x0: s.x0,
+            x1: s.x1,
+            surface_row: s.row,
+            surface_y: s.surface_y,
+            ride: None,
         })
         .collect();
-    for (i, edges) in edges_from_all(level, &platforms, &takeoffs, &options)
+    for (i, edges) in edges_from_all(level, &landing, &takeoffs, &options)
         .into_iter()
         .enumerate()
     {
@@ -2320,7 +2628,7 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
                 to,
                 touches_flag: traj.touched_goal,
                 takeoff_x: jump.takeoff_x as f32 + jump.takeoff_offset,
-                surface_row: stands[i].0,
+                surface_row: stands[i].row,
                 plan: match (edge_move.climb, edge_move.swim, edge_move.vine) {
                     (Some(dir), _, _) => RouteMove::Climb { dir },
                     (_, Some((dir, dive)), _) => RouteMove::Swim { dir, dive },
@@ -2341,7 +2649,7 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
             match to {
                 Some(j) => match crossings[i].iter_mut().find(|e| e.to == Some(j)) {
                     Some(slot) => {
-                        if better_plan(&edge, slot, stands[j]) {
+                        if better_plan(&edge, slot, (stands[j].row, stands[j].x0, stands[j].x1)) {
                             *slot = edge;
                         }
                     }
@@ -2372,10 +2680,10 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
             // had to climb. A flag whose ground is out of standing reach is not that stand's goal —
             // the move that wins is the *crossing* that touches it in flight (`touches_flag`), and
             // it keeps its own hop count.
-            .filter(|(_, &(r, x0, x1))| {
-                col >= x0 && col <= x1 && g.y + g.h >= r as f32 - PHYSICS.player_h
+            .filter(|(_, s)| {
+                col >= s.x0 && col <= s.x1 && g.y + g.h >= s.surface_y - PHYSICS.player_h
             })
-            .min_by_key(|(_, &(r, _, _))| r)
+            .min_by_key(|(_, s)| s.row)
             .map(|(i, _)| i)
     });
     let mut reached_from: Vec<Vec<usize>> = vec![Vec::new(); stands.len()];
@@ -2384,6 +2692,14 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
             if let Some(j) = edge.to {
                 reached_from[j].push(i);
             }
+        }
+    }
+    // The rides are edges in this search and in nothing else: a stand you are carried to has one
+    // fewer crossing left, exactly as if a move had put you there, so a shuttle's far deck is the
+    // next rung of the route rather than the end of it.
+    for (i, s) in stands.iter().enumerate() {
+        if let Some(j) = s.ride {
+            reached_from[j].push(i);
         }
     }
     let mut hops: Vec<Option<u32>> = vec![None; stands.len()];
@@ -2605,7 +2921,9 @@ mod tests {
         let routes = goal_routes(&level);
         let bottom = routes.zone_at(5, 8).expect("the spawn's stand");
         let leg_top = routes.zone_at(2, 6).expect("the top of the first leg");
-        let turn = routes.zone_at(5, 4).expect("the first stand back toward the flag");
+        let turn = routes
+            .zone_at(5, 4)
+            .expect("the first stand back toward the flag");
         let top = routes.zone_at(8, 2).expect("the flag's own stand");
         assert_eq!(routes.hops_to_flag(top), Some(0), "the flag's own stand");
         for (from, to) in [(bottom, leg_top), (leg_top, turn), (turn, top)] {
@@ -2666,6 +2984,8 @@ mod tests {
                     x0,
                     x1,
                     surface_row,
+                    surface_y: surface_row as f32,
+                    ride: None,
                 }
             })
             .collect();
@@ -2701,13 +3021,7 @@ mod tests {
         let level = level(
             "spiked",
             &[
-                "........",
-                "........",
-                "........",
-                "........",
-                "........",
-                "...^....",
-                "########",
+                "........", "........", "........", "........", "........", "...^....", "########",
                 "########",
             ],
             (1, 5),
@@ -2764,7 +3078,7 @@ mod tests {
             &lv,
             &platforms,
             2.90,
-            7,
+            7.0,
             &Takeoff::with_runway(
                 TakeoffDir::Right,
                 JumpHold::Full,
@@ -2894,7 +3208,12 @@ mod tests {
     #[test]
     fn every_route_edge_replays_to_the_stand_it_claims() {
         // A fixture: name, tile rows, spawn, flag entries.
-        type Case<'a> = (&'a str, &'a [&'a str], (i32, i32), &'a [(&'a str, i32, i32)]);
+        type Case<'a> = (
+            &'a str,
+            &'a [&'a str],
+            (i32, i32),
+            &'a [(&'a str, i32, i32)],
+        );
         let cases: [Case; 4] = [
             ("gap", GAP, (1, 5), &[("goal", 19, 5)]),
             ("gap7", GAP7, (1, 5), &[("goal", 19, 5)]),
@@ -2913,7 +3232,7 @@ mod tests {
                             &lv,
                             &platforms,
                             edge.takeoff_x,
-                            edge.surface_row,
+                            edge.surface_row as f32,
                             &takeoff,
                         ),
                         RouteMove::Climb { dir } => simulate_wall_climb(
@@ -2939,9 +3258,7 @@ mod tests {
                             exit,
                         ),
                     };
-                    let landed = traj
-                        .landed_at
-                        .and_then(|(c, row)| routes.zone_at(c, row));
+                    let landed = traj.landed_at.and_then(|(c, row)| routes.zone_at(c, row));
                     assert_eq!(
                         landed, edge.to,
                         "{name}: the plan out of stand {stand} ({:?}) lands on {landed:?}, not the \
@@ -3038,7 +3355,11 @@ mod tests {
     fn the_ladder_fixture_is_beatable() {
         let report = report(&level("ladder", LADDER, (1, 5), &[("goal", 7, 3)]));
         assert!(report.goal_reached, "{:?}", report.diagnosis);
-        assert_eq!(report.start, Some(1), "spawn should sit on the ground platform");
+        assert_eq!(
+            report.start,
+            Some(1),
+            "spawn should sit on the ground platform"
+        );
         assert_eq!(report.goal_platform, Some(0));
         assert!(report.culprit.is_none());
     }
@@ -3067,8 +3388,14 @@ mod tests {
         );
         assert!(!without.goal_reached);
         let d = without.diagnosis.expect("a diagnosis");
-        assert!(d.contains("gap too wide to run"), "unexpected diagnosis: {d}");
-        assert!(d.contains("6.00"), "the sprint distance belongs in the answer: {d}");
+        assert!(
+            d.contains("gap too wide to run"),
+            "unexpected diagnosis: {d}"
+        );
+        assert!(
+            d.contains("6.00"),
+            "the sprint distance belongs in the answer: {d}"
+        );
         assert!(
             without.culprit.is_some(),
             "the editor needs a jump to highlight"
@@ -3133,7 +3460,13 @@ mod tests {
             .expect("the tower top is a platform")
             .id;
         // Flush against the tower's face (its column is 6) on the ground platform.
-        let climb = simulate_wall_climb(&lv, &platforms, 6.0 - PHYSICS.player_w, 6, TakeoffDir::Right);
+        let climb = simulate_wall_climb(
+            &lv,
+            &platforms,
+            6.0 - PHYSICS.player_w,
+            6,
+            TakeoffDir::Right,
+        );
         assert_eq!(
             climb.landed_on,
             Some(top),

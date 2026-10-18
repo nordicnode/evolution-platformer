@@ -624,20 +624,27 @@ pub struct TurretSpec {
 /// which is the reason it is worth the machinery: a platform that did not carry you would be
 /// a decoration, and a lift that did not is a staircase.
 ///
-/// **The oracle does not model it.** A route is a statement about the terrain, and a mover is
-/// not terrain: the sweep would have to know the phase it will be at, which is a fact about
-/// the episode rather than about the level. So a level with a mover is swept as if the mover
-/// were not there, and the level's own note is where the author says what that means. The
-/// alternative — refusing to answer at all — would make every level with a lift unverifiable.
+/// **The oracle models it as a ride**, not as terrain: the phase of the turn is a fact about
+/// the episode, so the sweep does not simulate the shelf's motion at all. What it asks instead
+/// is the question an author's level actually depends on — *can a body stand on this shelf and
+/// be carried to the far end of its travel?* — and a body that can reach the shelf at its home
+/// can always wait for the cycle to bring it there. See [`crate::reach`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlatformSpec {
-    /// The box at the low end of its travel: `w` tiles wide and half a tile tall, its **bottom
-    /// edge** on the bottom of row `y` (so the deck is mid-row).
+    /// The box where the shelf **starts**: `w` tiles wide and half a tile tall, its bottom edge
+    /// on the bottom of row `y` (so the deck is mid-row). `dir` says which way it leaves it.
     pub rect: Rect,
-    /// How far it travels, in tiles.
+    /// How far it travels, in tiles. Never negative: the *direction* is [`Self::dir`].
     pub span: f32,
-    /// True for a lift (travels up), false for a slider (travels right).
+    /// True for a lift (travels vertically), false for a slider (travels horizontally).
     pub vertical: bool,
+    /// Which way it travels: `+1` right (or up, for a lift), `-1` left (or down).
+    ///
+    /// The file carries it for the same reason a turret carries its firing direction: a shelf
+    /// whose only use is arriving from the left is a different level from one that goes right,
+    /// and a sign on the span would make the two indistinguishable from the box alone. A
+    /// missing one is `+1`, which is every shelf written before the field existed.
+    pub dir: i8,
 }
 
 /// A platform's width and travel when the file does not say: three tiles wide, four of travel.
@@ -649,14 +656,14 @@ pub const DEFAULT_PLATFORM_TILES: i32 = 3;
 pub const DEFAULT_PLATFORM_SPAN: i32 = 4;
 
 impl PlatformSpec {
-    /// A shelf anchored at tile `(tx, ty)`, `tiles` wide, travelling `span` tiles to the right (or
-    /// up, for a lift).
+    /// A shelf anchored at tile `(tx, ty)`, `tiles` wide, travelling `span` tiles towards `dir`
+    /// (`+1` right, or up for a lift; `-1` left, or down).
     ///
     /// The one place the geometry of a shelf is stated. The loader and the editor's platform
     /// brush both come through here, because two copies of "half a tile tall, bottom edge on the
     /// row below the cell" is exactly the shape of bug that has the editor drawing a shelf where
     /// the sim will not put it.
-    pub fn at(tx: i32, ty: i32, tiles: i32, span: i32, vertical: bool) -> PlatformSpec {
+    pub fn at(tx: i32, ty: i32, tiles: i32, span: i32, vertical: bool, dir: i8) -> PlatformSpec {
         PlatformSpec {
             rect: Rect::new(
                 tx as f32,
@@ -666,6 +673,7 @@ impl PlatformSpec {
             ),
             span: span.max(1) as f32,
             vertical,
+            dir: if dir < 0 { -1 } else { 1 },
         }
     }
 }
@@ -827,9 +835,8 @@ impl Level {
                 ));
             }
             for (col, ch) in chars.into_iter().enumerate() {
-                let tile = Tile::from_glyph(ch).ok_or_else(|| {
-                    format!("row {row} column {col}: unknown tile glyph {ch:?}")
-                })?;
+                let tile = Tile::from_glyph(ch)
+                    .ok_or_else(|| format!("row {row} column {col}: unknown tile glyph {ch:?}"))?;
                 tiles.push(tile);
             }
         }
@@ -905,14 +912,22 @@ impl Level {
                 // than a sign on the span. [`PlatformSpec::at`] owns the geometry so the
                 // editor's brush and this reader cannot disagree about it.
                 "platform" => {
-                    let vertical = matches!(e.axis.as_deref(), Some("y") | Some("up"))
-                        || matches!(e.axis.as_deref(), Some("down"));
+                    let axis = e.axis.as_deref();
+                    let vertical = matches!(axis, Some("y") | Some("up") | Some("down"));
+                    // `dir` is the field a shelf shares with a turret, and it means the same
+                    // thing: which way the thing goes. A file written before it existed has
+                    // none, and reads as the `+1` every shelf used to be. `axis: "down"` is
+                    // the one axis name that says the direction on its own, so it is honoured
+                    // as one — a lift told to go down and then sent up is the kind of quiet
+                    // disagreement between file and picture the editor exists to prevent.
+                    let dir = e.dir.unwrap_or(if axis == Some("down") { -1 } else { 1 });
                     level.platforms.push(PlatformSpec::at(
                         e.x,
                         e.y,
                         e.tiles.unwrap_or(DEFAULT_PLATFORM_TILES),
                         e.span.unwrap_or(DEFAULT_PLATFORM_SPAN),
                         vertical,
+                        dir,
                     ));
                 }
                 "goal" => {
@@ -1334,11 +1349,7 @@ impl Level {
     /// Convert to the character grid, for rendering and round-tripping.
     pub fn to_glyph_rows(&self) -> Vec<String> {
         (0..self.height)
-            .map(|ty| {
-                (0..self.width)
-                    .map(|tx| self.get(tx, ty).glyph())
-                    .collect()
-            })
+            .map(|ty| (0..self.width).map(|tx| self.get(tx, ty).glyph()).collect())
             .collect()
     }
 
@@ -1426,6 +1437,7 @@ impl Level {
             p.rect.hash_into(&mut h);
             h.f32(p.span);
             h.u8(p.vertical as u8);
+            h.i8(p.dir);
         }
         h.finish()
     }
@@ -1531,11 +1543,7 @@ impl Level {
     /// What was true is that `Walker::new`, which tooling uses for a deterministic pose, builds
     /// one facing right. See `REVIEW.md` §2.9.
     pub fn mirrored_horizontal(&self) -> Level {
-        let mut out = Level::starter(
-            format!("{} mirrored", self.name),
-            self.width,
-            self.height,
-        );
+        let mut out = Level::starter(format!("{} mirrored", self.name), self.width, self.height);
         for ty in 0..self.height {
             for tx in 0..self.width {
                 let tile = self.get(tx, ty);
@@ -1579,12 +1587,14 @@ impl Level {
             })
             .collect();
 
-        // The later enemies and the movers, mirrored by the same far-edge rule. Two of
+        // The later enemies and the movers, mirrored by the same far-edge rule. Three of
         // them carry something that has to turn with them: a turret's **firing direction**
         // is a fact about which way its row is dangerous, so a mirrored turret fires left
-        // from its new home; and a flyer's beat is stored as two ends, which swap. A
-        // slider still slides *right* after a mirror — the level flipped, not the clock —
-        // so a platform's span and axis are untouched.
+        // from its new home; a flyer's beat is stored as two ends, which swap; and a
+        // **slider's travel** is a direction in the mirrored axis, so a shelf that used to
+        // go right now goes left from its mirrored home — otherwise the mirror of a level
+        // whose only ride arrives from the left would be a level whose ride leaves.
+        // A lift's up/down is not the mirrored axis and does not turn.
         out.chasers = self
             .chasers
             .iter()
@@ -1614,6 +1624,7 @@ impl Level {
                 rect: Rect::new(w - (p.rect.x + p.rect.w), p.rect.y, p.rect.w, p.rect.h),
                 span: p.span,
                 vertical: p.vertical,
+                dir: if p.vertical { p.dir } else { -p.dir },
             })
             .collect();
         out
@@ -1676,10 +1687,7 @@ impl Level {
 
         let before = self.walkers.len();
         self.walkers.retain(|w| {
-            let (tx, ty) = (
-                tile_of_x(w.x, PHYSICS.walker_w),
-                tile_of_bottom(w.bottom()),
-            );
+            let (tx, ty) = (tile_of_x(w.x, PHYSICS.walker_w), tile_of_bottom(w.bottom()));
             !tx_out(tx, ty, width, height)
         });
         report.dropped_walkers = before - self.walkers.len();
@@ -1689,8 +1697,14 @@ impl Level {
         // entity past its edge is one the writer refuses, so leaving them would only move
         // the failure from "a level that lost a flyer" to "a level that cannot be saved".
         let before = self.chasers.len() + self.flyers.len() + self.turrets.len();
-        self.chasers
-            .retain(|r| !tx_out(tile_of_x(r.x, PHYSICS.walker_w), tile_of_bottom(r.bottom()), width, height));
+        self.chasers.retain(|r| {
+            !tx_out(
+                tile_of_x(r.x, PHYSICS.walker_w),
+                tile_of_bottom(r.bottom()),
+                width,
+                height,
+            )
+        });
         self.flyers.retain(|f| {
             !tx_out(
                 tile_of_x(f.rect.x, PHYSICS.flyer_w),
@@ -1707,7 +1721,8 @@ impl Level {
                 height,
             )
         });
-        report.dropped_enemies = before - (self.chasers.len() + self.flyers.len() + self.turrets.len());
+        report.dropped_enemies =
+            before - (self.chasers.len() + self.flyers.len() + self.turrets.len());
 
         let before = self.platforms.len();
         self.platforms.retain(|p| {
@@ -1721,8 +1736,7 @@ impl Level {
         report.dropped_platforms = before - self.platforms.len();
 
         let before = self.scenery.len();
-        self.scenery
-            .retain(|s| !tx_out(s.x, s.y, width, height));
+        self.scenery.retain(|s| !tx_out(s.x, s.y, width, height));
         report.dropped_scenery = before - self.scenery.len();
 
         let before = self.goals.len();
@@ -1769,12 +1783,7 @@ impl Level {
     pub fn walker_tiles(&self) -> Vec<(i32, i32)> {
         self.walkers
             .iter()
-            .map(|w| {
-                (
-                    tile_of_x(w.x, PHYSICS.walker_w),
-                    tile_of_bottom(w.bottom()),
-                )
-            })
+            .map(|w| (tile_of_x(w.x, PHYSICS.walker_w), tile_of_bottom(w.bottom())))
             .collect()
     }
 
@@ -1980,13 +1989,12 @@ impl Level {
     /// end runs into a wall is a shelf that stops early, which the sim already handles, and
     /// refusing it here would make the author hunt for the exact tile the wall is on.
     pub fn platform_placeable(&self, tx: i32, ty: i32, tiles: i32) -> bool {
-        !tx_out(tx, ty, self.width, self.height)
-            && tx + tiles.max(1) - 1 < self.width
-            && ty >= 0
+        !tx_out(tx, ty, self.width, self.height) && tx + tiles.max(1) - 1 < self.width && ty >= 0
     }
 
-    /// Add a moving platform anchored at a tile. `tiles` is its width, `span` its travel, and
-    /// `vertical` whether it is a lift (up) rather than a slider (right).
+    /// Add a moving platform anchored at a tile. `tiles` is its width, `span` its travel,
+    /// `vertical` whether it is a lift rather than a slider, and `dir` which way it goes
+    /// (`+1` right/up, `-1` left/down).
     pub fn add_platform_tile(
         &mut self,
         tx: i32,
@@ -1994,12 +2002,13 @@ impl Level {
         tiles: i32,
         span: i32,
         vertical: bool,
+        dir: i8,
     ) -> bool {
         if !self.platform_placeable(tx, ty, tiles) {
             return false;
         }
         self.platforms
-            .push(PlatformSpec::at(tx, ty, tiles, span, vertical));
+            .push(PlatformSpec::at(tx, ty, tiles, span, vertical, dir));
         true
     }
 
@@ -2023,20 +2032,15 @@ impl Level {
 
     /// Remove whatever enemy or platform owns tile `(tx, ty)`. Returns whether one went.
     pub fn remove_enemy_at(&mut self, tx: i32, ty: i32) -> bool {
-        let before =
-            self.walkers.len() + self.chasers.len() + self.flyers.len() + self.turrets.len() + self.platforms.len();
-        self.walkers.retain(|w| {
-            (
-                tile_of_x(w.x, PHYSICS.walker_w),
-                tile_of_bottom(w.bottom()),
-            ) != (tx, ty)
-        });
-        self.chasers.retain(|c| {
-            (
-                tile_of_x(c.x, PHYSICS.walker_w),
-                tile_of_bottom(c.bottom()),
-            ) != (tx, ty)
-        });
+        let before = self.walkers.len()
+            + self.chasers.len()
+            + self.flyers.len()
+            + self.turrets.len()
+            + self.platforms.len();
+        self.walkers
+            .retain(|w| (tile_of_x(w.x, PHYSICS.walker_w), tile_of_bottom(w.bottom())) != (tx, ty));
+        self.chasers
+            .retain(|c| (tile_of_x(c.x, PHYSICS.walker_w), tile_of_bottom(c.bottom())) != (tx, ty));
         self.flyers.retain(|f| {
             (
                 tile_of_x(f.rect.x, PHYSICS.flyer_w),
@@ -2051,7 +2055,10 @@ impl Level {
         });
         self.platforms
             .retain(|p| (p.rect.x.round() as i32, tile_of_bottom(p.rect.bottom())) != (tx, ty));
-        self.walkers.len() + self.chasers.len() + self.flyers.len() + self.turrets.len()
+        self.walkers.len()
+            + self.chasers.len()
+            + self.flyers.len()
+            + self.turrets.len()
             + self.platforms.len()
             != before
     }
@@ -2082,12 +2089,8 @@ impl Level {
     /// Remove the walker standing in tile `(tx, ty)`, if any.
     pub fn remove_walker_at(&mut self, tx: i32, ty: i32) -> bool {
         let before = self.walkers.len();
-        self.walkers.retain(|w| {
-            (
-                tile_of_x(w.x, PHYSICS.walker_w),
-                tile_of_bottom(w.bottom()),
-            ) != (tx, ty)
-        });
+        self.walkers
+            .retain(|w| (tile_of_x(w.x, PHYSICS.walker_w), tile_of_bottom(w.bottom())) != (tx, ty));
         self.walkers.len() != before
     }
 
@@ -2180,8 +2183,11 @@ impl Level {
     /// over it, so the eraser still takes what is under the pointer.
     pub fn remove_scenery_at(&mut self, tx: i32, ty: i32) -> bool {
         let exact = self.scenery.iter().rposition(|s| s.x == tx && s.y == ty);
-        let index =
-            exact.or_else(|| self.scenery.iter().rposition(|s| scenery_reaches(s, tx, ty)));
+        let index = exact.or_else(|| {
+            self.scenery
+                .iter()
+                .rposition(|s| scenery_reaches(s, tx, ty))
+        });
         match index {
             Some(index) => {
                 self.scenery.remove(index);
@@ -2199,7 +2205,10 @@ impl Level {
     /// back as a goal *entity*, so it is not writable.
     pub fn validate(&self) -> Result<(), String> {
         if self.width <= 0 || self.height <= 0 {
-            return Err(format!("level has non-positive size {}x{}", self.width, self.height));
+            return Err(format!(
+                "level has non-positive size {}x{}",
+                self.width, self.height
+            ));
         }
         if self.tiles.len() != (self.width * self.height) as usize {
             return Err(format!(
@@ -2211,9 +2220,11 @@ impl Level {
             ));
         }
         if self.tiles.contains(&Tile::Goal) {
-            return Err("grid contains a 'G' tile: it is load-time sugar, and writing it \
+            return Err(
+                "grid contains a 'G' tile: it is load-time sugar, and writing it \
                  would load back as a goal entity with different tiles"
-                .into());
+                    .into(),
+            );
         }
         if self.goals.is_empty() {
             return Err("level has no goal (place a goal entity or drop a 'G' tile)".into());
@@ -2306,6 +2317,7 @@ impl Level {
                 tiles: Some(p.rect.w.round().max(1.0) as i32),
                 span: Some(p.span.round().max(1.0) as i32),
                 axis: Some(if p.vertical { "y" } else { "x" }.to_string()),
+                dir: Some(p.dir),
                 ..RawEntity::of(
                     "platform",
                     p.rect.x.round() as i32,
@@ -2445,7 +2457,11 @@ mod editing_tests {
             assert_eq!(back.content_hash(), level.content_hash(), "{slug} hash");
             assert_eq!(back.content_hash_string(), level.content_hash_string());
             assert_eq!(back.name, level.name, "{slug} name");
-            assert_eq!((back.width, back.height), (level.width, level.height), "{slug} size");
+            assert_eq!(
+                (back.width, back.height),
+                (level.width, level.height),
+                "{slug} size"
+            );
             assert_eq!(back.to_glyph_rows(), level.to_glyph_rows(), "{slug} grid");
             assert_eq!(back.spawn, level.spawn, "{slug} spawn");
             assert_eq!(back.walkers, level.walkers, "{slug} walkers");
@@ -2460,7 +2476,11 @@ mod editing_tests {
 
             // Writing is deterministic: the same document gives the same bytes, so a
             // save that changed nothing does not produce a diff.
-            assert_eq!(level.to_json_pretty().unwrap(), json, "{slug} writer stability");
+            assert_eq!(
+                level.to_json_pretty().unwrap(),
+                json,
+                "{slug} writer stability"
+            );
             // And the written file is a level document, not just valid JSON.
             assert!(json.contains(LEVEL_FORMAT), "{slug} carries the format tag");
             assert!(json.ends_with('\n'), "{slug} ends with a newline");
@@ -2509,12 +2529,20 @@ mod editing_tests {
 
         // Refusals: a duplicate, a solid cell, a tree with no room above it, off-grid.
         assert!(!level.add_scenery("bush_c", 4, 7), "a duplicate is refused");
-        assert!(!level.add_scenery("bush_c", 4, 9), "that cell is solid floor");
+        assert!(
+            !level.add_scenery("bush_c", 4, 9),
+            "that cell is solid floor"
+        );
         level.set_tile(3, 5, Tile::Solid);
-        assert!(!level.add_scenery("tree_b_base", 3, 7), "no room for a tree");
+        assert!(
+            !level.add_scenery("tree_b_base", 3, 7),
+            "no room for a tree"
+        );
         assert!(!level.add_scenery("bush_c", -1, 7), "off the grid");
 
-        let json = level.to_json_pretty().expect("a decorated level is writable");
+        let json = level
+            .to_json_pretty()
+            .expect("a decorated level is writable");
         let back = Level::from_json_str(&json).expect("and it loads back");
         assert_eq!(back.scenery(), level.scenery());
         assert_eq!(back.content_hash(), level.content_hash());
@@ -2572,7 +2600,11 @@ mod editing_tests {
         let original = level.tile(10, 12);
 
         assert!(level.set_tile(10, 12, Tile::Solid));
-        assert_ne!(level.content_hash(), before, "painting must change the level");
+        assert_ne!(
+            level.content_hash(),
+            before,
+            "painting must change the level"
+        );
         assert!(level.set_tile(10, 12, original.expect("in bounds")));
         assert_eq!(level.content_hash(), before, "erasing must give it back");
 
@@ -2588,7 +2620,10 @@ mod editing_tests {
         let mut level = Level::starter("edges", 20, 10);
         let before = level.content_hash();
         for (tx, ty) in [(-1, 5), (20, 5), (5, -1), (5, 10), (99, 99)] {
-            assert!(!level.set_tile(tx, ty, Tile::Solid), "({tx}, {ty}) must be refused");
+            assert!(
+                !level.set_tile(tx, ty, Tile::Solid),
+                "({tx}, {ty}) must be refused"
+            );
             assert_eq!(level.tile(tx, ty), None, "no tile exists at ({tx}, {ty})");
         }
         // A `G` tile is load-time sugar and would load back as an entity.
@@ -2610,7 +2645,10 @@ mod editing_tests {
         let mut level = Level::starter("one-goal", 20, 10);
         assert_eq!(level.goals.len(), 1);
 
-        assert!(level.remove_goal_at(18, 8), "the starter's own flag comes off");
+        assert!(
+            level.remove_goal_at(18, 8),
+            "the starter's own flag comes off"
+        );
         assert!(level.goals.is_empty());
         assert!(!level.remove_goal_at(18, 8), "already gone");
 
@@ -2686,11 +2724,17 @@ mod editing_tests {
         // The starter's goal is anchored at (18, 8) with its cloth in (18, 7).
         assert!(level.goal_covers(18, 8), "the pole's base cell");
         assert!(level.goal_covers(18, 7), "the cell the flag is drawn in");
-        assert!(!level.goal_covers(18, 6), "one cell above the flag is open air");
+        assert!(
+            !level.goal_covers(18, 6),
+            "one cell above the flag is open air"
+        );
         assert!(!level.goal_covers(17, 7), "one column left is open air");
 
         // Erased by its cloth — the only part of the marker with any colour in it.
-        assert!(level.remove_goal_at(18, 7), "erased by the flag, not the pole");
+        assert!(
+            level.remove_goal_at(18, 7),
+            "erased by the flag, not the pole"
+        );
         assert!(level.goals.is_empty());
 
         // And by the pole's own cell, once the flag is back where it was.
@@ -2714,14 +2758,20 @@ mod editing_tests {
 
         // A bush is one cell, and the air above it is not the bush.
         assert!(level.add_scenery("bush_c", 12, 7));
-        assert!(!level.remove_scenery_at(12, 6), "air above a bush is open air");
+        assert!(
+            !level.remove_scenery_at(12, 6),
+            "air above a bush is open air"
+        );
         assert_eq!(level.scenery_at(12, 7), Some("bush_c"));
         assert!(level.remove_scenery_at(12, 7));
 
         // A cell holding a piece of its own takes the pointer's target first, even when a
         // tree's canopy reaches over it: one click, the thing under the cursor.
         assert!(level.add_scenery("tree_a_base", 12, 7));
-        assert!(level.add_scenery("bush_c", 12, 6), "in the tree's canopy cell");
+        assert!(
+            level.add_scenery("bush_c", 12, 6),
+            "in the tree's canopy cell"
+        );
         assert!(level.remove_scenery_at(12, 6));
         assert_eq!(level.scenery_at(12, 6), None, "the bush under the pointer");
         assert_eq!(
@@ -2729,7 +2779,10 @@ mod editing_tests {
             Some("tree_a_base"),
             "the tree it was standing in front of survives one click"
         );
-        assert!(level.remove_scenery_at(12, 6), "the second click takes the tree");
+        assert!(
+            level.remove_scenery_at(12, 6),
+            "the second click takes the tree"
+        );
         assert_eq!(level.scenery_at(12, 7), None);
     }
 
@@ -2833,7 +2886,10 @@ mod editing_tests {
         // the level stays writable.
         let report = level.resize(MIN_LEVEL_W, MIN_LEVEL_H, Tile::Empty);
         assert!(report.spawn_moved, "the spawn was 40 tiles to the right");
-        assert!(report.goal_moved, "the goal was dragged back to the grid edge");
+        assert!(
+            report.goal_moved,
+            "the goal was dragged back to the grid edge"
+        );
         assert!(level.validate().is_ok(), "{:?}", level.validate());
         assert_eq!(
             level.goal_tiles()[0],
@@ -2857,7 +2913,7 @@ mod editing_tests {
         assert!(level.add_chaser_tile(30, 9));
         assert!(level.add_flyer_tile(32, 6, 2));
         assert!(level.add_turret_tile(34, 9, 1));
-        assert!(level.add_platform_tile(36, 6, 2, 2, false));
+        assert!(level.add_platform_tile(36, 6, 2, 2, false, 1));
         assert_eq!(level.goal_tiles().len(), 1);
 
         let report = level.resize(10, 8, Tile::Empty);
@@ -2886,7 +2942,7 @@ mod editing_tests {
         assert!(level.add_chaser_tile(8, 9));
         assert!(level.add_flyer_tile(12, 6, 4));
         assert!(level.add_turret_tile(20, 9, -1));
-        assert!(level.add_platform_tile(24, 6, 3, 4, true));
+        assert!(level.add_platform_tile(24, 6, 3, 4, true, 1));
         assert!(level.set_goal_tile(36, 9));
 
         let mirrored = level.mirrored_horizontal();

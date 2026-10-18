@@ -30,7 +30,7 @@ numbered findings, the verification detail and the deferred work are in
 | **M4** editor + content | pixel renderer, generated art, drag-and-drop editor with a browsable level shelf and a whole-document mirror, playtest, the two **trap tiles** (brittle ground and spring pads), and the whole watch mode inside the window. Not yet: a curated starter pack |
 | **M5** web/release | not started — except its stall chain, which was done early |
 
-Version trio: **sim 0.13.0 / sensors v11 / fitness v8**, on **level format v2**. Every champion file records all
+Version trio: **sim 0.15.0 / sensors v12 / fitness v8**, on **level format v3**. Every champion file records all
 three and is *refused* rather than replayed against different physics or a different
 objective. What each version changed, and why, is in
 [FINDINGS.md](FINDINGS.md#the-version-trio).
@@ -47,7 +47,7 @@ thing at stake is whether the artifact on disk still counts.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 626 tests
+cargo test --workspace                 # 672 tests
 cargo build --release
 
 # The game: draw a level, drag tiles out of a palette, play it yourself.
@@ -60,6 +60,10 @@ cargo run --release -p app             # title screen, then l1-flat-run.json
 #   ctrl+click takes the brush from the tile under the pointer; shift-drag draws a line
 #   ctrl+Z / ctrl+Y undo   G grid   F fit   ctrl+S save   P play/pause-mode
 #   Mirror (in the tool bar) flips the whole level left to right, in one undo step
+#   Levels (in the tool bar) is the pack as pictures: click a card to open it,
+#   double-click the same card to playtest it. New starts a blank 60 x 15 level;
+#   if the one on the canvas has unsaved edits, the window asks first — on a card
+#   above the status bar, with Discard and Keep editing on it.
 #   in play: arrows or W/A/S/D move and jump, R restarts, P or Esc returns
 #   ? (or F1) opens the key card for whichever view is on screen
 cargo run --release -p app -- --level levels/l6-marathon.json
@@ -168,6 +172,14 @@ be started in one front-end and resumed in the other:
 ./target/release/train-cli bench --protocol chain --arm default
 ./target/release/train-cli bench --protocol chain --arm hidden32 --hidden 32
 ./target/release/train-cli bench --compare bench/chain-default.json,bench/chain-hidden32.json
+
+# The stricter stop, and the one to use when the saved champion is going to be raced: stop when
+# the *record* has won every fixed validation episode, not when a generation has won its own
+# three drawn patrol phases. Four seeds of `chain` moved from 22 of 48 fresh episodes won to
+# 48 of 48, at a median of 23 extra generations.
+./target/release/train-cli train --level levels/l9-wait-and-climb.json \
+    --generations 400 --pop 200 --stop-on-win --stop-on-validated
+./target/release/train-cli bench --protocol chain --arm strict --stop-on-validated
 ```
 
 Two knobs are worth knowing before reading a table, because they change what the search can be
@@ -188,6 +200,14 @@ pop 200 on `l3-gauntlet` for the same first-win counts. `--no-common-episodes` r
 per-genome policy every table in [REVIEW.md](REVIEW.md) taken before it was measured under (and
 turns racing off, since a race cannot be sounded on unpaired episodes); `--no-race-episodes` keeps
 pairing and judges every genome on every trial. The arms are in §4 of [REVIEW.md](REVIEW.md).
+
+**What "solved" means is two numbers now.** A genome's `won` is the one episode a champion file
+records; its `solved` is every episode it was actually judged on, and that is what the chart, the
+panel and `--stop-on-win` read. The champion a run saves is chosen on a held-out set
+(`--validation-episodes`, twelve by default), on solve count before mean fitness, and never at the
+expense of a record whose own episode won — so `replay` still shows a win. `--stop-on-validated`
+extends the same rule to the stop itself. The measurements are in [FINDINGS.md](FINDINGS.md),
+"Solved, then validated".
 
 `train-cli --help` lists every option. The window takes the same ones as its own
 commands (`--evolve`, `--play`, `--replay`, `--screenshot`, `--splash`). `train` and
@@ -254,7 +274,7 @@ Three tiles that change the **body** rather than the terrain, and the only ones 
 |---|---|
 | a pool | **water** (`~`). A body whose centre is in it **sinks** at `water_sink` (0.02 tiles/tick, 1.2 tiles a second) whatever its gear, and its horizontal speed is capped at `water_speed` (half a run). Holding jump **swims** up at `water_swim`; a fresh press at the surface is a **push off it** at `water_jump_v0` — the same 2.5 tiles as a jump, and the only way out of a pool whose lip is above the water. A body falling in has the fall taken out of it at the surface line, so a terminal-speed drop into a pool is an arrival rather than a splat |
 | a lava pool | **lava** (`L`). Not solid, **lethal on contact** like a spike, and — when the cell above is open — a **vent**: it throws a ball every `lava_period` (150 ticks, 2.5 s), out of phase with its neighbours, that rises `v0²/(2g)` = 2.5 tiles and falls back. The ball is lethal too, and the pool is full, so the hazard is the cell rather than a drawn box |
-| a hanging stem | a **vine** (`V`). Not solid. A body overlapping one is **on it**: gravity is replaced by the vine's own rate, so holding jump **climbs** at `vine_climb` and releasing **slides down** at `vine_slide` — slower than a wall slide, because going down a vine is a move rather than a fall. A vine only counts once the body is airborne, so a body standing at the foot of one keeps its jump. A vine that hangs beside a ledge is left by pressing the side at its top; a vine that hangs under a **one-tile-thick block** has no sideways exit, so holding climb when the head meets the block's underside **hauls the body up over it** (`MANTLE_TICKS`, a hand-over-hand pull-up that ends standing on the block) |
+| a hanging stem | a **vine** (`V`). Not solid. A body overlapping one is **on it**: gravity is replaced by the vine's own rate, so holding jump **climbs** at `vine_climb` and releasing **slides down** at `vine_slide` — slower than a wall slide, because going down a vine is a move rather than a fall. **The grab is a grip**: a body that arrives at a run has its horizontal speed spent on the hold, and while the climb is held below the top of the run a direction is not a walk, so "hold jump and keep running" climbs instead of sliding back out of the column. The last `VINE_EXIT_REACH` (0.9 tiles) below the top is the exit window — the side press that carries a body onto the ledge beside the run — and releasing the climb lets a side press step off mid-shaft. A vine only counts once the body is airborne, so a body standing at the foot of one keeps its jump. A vine that hangs under a **one-tile-thick block** has no sideways exit, so holding climb when the head meets the block's underside **hauls the body up over it** (`MANTLE_TICKS`, a hand-over-hand pull-up that ends standing on the block) |
 
 **A fluid is drawn the way the ground is, in pieces.** A solid tile is a mask, a crown and its
 variants; a pool is a body texture, a surface, a bed and two edges, and its neighbours decide
@@ -323,7 +343,7 @@ Human-writable ASCII grid plus an entity list:
     {"type": "chaser", "x": 26, "y": 12},
     {"type": "flyer", "x": 15, "y": 8, "span": 12},
     {"type": "turret", "x": 31, "y": 12, "dir": -1},
-    {"type": "platform", "x": 35, "y": 12, "tiles": 3, "span": 4, "axis": "x"},
+    {"type": "platform", "x": 35, "y": 12, "tiles": 3, "span": 4, "axis": "x", "dir": -1},
     {"type": "goal", "x": 57, "y": 12}
   ]
 }
@@ -363,7 +383,7 @@ fields its kind needs are written:
 | `chaser` | `x`, `y` | a patrol's body that **hunts**: heads for the player and stops at a ledge |
 | `flyer` | `x`, `y`, `span` | an enemy that ignores gravity and beats `span` tiles **of travel**, centred on `x` |
 | `turret` | `x`, `y`, `dir` | a fixed enemy that fires along its row; `dir` is `1` (right, the default) or `-1` |
-| `platform` | `x`, `y`, `tiles`, `span`, `axis` | a moving platform: `tiles` wide, travelling `span` tiles, `axis` `"x"` (slide, the default) or `"y"` (lift) |
+| `platform` | `x`, `y`, `tiles`, `span`, `axis`, `dir` | a moving platform: `tiles` wide, travelling `span` tiles, `axis` `"x"` (slide, the default) or `"y"` (lift), and `dir` `1` (right, or up for a lift — the default) or `-1` (left, or down). The box says where it starts; `dir` says which way it leaves it, the same way a turret's `dir` says which way it fires |
 | `scenery` | `x`, `y`, `sprite` | a decorative prop the physics never sees |
 
 **Each version reads every earlier one.** The version says which alphabet a file is written
@@ -422,7 +442,7 @@ never tuned separately:
 | `water_sink` / `water_swim` | 0.02 down / 0.07 up, tiles/tick |
 | `water_jump_v0` | 0.25 tiles/tick — a push off the surface: **2.50 tiles**, the same as a jump |
 | `water_speed` | 0.06 tiles/tick, the horizontal cap in water |
-| `vine_climb` / `vine_slide` | 0.06 up / 0.03 down, tiles/tick |
+| `vine_climb` / `vine_slide` | 0.06 up / 0.03 down, tiles/tick; `VINE_EXIT_REACH` 0.9 tiles below the top |
 | `lava_v0` / `lava_period` | 0.25 tiles/tick (**2.50 tiles** high) / 150 ticks between a vent's balls |
 | spring height | `spring_v0²/(2g)` = **4.90 tiles** — two jumps and a bit, and the pad's launch zone is as tall as `max_fall` so no fall can tunnel through it |
 | air time | `2·v0/g` = 40 ticks |

@@ -80,7 +80,7 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `turret_l` | the same turret mirrored. The view mirrors `turret_r` instead of drawing this one, so the two can never drift apart; the sprite is here for tools and for tilesets that prefer the pair |
 | `shot` | a turret's projectile: a hot core with a short tail behind it, so a still frame reads as motion |
 | `oneway_l`, `oneway_m`, `oneway_r` | the one-way platform (`Tile::OneWay`, `=`): a timber shelf across the **top** of its cell, with iron brackets under it, in three pieces so a run of them has cut ends. Ground from above, air from below and from the side |
-| `mover_l`, `mover_m`, `mover_r` | a moving platform (`sim::level::PlatformSpec`): the same shelf with an iron rail on top and a hanging link, drawn in the **top half** of the cell because half a cell is the platform's whole box |
+| `mover_l`, `mover_m`, `mover_r` | a moving platform (`sim::level::PlatformSpec`): the same shelf with an iron rail on top and a hanging link, drawn in the **top half** of the cell because half a cell is the platform's whole box. The three pieces are a cut run, not a direction: which way the shelf travels is the level's `dir`, and the art is the same either way — a rail has no front |
 | `goal_top`, `goal_bottom`, `goal_flag_1`, `goal_flag_2`, `goal_flag_3`, `goal_flag_4` | the flag on its pole, waving through four frames |
 | `spawn_marker` | where the player starts, editor only |
 | `bush_a`, `bush_b` | a leafy mound, two frames of sway |

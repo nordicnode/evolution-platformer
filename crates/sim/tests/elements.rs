@@ -153,7 +153,10 @@ fn jump_swims_and_a_press_at_the_surface_leaves_the_water() {
     let mut sim = Sim::new(&pool(), 7);
     step_n(&mut sim, AgentAction::Brake, 200);
     assert!(sim.player().in_water);
-    assert!(sim.player().grounded, "the body should be on the pool's floor");
+    assert!(
+        sim.player().grounded,
+        "the body should be on the pool's floor"
+    );
 
     let deep = sim.player().y;
     step_n(&mut sim, AgentAction::JumpInPlace, 20);
@@ -265,7 +268,10 @@ fn a_vine_is_climbed_and_slid_down() {
     // Jump off the floor and onto the vine: it is grabbed on the first airborne tick.
     sim.step(AgentAction::JumpInPlace);
     sim.step(AgentAction::JumpInPlace);
-    assert!(sim.player().on_vine, "the body should have grabbed the vine");
+    assert!(
+        sim.player().on_vine,
+        "the body should have grabbed the vine"
+    );
     assert!(
         (sim.player().vy + ph.vine_climb).abs() < 1e-5,
         "holding jump on a vine should climb at vine_climb, got {}",
@@ -340,6 +346,133 @@ fn a_climber_reaches_the_ledge_above_the_vine() {
         (feet(&sim) - 2.0).abs() < 1e-3,
         "the ledge's surface is at y = 2.0, the body stands at {:.3}",
         feet(&sim)
+    );
+}
+
+/// A vine hanging from the lip of a ledge, over the lava pit that starts one column to its
+/// right — the shape a person draws first, and the one the window's agents kept falling into.
+///
+/// ```text
+/// ................
+/// ................   <- air above the ledge
+/// ...######.......   <- the one-tile ledge the vine hangs from
+/// ...V............
+/// ...V............   <- the run, eight tiles down to the lip
+/// ...V............
+/// ####LLLLLL######   <- ground to the vine's column, then lava
+/// ####LLLLLL######
+/// ```
+///
+/// The spawn is on the left ground and the flag on the right, so the only way across the pit is
+/// up the vine and over the ledge.
+fn vine_over_lava() -> sim::Level {
+    fixture(
+        "vine-over-lava",
+        &[
+            "................",
+            "................",
+            "................",
+            "................",
+            "...######.......",
+            "...V............",
+            "...V............",
+            "...V............",
+            "...V............",
+            "...V............",
+            "...V............",
+            "...V............",
+            "...V............",
+            "####LLLLLL######",
+            "####LLLLLL######",
+        ],
+        (0, 12),
+        &[("goal", 14, 12)],
+    )
+}
+
+/// **A vine catches a body that arrives at a run, and holding right does not pull it off.**
+///
+/// The bug this pins is the one the window showed: an agent running right at a vine over a pit
+/// grabbed it, climbed for a tile and a half, drifted out of the column because it was still
+/// holding right, and fell into the lava. A vine was therefore a route the oracle could walk and
+/// a population could not — the policy that runs right is the only one the level rewards
+/// anywhere else, and at the vine it was fatal.
+///
+/// The measurement is the whole crossing, with the run button held the entire time: jump from the
+/// lip, be caught, climb the eight-tile run, pull up onto the ledge, stand on it. No frame of the
+/// climb is allowed to end the episode, and the body is never allowed to leave the vine's column
+/// before the top — which is exactly what "the vine holds" means.
+#[test]
+fn a_vine_catches_a_running_body_and_holds_it_while_the_climb_is_pressed() {
+    let level = vine_over_lava();
+    let mut sim = Sim::new(&level, 11);
+    let vine_col = 3;
+
+    // Run at the lip, then jump and keep both the direction and the climb held.
+    let mut grabbed = false;
+    let mut highest = f32::INFINITY;
+    let mut grab_x = 0.0_f32;
+    for _ in 0..600 {
+        if sim.outcome().is_finished() {
+            break;
+        }
+        let action = if sim.player().x >= 2.6 {
+            AgentAction::SprintJump
+        } else {
+            AgentAction::Run
+        };
+        sim.step(action);
+        if sim.player().on_vine {
+            if !grabbed {
+                grab_x = sim.player().x;
+            }
+            grabbed = true;
+            highest = highest.min(sim.player().y);
+            let x = sim.player().x;
+            // The hold is the claim: while the climb is pressed below the exit window, the
+            // direction must not move the body along the column at all. (It may *straddle* the
+            // column when it arrives — the grab does not centre it — but it may not slide.)
+            assert!(
+                (x - grab_x).abs() < 1e-3,
+                "a pressing body slid from x {grab_x:.2} to {x:.2} on the vine (feet {:.2})",
+                feet(&sim)
+            );
+        }
+        if grabbed && sim.player().grounded {
+            break;
+        }
+    }
+
+    assert!(
+        grabbed,
+        "the run never caught the vine (at {:.2}, {:.2})",
+        sim.player().x,
+        sim.player().y
+    );
+    assert!(
+        grab_x < vine_col as f32 + 1.0 && grab_x + sim.player().w > vine_col as f32,
+        "the body was said to be on column {vine_col} at x {grab_x:.2}"
+    );
+    assert_eq!(
+        sim.outcome(),
+        Outcome::Running,
+        "the crossing ended as {:?} at ({:.2}, {:.2})",
+        sim.outcome(),
+        sim.player().x,
+        sim.player().y
+    );
+    // Eight tiles of climb from the lip at row 13 to the ledge's surface at row 4.
+    assert!(
+        highest <= 13.0 - 7.0,
+        "the body climbed only {:.1} tiles before the vine let go",
+        13.0 - highest
+    );
+    assert!(sim.player().grounded, "the pull-up never ended standing");
+    assert!(
+        (feet(&sim) - 4.0).abs() < 1e-3,
+        "the body should be standing on the ledge (feet {:.2}, at x {:.2})",
+        feet(&sim),
+        sim.player().x
     );
 }
 
@@ -420,10 +553,17 @@ fn lava_vent() -> sim::Level {
 fn a_lava_vent_throws_a_ball_up_and_gravity_brings_it_back() {
     let ph = sim::PHYSICS;
     let level = lava_vent();
-    assert_eq!(level.lava_vents(), vec![(4, 5)], "one open lava cell is one vent");
+    assert_eq!(
+        level.lava_vents(),
+        vec![(4, 5)],
+        "one open lava cell is one vent"
+    );
 
     let mut sim = Sim::new(&level, 1);
-    assert!(sim.lava_balls().is_empty(), "a level does not start mid-throw");
+    assert!(
+        sim.lava_balls().is_empty(),
+        "a level does not start mid-throw"
+    );
 
     // Stand still on the rim (out of the fountain's way is not possible here — the body is
     // *over* the vent — so the test steps until the ball is thrown and stops there).
@@ -488,7 +628,11 @@ fn a_lava_ball_kills_a_body_over_the_vent() {
     while sim.stats().frames + 1 < ph.lava_period {
         sim.step(AgentAction::Brake);
     }
-    assert_eq!(sim.outcome(), Outcome::Running, "nothing has been thrown yet");
+    assert_eq!(
+        sim.outcome(),
+        Outcome::Running,
+        "nothing has been thrown yet"
+    );
 
     step_n(&mut sim, AgentAction::Brake, 2);
     assert_eq!(
@@ -545,9 +689,18 @@ fn the_sensor_patch_reads_water_lava_and_vine_as_their_own_values() {
     let vine = read('V');
     let air = read('.');
 
-    assert!(water < air, "water must not read as air: {water} against {air}");
-    assert!(lava < water, "lava must read worse than water: {lava} against {water}");
-    assert!(vine > air, "a vine must read as better than air: {vine} against {air}");
+    assert!(
+        water < air,
+        "water must not read as air: {water} against {air}"
+    );
+    assert!(
+        lava < water,
+        "lava must read worse than water: {lava} against {water}"
+    );
+    assert!(
+        vine > air,
+        "a vine must read as better than air: {vine} against {air}"
+    );
     assert_eq!(
         lava,
         sim::sensors::ENC_LAVA,
@@ -650,7 +803,10 @@ fn holding_the_climb_hauls_the_body_onto_the_block_the_vine_hangs_from() {
         }
         sim.step(AgentAction::Run);
     }
-    assert!(reached, "the flag on the block should be walkable from the lip");
+    assert!(
+        reached,
+        "the flag on the block should be walkable from the lip"
+    );
 }
 
 /// **A vine under a block with no room above it is a dead end, not a route.**

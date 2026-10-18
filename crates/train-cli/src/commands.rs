@@ -32,6 +32,9 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "crossover",
     "action-repeat",
     "fine-children",
+    "fine-sigma-scale",
+    "validation-episodes",
+    "no-validation",
     "stagnation",
     "immigrants",
     "archive-children",
@@ -60,6 +63,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "csv",
     "max-seconds",
     "stop-on-win",
+    "stop-on-validated",
     "quiet",
 ];
 /// `es`: the baseline arm. Its flags are the ones that change what it measures — the batch, the
@@ -142,6 +146,33 @@ pub fn train(a: &Args) -> Result<(), String> {
     let out_dir = a.string("out", "champions");
     let quiet = a.has_flag("quiet");
     let stop_on_win = a.has_flag("stop-on-win");
+    // The stricter stop: the *record* has to be solved on its held-out set, not merely a generation
+    // solved on its own three patrol phases. See `GenerationReport::record_solved`.
+    let stop_on_validated = a.has_flag("stop-on-validated");
+    if stop_on_validated && !stop_on_win {
+        return Err(
+            "usage: --stop-on-validated refines when to stop, it does not start stopping: pass \
+             --stop-on-win beside it"
+                .into(),
+        );
+    }
+    if stop_on_validated && a.has_flag("no-validation") {
+        return Err(
+            "usage: --stop-on-validated needs a validation set, and --no-validation switches the \
+             one it reads off"
+                .into(),
+        );
+    }
+    if stop_on_validated && suite {
+        // The suite's own stop is already the conservative one (every level plus every trial), and
+        // the record's validation set is drawn on **one** level. Accepting the pair would be a flag
+        // that is silently ignored, which this file refuses everywhere.
+        return Err(
+            "usage: --stop-on-validated reads one level's validation set; a suite already stops \
+             when every level is won, so pass --stop-on-win alone"
+                .into(),
+        );
+    }
     // The stall chain (§12 M5), the terminal's copy of the window's: fall back to an
     // easier level when the run stops moving. With no `--curriculum` the fallback is
     // derived instead (finding 50) — the level itself, starting from the furthest stand
@@ -307,14 +338,19 @@ pub fn train(a: &Args) -> Result<(), String> {
             wins: report.wins,
         });
 
-        // What "solved" means depends on the run. On one level it is the first genome on the
-        // flag. On a suite it is a genome that won **every** level, because the claim a suite run
-        // makes is a generalisation claim: stopping on the first level won would end the run on
-        // exactly the specialist the reward was built to discourage.
+        // What "solved" means depends on the run, and it is the **conservative** reading on both.
+        // On one level it is the first genome that won every episode it was judged on, which on a
+        // deterministic level is simply the first genome on the flag — and on a walker level is not
+        // the first genome that drew a quiet patrol phase. On a suite it is a genome that won
+        // **every level and every trial of it**, because the claim a suite run makes is a
+        // generalisation claim: stopping on the first level won would end the run on exactly the
+        // specialist the reward was built to discourage.
         let solved_now = if suite {
             report.suite_solved > 0
+        } else if stop_on_validated {
+            report.record_solved
         } else {
-            report.wins > 0
+            report.solved > 0
         };
         if solved_at.is_none() && solved_now {
             solved_at = Some(report.generation);
@@ -498,6 +534,9 @@ pub fn train(a: &Args) -> Result<(), String> {
     println!();
     match solved_at {
         Some(g) if suite => println!("solved at generation {g} (every level won)"),
+        Some(g) if stop_on_validated => println!(
+            "solved at generation {g} (the record won every validation episode)"
+        ),
         Some(g) => println!("solved at generation {g} (first win)"),
         None => println!(
             "not solved in {} generations; best-evidence: max fitness {:.2}",
@@ -575,6 +614,24 @@ pub fn train(a: &Args) -> Result<(), String> {
         println!(
             "note    the champion is recorded on {} — fitness and frames below are that level's\n         episode, because a champion file is a claim about one level that `replay` checks",
             levels[0].name
+        );
+    }
+    // The record's **held-out** reading, when the run took one: the episode below is the episode
+    // that earned the record (`replay` reproduces it), and this is the same genome on episodes no
+    // generation drew. A record that only wins its own episode shows up here as a gap between the
+    // two numbers, which is exactly what it is.
+    if let Some(validated) = best.validated {
+        println!(
+            "held    {:.2} mean, {} of {} fixed validation episodes won{}{}",
+            validated.mean,
+            validated.wins,
+            validated.episodes,
+            if validated.solved() {
+                " (every one)"
+            } else {
+                ""
+            },
+            " — see GaConfig::validation_episodes"
         );
     }
     println!(
@@ -876,6 +933,18 @@ pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
         mutation_sigma: usage(a.f32_opt("mut-sigma", default.mutation_sigma))?,
         crossover_rate: usage(a.f32_opt("crossover", default.crossover_rate))?,
         fine_children: usage(a.usize_opt("fine-children", default.fine_children))?,
+        // How big the fine scale's step is, as a fraction of `--mut-sigma`. A fine child moves one
+        // to three genes, so it is local in count; this is what makes it local in size too. See
+        // `GaConfig::fine_sigma_scale` — the archive's children use the same step.
+        fine_sigma_scale: usage(a.f32_opt("fine-sigma-scale", default.fine_sigma_scale))?,
+        // Episodes, on fixed seeds no generation draws, on which a record candidate and the record
+        // it would replace are compared (`--no-validation` switches it off, which is the only way
+        // to reproduce a pre-validation arm exactly).
+        validation_episodes: if a.has_flag("no-validation") {
+            0
+        } else {
+            usage(a.usize_opt("validation-episodes", default.validation_episodes as usize))? as u32
+        },
         adaptive_sigma,
         stagnation_generations: usage(
             a.usize_opt("stagnation", default.stagnation_generations as usize),
@@ -1920,6 +1989,53 @@ mod tests {
         .expect("training runs");
         let champion = dir.join("l1-flat-run.json");
         (load_level(&level_path).expect("level"), champion, dir)
+    }
+
+    /// The stricter stop is a *refinement* of `--stop-on-win`, not a second way to stop, and it
+    /// needs the reading it stops on. Both are usage errors rather than a flag that quietly does
+    /// nothing — the failure mode this file refuses everywhere else.
+    #[test]
+    fn the_validated_stop_needs_the_win_stop_and_a_validation_set() {
+        let level = wpath("levels/l1-flat-run.json");
+        let on_its_own = train(&a(&[
+            "train",
+            "--level",
+            &level,
+            "--stop-on-validated",
+            "--generations",
+            "1",
+        ]))
+        .expect_err("--stop-on-validated without --stop-on-win is a usage error");
+        assert!(on_its_own.contains("--stop-on-win"), "{on_its_own}");
+
+        let without_set = train(&a(&[
+            "train",
+            "--level",
+            &level,
+            "--stop-on-win",
+            "--stop-on-validated",
+            "--no-validation",
+            "--generations",
+            "1",
+        ]))
+        .expect_err("--stop-on-validated with --no-validation is a usage error");
+        assert!(without_set.contains("--no-validation"), "{without_set}");
+
+        // A suite already has the conservative stop, and the validation set is one level's: the
+        // pair is refused rather than accepted and ignored.
+        let second = wpath("levels/l2-first-gap.json");
+        let suite = format!("{level},{second}");
+        let with_suite = train(&a(&[
+            "train",
+            "--suite",
+            &suite,
+            "--stop-on-win",
+            "--stop-on-validated",
+            "--generations",
+            "1",
+        ]))
+        .expect_err("--stop-on-validated on a suite is a usage error");
+        assert!(with_suite.contains("suite"), "{with_suite}");
     }
 
     #[test]

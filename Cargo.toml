@@ -110,8 +110,22 @@ members = [
 # earlier champion would be replayed against a body that cannot swim or climb and a world with no
 # fountains in it; sim 0.14.0, sensors v12 (the patch reads water, lava and vine as their own
 # values) and level format 3 (three new glyphs) move together.
+# 0.15.0: **the vine holds.** A body that arrived at a vine at a run kept its horizontal velocity,
+# so it slid out of the column after a tile and a half and fell — and an agent that was still
+# holding right, which is what every level rewards it for, could therefore never use one. That is
+# the one bug the window's own agents found for us: on a vine hanging over a lava pit they grabbed
+# the vine, climbed, drifted off and fell in, on seed after seed. The grab now spends the body's
+# horizontal speed (the vertical half was already caught — the vine *is* a catch), and below the
+# top of the run, with the climb held, the vine owns x: a direction is not a walk. The last
+# `VINE_EXIT_REACH` (0.9 tiles) below the top is the exit window the oracle's own script presses
+# in, so stepping off onto a ledge is unchanged, and releasing the climb still lets a side press
+# step off mid-shaft. Every route the oracle walks is bit-identical: its script presses nothing
+# until that window. What a champion was trained against is not — the hold changes the body's path
+# whenever it presses into a vine — so the trio moves to sim 0.15.0. Sensors and fitness are
+# unchanged: the patch already said where the vine is, and what changed is what the body does on
+# it.
 [workspace.package]
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"

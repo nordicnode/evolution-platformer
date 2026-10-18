@@ -291,6 +291,15 @@ pub enum Action {
 /// answers "where am I?" as well as "what is there?".
 pub fn show(ui: &mut Ui, entries: &[Entry], current: Option<&Path>) -> Action {
     let mut action = Action::None;
+    // **A double-click is the same card clicked twice.** egui's own `double_clicked` is counted
+    // per *pointer*, not per widget — its only test is whether two clicks arrived within
+    // `max_double_click_delay`, with no check on where either landed — so a card clicked shortly
+    // after anything else (the *Levels* button that opened this window, or the card above it)
+    // reports a double click it never received, and a person trying to open a level was dropped
+    // into a playtest instead. The pair is remembered here, by name and by the clock.
+    let last: Option<(String, f64)> = ui.data(|d| d.get_temp(last_click_id()));
+    let now = ui.input(|i| i.time);
+    let mut clicked_card: Option<&Entry> = None;
     if entries.is_empty() {
         ui.label(
             egui::RichText::new("no levels here yet — draw one and press Save")
@@ -305,14 +314,7 @@ pub fn show(ui: &mut Ui, entries: &[Entry], current: Option<&Path>) -> Action {
                 let selected = current == Some(entry.path.as_path());
                 let response = card(ui, entry, selected);
                 if response.clicked() {
-                    action = if entry.loadable() {
-                        Action::Open(entry.path.clone())
-                    } else {
-                        Action::None
-                    };
-                }
-                if response.double_clicked() && entry.loadable() {
-                    action = Action::Play(entry.path.clone());
+                    clicked_card = Some(entry);
                 }
                 response.on_hover_text(if entry.loadable() {
                     format!(
@@ -325,8 +327,33 @@ pub fn show(ui: &mut Ui, entries: &[Entry], current: Option<&Path>) -> Action {
                 });
             }
         });
+    if let Some(entry) = clicked_card {
+        let twice = last
+            .as_ref()
+            .is_some_and(|(name, at)| name == &entry.name && now - at < DOUBLE_CLICK_SECONDS);
+        action = if !entry.loadable() {
+            Action::None
+        } else if twice {
+            Action::Play(entry.path.clone())
+        } else {
+            Action::Open(entry.path.clone())
+        };
+        // The pair is only remembered for a card that answered, so a click on the shell of the
+        // window is not the first half of somebody's double click.
+        ui.data_mut(|d| d.insert_temp(last_click_id(), (entry.name.clone(), now)));
+    }
     action
 }
+
+/// What the shelf remembers about its last card click: which card, and when.
+fn last_click_id() -> egui::Id {
+    egui::Id::new("shelf-last-click")
+}
+/// How close together two clicks on one card have to be to mean "playtest this".
+///
+/// The same delay egui uses for its own (pointer-wide) count, applied to a pair that is actually
+/// on one card.
+const DOUBLE_CLICK_SECONDS: f64 = 0.3;
 
 /// One card: the thumbnail, the name, the facts, and what a click does.
 fn card(ui: &mut Ui, entry: &Entry, selected: bool) -> Response {
@@ -339,71 +366,70 @@ fn card(ui: &mut Ui, entry: &Entry, selected: bool) -> Response {
     } else {
         theme::card_frame()
     };
-    let response = frame
-        .show(ui, |ui| {
-            ui.set_width(THUMB_WIDTH + 20.0);
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&entry.name)
-                            .color(if entry.loadable() {
-                                theme::TEXT
-                            } else {
-                                theme::TEXT_FAINT
-                            })
-                            .monospace()
-                            .strong(),
-                    );
-                    if selected {
-                        // A filled chip rather than gold type on cream: the gold is the window's
-                        // *fill* accent, and as 11-point type on a card it measured 1.5:1. Filled,
-                        // it is dark ink on the accent — 9.8:1 — and reads as a badge.
+    let response =
+        frame
+            .show(ui, |ui| {
+                ui.set_width(THUMB_WIDTH + 20.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(" open ")
-                                .small()
-                                .background_color(theme::ACCENT)
-                                .color(theme::INK_ON_ACCENT),
+                            egui::RichText::new(&entry.name)
+                                .color(if entry.loadable() {
+                                    theme::TEXT
+                                } else {
+                                    theme::TEXT_FAINT
+                                })
+                                .monospace()
+                                .strong(),
                         );
-                    }
-                });
-                // The thumbnail is drawn, not interacted with: the card's own rect is the
-                // control (see below), so a click on the map and a click on the name are one
-                // action rather than two widgets that have to agree about it.
-                let _ = draw_thumbnail(ui, entry);
-                ui.label(
-                    egui::RichText::new(entry.summary())
-                        .small()
-                        .color(if entry.loadable() {
+                        if selected {
+                            // A filled chip rather than gold type on cream: the gold is the window's
+                            // *fill* accent, and as 11-point type on a card it measured 1.5:1. Filled,
+                            // it is dark ink on the accent — 9.8:1 — and reads as a badge.
+                            ui.label(
+                                egui::RichText::new(" open ")
+                                    .small()
+                                    .background_color(theme::ACCENT)
+                                    .color(theme::INK_ON_ACCENT),
+                            );
+                        }
+                    });
+                    // The thumbnail is drawn, not interacted with: the card's own rect is the
+                    // control (see below), so a click on the map and a click on the name are one
+                    // action rather than two widgets that have to agree about it.
+                    let _ = draw_thumbnail(ui, entry);
+                    ui.label(egui::RichText::new(entry.summary()).small().color(
+                        if entry.loadable() {
                             theme::TEXT_DIM
                         } else {
                             // The failure *ink*: `BAD` is a fill and measured 3.3:1 as small type
                             // on a card, which is under the floor a sentence has to clear.
                             theme::BAD_INK
-                        }),
-                );
-                if !entry.materials.is_empty() {
-                    ui.label(
-                        // Metadata on a card: the tertiary ink, which is measured at 5.9:1 there
-                        // rather than the 2.8:1 the old value drew.
-                        egui::RichText::new(entry.materials.join(" · "))
-                            .small()
-                            .color(theme::TEXT_FAINT),
-                    );
-                }
-                // The one line a card gets that is about the *run* rather than the level: this is
-                // what says the pack and the training are two halves of one game (AUDIT.md V3).
-                // The accent ink rather than a badge sprite, because the shelf draws no art — its
-                // thumbnails are maps, not pictures — and a word is legible at this size.
-                if entry.champion.is_some() {
-                    ui.label(
-                        egui::RichText::new("beaten — a champion is saved for this level")
-                            .small()
-                            .color(theme::GOOD_INK),
-                    );
-                }
-            });
-        })
-        .response;
+                        },
+                    ));
+                    if !entry.materials.is_empty() {
+                        ui.label(
+                            // Metadata on a card: the tertiary ink, which is measured at 5.9:1 there
+                            // rather than the 2.8:1 the old value drew.
+                            egui::RichText::new(entry.materials.join(" · "))
+                                .small()
+                                .color(theme::TEXT_FAINT),
+                        );
+                    }
+                    // The one line a card gets that is about the *run* rather than the level: this is
+                    // what says the pack and the training are two halves of one game (AUDIT.md V3).
+                    // The accent ink rather than a badge sprite, because the shelf draws no art — its
+                    // thumbnails are maps, not pictures — and a word is legible at this size.
+                    if entry.champion.is_some() {
+                        ui.label(
+                            egui::RichText::new("beaten — a champion is saved for this level")
+                                .small()
+                                .color(theme::GOOD_INK),
+                        );
+                    }
+                });
+            })
+            .response;
     // **The whole card is the control, and it says so before the click.** The frame's own
     // response is drawn-only, so a click on the name or the facts used to do nothing — the card
     // was one big target in the tooltip and a thumbnail-sized target in fact. The interactive
@@ -518,6 +544,81 @@ mod tests {
         }
     }
 
+    /// **A double-click is the same card clicked twice**, not any two clicks in a row.
+    ///
+    /// The bug this pins: egui counts a double-click on the *pointer*, with the clock as its
+    /// only test, so the second of two quick clicks anywhere reports `double_clicked` on whatever
+    /// it landed on. A person who opened the shelf and clicked a card in the same second was
+    /// therefore dropped into a playtest instead of the editor, and so was anyone clicking down a
+    /// column of levels. The shelf remembers the card and the time itself, and a click that is
+    /// not on the card it followed is a single click however fast it arrives.
+    #[test]
+    fn a_quick_second_click_opens_a_different_card_and_double_click_plays_the_same_one() {
+        use egui::{Pos2, RawInput, Rect, Vec2};
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let entries = scan(&levels_dir(), None);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 900.0));
+        let mut time = 0.0_f64;
+        let mut actions = Vec::new();
+        let mut run = |events: Vec<egui::Event>| {
+            time += 1.0 / 60.0;
+            let input = RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::default())
+                    .show(ctx, |ui| {
+                        let action = show(ui, &entries, None);
+                        actions.push(action);
+                    });
+            });
+        };
+        let click = |at: Pos2, run: &mut dyn FnMut(Vec<egui::Event>)| {
+            run(vec![egui::Event::PointerMoved(at)]);
+            run(vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }]);
+            run(vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }]);
+        };
+        // Two different cards, as fast as two clicks can arrive.
+        click(Pos2::new(40.0, 30.0), &mut run);
+        click(Pos2::new(40.0, 190.0), &mut run);
+        // And one card twice.
+        click(Pos2::new(40.0, 190.0), &mut run);
+
+        let opens: Vec<&Action> = actions
+            .iter()
+            .filter(|a| !matches!(a, Action::None))
+            .collect();
+        assert_eq!(opens.len(), 3, "three clicks, three answers: {actions:?}");
+        let first = &entries[0].path;
+        let second = &entries[1].path;
+        assert_eq!(opens[0], &Action::Open(first.clone()));
+        assert_eq!(
+            opens[1],
+            &Action::Open(second.clone()),
+            "a quick second click on another card was taken as a double click"
+        );
+        assert_eq!(
+            opens[2],
+            &Action::Play(second.clone()),
+            "the same card clicked twice is a playtest"
+        );
+    }
+
     /// A card's facts are read off the level rather than guessed.
     #[test]
     fn a_card_reports_the_levels_own_materials_and_size() {
@@ -617,7 +718,10 @@ mod tests {
         // The run's own naming — `{stem}.json` — beside the level's own file.
         std::fs::write(champions.join("l1-flat-run.json"), "{}").unwrap();
         let checked = scan(&levels, Some(&champions));
-        let champion = checked[0].champion.as_ref().expect("the champion was found");
+        let champion = checked[0]
+            .champion
+            .as_ref()
+            .expect("the champion was found");
         assert!(
             champion.ends_with("l1-flat-run.json"),
             "{}",

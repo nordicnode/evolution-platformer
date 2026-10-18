@@ -267,6 +267,15 @@ TRAIN OPTIONS:
                           protocols. On by default; the flag is for saying so explicitly.
     --no-race-episodes    Judge every genome on every trial, which is what a flat three-trial
                           pass costs, for comparing against the raced default.
+    --validation-episodes <N>
+                          Episodes, drawn from seeds no generation ever sees, on which a
+                          **record** candidate and the record it would replace are
+                          compared. The champion a run saves is therefore picked on worlds
+                          it was not trained on, and on solve count before mean fitness:
+                          a genome that wins the set beats one that merely scored well.
+                          Costs nothing until a record is challenged.       [default 12]
+    --no-validation       Reproduce a pre-validation arm exactly: the record is the
+                          generation's best score with no held-out reading.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
     --curriculum-generations <N>
                           Generations spent there before returning. 0 takes the detour
@@ -313,7 +322,16 @@ TRAIN OPTIONS:
     --out <DIR>           Champion output directory.                  [default champions]
     --csv <PATH>          Also write the (generation, max, avg) history as CSV.
     --max-seconds <S>     Stop early after S wall-clock seconds.
-    --stop-on-win         Stop as soon as any agent touches the flag.
+    --stop-on-win         Stop as soon as the first genome wins **every** episode it was
+                          judged on: every trial, and on a suite every level. On a walker
+                          level that is three patrol phases rather than one, which is what
+                          keeps a quiet phase from ending the run.
+    --stop-on-validated   With --stop-on-win, stop when the **record** has won every
+                          validation episode instead of when a generation has won every
+                          trial. The stricter claim, and the one a champion is quoted on:
+                          three drawn phases can still be a coin flip, while twelve fixed
+                          worlds no generation saw are not. Measured in FINDINGS.md,
+                          "Solved, then validated".
     --quiet               Print only the final summary and the champion path.
 
 ES OPTIONS:
@@ -365,7 +383,13 @@ BENCH OPTIONS:
     measures (--suite, --curriculum, --curriculum-generations, --csv, --max-seconds), and
     it never fires a detour or reads a clock: it drives the trainer one level at a time for
     a fixed number of generations and stops at the first win, which is exactly what
-    FINDINGS.md's own `for seed in $(seq 1 12)` loops do by hand.
+    FINDINGS.md's own `for seed in $(seq 1 12)` loops do by hand. `--stop-on-validated`
+    changes the stop to the first *validated* solve and is recorded in the arm; two arms
+    are not comparable across that field.
+    --stop-on-validated   Stop each seed when the record has won every validation episode,
+                          instead of when a generation has won its own trials. The stricter
+                          protocol: 48 of 48 fresh episodes won against 22 of 48 on four
+                          seeds of `chain` (FINDINGS.md, "Solved, then validated").
 
     --protocol <NAME>     The sweep: a frozen (level, pop, generations, seeds) row whose
                           name is how a table in the notes is reproduced. `--list` prints
