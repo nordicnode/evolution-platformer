@@ -6,10 +6,11 @@ can create — exploring and exploiting the level and the game mechanics to the 
 of its ability — while performing well on modest hardware.
 
 **Baseline machine** (the "consumer hardware" bar for every number below, same as
-[AI_REVIEW.md](AI_REVIEW.md)): Intel Core i5-9400, 6 cores / 6 threads, 2.9 GHz
+the October 2026 AI review): Intel Core i5-9400, 6 cores / 6 threads, 2.9 GHz
 base / 4.1 GHz turbo, 16 GiB RAM, GTX 1660 Super, AVX2 + FMA, no AVX-512.
 
-**Relationship to AI_REVIEW.md.** That review asked where the learning loop leaves
+**Relationship to the October 2026 AI review (AI_REVIEW.md, retired 2026-10-18
+and preserved in git history; section citations below refer to it).** That review asked where the learning loop leaves
 intelligence on the table, and its top items have since landed: "solved" means won
 every trial, champions are validated on held-out episodes (48/48 fresh wins under
 `--stop-on-validated`), the fine mutation scale is separate, the forward pass is

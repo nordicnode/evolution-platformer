@@ -13,11 +13,12 @@ population has found, the playtest runs the same clock so you can try to beat it
 reward for finishing quickly is part of what the search is selected on — so "solved" is a
 level, and "solved in 6.15 s of the 40 s it was allowed" is a run.
 
-This repository implements [development_plan.md](development_plan.md), the design
-document. **This README is what the thing is and how to run it.** The measurements, the
+**This README is what the thing is and how to run it.** The measurements, the
 numbered findings, the verification detail and the deferred work are in
-[FINDINGS.md](FINDINGS.md), and the art pass with its remaining rough edges is in
-[REVIEW.md](REVIEW.md).
+[FINDINGS.md](FINDINGS.md), and the forward plan for the AI is in
+[AI_IMPROVEMENT_PLAN.md](AI_IMPROVEMENT_PLAN.md). (The original design document
+and the dated review/audit snapshots this repo accumulated were retired on
+2026-10-18; they live in git history.)
 
 ## Status
 
@@ -214,9 +215,9 @@ and because the episodes are paired, the extra trials can be spent only where th
 (`race_episodes`): trial 0 for everyone, trial 1 for the better half, trial 2 for the better quarter.
 That is 1.75 episodes per genome on a walker level instead of 3.00, and 29 % off the wall clock at
 pop 200 on `l3-gauntlet` for the same first-win counts. `--no-common-episodes` restores the
-per-genome policy every table in [REVIEW.md](REVIEW.md) taken before it was measured under (and
+per-genome policy every earlier table was taken under (and
 turns racing off, since a race cannot be sounded on unpaired episodes); `--no-race-episodes` keeps
-pairing and judges every genome on every trial. The arms are in §4 of [REVIEW.md](REVIEW.md).
+pairing and judges every genome on every trial. The arms are recorded in [FINDINGS.md](FINDINGS.md).
 
 **What "solved" means is two numbers now.** A genome's `won` is the one episode a champion file
 records; its `solved` is every episode it was actually judged on, and that is what the chart, the
@@ -503,7 +504,7 @@ the reachability diagnostics quote. Three rules matter as much as the numbers:
   on the floor — passes through untouched. That is one rule rather than two, and it is what
   makes a pad a target to land on rather than an obstacle in a corridor. The launch spends
   the body's jump cut as it fires, so a pad delivers its full derived 4.90 tiles rather than
-  the 45% a cut ascent would leave (REVIEW.md §1.10).
+  the 45% a cut ascent would leave.
 * **Brittle ground is ground until it is not, and `CRUMBLE_TICKS` starts when a body
   *stands* on it.** A body crossing a cracked span at running speed is past each tile long
   before its fuse burns out, so a bridge is crossed at a run and lost by hesitating; a walker
@@ -532,7 +533,7 @@ tools/art/         the art itself: terrain, characters, props, one module each
 champions/         generated champion files (git-ignored)
 ```
 
-Where to read next: [development_plan.md](development_plan.md) for the design,
-[FINDINGS.md](FINDINGS.md) for what was measured and what deviated and why (findings
-are numbered and append-only, and source comments cite them by number), and
-[REVIEW.md](REVIEW.md) for the art pass and the outstanding rough edges.
+Where to read next: [FINDINGS.md](FINDINGS.md) for what was measured and what
+deviated and why (findings are numbered and append-only, and source comments cite
+them by number), and [AI_IMPROVEMENT_PLAN.md](AI_IMPROVEMENT_PLAN.md) for where
+the AI goes next.
