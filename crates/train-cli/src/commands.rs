@@ -622,7 +622,7 @@ pub fn train(a: &Args) -> Result<(), String> {
     // two numbers, which is exactly what it is.
     if let Some(validated) = best.validated {
         println!(
-            "held    {:.2} mean, {} of {} fixed validation episodes won{}{}",
+            "held    {:.2} mean, {} of {} fixed validation episodes won{} — see GaConfig::validation_episodes",
             validated.mean,
             validated.wins,
             validated.episodes,
@@ -630,8 +630,7 @@ pub fn train(a: &Args) -> Result<(), String> {
                 " (every one)"
             } else {
                 ""
-            },
-            " — see GaConfig::validation_episodes"
+            }
         );
     }
     println!(

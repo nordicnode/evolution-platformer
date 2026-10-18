@@ -1907,7 +1907,7 @@ impl Trainer {
     /// Cost is `validation_episodes` episodes, paid only when a record is challenged. On a
     /// deterministic level the caller does not ask at all.
     fn validate(&self, level: &Level, genome: &Genome) -> Validation {
-        let episodes = self.config.validation_episodes.min(16).max(1);
+        let episodes = self.config.validation_episodes.clamp(1, 16);
         let eval = self.config.eval_config();
         let mut sum = 0.0f32;
         let mut wins = 0u32;
