@@ -98,7 +98,7 @@ Known blind spots, evidenced in code (sensors.rs unless noted):
 2. **Version-trio discipline.** Changes to physics, sensors or fitness move a
    version and refuse every existing champion. Version-moving packages are
    batched into as few retrain windows as the measurement protocol allows
-   (Phase B and Phase D each move exactly one version; see §7).
+   (Phase B and Phase D each move exactly one version; see §8).
 3. **Determinism is a feature.** Everything stays seeded, thread-count
    independent and bit-reproducible. This rules out GPU policy evaluation
    (§6) and any library that hides its RNG.
@@ -230,9 +230,9 @@ make planning a recurring part of training, in segments small enough to learn.
   plan-mimic that cannot improvise. Where no plan exists, the term is absent
   and v10 reduces to v9.
 - **Version impact:** **fitness v9 → v10.** Batch with nothing else; the pack
-  retrains once for Phase B (§7).
+  retrains once for Phase B (§8).
 - **Gate.** 24-seed paired arms, plan-bonus vs. v9, on l11 and on one
-  switchback-style level from the battery (§8). Decayed-to-zero must be
+  switchback-style level from the battery (§9). Decayed-to-zero must be
   verified: final champions re-scored under pure v9 must not collapse.
 - **Effort:** M (3–4 days; the plan trajectory is already computed for WP4).
 - **Risk.** Reward hacking the proximity term (hovering near the plan path).
@@ -261,7 +261,7 @@ make planning a recurring part of training, in segments small enough to learn.
      form of the owner's goal, surfaced where levels are made.
 - **Version impact:** none (planner internals and presentation; plan routes
   are not champions).
-- **Gate.** Planner budget test: every pack level plus the battery (§8)
+- **Gate.** Planner budget test: every pack level plus the battery (§9)
   either solved inside the budget or reported unsolved-by-planner, with
   timings recorded in FINDINGS. Determinism test: parallel planner output
   bit-identical across thread counts, same standard as the GA's existing
@@ -325,7 +325,7 @@ make planning a recurring part of training, in segments small enough to learn.
   archive explores, it does not crown.
 - **Version impact:** none to sim/sensors/fitness arithmetic (episode start
   state is a trainer concern; validation stays spawn-started).
-- **Gate.** The deceptive battery levels (§8: pit-bait, backtrack) at 24
+- **Gate.** The deceptive battery levels (§9: pit-bait, backtrack) at 24
   seeds, episodes-matched, vs. the current detour chain. Also re-run the
   documented stall-chain protocol (24/24 with detour vs. 17 and 9 without)
   to confirm no regression in the mechanism this generalises.
@@ -380,7 +380,7 @@ than once per idea. Proposed v14 contents, each traceable to a blind spot in §1
 **Deliberately not included:** a bigger patch. The patch scan is part of the
 per-decision sensor cost and radius 4 → 6 grows it 81 → 169 cells for
 information the waypoint and object slots carry more cheaply. If a battery
-level (§8) fails specifically on patch range, revisit with that evidence.
+level (§9) fails specifically on patch range, revisit with that evidence.
 
 - **Version impact:** **sensors v13 → v14** (fitness unchanged in this
   phase). One pack retrain; FINDINGS records the new difficulty table.
@@ -409,7 +409,212 @@ level needs the capacity.
 
 ---
 
-## 7. Sequencing
+## 7. Phase E — the wow phase: discovery, mastery, showmanship
+
+Phases A–D make the AI *competent*. This phase (added at the owner's request,
+2026-10-18) aims at a different reaction: **"the AI learned how to do THAT?
+I didn't even know that was possible!"** That reaction is a design target, and
+the current system suppresses it in four specific ways:
+
+1. **It stops at the first win.** `--stop-on-win`, a 10,000-point win bonus
+   and a speed bonus worth at most 200 of it: the first sloppy solution ends
+   the run. Nothing is ever optimised, refined, or made strange.
+2. **It taxes experimentation.** −2 per jump and −20 per death teach the
+   population that the intended-looking route is the good route.
+3. **Its diversity archive cannot see technique.** MAP-Elites cells are
+   (progress × checkpoints × finish time). A genome that stomps five walkers
+   to cross a pit but finishes slower is simply a worse genome, and dies.
+4. **Its sense of "possible" is inherited from the oracle.** The route graph
+   defines which stands are reachable, and the waypoint compass steers the
+   whole population along it. Exploits live outside that envelope by
+   definition, and nothing ever looks there. Even the genius splash fires
+   only on a progress spike (>1.5× previous max), never on a new technique.
+
+The physics, meanwhile, is rich in unused trick potential: stomp bounces
+retain 0.85× jump velocity and flyers are stompable (enemies as stepping
+stones, or as a lift); springs preserve full horizontal momentum
+(sprint-spring leaps that skip stands); a wall jump is worth a full jump's
+height and the wall slide is slow enough (0.06) to line up the next one
+(sealed-shaft climbs); crumble tiles burn an 8-block fuse that can in
+principle be surfed; movers carry riders, so a jump at peak deck velocity
+inherits the carry; and coyote time (4 ticks), jump buffering (6) and the
+0.45 jump cut reward sub-tile, sub-block precision no human hits reliably.
+
+**Standing policy for this phase: tech, not bugs.** When the AI finds a
+physics quirk, the default is to catalogue it as a technique, not patch it.
+The version trio already pins champions to their physics, so a discovered
+trick stays stable and collectible. Patching is reserved for quirks that
+break determinism or make levels trivially void (e.g. leaving the world
+bounds), and each patch is a physics version bump with the cost stated.
+
+### WP11. The mastery league: don't stop at solved
+
+- **Change.** When a run strict-solves a level, it enters a second phase
+  instead of stopping (a mode, `--mastery` / panel toggle; `--stop-on-win`
+  remains for measurement runs): the population of winners keeps evolving
+  with the objective flipped to **pure time** (win first, then frames, then
+  fewest deaths as tiebreak), the jump penalty removed, and the death
+  penalty kept. Selection is among winners only; the solved champion of
+  record is never displaced by a league genome that does not also validate
+  under the strict protocol.
+- **Why.** Optimisation pressure with nothing left to spend it on except
+  speed is what produces shortcut-hunting: every frame saved has to come
+  from a better line, a braver jump, an earlier take-off.
+- **Version impact:** none — league scoring is a run mode with its own
+  recorded objective label, like the suite aggregate; the crowning fitness
+  (v9/v10) is untouched.
+- **Gate.** On three pack levels: median validated win time improves by a
+  stated margin (propose ≥10%) over the first-solve champion, and at least
+  one league champion per level uses a measurably different route (route-hop
+  sequence differs from the first solver's).
+- **Effort:** S–M (trainer mode + objective; the reporting exists).
+
+### WP12. TAS polish: a 1-tick optimiser over the champion's run
+
+- **Problem.** The policy decides every 4 ticks (`DECISION_TICKS`). Tricks
+  that need 1–3 tick precision — a take-off on the last sub-tile offset, a
+  jump cut one tick earlier, a buffered press landing inside the coyote
+  window — are inexpressible to the population, however long it evolves.
+- **Change.** A post-solve sequence optimiser (`train --tas-polish`): take
+  the validated champion's *action sequence* (not its genome), and run a
+  small CEM / coordinate search over per-block action substitutions and
+  hold-length tweaks at full 60 Hz resolution, scored purely on frames-to-
+  win with death = reject. Deterministic seeding, same as everything else;
+  the result is stored as a *route artifact* (like a plan route), never as
+  a champion genome, and labelled as machine-polished so the distinction
+  between "evolved" and "polished" stays honest in the UI.
+- **Version impact:** none (route artifacts are not champions).
+- **Gate.** On the WP11 levels: polish finds a faster route than the league
+  champion on at least one, or proves the league champion locally optimal
+  at block granularity on the others (a recorded negative is a result).
+  Any polished route must replay bit-identically from its artifact.
+- **Effort:** M (the replay machinery exists; the search is small).
+
+### WP13. Reward firsts; preserve freaks (technique archive)
+
+- **Change, in two halves that land together.**
+  1. **Extend episode stats** with the technique counters the sim already
+     half-tracks: stomps exist; add wall jumps, spring launches, crumble
+     tiles burned while stood on, max stomp chain, max airtime, peak
+     |velocity|, decks ridden (partly present via deck bonus). Stats are
+     reporting, not fitness — no version impact.
+  2. **A technique archive beside the QD archive**, keyed by technique
+     signature bins (stomps, wall jumps, spring launches, airtime), filled
+     like MAP-Elites but never culled by progress: a cell's incumbent is
+     the genome that did the *most* of that technique, full stop. Plus a
+     **firsts bonus in league/discovery scoring only** (never in the
+     crowning fitness): the first genome in a run to achieve a technique
+     first (first stomp chain ×3, first sprint-spring launch, first
+     crumble surf across ≥3 tiles) gets a one-generation rarity spotlight —
+     bred from as a fine parent for a few generations, win or lose.
+- **Why.** Real exploit lineages start as useless tricks. The main search
+  will always kill them for slowness; something has to keep them alive
+  until a later mutation weaponises them. This also builds the raw
+  material for a skill library: mastered technique demonstrations,
+  extracted from archive incumbents, reusable as WP4 segment seeds on new
+  levels — the AI visibly *remembering* a trick is its own wow.
+- **Version impact:** none (stats + archive are trainer/reporting).
+- **Gate.** Instrumentation first: run the current default on the pack and
+  record how often each technique occurs at all (the baseline may be near
+  zero for stomps-as-transport — that is the finding, either way). Then:
+  technique-archive runs must produce at least one validated champion
+  whose route uses a technique the baseline population never produced, on
+  at least one battery/pack level.
+- **Effort:** M (stats plumbing through `EpisodeStats` consumers is the
+  bulk; the archive is a second instance of an existing pattern).
+
+### WP14. Hunt tricks on purpose: oracle-defying search + shortcut hunter
+
+- **Change.**
+  1. **Oracle-defying search.** A diagnostic-turned-tool (`train
+     --trick-hunt <level>`): beam search over sim snapshots (the WP6
+     anytime planner's machinery) with *non-goal* objectives — max height,
+     max airtime, max speed, ground-free distance — and a standing target
+     list: every stand the reachability oracle marked **unreachable**.
+     Any trajectory that reaches one, or beats the oracle's assumed jump
+     envelope (height/carry from `physics.rs` derivations), is saved as a
+     replayable *discovery artifact* with the trajectory attached.
+  2. **Shortcut hunter.** For every validated champion (and every TAS
+     route), diff its route-hop sequence against the level's intended
+     route graph: stands skipped, hops bypassed, order violations. Report
+     a skip percentage and the first skipped stand. Runs automatically at
+     the end of a mastery run (WP11) and inside `bench`.
+- **Why.** This converts luck into a search: instead of hoping evolution
+  stumbles outside the oracle's envelope, aim a search directly at the
+  envelope's edge. The shortcut percentage is also the most communicable
+  number the game produces ("the AI skipped 40% of your level").
+- **Version impact:** none.
+- **Gate.** Trick hunt across pack + battery inside the WP6 planner budget
+  per level: every discovery artifact replays bit-identically, and every
+  claimed envelope violation is re-derived against the physics constants
+  before it is recorded (no false "impossible" headlines).
+- **Effort:** M (objectives and diffing are new; the search is WP6's).
+
+### WP15. Style championships: constraints breed alien solutions
+
+- **Change.** Alongside the champion of record, per-level *style titles*,
+  each a constrained run seeded from the champion population: **Fastest**
+  (WP11's league winner), **Fewest jumps**, **No sprint**, **No wall
+  jump**, **Stomp-only crossings** (crossings of gaps ≥3 tiles must begin
+  with a stomp), **Minimalist** (fewest total inputs). Constraints are
+  enforced as action masks / scoring rules recorded on the artifact; a
+  title is awarded only to a strict-validated winner under its constraint.
+  The level's shelf card grows a gallery: up to six solutions, each a
+  replay.
+- **Why.** Banning the obvious tool is the most reliable trick-invention
+  machine there is — it is how speedrun categories generate tech — and a
+  gallery of different solutions is a better show than one champion.
+- **Version impact:** none (constraints are run configuration, recorded
+  on the artifact like the net shape already is).
+- **Gate.** On two pack levels, at least three titles each are won by
+  routes whose hop sequences pairwise differ. A title nobody can win is
+  retired or re-scoped, in writing.
+- **Effort:** M (masks are easy; the gallery UI is the real cost — the
+  shelf and replay machinery exist to extend).
+
+### WP16. Show the discovery (presentation — owner decisions)
+
+Half the wow is noticing. Packages:
+
+1. **Discovery detector + naming.** A classifier over champion/league
+   trajectories detects technique firsts and envelope violations (from
+   WP13/WP14 data) and fires the presentation below. Names are generated
+   from a small grammar over (mechanic, effect): *Springboard Skip*,
+   *Corpse Bridge* (stomp chain), *Fusesurf*, *Shaft Requiem* — a fixed
+   hand-written table, not a language model; names must be stable per
+   discovery so players can talk about them.
+2. **The moment.** On a discovery during a watched run: slow-motion
+   replay of the trajectory segment, the intended route drawn faintly
+   underneath the found route, the discovery's name and one line of
+   explanation ("crossed the pit on three walkers — the oracle said this
+   gap needed the mover"). The existing genius splash is the shell; this
+   replaces its progress-only trigger for technique events.
+3. **Trick codex.** A per-level (and global) journal page: techniques
+   discovered, by whom (which run), replay attached, plus the shortcut
+   percentage history. Filling the codex is a collection goal the player
+   pursues by building levels that provoke discoveries.
+4. **"Break my level" mode.** The player picks a level; the system's
+   stated job is to find the skip, the cheese, the unintended route —
+   WP14's hunt + WP11's league, presented as a report: intended route,
+   found route, skip %, discoveries, replays. This is level-design QA as
+   entertainment, and every discovery it makes feeds WP13's archive.
+5. **"Can you do THAT?"** From any discovery replay, a playtest challenge:
+   the player attempts the trick with the AI's ghost running beside them
+   (the ghost machinery already races champions in playtest).
+
+- **Version impact:** none.
+- **Gate.** The fun gate, extended: a watcher who has never seen the game
+  should be able to say what the AI discovered, unprompted, after one
+  mastery run. If they can only say "it got better", the presentation
+  failed even if the search succeeded.
+- **Effort:** M–L (detector + codex + mode; mostly window work).
+- **Owner decisions:** discovery naming tone, whether Break-my-level runs
+  automatically after a solve or only on request, and whether TAS-polished
+  routes (WP12) may appear in the codex beside evolved ones (labelled).
+
+---
+
+## 8. Sequencing
 
 ```
 Phase A (WP1–WP3)          no versions move; land any time, each behind its arm
@@ -422,12 +627,19 @@ Phase C (WP9 early,        no versions move; WP7/WP8 judged at equal episodes;
         │                  with WP4's segment machinery
 Phase D (WP10 = v14)       sensors v13 → v14 → ONE pack retrain; last, so the
                            perception retrain is not repeated for B or C
+Phase E (WP11–WP16)        no versions move; WP11/WP12 need only a level that
+                           solves, so they can start as soon as Phase A's
+                           arms land; WP13 pairs with WP7's diversity work;
+                           WP14 rides on WP6's anytime planner; WP15 after
+                           WP11; WP16 last (it presents what the others find)
 ```
 
 Retrain windows: exactly two in the whole plan (fitness v10, sensors v14).
 If WP5's gate fails, its window disappears and Phase D's is the only one.
+Phase E adds no window: league scoring, technique stats, constraints and
+polish all live outside the crowning fitness and the sensor vector.
 
-## 8. The adversarial battery (build before Phase B's gate can run)
+## 9. The adversarial battery (build before Phase B's gate can run)
 
 The pack (l1–l11) does not contain levels that isolate the skills this plan
 claims to add. Author one small level per skill, each verified solvable by
@@ -447,7 +659,7 @@ a battery level the current system already solves tests nothing:
 The battery joins the difficulty table as a permanent regression gate: every
 future default change reports pack + battery together.
 
-## 9. What this plan deliberately does not do
+## 10. What this plan deliberately does not do
 
 - **Full NEAT / topology evolution.** No evidence capacity binds: AI_REVIEW's
   h32 arm was *worse* on l9, and the repo's own capacity arm found no gain.
@@ -461,7 +673,7 @@ future default change reports pack + battery together.
   the same silicon on diversity instead of duplicates.
 - **GPU training.** See §6. The 1660 Super is the renderer's card.
 
-## 10. Success criteria for the plan as a whole
+## 11. Success criteria for the plan as a whole
 
 1. **l11-the-elements falls to an evolved, validated champion** inside WP4's
    stated budget. This is the plan's headline and its first gate.
@@ -476,3 +688,10 @@ future default change reports pack + battery together.
    configuration, WP7's islands excepted (judged at equal episodes).
 5. Every claim above recorded in FINDINGS.md under the §2 protocol — or the
    package that promised it is retired, in writing, in the same place.
+6. **The wow criterion (Phase E):** across pack + battery, the system produces
+   at least three verified discoveries — a route that skips ≥1 intended hop,
+   a trajectory that reaches an oracle-unreachable stand or beats the jump
+   envelope, or a technique-first (WP13) that no baseline run produced — each
+   replayable bit-identically from its artifact and each surfaced to a
+   watcher through WP16's presentation. A discovery nobody is shown does
+   not count.
