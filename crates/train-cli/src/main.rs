@@ -82,6 +82,7 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         "reach" => commands::reach(&args),
         "replay" => commands::replay(&args),
         "score" => commands::score(&args),
+        "shortcut" => commands::shortcut(&args),
         "play" => commands::play(&args),
         "render" => commands::render(&args),
         "sensors" => commands::sensors(&args),
@@ -122,6 +123,7 @@ COMMANDS:
               generation, speed control, pause, death markers, genius splash (M3).
     reach     Check that a level is beatable in principle (jump-reachability oracle).
     replay    Re-simulate a saved champion and confirm it reproduces its trajectory.
+    shortcut  Diff a champion's route against the level's intended route (WP14).
     score     Score a saved champion on one level or a suite of them: what one policy
               actually does on each, which is the read a suite's claim has to survive.
     play      Play a level yourself with the keyboard, in the terminal.
@@ -185,6 +187,26 @@ TRAIN OPTIONS:
     --fine-children <N>   Offspring per generation bred by perturbing only one to three
                           genes of the generation's best genome (a step) rather than the
                           ~86 genes a normal child moves (a jump). 0 disables.  [default 8]
+    --jump-timing-share <F>
+                          Share of those fine children aimed at the jump-decision genes alone
+                          (the output rows that draw "press now"), so a near-miss at a ledge
+                          gets a child with the take-off moved rather than a redrawn input
+                          weight. 0.5 is the plan's arm; 0 is the shipped search and the
+                          default until the 24-seed measurement lands.        [default 0.0]
+    --mastery             After the record solves the level, keep evolving in a second phase that
+                          ranks **winners by the clock** (the jump penalty is gone; the crowned
+                          fitness still selects and validates the champion). `--stop-on-win`
+                          remains the way to stop at the first solve for a measurement run.
+    --polish              **Refine a champion's output layer instead of training.** Reads the
+                          genome from --from-champion, freezes every hidden gene, and runs a
+                          small CEM over the last layer's weights and biases — the 187 genes
+                          that draw the action boundaries a run is usually stuck on. Writes
+                          <level>-polished.json; a candidate that does not still win every
+                          held-out episode is reported and not written.
+    --polish-generations <N>
+                          CEM generations for --polish.                     [default 30]
+    --polish-batch <N>    Candidates per generation.                         [default 32]
+    --polish-sigma <S>    Initial CEM step, in gene units.                  [default 0.08]
     --stagnation <N>      Generations without a new best before the population is given a
                           shake. 0 disables.                                [default 20]
     --immigrants <N>      How many arrive when that happens. They are **reheated copies of
@@ -376,9 +398,9 @@ WATCH OPTIONS:
     --frames <N>          Stop after N rendered frames (always on when headless).[default 6]
     --headless            Plain text frames, no keyboard. Implied without a TTY.
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
-    --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --stagnation,
-    --immigrants, --archive-children, --reheat-factor, --elite, --tournament, --crossover,
-    --action-repeat, --feedback, --hidden, --rank-pessimism, --trials
+    --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --jump-timing-share,
+    --mastery, --stagnation, --immigrants, --archive-children, --reheat-factor, --elite,
+    --tournament, --crossover, --action-repeat, --feedback, --hidden, --rank-pessimism, --trials
                           As for `train`.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
     --curriculum-generations <N>
@@ -459,6 +481,14 @@ REPLAY OPTIONS:
     --champion <PATH>     Champion JSON to replay.                      [required]
     --level <PATH>        Level it was trained on; omitted = infer from name.
     --frames <N>          Render up to N ASCII frames of the replay.
+
+SHORTCUT OPTIONS:
+    --champion <PATH>     Champion JSON whose route to diff.            [required]
+    --level <PATH>        Level to trace it on (default: the one matching its hash).
+    --levels-dir <DIR>    Directory the hash is looked up in.            [default levels]
+    --seed <N>            Episode seed; defaults to the champion's recorded episode.
+                          Prints the intended route, the stands the body used, and the
+                          percentage of the route it skipped. A report, not a score.
 
 SCORE OPTIONS:
     --champion <PATH>     Champion JSON to score.                       [required]

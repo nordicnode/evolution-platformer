@@ -72,6 +72,8 @@ const WATCH_OPTS: &[&str] = &[
     "tournament",
     "crossover",
     "fine-children",
+    "jump-timing-share",
+    "mastery",
     "stagnation",
     "immigrants",
     "reheat-factor",
@@ -200,7 +202,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
         return finish_champion(&mut screen, &level, &champion);
     }
 
-    let cfg = GaConfig {
+    let mut cfg = GaConfig {
         pop_size,
         elite: usage(a.usize_opt("elite", 4))?,
         tournament: usage(a.usize_opt("tournament", 4))?,
@@ -213,6 +215,11 @@ pub fn watch(a: &Args) -> Result<(), String> {
         ))?),
         mutation_sigma: usage(a.f32_opt("mut-sigma", 0.30))?,
         fine_children: usage(a.usize_opt("fine-children", 8))?,
+        jump_timing_share: usage(a.f32_opt(
+            "jump-timing-share",
+            GaConfig::default().jump_timing_share,
+        ))?,
+        mastery: a.has_flag("mastery"),
         adaptive_sigma: if a.has_flag("adaptive-sigma") {
             true
         } else {
@@ -265,6 +272,12 @@ pub fn watch(a: &Args) -> Result<(), String> {
         master_seed: usage(a.u64_opt("seed", 1))?,
         ..GaConfig::default()
     };
+    let auto_shape = evo::apply_auto_shape(
+        &mut cfg,
+        std::slice::from_ref(&level),
+        a.opt("feedback").is_some(),
+        a.opt("rank-pessimism").is_some(),
+    );
     live.mut_rate = cfg.mutation_rate;
 
     println!(
@@ -287,6 +300,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
         evo::FITNESS_VERSION,
         oracle_line(&level)
     );
+    if let Some(auto) = &auto_shape {
+        println!("auto    {}", auto.line());
+    }
 
     // A run started from a checkpoint is the plan's "restart from where it got
     // stuck": the population, its genome ids (part of every episode seed) and the

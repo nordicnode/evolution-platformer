@@ -57,8 +57,8 @@ use sim::Level;
 
 use crate::fitness::{self, EpisodeResult, EvalConfig};
 use crate::genome::{
-    crossover, default_shape, mutate, mutate_few, reheat, Genome, NetShape, MAX_FEEDBACK,
-    MAX_HIDDEN_LAYERS, MAX_HIDDEN_WIDTH,
+    crossover, default_shape, mutate, mutate_few, mutate_jump_timing, reheat, Genome, NetShape,
+    MAX_FEEDBACK, MAX_HIDDEN_LAYERS, MAX_HIDDEN_WIDTH,
 };
 
 /// GA hyperparameters (§7.5). Populated with the plan's v1 values.
@@ -80,6 +80,36 @@ pub struct GaConfig {
     /// genome: one to [`FINE_GENE_MAX`] genes, against the coarse
     /// `mutation_rate × n_genes` a normal child gets. 0 disables the second scale.
     pub fine_children: usize,
+    /// The share of [`GaConfig::fine_children`] bred with
+    /// [`crate::genome::mutate_jump_timing`] instead of [`mutate_few`].
+    ///
+    /// A fine child is a local step; this makes half of them a local step **in the one
+    /// direction crossings actually fail in**. The jump-timing operator moves only the output
+    /// rows and biases of the actions that hold jump — the genes that draw the boundary between
+    /// "keep running" and "press now" — so a lineage that reaches a ledge and presses a tick
+    /// early gets a child that tries the same approach with a different boundary, instead of a
+    /// child that redraws one of ninety-six input weights and keeps the boundary. The two scales
+    /// are complementary: the plain fine children still explore the approach, and these polish
+    /// its timing.
+    ///
+    /// **`0.0` is the shipped default, deliberately.** Finding 53's operator is now part of the
+    /// main search, and `0.5` is the arm the plan proposes measuring against it — but the project's
+    /// own ground rule is that a default does not move on fewer than 24 paired seeds, and that arm
+    /// has not been run. Shipping the half share unmeasured also moved an existing measured claim:
+    /// with timing children in every run, a random population on `l2-first-gap` caught the warm
+    /// start's median, and the warm-start regression test refuses that. So the mechanism is wired,
+    /// `--jump-timing-share 0.5` is the arm, and the default stays the bit-identical pre-WP1 search
+    /// until the arm says otherwise.
+    pub jump_timing_share: f32,
+    /// **The mastery league** (WP11): once the run's record has solved the level, keep evolving
+    /// and rank the winners by the clock instead of by the crowned fitness.
+    ///
+    /// The crowning fitness is untouched — a champion is still selected, validated and recorded
+    /// under the scored objective — so a league genome can only earn a place by being *faster on a
+    /// winning episode*, not by scoring better on a near-miss. Before the record solves, the run
+    /// is an ordinary run, which is what stops a mastery flag from changing how a level is first
+    /// learned. `false` reproduces every pre-WP11 run bit for bit.
+    pub mastery: bool,
     /// The fine scale's **step**, as a multiple of [`GaConfig::mutation_sigma`]. `0.25` at the
     /// shipped sigma is 0.075, which is the size a "fine" child was always meant to be.
     ///
@@ -386,6 +416,8 @@ impl Default for GaConfig {
             mutation_rate: 0.05,
             crossover_rate: 0.75,
             fine_children: 8,
+            jump_timing_share: 0.0,
+            mastery: false,
             fine_sigma_scale: 0.25,
             archive_children: 0,
             archive_on_diversity: false,
@@ -500,6 +532,9 @@ impl GaConfig {
         // A *fraction* of the run's step, so above 1.0 would mean a "fine" child that moves
         // further than a coarse one — a different search wearing the same name.
         self.fine_sigma_scale = self.fine_sigma_scale.clamp(0.0, 1.0);
+        // A share, not a count: above one would breed more jump-timing children than there are
+        // fine slots, and the budget already belongs to `fine_children`.
+        self.jump_timing_share = self.jump_timing_share.clamp(0.0, 1.0);
         // A record comparison, not a training run: past sixteen episodes it is measuring a level's
         // patrol distribution rather than two genomes, and the cost stops being a rounding error.
         self.validation_episodes = self.validation_episodes.min(16);
@@ -1294,6 +1329,38 @@ fn selection_scores(
         .collect()
 }
 
+/// The mastery league's selection score (WP11): winners on the clock, everyone else on progress.
+///
+/// The two halves exist because a league is a *second* search, not a second objective. A genome
+/// that has not reached the flag still has to be able to climb toward it, or the population loses
+/// the ability to recover from a mutation that breaks a winning route. So an unsolved episode is
+/// scored on the progress the v9 terms already measure, **without the jump penalty** — mastery is
+/// supposed to reward bravery, and every jump a faster line needs would otherwise be a cost. A
+/// solved episode is scored above every unsolved one by construction, and among winners the only
+/// thing left to buy is time: the score falls linearly with the fraction of the budget spent, so
+/// one frame is always worth the same and the tie-break is the clock itself.
+///
+/// It is deliberately **not** a fitness version: this number selects and is never recorded. The
+/// champion file keeps the crowned fitness, and a league genome replaces the record only by
+/// passing the same validation as any other candidate.
+pub fn league_score(r: &EpisodeResult, budget_frames: u32) -> f32 {
+    if r.won() {
+        // Twice the crowning goal bonus: no near-miss, however much ground it covered, can
+        // outrank a win. The speed half is the only term that differs between winners.
+        let budget = budget_frames.max(1) as f32;
+        let spent = r.frames.min(budget_frames) as f32;
+        20_000.0 + 5_000.0 * (1.0 - spent / budget)
+    } else {
+        let mut score = r.progress_pixels;
+        score += r.checkpoints as f32 * crate::fitness::CHECKPOINT_BONUS;
+        score += r.route_hops_closed as f32 * crate::fitness::ROUTE_HOP_BONUS;
+        if r.outcome == sim::Outcome::Died {
+            score += crate::fitness::DEATH_PENALTY;
+        }
+        score
+    }
+}
+
 /// What a genome is worth to a ranking that does not trust a mean: `mean + k × (floor - mean)`.
 ///
 /// `k` is [`GaConfig::rank_pessimism`], and the two ends of it are the two honest answers to "how
@@ -1555,6 +1622,9 @@ pub struct Trainer {
     /// module maintains in one place, and a front-end that shows a ghost beside a time is
     /// therefore showing the same episode twice rather than two different ones.
     fastest_agent: Option<BestEver>,
+    /// Whether the last generation was ranked by the **mastery league** (WP11): the record was
+    /// solved and [`GaConfig::mastery`] is on, so the winners are being ordered by frames.
+    mastery_active: bool,
 }
 
 impl Trainer {
@@ -1582,6 +1652,7 @@ impl Trainer {
             archive: MapElitesArchive::new(),
             fastest: None,
             fastest_agent: None,
+            mastery_active: false,
         }
     }
 
@@ -1647,6 +1718,7 @@ impl Trainer {
             archive: MapElitesArchive::new(),
             fastest: None,
             fastest_agent: None,
+            mastery_active: false,
         })
     }
 
@@ -1859,6 +1931,12 @@ impl Trainer {
         self.last_max
     }
 
+    /// Is the run in its **mastery league** (WP11)? True once the record has solved the level and
+    /// the config asked for it; from then on winners are ranked by the clock.
+    pub fn mastery_active(&self) -> bool {
+        self.mastery_active
+    }
+
     /// Next genome id that will be handed out. Exposed so a test can assert that
     /// every id ever issued was distinct on first sight.
     pub fn next_id(&self) -> u32 {
@@ -2013,8 +2091,23 @@ impl Trainer {
         // a plain run is bit-identical to one from before either field existed. Everything
         // *recorded* — the chart, the champion, every number in `REVIEW.md` — reads `results`, so a
         // ranking knob can change what is bred and never what is claimed.
-        let selection: Vec<f32> = if self.config.novelty_weight > 0.0 || self.config.rank_pessimism > 0.0
-        {
+        // **The mastery league** (WP11). It arms only once the *record* has solved the level, so a
+        // flagged run learns the level exactly as it always did and then changes what it is
+        // optimising for — the plan's "enter a second phase instead of stopping". Winners are then
+        // ranked by frames; the crowned fitness in `results` is untouched, which is what keeps the
+        // champion a claim about the level rather than about the league.
+        let league = self.config.mastery
+            && self
+                .best_ever
+                .as_ref()
+                .is_some_and(|b| b.result.solved());
+        self.mastery_active = league;
+        let selection: Vec<f32> = if league {
+            results
+                .iter()
+                .map(|r| league_score(r, budget_frames))
+                .collect()
+        } else if self.config.novelty_weight > 0.0 || self.config.rank_pessimism > 0.0 {
             selection_scores(
                 &levels[0],
                 &results,
@@ -2378,13 +2471,25 @@ impl Trainer {
         if fine > 0 {
             let best_slot = ranking[0];
             let best_fitness = self.genomes[best_slot].fitness;
-            for _ in 0..fine {
+            // The timing half of the fine budget. Rounded, so a `--fine-children 8` at the
+            // default share is exactly four of each rather than a coin flip; capped at `fine`
+            // because the share is a fraction of this generation's slots, not of the config.
+            let timing = ((fine as f32) * self.config.jump_timing_share).round() as usize;
+            let timing = timing.min(fine);
+            for slot in 0..fine {
                 let mut child = self.genomes[best_slot].clone();
                 let genes = 1 + (next_f32(&mut self.rng) * FINE_GENE_MAX as f32) as usize;
                 // The **fine** step, not the coarse one: a fine child is local in count *and* in
                 // size (see `GaConfig::fine_sigma_scale`), which is what makes it a step from a
-                // lineage rather than a re-roll of three of its genes.
-                mutate_few(&mut child, genes, fine_sigma, &mut self.rng);
+                // lineage rather than a re-roll of three of its genes. The first `timing` slots
+                // aim that step at the jump-decision genes alone; the rest keep the whole
+                // genome's fine step. Both draw the same RNG stream, so `share = 0` reproduces
+                // the pre-WP1 search exactly.
+                if slot < timing {
+                    child = mutate_jump_timing(&child, genes, fine_sigma, &mut self.rng);
+                } else {
+                    mutate_few(&mut child, genes, fine_sigma, &mut self.rng);
+                }
                 child.id = self.next_id;
                 child.fitness = 0.0;
                 child.shape = shape.clone();
@@ -3309,6 +3414,59 @@ mod tests {
         assert!((half[1] - 70.0).abs() < 1e-4, "{:?}", half[1]);
     }
 
+    /// **The league ranks winners on the clock and never taxes a jump.**
+    ///
+    /// Built rather than run, like the pessimism fixture: the arithmetic is the whole claim. A
+    /// winner always outranks a near-miss however far the near-miss got; between winners the faster
+    /// episode wins; and two unsolved episodes that differ only in jump count score the same,
+    /// which is what "mastery removes the jump penalty" means.
+    #[test]
+    fn the_mastery_league_trades_the_crown_for_the_clock() {
+        let budget = 1_000;
+        let fast = EpisodeResult {
+            outcome: sim::Outcome::Won,
+            frames: 300,
+            ..episode(11_000.0)
+        };
+        let slow = EpisodeResult {
+            outcome: sim::Outcome::Won,
+            frames: 700,
+            ..episode(11_000.0)
+        };
+        let far = EpisodeResult {
+            outcome: sim::Outcome::Running,
+            progress_pixels: 5_000.0,
+            ..episode(5_000.0)
+        };
+        assert!(league_score(&fast, budget) > league_score(&slow, budget));
+        assert!(
+            league_score(&far, budget) < league_score(&slow, budget),
+            "a near-miss cannot outrank a win"
+        );
+        assert!(
+            (league_score(&fast, budget) - league_score(&slow, budget)).abs() > 1.0,
+            "the clock has to be worth more than a rounding error"
+        );
+
+        // Jumps are not a term: two identical unsolved episodes, one hopping constantly, score
+        // exactly the same.
+        let calm = EpisodeResult {
+            jumps: 0,
+            progress_pixels: 120.0,
+            ..episode(120.0)
+        };
+        let hoppy = EpisodeResult {
+            jumps: 40,
+            progress_pixels: 120.0,
+            ..episode(120.0)
+        };
+        assert_eq!(league_score(&calm, budget), league_score(&hoppy, budget));
+
+        // And a plain run is not in the league: the flag is off by default and the selection path
+        // only reaches `league_score` when both it and a solved record hold.
+        assert!(!GaConfig::default().mastery);
+    }
+
     /// **`won` is one episode; `solved` is all of them.** The distinction the trial rule exists for,
     /// made on a tally rather than on a run so the arithmetic is checkable by eye.
     ///
@@ -4158,6 +4316,60 @@ mod tests {
             .filter(|c| gene_distance(&best, c) == 0)
             .count();
         assert!(copies > 0, "a zero-rate coarse child must be a copy of a parent");
+    }
+
+    /// **The timing share spends its fine slots on the jump boundary and nothing else.**
+    ///
+    /// With the share at 1 every fine child is a `mutate_jump_timing` child, so every gene
+    /// outside [`crate::genome::jump_timing_slots`] has to be the best genome's, bit for bit.
+    /// This is what makes the operator a *targeted* step rather than a fourth kind of noise: it
+    /// can only move the output rows and biases that decide when a jump begins.
+    #[test]
+    fn a_full_jump_timing_share_moves_only_the_jump_decision_genes() {
+        let level = flat_level();
+        let cfg = GaConfig {
+            pop_size: 32,
+            elite: 2,
+            fine_children: 6,
+            jump_timing_share: 1.0,
+            mutation_rate: 0.0,
+            crossover_rate: 0.0,
+            adaptive_sigma: false,
+            stagnation_generations: 0,
+            master_seed: 33,
+            ..GaConfig::default()
+        };
+        let mut t = Trainer::new(cfg.clone());
+        t.step(&level);
+
+        let best = &t.genomes[0];
+        let slots = crate::genome::jump_timing_slots(&best.shape);
+        assert!(!slots.is_empty(), "the shipped net has jump decisions");
+        let gene = |g: &Genome, i: usize| {
+            if i < g.weights.len() {
+                g.weights[i]
+            } else {
+                g.biases[i - g.weights.len()]
+            }
+        };
+        for slot in cfg.elite..cfg.elite + cfg.fine_children {
+            let child = &t.genomes[slot];
+            for i in 0..best.n_genes() {
+                if slots.contains(&i) {
+                    continue;
+                }
+                assert_eq!(
+                    gene(child, i),
+                    gene(best, i),
+                    "fine child in slot {slot} moved gene {i}, which is not a jump-decision \
+                     gene: a timing child may only move the boundary it was aimed at"
+                );
+            }
+            assert!(
+                (1..=FINE_GENE_MAX).contains(&gene_distance(best, child)),
+                "a timing child is still a fine step (slot {slot})"
+            );
+        }
     }
 
     #[test]

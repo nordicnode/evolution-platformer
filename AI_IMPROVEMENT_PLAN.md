@@ -18,10 +18,48 @@ blocked and 2.5× faster bit-identically, sensors v13 gave the policy a clock, a
 `sim::plan` is a model-based teacher. This plan does not repeat that roadmap. It
 starts from what those changes exposed and aims at the owner's goal above.
 
-**Status of this document:** plan only. No code in this plan has been implemented
-or measured yet, except where a number is explicitly cited from AI_REVIEW.md or
-FINDINGS.md. Every work package carries the measurement that would justify — or
-kill — it.
+**Status of this document:** plan plus a first implementation pass (2026-10-18).
+Six packages have code and tests; none of their gates have been measured yet, and
+no measurement below is claimed. §0.1 lists exactly what landed and what is still
+parked. Every work package keeps the measurement that would justify — or kill — it.
+
+### 0.1 What has landed (2026-10-18), and what has not
+
+Landed, with unit/integration tests and no version moves:
+
+- **WP1 — jump-timing children in breeding.** `GaConfig::jump_timing_share` splits the
+  fine-child budget between `mutate_few` and `mutate_jump_timing` (`ga.rs`), recorded in
+  `TrainingSummary`. **The shipped default is 0.0**, not the plan's proposed 0.5: with
+  timing children on, a random population caught the warm start on `l2-first-gap` and
+  `tests/imitate.rs` refused the regression. The mechanism is wired and
+  `--jump-timing-share 0.5` is the arm; the default waits for its 24-seed gate.
+- **WP2 — auto-shape from the level scan.** `evo::autoshape` raises feedback to 16 on
+  turrets, movers, vents, flyers or cracked ground, and sets rank pessimism 0.5 on
+  patrol levels; it never overrides an explicit flag, only raises memory, and prints
+  its reasons in the run header. Wired into `train`, `watch` and the window's `Lab`.
+- **WP3 — the thinking dial.** `THINKING = [1, 4, 16, 64]` on the run panel: one request
+  computes that many generations and queues the last, so the worker still never runs
+  more than one request past the screen. **Best-of-N restarts are not implemented**;
+  the dial is the generations-per-screen half only.
+- **WP9 — CEM output-layer polish.** `evo::polish` + `train --polish` (with
+  `--from-champion`): mirrored CEM over the last layer's weights and biases, hidden
+  genes frozen, judged on fixed seeds, certified only on a separate held-out set, and
+  written as `<level>-polished.json` rather than over its input.
+- **WP11 — the mastery league.** `--mastery`: once the record solves, selection ranks
+  winners by the clock (`ga::league_score`, jump penalty removed for unsolved
+  episodes); the crowned fitness still selects, validates and writes the champion.
+- **WP14 — the shortcut hunter (second half only).** `evo::shortcut` + `train-cli
+  shortcut`: replay the champion's own episode, record the route stands it actually
+  used, diff against the graph's intended route, and print the skipped percentage and
+  first skipped stand. The non-goal *trick hunt* search is not implemented.
+
+Parked, in the plan's own order: **WP4** (segment distillation), **WP5** (planner-guided
+fitness v10), **WP6** (anytime planner, solver ghost, editor verdict), **WP7** (islands),
+**WP8** (snapshot archive), **WP10** (sensors v14), **WP12** (TAS polish), **WP13**
+(technique stats/archive), **WP15** (style championships), **WP16** (presentation), and
+the §9 battery levels. They are not stubs: each needs either a retrain window (WP5,
+WP10), a trainer restructure (WP7, WP8), or authored-and-verified levels (the battery),
+and shipping a shallow version would make the plan's gates unreadable rather than met.
 
 ---
 

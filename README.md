@@ -156,6 +156,21 @@ be started in one front-end and resumed in the other:
 ./target/release/train-cli score --champion champions/l2-first-gap-suite.json \
     --suite levels/l2-first-gap.json,levels/l5-tightrope.json,levels/l9-wait-and-climb.json
 
+# The mastery league: once the record solves, keep evolving with the objective flipped to the
+# clock. The crowned fitness still selects and validates the champion; the league only changes
+# what the next generation is bred toward, and the jump penalty is gone for unsolved lines.
+./target/release/train-cli train --level levels/l3-gauntlet.json --mastery --generations 500
+
+# Post-solve polish: a small CEM over the champion's output layer alone (187 genes), every
+# hidden gene frozen, judged on fixed seeds and certified only on a held-out set it did not
+# train on. Writes <level>-polished.json; never replaces the file it started from.
+./target/release/train-cli train --level levels/l3-gauntlet.json \
+    --from-champion champions/l3-gauntlet.json --polish
+
+# What did a champion skip? Replays its own recorded episode, records the route stands it
+# actually stood on, and diffs that against the graph's intended route.
+./target/release/train-cli shortcut --champion champions/l3-gauntlet.json
+
 # Where a run starts. `--resume` continues a **population** checkpoint (the artifact a stall
 # writes); `--from-champion` starts a new population around one saved **genome** — the champion
 # in slot 0 and a shell of reheated copies of it behind. The second is what to reach for when a

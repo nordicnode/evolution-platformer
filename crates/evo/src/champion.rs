@@ -204,6 +204,16 @@ pub struct TrainingSummary {
     /// version trio with the message that explains why instead of as malformed JSON.
     #[serde(default)]
     pub fine_children: usize,
+    /// Share of the fine children bred with the jump-timing operator (WP1). Defaulted to 0.0 for
+    /// a file written before the operator existed: that run had none, and claiming half would
+    /// describe a search it did not run.
+    #[serde(default)]
+    pub jump_timing_share: f32,
+    /// Whether the run entered the **mastery league** after its record solved the level (WP11).
+    /// Defaulted to `false` for a file written before the mode existed: that run ranked on the
+    /// crowned fitness throughout, which is what "no league" means.
+    #[serde(default)]
+    pub mastery: bool,
     /// Whether the run tuned its own mutation size. Defaulted to `false`, which is the
     /// conservative reading: a file that does not say cannot claim the extra search.
     #[serde(default)]
@@ -239,6 +249,8 @@ impl From<&GaConfig> for TrainingSummary {
             crossover_rate: c.crossover_rate,
             master_seed: c.master_seed,
             fine_children: c.fine_children,
+            jump_timing_share: c.jump_timing_share,
+            mastery: c.mastery,
             adaptive_sigma: c.adaptive_sigma,
             stagnation_generations: c.stagnation_generations,
             immigrants: c.immigrants,
@@ -649,6 +661,8 @@ mod tests {
             .expect("training_config is an object");
         for field in [
             "fine_children",
+            "jump_timing_share",
+            "mastery",
             "adaptive_sigma",
             "stagnation_generations",
             "immigrants",
@@ -668,6 +682,8 @@ mod tests {
         // four honest zeros, and a reheat temperature of 1.0 — the factor the random source was
         // replaced with, where 0.0 would claim a run configured to reheat at the sigma floor.
         assert_eq!(run.fine_children, 0);
+        assert_eq!(run.jump_timing_share, 0.0);
+        assert!(!run.mastery);
         assert!(!run.adaptive_sigma);
         assert_eq!(run.stagnation_generations, 0);
         assert_eq!(run.immigrants, 0);

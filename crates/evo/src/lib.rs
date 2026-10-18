@@ -10,6 +10,7 @@
 //! This crate depends on `sim` and nothing else from the workspace. It contains
 //! no rendering and no terminal I/O.
 
+pub mod autoshape;
 pub mod champion;
 pub mod curriculum;
 pub mod es;
@@ -17,9 +18,13 @@ pub mod fitness;
 pub mod ga;
 pub mod genome;
 pub mod imitate;
+pub mod polish;
 pub mod population;
 pub mod route_play;
+pub mod shortcut;
 
+pub use autoshape::{apply as apply_auto_shape, scan as scan_level_shape, AutoShape};
+pub use polish::{polish, output_slots, PolishConfig, PolishReport};
 pub use champion::{
     check_reproducibility, ChampionFile, ChampionMetadata, NetworkSpec, TrainingSummary,
     CHAMPION_FORMAT, CHAMPION_VERSION,
@@ -46,6 +51,7 @@ pub use imitate::{
     ImitationReport,
 };
 pub use route_play::{replay, timed_play, Decision, RoutePlay};
+pub use shortcut::{intended_route, trace as trace_shortcut, ShortcutReport};
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///

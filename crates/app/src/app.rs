@@ -1422,6 +1422,9 @@ impl EvoApp {
         if actions.speed != 0 {
             self.apply(Command::Speed(actions.speed));
         }
+        if actions.thinking != 0 {
+            self.apply(Command::Thinking(actions.thinking));
+        }
         // Not a command: the window itself is what this one opens.
         if actions.details {
             self.details_open = !self.details_open;
@@ -1498,6 +1501,17 @@ impl EvoApp {
                     replay.speed = lab::step_speed(replay.speed, step > 0);
                 } else {
                     self.view.speed = lab::step_speed(self.view.speed, step > 0);
+                }
+            }
+            Command::Thinking(step) => {
+                self.view.thinking = lab::step_thinking(self.view.thinking, step > 0);
+                // The run's own rate of thought, not the view's: the worker reads it on the
+                // next request, so a turn of the dial is visible from the next generation on.
+                if let Some(lab) = &mut self.lab {
+                    lab.set_thinking(self.view.thinking);
+                    // Read back rather than trust the rung: `set_thinking` clamps, and the
+                    // panel's reading should describe the search the worker will actually run.
+                    self.view.thinking = lab.thinking();
                 }
             }
             Command::MutationRate(rate) => {

@@ -315,6 +315,8 @@ pub struct ViewState {
     pub paused: bool,
     /// Physics ticks per 1/60 s of wall clock (see `lab::SPEEDS`).
     pub speed: u32,
+    /// Generations computed per generation displayed (see `lab::THINKING`, WP3).
+    pub thinking: u32,
     /// Per-gene mutation probability, always one of `lab::MUTATION_RATES`.
     pub mutation_rate: f32,
     pub show_deaths: bool,
@@ -335,6 +337,7 @@ impl Default for ViewState {
         ViewState {
             paused: false,
             speed: crate::lab::DEFAULT_SPEED,
+            thinking: crate::lab::DEFAULT_THINKING,
             mutation_rate: MUTATION_RATES[1],
             show_deaths: true,
             follow: false,
@@ -369,6 +372,8 @@ pub enum Command {
     Scrub(i32),
     /// One rung of the speed ladder: +1 faster, -1 slower.
     Speed(i32),
+    /// One rung of the thinking ladder: +1 more generations per screen, -1 fewer.
+    Thinking(i32),
     /// Dial the mutation rate, in rungs of the ladder.
     MutationRate(f32),
 }
@@ -393,6 +398,8 @@ pub struct Actions {
     /// One rung of the speed ladder: +1 faster, -1 slower. Reported rather than applied, so a
     /// button on the panel and the `+`/`-` keys reach the run through one command.
     pub speed: i32,
+    /// One rung of the thinking ladder (WP3), reported to the window like [`Actions::speed`].
+    pub thinking: i32,
     /// Open or close the Details window.
     ///
     /// The one request a panel makes that is not about the run: both panels carry the row, because
@@ -699,6 +706,64 @@ pub fn pace_step(rung: usize, up: bool) -> i32 {
     }
 }
 
+/// One rung of a ladder, or `0` at an end — the rule both steppers share.
+///
+/// Pure and generic over the ladder's length, so the thinking dial's ends are a test rather
+/// than a button a viewer can press to learn nothing happened.
+fn ladder_step(rung: usize, len: usize, up: bool) -> i32 {
+    if up {
+        if rung + 1 < len {
+            1
+        } else {
+            0
+        }
+    } else if rung > 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// The thinking stepper: `− 16× +`, one rung of [`crate::lab::THINKING`].
+///
+/// Same shape and same end behaviour as [`pace_row`], because it is the same kind of control —
+/// a ladder the viewer walks one rung at a time, with both plates refusing at the ends. The
+/// reading is in *generations per displayed generation* rather than in ticks per second: it is
+/// a rate of thought, not of playback, and calling it `16x` beside the pace's `8x` would invite
+/// the reading that the game runs twice as fast.
+fn thinking_row(ui: &mut egui::Ui, atlas: Option<&Atlas>, current: u32) -> i32 {
+    use crate::lab::THINKING;
+    let mut step = 0;
+    let rung = THINKING
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, rung)| rung.abs_diff(current))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    ui.horizontal(|ui| {
+        let down = ladder_step(rung, THINKING.len(), false);
+        if ui::icon_button(ui, atlas, None, "\u{2212}", SPEED_STEP, false, down != 0)
+            .on_hover_text("think less between frames")
+            .clicked()
+        {
+            step = down;
+        }
+        reading(
+            ui,
+            format!("{}x", THINKING[rung]),
+            "generations per screen",
+        );
+        let up = ladder_step(rung, THINKING.len(), true);
+        if ui::icon_button(ui, atlas, None, "+", SPEED_STEP, false, up != 0)
+            .on_hover_text("think more between frames: the run computes this many generations per one you watch")
+            .clicked()
+        {
+            step = up;
+        }
+    });
+    step
+}
+
 fn speed_rung(speed: u32) -> usize {
     SPEEDS
         .iter()
@@ -878,6 +943,12 @@ pub fn lab_panel(
     // the Details window was a setting a person had to know was there; the keys reached it, but a
     // key is not a control, and the number was two hundred points from the menu it belonged to.
     actions.speed = pace_row(ui, atlas, view.speed, "the pace it plays at");
+    // The second dial beside the first, and deliberately next to it: both answer "how much
+    // happens between frames", one in pixels and one in search. A viewer who has just turned
+    // the pace up because a run was slow to watch can turn thinking up for the same reason and
+    // get *better* generations rather than merely faster ones.
+    ui.add_space(4.0);
+    actions.thinking = thinking_row(ui, atlas, view.thinking);
 
     // --- what to do about it ----------------------------------------------
     section(ui, "The controls");
@@ -2811,5 +2882,25 @@ mod tests {
         let idle = draw_panel(&summary, &mut view);
         assert_eq!(idle.speed, 0);
         assert_eq!(view.speed, SPEEDS[speed_rung(view.speed)]);
+    }
+
+    /// The thinking dial is the pace stepper's twin: same one-rung-at-a-time rule, same refusal
+    /// at the ends, and it reports rather than applying.
+    #[test]
+    fn the_thinking_dial_walks_its_ladder_and_stops_at_the_ends() {
+        use crate::lab::THINKING;
+        assert_eq!(ladder_step(0, THINKING.len(), false), 0);
+        assert_eq!(ladder_step(0, THINKING.len(), true), 1);
+        assert_eq!(ladder_step(THINKING.len() - 1, THINKING.len(), true), 0);
+        assert_eq!(ladder_step(THINKING.len() - 1, THINKING.len(), false), -1);
+        assert_eq!(THINKING[0], 1, "the default is still one generation at a time");
+
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
+        let summary = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        let mut view = ViewState::default();
+        assert!(THINKING.contains(&view.thinking), "the default is a rung");
+        assert_eq!(view.thinking, crate::lab::DEFAULT_THINKING);
+        let idle = draw_panel(&summary, &mut view);
+        assert_eq!(idle.thinking, 0, "a panel at rest asks for no step");
     }
 }

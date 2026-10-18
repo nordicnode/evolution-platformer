@@ -7,10 +7,10 @@ use std::time::Instant;
 use evo::champion::replay as replay_champion;
 use evo::ga::MUTATION_SIGMA_RANGE;
 use evo::{
-    curriculum_step, from_plan, from_route, practice_level_for_stall, practice_step,
-    save_practice_level, warm_population, ChampionFile, EsConfig, EsTrainer, EvalConfig, GaConfig,
-    ImitateConfig, ImitationReport, PopulationFile, RoutePlay, Trainer,
-    DEFAULT_CURRICULUM_GENERATIONS, FITNESS_VERSION,
+    curriculum_step, from_plan, from_route, polish, practice_level_for_stall, practice_step,
+    run_episode, save_practice_level, warm_population, ChampionFile, EsConfig, EsTrainer,
+    EvalConfig, GaConfig, ImitateConfig, ImitationReport, PolishConfig, PopulationFile, RoutePlay,
+    Trainer, DEFAULT_CURRICULUM_GENERATIONS, FITNESS_VERSION,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use sim::physics::{AgentAction, PHYSICS};
@@ -33,6 +33,12 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "action-repeat",
     "fine-children",
     "fine-sigma-scale",
+    "jump-timing-share",
+    "mastery",
+    "polish",
+    "polish-generations",
+    "polish-batch",
+    "polish-sigma",
     "validation-episodes",
     "no-validation",
     "stagnation",
@@ -90,6 +96,7 @@ const ES_OPTS: &[&str] = &[
 const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose", "timed", "seed"];
 const REPLAY_OPTS: &[&str] = &["champion", "level", "levels-dir"];
 const SCORE_OPTS: &[&str] = &["champion", "level", "suite", "levels-dir", "seed"];
+const SHORTCUT_OPTS: &[&str] = &["champion", "level", "levels-dir", "seed"];
 const PLAY_OPTS: &[&str] = &["level", "seed"];
 const RENDER_OPTS: &[&str] = &["level", "steps", "stride", "action", "seed"];
 const SENSORS_OPTS: &[&str] = &[];
@@ -101,6 +108,103 @@ pub(crate) fn usage<T>(r: Result<T, ParseError>) -> Result<T, String> {
 
 pub(crate) fn load_level(path: &str) -> Result<Level, String> {
     Level::from_json_file(path)
+}
+
+/// `train --polish`: refine one champion's output layer without touching the rest of its brain.
+///
+/// The champion is the *seed* (`--from-champion`) and the level is the claim it is judged against,
+/// so this goes through [`ChampionFile::load_for_level`] rather than `load_seed`: a polish that
+/// ranked a genome on a level it was not trained on would be measuring an untested claim. The
+/// result is written as `<level>-polished.json`, never over the input: the file the polish started
+/// from is the evidence that it improved something, and replacing it at the moment the comparison
+/// matters is the silent-replacement failure this file's training path already refuses.
+fn polish_champion(
+    a: &Args,
+    level: &Level,
+    level_path: &str,
+    out_dir: &str,
+    quiet: bool,
+) -> Result<(), String> {
+    if a.opt("suite").is_some() {
+        return Err("usage: --polish refines one champion on one level; it does not take --suite"
+            .into());
+    }
+    let seed_path = a.opt("from-champion").ok_or_else(|| {
+        "usage: --polish reads the genome from --from-champion <path>; a polish without a champion \
+         is a training run wearing the wrong name"
+            .to_string()
+    })?;
+    let champ = ChampionFile::load_for_level(seed_path, level)?;
+    let genome = champ.to_genome()?;
+    let mut cfg = PolishConfig {
+        generations: usage(a.usize_opt("polish-generations", 30))? as u32,
+        batch: usage(a.usize_opt("polish-batch", 32))?,
+        sigma: usage(a.f32_opt("polish-sigma", 0.08))?,
+        master_seed: usage(a.u64_opt("seed", 1))?,
+        trials: usage(a.usize_opt("trials", 3))? as u32,
+        action_repeat: champ.metadata.action_repeat,
+        ..PolishConfig::default()
+    };
+    cfg = cfg.sanitized();
+    // The held-out set is deliberately *not* `cfg.seeds()`: a candidate ranked on seeds it was
+    // also certified on would pass by construction. A different salt and a fresh count is the
+    // cheapest honest split, and it is the same standard `--stop-on-validated` applies.
+    let held_out = usage(a.usize_opt("validation-episodes", 8))? as u32;
+    let validate: Vec<u64> = (0..held_out.max(1))
+        .map(|i| {
+            cfg.master_seed
+                .wrapping_mul(0xD1B5_4A32_D192_ED03)
+                .wrapping_add(i as u64 + 1)
+        })
+        .collect();
+
+    if !quiet {
+        println!(
+            "polish  {} on {} (cadence {})",
+            seed_path, level.name, cfg.action_repeat
+        );
+        println!(
+            "cem     {} generations  batch {}  sigma {:.3}  trials {}  held out {}",
+            cfg.generations, cfg.batch, cfg.sigma, cfg.trials, validate.len()
+        );
+    }
+    let started = Instant::now();
+    let report = polish(level, &genome, cfg, &validate);
+    let secs = started.elapsed().as_secs_f64();
+
+    match &report.genome {
+        Some(polished) => {
+            let eval = EvalConfig {
+                action_repeat: cfg.action_repeat,
+            };
+            let result = run_episode(level, polished, &eval, validate[0]);
+            let mut ga_cfg = GaConfig {
+                action_repeat: cfg.action_repeat,
+                ..GaConfig::default()
+            };
+            ga_cfg.shape = polished.shape.clone();
+            let file = ChampionFile::new(
+                polished,
+                &result,
+                level,
+                champ.metadata.generation,
+                &ga_cfg,
+            );
+            let stem = Path::new(level_path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| level.name.clone());
+            let out = Path::new(out_dir).join(format!("{stem}-polished.json"));
+            file.save(&out)?;
+            println!("{}", report.note);
+            println!("wrote {} ({:.1} s)", out.display(), secs);
+        }
+        None => {
+            println!("{}", report.note);
+            println!("nothing written ({:.1} s)", secs);
+        }
+    }
+    Ok(())
 }
 
 fn parse_action(name: &str) -> Result<AgentAction, String> {
@@ -148,6 +252,12 @@ pub fn train(a: &Args) -> Result<(), String> {
     let generations = usage(a.usize_opt("generations", 30))?;
     let out_dir = a.string("out", "champions");
     let quiet = a.has_flag("quiet");
+    // **The post-solve polish** (WP9): a separate, smaller search over the champion's output
+    // layer, run before the GA loop would start. It takes the genome from `--from-champion`,
+    // because a polish without a champion is a training run wearing the wrong name.
+    if a.has_flag("polish") {
+        return polish_champion(a, &level, &level_path, &out_dir, quiet);
+    }
     let stop_on_win = a.has_flag("stop-on-win");
     // The stricter stop: the *record* has to be solved on its held-out set, not merely a generation
     // solved on its own three patrol phases. See `GenerationReport::record_solved`.
@@ -202,7 +312,16 @@ pub fn train(a: &Args) -> Result<(), String> {
         None => None,
     };
 
-    let cfg = train_config(a)?;
+    let mut cfg = train_config(a)?;
+    // **The level tells the trainer what brain it needs** (WP2): a timed mechanic raises the
+    // feedback width, a patrol level raises the pessimism, and an explicit flag is never
+    // overridden. The header prints the answer and its reasons below.
+    let auto_shape = evo::apply_auto_shape(
+        &mut cfg,
+        &levels,
+        a.opt("feedback").is_some(),
+        a.opt("rank-pessimism").is_some(),
+    );
     // What the header prints, when the header prints the *shape* of the search space: the
     // trainer's own clamps applied first, because a header that quotes `--hidden 1000` while the
     // run trains at 64 would be exactly the sort of number this file's comments exist to prevent.
@@ -240,6 +359,15 @@ pub fn train(a: &Args) -> Result<(), String> {
             shown.shape.label(),
             rank_label(shown.rank_pessimism)
         );
+        if let Some(auto) = &auto_shape {
+            println!("auto    {}", auto.line());
+        }
+        if cfg.mastery {
+            println!(
+                "league  mastery armed: once the record solves, winners are ranked by the clock \
+                 (the crowned fitness still picks the champion)"
+            );
+        }
         // The episode budget is per level and comes from the trainer's own rule (three patrol
         // phases where a level has walkers, one where it does not), so a suite prints what each
         // level actually costs rather than the flag's single number.
@@ -1015,6 +1143,8 @@ pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
         mutation_sigma: usage(a.f32_opt("mut-sigma", default.mutation_sigma))?,
         crossover_rate: usage(a.f32_opt("crossover", default.crossover_rate))?,
         fine_children: usage(a.usize_opt("fine-children", default.fine_children))?,
+        jump_timing_share: usage(a.f32_opt("jump-timing-share", default.jump_timing_share))?,
+        mastery: a.has_flag("mastery"),
         // How big the fine scale's step is, as a fraction of `--mut-sigma`. A fine child moves one
         // to three genes, so it is local in count; this is what makes it local in size too. See
         // `GaConfig::fine_sigma_scale` — the archive's children use the same step.
@@ -1628,6 +1758,58 @@ pub(crate) fn find_level_by_hash(dir: &str, hash: &str) -> Result<Option<Level>,
 /// with, so a level with walkers in it is judged on three patrol phases: a policy that solves a
 /// patrol on one phase and dies on the next has not solved the level, and this is the command
 /// where that would otherwise be the easiest thing to hide.
+/// `shortcut`: what a champion skipped relative to the level's intended route (WP14).
+///
+/// A report, never a score. The episode is the champion's own — its recorded seed, its cadence —
+/// so "this route skipped 40% of your level" is a statement about the run the file describes, not
+/// about a second simulation with a different clock.
+pub fn shortcut(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(SHORTCUT_OPTS))?;
+    let champion_path = usage(a.required_path("champion"))?;
+    let raw = fs::read_to_string(&champion_path)
+        .map_err(|e| format!("cannot read {champion_path}: {e}"))?;
+    let champion =
+        ChampionFile::from_json_str(&raw).map_err(|e| format!("{champion_path}: {e}"))?;
+    let genome = champion.to_genome()?;
+    // The level is resolved by hash first, for the same reason `score` does: a renamed level is
+    // still the level the policy was fitted to, while a hand-named one may not be.
+    let level = match a.opt("level") {
+        Some(path) => load_level(path)?,
+        None => find_level_by_hash(
+            &a.string("levels-dir", "levels"),
+            &champion.metadata.level_hash,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "no level in {} matches this champion's hash; name one with --level",
+                a.string("levels-dir", "levels")
+            )
+        })?,
+    };
+    champion.check_compat(&level)?;
+    let eval = EvalConfig {
+        action_repeat: champion.metadata.action_repeat,
+    };
+    let seed = usage(a.u64_opt("seed", champion.metadata.episode_seed))?;
+    let report = evo::trace_shortcut(&level, &genome, &eval, seed);
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!("route   {} hops: {:?}", report.intended.len().saturating_sub(1), report.intended);
+    println!("walked  {:?}", report.visited);
+    println!("skipped {:?}", report.skipped);
+    println!("{}", report.note);
+    if report.won {
+        println!(
+            "shortcut {:.0}%{}",
+            report.skip_percent(),
+            report
+                .first_skipped
+                .map(|s| format!(", first skipped stand {s}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 pub fn score(a: &Args) -> Result<(), String> {
     usage(a.reject_unknown(SCORE_OPTS))?;
     let champion_path = usage(a.required_path("champion"))?;
