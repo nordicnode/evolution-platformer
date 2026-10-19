@@ -96,6 +96,10 @@ const EDIT: &[Key] = &[
         keys: "V",
         what: "watch the run's best agent",
     },
+    Key {
+        keys: "M",
+        what: "sound on or off",
+    },
 ];
 
 /// The playtest's keys: the same physics and the same action set the evolution sees.
@@ -135,6 +139,10 @@ const PLAY: &[Key] = &[
     Key {
         keys: "F",
         what: "fit the whole level in the window",
+    },
+    Key {
+        keys: "M",
+        what: "sound on or off",
     },
     Key {
         keys: "P  /  Esc",
@@ -232,6 +240,10 @@ const REPLAY: &[Key] = &[
     Key {
         keys: "K",
         what: "the trick codex — what this level has produced",
+    },
+    Key {
+        keys: "M",
+        what: "sound on or off",
     },
     Key {
         keys: "V  /  P  /  E  /  Esc",

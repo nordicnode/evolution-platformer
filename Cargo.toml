@@ -151,6 +151,10 @@ eframe = { version = "0.32", default-features = false, features = [
 ] }
 egui = "0.32"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Sound: the game synthesises every effect in code (no audio assets), and rodio
+# is the pipe to the speakers. Default features off where they can be: no mp3 or
+# wav decoding is needed for tones generated sample by sample.
+rodio = { version = "0.20", default-features = false }
 
 # Training is a tight numeric loop; keep release fat.
 [profile.release]

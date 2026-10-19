@@ -42,6 +42,7 @@ mod panel;
 mod play;
 mod replay;
 mod shelf;
+mod sound;
 mod splash;
 mod theme;
 mod ui;

@@ -225,6 +225,10 @@ pub struct Replay {
     pub paused: bool,
     /// Physics ticks per 1/60 s of wall clock. Opens at [`REAL_TIME`].
     pub speed: u32,
+    /// The star's ears (`crate::sound`). Only the star is heard: a field of
+    /// thirty ghosts jumping at once is a noise, and the star is the episode
+    /// being watched.
+    star_ear: crate::sound::Ear,
 }
 
 impl Replay {
@@ -311,6 +315,7 @@ impl Replay {
             ghosts: true,
             paused: false,
             speed: REAL_TIME,
+            star_ear: crate::sound::Ear::new(),
         })
     }
 
@@ -337,6 +342,9 @@ impl Replay {
         for anim in &mut self.anims {
             *anim = AgentAnim::new();
         }
+        if let Some(star) = self.runners.first() {
+            self.star_ear.reset(star.sim());
+        }
         self.carry = 0.0;
         self.ticks = 0;
         self.paused = false;
@@ -352,7 +360,12 @@ impl Replay {
         let whole = self.carry.floor();
         self.carry -= whole;
         let ticks = whole.max(0.0) as u32;
-        for (runner, anim) in self.runners.iter_mut().zip(self.anims.iter_mut()) {
+        for (index, (runner, anim)) in self
+            .runners
+            .iter_mut()
+            .zip(self.anims.iter_mut())
+            .enumerate()
+        {
             let mut stepped = 0u32;
             for _ in 0..ticks {
                 // A finished episode holds its last frame while the agents still running
@@ -362,6 +375,12 @@ impl Replay {
                 }
                 runner.step();
                 stepped += 1;
+                if index == 0 {
+                    // The star is heard at the replay's own speed: at 8x its
+                    // jumps are 8x as frequent, which is the honest sound of
+                    // watching at 8x.
+                    self.star_ear.observe(runner.sim(), 0.9);
+                }
             }
             // Simulated time, not wall clock: a dead ghost's dust settles instead of
             // drifting for as long as the slowest agent in the field keeps going.

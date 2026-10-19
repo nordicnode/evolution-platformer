@@ -277,7 +277,10 @@ impl Splash {
         // The champion's level *is* this level: `check_compat` refuses a file whose level
         // hash is not this document's, so the picture and the editor are looking at the same
         // terrain, which is the point of playing the run's own agent at the front door.
-        let session = play::Session::new(level, run.seed);
+        let mut session = play::Session::new(level, run.seed);
+        // The demo plays the game at the viewer; it does not play its sounds at
+        // them. Menu keys still blip (see `show`), the running does not.
+        session.set_audible(false);
         Splash {
             level: level.clone(),
             session,
@@ -292,7 +295,8 @@ impl Splash {
     /// The screen with no champion to play: the splash's own level, and its script.
     pub fn scripted() -> Splash {
         let level = level();
-        let session = play::Session::new(&level, SEED);
+        let mut session = play::Session::new(&level, SEED);
+        session.set_audible(false);
         Splash {
             level,
             session,
@@ -513,6 +517,9 @@ impl Splash {
         });
         match pressed {
             Pressed::Move(next) => {
+                if next != self.selected {
+                    crate::sound::play(crate::sound::Sfx::MenuMove, 1.0);
+                }
                 self.selected = next;
                 None
             }

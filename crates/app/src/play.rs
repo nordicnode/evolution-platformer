@@ -126,6 +126,9 @@ struct Ghost {
     spec: GhostSpec,
     anim: AgentAnim,
     visible: bool,
+    /// The ghost's ears: it is heard (jump, stomp, the flag) at a lower gain
+    /// than the player, because it is company in the race, not the racer.
+    ear: crate::sound::Ear,
 }
 
 /// One playtest of one level.
@@ -165,6 +168,14 @@ pub struct Session {
     /// squash are advanced by, so the legs move with the drawn body rather than with the frames that
     /// happen to carry a tick (see [`Session::advance_actions`]).
     anim_clock: f32,
+    /// The player's ears: what each tick did, turned into sound
+    /// (`crate::sound`). Silent when `audible` is false.
+    ear: crate::sound::Ear,
+    /// Whether this session makes sound at all. A playtest does; the title
+    /// screen's demo session does not (a menu that plays the game at you is
+    /// showing off, and it can stay quiet about it), so the splash builds its
+    /// session and then mutes it with [`Session::set_audible`].
+    audible: bool,
     /// The quickest *playthrough* that has touched the flag in this session, if any.
     ///
     /// The player's own record, kept for the reason the run keeps the AI's ([`FastWin`]): a
@@ -189,8 +200,16 @@ impl Session {
             prev_ghost: None,
             render_alpha: 0.0,
             anim_clock: 0.0,
+            ear: crate::sound::Ear::new(),
+            audible: true,
             best: None,
         }
+    }
+
+    /// Whether this session makes sound. See the `audible` field: the one
+    /// caller that wants silence is the title screen's demo.
+    pub fn set_audible(&mut self, audible: bool) {
+        self.audible = audible;
     }
 
     /// Where to **draw** the body this frame: between the last two physics ticks, by however
@@ -256,11 +275,13 @@ impl Session {
     pub fn restart(&mut self, level: &Level) {
         let clock = self.clock;
         let best = self.best;
+        let audible = self.audible;
         let spec = self.ghost.as_ref().map(|g| g.spec.clone());
         let visible = self.ghost.as_ref().map(|g| g.visible).unwrap_or(true);
         *self = Session::new(level, self.seed);
         self.clock = clock;
         self.best = best;
+        self.audible = audible;
         if let Some(spec) = spec {
             self.attach_ghost(spec);
             if let Some(ghost) = &mut self.ghost {
@@ -293,6 +314,7 @@ impl Session {
             spec,
             anim: AgentAnim::new(),
             visible: true,
+            ear: crate::sound::Ear::new(),
         });
     }
 
@@ -438,6 +460,7 @@ impl Session {
     /// keys, and a held key is the same action on every tick of the frame.
     pub fn advance_actions(&mut self, dt: f32, mut decide: impl FnMut(&Sim) -> AgentAction) {
         self.clock += dt;
+        let audible = self.audible;
         self.accumulator += dt.min(MAX_CATCHUP);
         let mut stepped = 0u32;
         while self.accumulator >= TICK {
@@ -452,6 +475,9 @@ impl Session {
             }
             let action = decide(&self.sim);
             self.sim.step(action);
+            if audible {
+                self.ear.observe(&self.sim, 1.0);
+            }
             // The ghost runs on the player's ticks, not on its own clock: one AI
             // tick per player tick is what keeps the two episodes on the same time, at
             // any frame rate. A finished ghost holds its ground — it reached the flag
@@ -459,6 +485,9 @@ impl Session {
             if let Some(ghost) = &mut self.ghost {
                 if !ghost.runner.is_finished() {
                     ghost.runner.step();
+                    if audible {
+                        ghost.ear.observe(ghost.runner.sim(), 0.35);
+                    }
                 }
             }
             stepped += 1;

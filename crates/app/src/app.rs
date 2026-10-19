@@ -474,6 +474,10 @@ impl EvoApp {
         // The window's own look, installed once: every panel, button and slider after this
         // line draws itself in the game's palette rather than egui's stock one.
         theme::apply(ctx);
+        // Sound starts with the window: the device opens once here and every
+        // effect after this is a `crate::sound::play` away. A machine with no
+        // audio device leaves the game silent rather than unstarted.
+        crate::sound::init();
         let atlas = Atlas::load(ctx, &assets)?;
         let sprites = Sprites::load(&atlas)?;
 
@@ -1248,6 +1252,13 @@ impl EvoApp {
         // answers — "what can I press here?" — is the same question in all four.
         if ctx.input(|i| i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1)) {
             self.help_open = !self.help_open;
+        }
+        // Sound on/off. Not in the evolution view: there M already means the
+        // mutation rate, and one key with two jobs is a bug report waiting to
+        // be filed. The sounds themselves are synthesised in `crate::sound`;
+        // this is only the switch.
+        if self.mode != Mode::Evolve && ctx.input(|i| i.key_pressed(egui::Key::M)) {
+            crate::sound::toggle_mute();
         }
         // **The codex (WP16).** Loaded when the page is opened rather than every frame: it is a
         // file, and a window that re-read it at 60 Hz would be a disk read per frame to show the
@@ -4193,6 +4204,7 @@ impl EvoApp {
             // repaints only on input would show a frozen runner to somebody deciding.
             ctx.request_repaint();
             if let Some(action) = action {
+                crate::sound::play(crate::sound::Sfx::MenuConfirm, 1.0);
                 self.splash = None;
                 // The door leads where the sign says: the two keys the title screen names
                 // enter the activity they name instead of dropping the viewer into the

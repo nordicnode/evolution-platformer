@@ -17,6 +17,7 @@ render.workspace = true
 # The trainer's own thread pool, sized to leave the window a core to draw with
 # (see `lab::training_threads`). The *work* is `evo`'s; this is only the pool.
 rayon.workspace = true
+rodio.workspace = true
 eframe.workspace = true
 egui.workspace = true
 image.workspace = true
