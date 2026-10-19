@@ -334,12 +334,27 @@ pub const DECK_BONUS: f32 = 16.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvalConfig {
     pub action_repeat: u32,
+    /// **Item 5's early cut, in physics ticks of no progress.** `0` is off, and that is the
+    /// default because the cut is an evaluation policy rather than a rule of the game.
+    ///
+    /// A body whose own no-progress counter has reached this many frames is ended early and
+    /// scored on the episode it actually played. Every term in [`score`] is monotone or one-shot
+    /// (progress, best x, checkpoints, hops, decks) and nothing pays per frame, so the reading is
+    /// the reading of the played part; a body that *can* still escape would have scored more by
+    /// playing on, which is exactly why the knob is off until an arm measures the saving on the
+    /// pack and a pinned wall-stander shows the score is unchanged where the claim is made.
+    ///
+    /// Not part of any version: a cut episode's score is a score this build already gives, the
+    /// trajectory hash covers the ticks that were played, and a champion is recorded from an
+    /// uncut replay.
+    pub cut_stuck_frames: u32,
 }
 
 impl Default for EvalConfig {
     fn default() -> Self {
         EvalConfig {
             action_repeat: ACTION_REPEAT,
+            cut_stuck_frames: 0,
         }
     }
 }
@@ -483,6 +498,10 @@ pub struct EpisodeResult {
     /// What ended a dying episode, when the stepper recorded one. Diagnostics only: it is not
     /// scored and not part of the trajectory hash.
     pub death_cause: Option<sim::DeathCause>,
+    /// **Item 5: this episode was ended by the no-progress cut**, not by the sim. Diagnostics
+    /// only, like `death_cause`: not scored, not hashed, and `false` on every run that leaves the
+    /// knob at its default.
+    pub cut_early: bool,
     pub seed: u64,
     /// Hash of the decision trace and final state. Champion round-trip tests
     /// compare this, so a replay that diverges anywhere is caught.
@@ -521,10 +540,18 @@ pub struct EpisodeRunner {
     scratch: ActScratch,
     action: AgentAction,
     repeat: u32,
+    /// The next tick a decision is due. Constant `repeat` for a headless genome, and the head's
+    /// choice (1, 2, 4 or 8) for one that carries a commitment output (Item 12).
+    next_decision: u32,
     seed: u64,
     trace: StateHasher,
     iterations: u32,
     guard: u32,
+    /// Item 5: end the episode after this many no-progress frames (see
+    /// [`EvalConfig::cut_stuck_frames`]); `0` never cuts.
+    cut_stuck_frames: u32,
+    /// Whether this episode was ended by that cut rather than by the sim.
+    cut: bool,
 }
 
 impl EpisodeRunner {
@@ -540,10 +567,13 @@ impl EpisodeRunner {
             scratch: ActScratch::new(),
             action: AgentAction::Walk,
             repeat,
+            next_decision: 0,
             seed,
             trace: StateHasher::new(),
             iterations: 0,
             guard,
+            cut_stuck_frames: cfg.cut_stuck_frames,
+            cut: false,
         }
     }
 
@@ -559,10 +589,13 @@ impl EpisodeRunner {
             scratch: ActScratch::new(),
             action: AgentAction::Walk,
             repeat,
+            next_decision: 0,
             seed,
             trace: StateHasher::new(),
             iterations: 0,
             guard,
+            cut_stuck_frames: cfg.cut_stuck_frames,
+            cut: false,
         }
     }
 
@@ -584,25 +617,47 @@ impl EpisodeRunner {
         &self.genome
     }
 
-    /// One physics tick. Queries the network every `action_repeat` ticks.
+    /// One physics tick. Queries the network when the current commitment has run out.
+    ///
+    /// With no cadence head the commitment is always [`EvalConfig::action_repeat`], so this is
+    /// exactly the old `frames % repeat == 0` rule. With a head (Item 12) the decision also
+    /// chooses how long it holds, and 4 — the shipped cadence — is what the head's zero value
+    /// encodes, which is what makes the migrated policy bit-identical before it is trained.
     pub fn step(&mut self) {
         if self.is_finished() {
             return;
         }
         let frames = self.sim.stats().frames;
-        if frames % self.repeat == 0 {
-            self.action = self.genome.act(&self.sim.observation(), &mut self.scratch);
+        if frames >= self.next_decision {
+            if self.genome.shape.commitment {
+                let (action, ticks) = self
+                    .genome
+                    .act_with_commitment(&self.sim.observation(), &mut self.scratch);
+                self.action = action;
+                self.next_decision = frames + ticks.max(1);
+            } else {
+                self.action = self.genome.act(&self.sim.observation(), &mut self.scratch);
+                self.next_decision = frames + self.repeat;
+            }
             self.trace.u32(frames);
             self.trace.u8(self.action.index() as u8);
         }
 
         self.sim.step(self.action);
         self.iterations += 1;
+        // Item 5: the sim's own no-progress counter is the timer the plan names, and the cut is
+        // read from it so "stuck" has one definition. A finished outcome is never overridden.
+        if self.cut_stuck_frames > 0
+            && !self.sim.outcome().is_finished()
+            && self.sim.stats().no_progress_frames >= self.cut_stuck_frames
+        {
+            self.cut = true;
+        }
     }
 
-    /// The episode ended, or the safety guard fired.
+    /// The episode ended, was cut short, or the safety guard fired.
     pub fn is_finished(&self) -> bool {
-        self.sim.outcome().is_finished() || self.iterations >= self.guard
+        self.cut || self.sim.outcome().is_finished() || self.iterations >= self.guard
     }
 
     /// The action currently being held.
@@ -647,6 +702,7 @@ impl EpisodeRunner {
             all_trials_won: outcome == Outcome::Won,
             death_pos: stats.death_pos,
             death_cause: self.sim.death_cause(),
+            cut_early: self.cut,
             seed: self.seed,
             trajectory_hash: self.trace.finish(),
         }
@@ -659,12 +715,7 @@ impl EpisodeRunner {
 ///
 /// The loop is deliberately dumb: decide every `action_repeat` ticks, step once
 /// per tick, no accumulator, no wall-clock.
-pub fn run_episode(
-    level: &Level,
-    genome: &Genome,
-    cfg: &EvalConfig,
-    seed: u64,
-) -> EpisodeResult {
+pub fn run_episode(level: &Level, genome: &Genome, cfg: &EvalConfig, seed: u64) -> EpisodeResult {
     let mut runner = EpisodeRunner::new(level, genome.clone(), cfg, seed);
     while !runner.is_finished() {
         runner.step();
@@ -692,12 +743,8 @@ pub fn run_episode_from_snapshot_sim(
     seed: u64,
     snapshot: &Sim,
 ) -> (EpisodeResult, Sim) {
-    let mut runner = EpisodeRunner::from_snapshot(
-        genome.clone(),
-        cfg,
-        seed,
-        snapshot.restart_from_snapshot(),
-    );
+    let mut runner =
+        EpisodeRunner::from_snapshot(genome.clone(), cfg, seed, snapshot.restart_from_snapshot());
     while !runner.is_finished() {
         runner.step();
     }
@@ -736,8 +783,8 @@ pub fn run_episode_guided(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genome::{default_shape, Genome};
     use crate::fitness::EpisodeRunner;
+    use crate::genome::{default_shape, Genome};
     use sim::physics::AgentAction;
     use sim::rng::rng_from_seed;
     use sim::EpisodeStats;
@@ -784,11 +831,7 @@ mod tests {
         }
     }
 
-    fn stats_with_checkpoints(
-        checkpoints: u32,
-        progress_pixels: f32,
-        frames: u32,
-    ) -> EpisodeStats {
+    fn stats_with_checkpoints(checkpoints: u32, progress_pixels: f32, frames: u32) -> EpisodeStats {
         EpisodeStats {
             checkpoints,
             ..stats(progress_pixels, frames)
@@ -828,7 +871,10 @@ mod tests {
         let mut rng = rng_from_seed(3);
         let g = Genome::random(1, default_shape(), &mut rng);
         for repeat in [1u32, 3, 4, 6, 16] {
-            let cfg = EvalConfig { action_repeat: repeat };
+            let cfg = EvalConfig {
+                action_repeat: repeat,
+                cut_stuck_frames: 0,
+            };
             let whole = run_episode(&level, &g, &cfg, 5);
             let mut runner = EpisodeRunner::new(&level, g.clone(), &cfg, 5);
             while !runner.is_finished() {
@@ -999,6 +1045,67 @@ mod tests {
         crate::fixture::gap_runway("fitness-pit-fixture", 40, 38, &[(16, 3)])
     }
 
+    /// Item 5's hard rule, on the level the rule is about: a body that walks into a wall and
+    /// stands there cannot earn another point, so cutting its episode early must score exactly
+    /// what playing it out scores — and must cost fewer frames.
+    #[test]
+    fn the_no_progress_cut_scores_a_wall_stander_exactly_as_the_full_episode_does() {
+        let rows = [
+            "............",
+            "............",
+            "............",
+            "......#.....",
+            "......#.....",
+            "......#.....",
+            "############",
+            "############",
+        ];
+        let level = crate::fixture::level(
+            "fitness-wall-stander",
+            &rows,
+            (1, 5),
+            &[("goal", 10, 5)],
+        );
+        // The all-zero genome runs right and stops against the wall: no jump, no climb.
+        let genome = Genome::zeros(0, default_shape());
+
+        let full = EvalConfig {
+            action_repeat: 4,
+            cut_stuck_frames: 0,
+        };
+        let cut = EvalConfig {
+            action_repeat: 4,
+            cut_stuck_frames: 60,
+        };
+        let played = run_episode(&level, &genome, &full, 5);
+        let ended = run_episode(&level, &genome, &cut, 5);
+
+        assert!(
+            ended.cut_early,
+            "the wall-stander has to trip the cut for this test to say anything"
+        );
+        assert!(!played.cut_early, "the control never cuts");
+        assert_eq!(
+            ended.fitness.to_bits(),
+            played.fitness.to_bits(),
+            "the cut changed the score: {} against {}",
+            ended.fitness,
+            played.fitness
+        );
+        assert_eq!(ended.best_x.to_bits(), played.best_x.to_bits());
+        assert_eq!(
+            ended.progress_pixels.to_bits(),
+            played.progress_pixels.to_bits()
+        );
+        assert_eq!(ended.checkpoints, played.checkpoints);
+        assert!(
+            ended.frames < played.frames,
+            "the cut saved nothing: {} frames against {}",
+            ended.frames,
+            played.frames
+        );
+    }
+
     #[test]
     fn the_episode_driver_is_deterministic_and_terminates() {
         let level = level();
@@ -1034,7 +1141,11 @@ mod tests {
             g.act(&[0.0f32; sim::sensors::N_INPUTS], &mut ActScratch::new()),
             AgentAction::Run
         );
-        assert!(flat.won(), "always-run solves a flat runway: {:?}", flat.outcome);
+        assert!(
+            flat.won(),
+            "always-run solves a flat runway: {:?}",
+            flat.outcome
+        );
 
         // With a pit it does not: run straight in and die. This is what makes the
         // pit fixture a real test.
@@ -1052,10 +1163,7 @@ mod tests {
     #[test]
     fn a_checkpoint_pays_for_arriving_where_the_frontier_only_pays_for_passing_over() {
         let frontier = 2.0 * sim::PIXELS_PER_TILE;
-        let arrived = score(
-            &stats_with_checkpoints(1, frontier, 200),
-            Outcome::Stuck,
-        );
+        let arrived = score(&stats_with_checkpoints(1, frontier, 200), Outcome::Stuck);
         let flew_over = score(&stats(frontier, 200), Outcome::Stuck);
         assert_eq!(
             arrived - flew_over,
@@ -1095,10 +1203,7 @@ mod tests {
     /// function of the count rather than of anything the body can repeat.
     #[test]
     fn checkpoints_cannot_be_farmed_in_place_of_progress() {
-        let padded = score(
-            &stats_with_checkpoints(2, 0.0, 600),
-            Outcome::Stuck,
-        );
+        let padded = score(&stats_with_checkpoints(2, 0.0, 600), Outcome::Stuck);
         let walked = score(&stats(2.0 * sim::PIXELS_PER_TILE, 600), Outcome::Stuck);
         assert_eq!(
             padded, walked,
@@ -1112,7 +1217,7 @@ mod tests {
         let level = level();
         let mut rng = rng_from_seed(3);
         let g = Genome::random(1, default_shape(), &mut rng);
-        let cfg = EvalConfig { action_repeat: 1 };
+        let cfg = EvalConfig { action_repeat: 1, cut_stuck_frames: 0 };
         let r = run_episode(&level, &g, &cfg, 99);
         assert!(r.outcome.is_finished());
     }
@@ -1221,11 +1326,17 @@ mod tests {
         let stats = runner.sim().stats().clone();
         let outcome = runner.sim().outcome();
         let r = runner.result();
-        assert!(r.won(), "the fixture has to win for the term to be paid at all");
+        assert!(
+            r.won(),
+            "the fixture has to win for the term to be paid at all"
+        );
 
         let budget_frames = sim::frame_budget(&level);
         assert_eq!(stats.budget_frames, budget_frames, "the sim's own budget");
-        assert_eq!(r.frames, stats.frames, "the clock is the episode's frame count");
+        assert_eq!(
+            r.frames, stats.frames,
+            "the clock is the episode's frame count"
+        );
         assert!(
             stats.frames < budget_frames,
             "a win inside the budget is what the term pays for: {} of {}",
@@ -1252,5 +1363,4 @@ mod tests {
             budget_frames
         );
     }
-
 }

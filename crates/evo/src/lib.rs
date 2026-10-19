@@ -12,7 +12,9 @@
 
 pub mod autoshape;
 pub mod champion;
+pub mod committee;
 pub mod curriculum;
+pub mod demos;
 pub mod discovery;
 pub mod es;
 pub mod fitness;
@@ -31,29 +33,25 @@ pub mod tas;
 pub mod technique;
 
 pub use autoshape::{apply as apply_auto_shape, scan as scan_level_shape, AutoShape};
-pub use polish::{polish, output_slots, PolishConfig, PolishReport};
 pub use champion::{
-    check_reproducibility, ChampionFile, ChampionMetadata, NetworkSpec, TrainingSummary,
-    CHAMPION_FORMAT, CHAMPION_VERSION,
+    check_reproducibility, measure_phase_gap, ChampionFile, ChampionMetadata, NetworkSpec, PhaseGap,
+    TrainingSummary, CHAMPION_FORMAT, CHAMPION_VERSION,
+};
+pub use committee::{
+    Committee, CommitteeFile, CommitteeReport, COMMITTEE_DIR, COMMITTEE_FORMAT, COMMITTEE_VERSION,
 };
 pub use curriculum::{
-    curriculum_step, next_stand, plan_segments, practice_level, practice_level_between,
-    practice_level_for_stall, practice_step, save_practice_level, segment_campaign, stuck_point,
-    CurriculumStep, PlanSegment, SegmentCampaign, DEFAULT_CURRICULUM_GENERATIONS,
+    curriculum_step, fuse_specialists, fused_seeding, next_stand, plan_segments, practice_level,
+    practice_level_between, practice_level_for_stall, practice_step, save_practice_level,
+    segment_campaign, stuck_point, CurriculumStep, FuseConfig, PlanSegment, SegmentCampaign,
+    DEFAULT_CURRICULUM_GENERATIONS,
 };
-pub use es::{EsConfig, EsRow, EsTrainer};
-pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};
+pub use demos::{fit as fit_demo, DemoDecision, HumanDemo, DEMO_FORMAT, DEMO_VERSION};
 pub use discovery::{
     detect as detect_discoveries, shortcut_name, Codex, Discovery, DiscoveryKind, CODEX_DIR,
     CODEX_FORMAT, CODEX_VERSION,
 };
-pub use islands::{IslandConfig, IslandStep, Islands};
-pub use navigate::{
-    aim_point, play as think, planned_actions, Driver, ThinkConfig, ThinkReport,
-};
-pub use snapshots::{SnapshotArchive, SnapshotCell, SnapshotKey};
-pub use style::{Style, StyleCheck, StyleTitle};
-pub use technique::{TechniqueArchive, TechniqueEntry, TechniqueFirst, TechniqueSignature};
+pub use es::{EsConfig, EsRow, EsTrainer};
 pub use fitness::{
     run_episode, score, EpisodeResult, EpisodeRunner, EvalConfig, ACTION_REPEAT, FITNESS_VERSION,
     SPEED_BONUS,
@@ -64,14 +62,26 @@ pub use ga::{
     ARCHIVE_BEHAVIOUR_CELLS, ARCHIVE_CELLS, ARCHIVE_CHECKPOINT_BINS, ARCHIVE_PROGRESS_BINS,
     ARCHIVE_TIME_BINS, ARCHIVE_TIME_SLOTS, MUTATION_RATES,
 };
-pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
+pub use genome::{
+    default_shape, ActScratch, BlockScratch, Genome, NetShape, BLOCK_LANES, N_INPUTS, N_OUTPUTS,
+};
 pub use imitate::{
     clone_from_play, from_plan, from_route, warm_population, warm_set, ImitateConfig,
     ImitationReport,
 };
+pub use islands::{IslandConfig, IslandStep, Islands};
+pub use navigate::{aim_point, planned_actions, play as think, Driver, ThinkConfig, ThinkReport};
+pub use polish::{output_slots, polish, PolishConfig, PolishReport};
+pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};
 pub use route_play::{replay, timed_play, Decision, RoutePlay};
 pub use shortcut::{intended_route, trace as trace_shortcut, ShortcutReport};
-pub use tas::{polish as tas_polish, play as tas_play, route_from_genome, TasConfig, TasKind, TasReport, TasRoute};
+pub use snapshots::{SnapshotArchive, SnapshotCell, SnapshotKey};
+pub use style::{Style, StyleCheck, StyleTitle};
+pub use tas::{
+    play as tas_play, polish as tas_polish, route_from_genome, TasConfig, TasKind, TasReport,
+    TasRoute,
+};
+pub use technique::{TechniqueArchive, TechniqueEntry, TechniqueFirst, TechniqueSignature};
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///
@@ -212,6 +222,11 @@ pub(crate) mod fixture {
             })
             .collect();
         let refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
-        level(name, &refs, (1, GROUND - 1), &[("goal", goal_x, GROUND - 1)])
+        level(
+            name,
+            &refs,
+            (1, GROUND - 1),
+            &[("goal", goal_x, GROUND - 1)],
+        )
     }
 }

@@ -27,20 +27,23 @@
 //! the app. A stray event from the window manager — a focus click, a key repeat — must not eat
 //! the title before a person has seen it, which is what [`ARMED`] is for.
 //!
-//! **Whose run it is.** If the run has a saved champion for the level this window opened on,
-//! that is what plays: the genome out of the champion file, on the terrain it was trained on,
-//! deciding every `action_repeat` ticks through the same simulation the trainer used (see
-//! [`ChampionRun`]) — so the picture is the episode the file records rather than an
-//! illustration of one, and the credit line under it says *whose* (see [`ChampionFile`]).
-//! Otherwise — no champion for this level, a file from another build, or a best-ever agent
-//! that never reached the flag — the screen is the little level and the script, which is what
-//! it always showed, and which is deliberately as good as the champion path rather than a
-//! consolation prize.
+//! **Whose run it is.** A run can leave two artifacts for the level this window opened on, and
+//! the screen prefers the committee when it is there *and passes its gate*: the persisted
+//! `committees/<level>.committee.json` (Item 10), validated against its best member on the run's
+//! fixed validation episodes, with each member keeping its own recurrent state (see
+//! [`CommitteeRun`]). A committee that fails the gate, or whose file is missing or from another
+//! build, falls through to the champion: the genome out of the champion file, deciding every
+//! `action_repeat` ticks through the same simulation the trainer used (see [`ChampionRun`]) — so
+//! the picture is the episode the file records rather than an illustration of one, and the
+//! credit line under it says *whose*. Otherwise — no artifact for this level, a file from
+//! another build, or a best-ever agent that never reached the flag — the screen is the little
+//! level and the script, which is what it always showed, and which is deliberately as good as
+//! the champion path rather than a consolation prize.
 
 use std::path::Path;
 
 use egui::{Align2, Color32, Context, CornerRadius, Painter, Pos2, Rect, Stroke, Vec2};
-use evo::{ActScratch, ChampionFile, Genome};
+use evo::{ActScratch, ChampionFile, Committee, CommitteeFile, Genome};
 use sim::{AgentAction, Level, Sim, Tile};
 
 use crate::atlas::Atlas;
@@ -223,6 +226,11 @@ enum Policy {
     Script,
     /// The run's own saved champion, on the level it beat.
     Champion(ChampionRun),
+    /// **The run's committee (Item 10), when it passed its gate.** Preferred over the single
+    /// champion because the vote is the run's result rather than one member of it — and only
+    /// ever shown after [`Committee::validate`] said it never loses to its best member on the
+    /// run's fixed validation episodes. A file that fails the gate falls back to the champion.
+    Committee(CommitteeRun),
 }
 
 /// A saved champion, being played back.
@@ -262,6 +270,29 @@ impl ChampionRun {
     }
 }
 
+/// A saved committee, being played back.
+///
+/// The same shape as [`ChampionRun`] with a vote where the genome was: each member keeps its own
+/// recurrent state inside the committee, and the action is taken on the same cadence the run
+/// trained at. The members are in the file's leaderboard order, which is also the tie-break, so
+/// the picture is reproducible from the file alone.
+struct CommitteeRun {
+    committee: Committee,
+    action: AgentAction,
+    repeat: u32,
+    seed: u64,
+    credit: String,
+}
+
+impl CommitteeRun {
+    fn decide(&mut self, sim: &Sim) -> AgentAction {
+        if sim.stats().frames % self.repeat == 0 {
+            self.action = self.committee.act(&sim.observation());
+        }
+        self.action
+    }
+}
+
 impl Default for Splash {
     fn default() -> Self {
         Self::scripted()
@@ -277,6 +308,23 @@ impl Splash {
     /// degraded mode — it is the screen every launch showed before there was a champion to
     /// show, and it is the screen a fresh checkout gets.
     pub fn open(level: &Level, champions: &Path, level_path: Option<&Path>) -> Splash {
+        // Item 10's display half: a committee that passed its gate is preferred, because it is
+        // the run's result rather than one member of it. The gate is a real exam — twelve fixed
+        // validation episodes against the best member — and a file that fails it falls through
+        // to the champion rather than being shown as the level's solver.
+        if let Some(run) = committee_run(level, champions, level_path) {
+            let mut session = play::Session::new(level, run.seed);
+            session.set_audible(false);
+            return Splash {
+                level: level.clone(),
+                session,
+                policy: Policy::Committee(run),
+                clock: 0.0,
+                hold: 0.0,
+                selected: 0,
+                logo: None,
+            };
+        }
         let Some(run) = champion_run(level, champions, level_path) else {
             return Splash::scripted();
         };
@@ -383,6 +431,9 @@ impl Splash {
             Policy::Champion(run) => {
                 self.session.advance_actions(dt, |sim| run.decide(sim));
             }
+            Policy::Committee(run) => {
+                self.session.advance_actions(dt, |sim| run.decide(sim));
+            }
         }
         if self.session.sim().outcome().is_finished() {
             self.hold = HOLD;
@@ -393,6 +444,7 @@ impl Splash {
     fn credit(&self) -> Option<&str> {
         match &self.policy {
             Policy::Champion(run) => Some(run.credit.as_str()),
+            Policy::Committee(run) => Some(run.credit.as_str()),
             Policy::Script => None,
         }
     }
@@ -622,7 +674,7 @@ impl Splash {
                 }
                 camera
             }
-            Policy::Champion(_) => {
+            Policy::Champion(_) | Policy::Committee(_) => {
                 let p = self.session.sim().player();
                 let zoom = framed(&self.level, rect).zoom.max(crate::app::FOLLOW_ZOOM);
                 let mut camera = Camera {
@@ -780,6 +832,48 @@ fn scripted(level: &Level, sim: &Sim) -> Keys {
 /// window was told to look in, and a title screen that refused to open over a stale one would
 /// be a worse bug than the one it would be reporting. The fallback is the demo run, and the
 /// tests pin each refusal.
+/// A validated committee for this level, if one is on disk and passes its gate.
+///
+/// The directory is the sibling of the champion directory the app was handed, so a run that
+/// writes `committees/<level>.committee.json` (which is what `train --committee` does) is found
+/// without a second configuration knob. Validation is the condition for showing it: the menu's
+/// caption cites the counts, and a vote that lost an episode to its best member is not the
+/// level's solver.
+fn committee_run(
+    level: &Level,
+    champions: &Path,
+    level_path: Option<&Path>,
+) -> Option<CommitteeRun> {
+    let dir = champions.with_file_name(evo::COMMITTEE_DIR);
+    let mut names = Vec::new();
+    if let Some(stem) = level_path.and_then(|path| path.file_stem()) {
+        names.push(stem.to_string_lossy().to_string());
+    }
+    names.push(crate::lab::slug(&level.name));
+    names.dedup();
+    names.iter().find_map(|name| {
+        let file = CommitteeFile::load(dir.join(format!("{name}.committee.json"))).ok()?;
+        file.check_compat(level).ok()?;
+        let report = file.validate(level).ok()?;
+        if report.episodes == 0 || !report.passes() {
+            return None;
+        }
+        let committee = file.to_committee().ok()?;
+        Some(CommitteeRun {
+            committee,
+            action: AgentAction::Walk,
+            repeat: file.action_repeat.max(1),
+            seed: file.master_seed,
+            credit: format!(
+                "committee · {} members · {}/{} validation wins",
+                file.members.len(),
+                report.won,
+                report.episodes
+            ),
+        })
+    })
+}
+
 fn champion_run(level: &Level, champions: &Path, level_path: Option<&Path>) -> Option<ChampionRun> {
     let champion = champion_file(level, champions, level_path)?;
     let (genome, result) = evo::champion::replay(level, &champion).ok()?;

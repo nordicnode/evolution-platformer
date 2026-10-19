@@ -229,6 +229,7 @@ fn a_clone_plays_the_level_only_at_the_demonstrations_own_cadence() {
     // The oracle's own grid: one decision per tick, which is the grid its scripts were swept on.
     let tick = EvalConfig {
         action_repeat: 1,
+        cut_stuck_frames: 0,
     };
     let play = replay(&level, 1, &tick);
     assert!(play.won(), "the route of l2-first-gap: {}", play.note);

@@ -349,11 +349,17 @@ mod tests {
     fn the_baselines_default_budget_matches_the_gas() {
         let ga = GaConfig::default();
         let es = EsConfig::default();
-        assert_eq!(es.pop_size, ga.pop_size, "λ must be the GA's population size");
+        assert_eq!(
+            es.pop_size, ga.pop_size,
+            "λ must be the GA's population size"
+        );
         assert_eq!(es.action_repeat, ga.action_repeat, "the cadence is shared");
         assert_eq!(es.trials, ga.trials, "and so is the trial count");
         assert_eq!(es.batch(), ga.pop_size, "and the batch really is that size");
-        assert_eq!(es.shape, ga.shape, "a smaller net would search a smaller space");
+        assert_eq!(
+            es.shape, ga.shape,
+            "a smaller net would search a smaller space"
+        );
     }
 
     /// A deliberately tiny net for the arithmetic tests.
@@ -369,6 +375,7 @@ mod tests {
             hidden: vec![3],
             outputs: 2,
             feedback: 0,
+            commitment: false,
         }
     }
 
@@ -417,7 +424,10 @@ mod tests {
             "the mean should be much closer to the target after 300 generations: {start} -> {end}"
         );
         assert!(
-            t.best_ever().map(|(_, _, f)| f).unwrap_or(f32::NEG_INFINITY) > -start * 0.5,
+            t.best_ever()
+                .map(|(_, _, f)| f)
+                .unwrap_or(f32::NEG_INFINITY)
+                > -start * 0.5,
             "the best evaluated point should be closer than the mean started"
         );
         assert_eq!(t.history().len(), 300);
@@ -430,7 +440,10 @@ mod tests {
     #[test]
     fn the_same_seed_gives_the_same_rows_and_the_same_mean() {
         let objective = |batch: &[Genome]| -> Vec<f32> {
-            batch.iter().map(|g| -genes(g).iter().map(|x| x * x).sum::<f32>()).collect()
+            batch
+                .iter()
+                .map(|g| -genes(g).iter().map(|x| x * x).sum::<f32>())
+                .collect()
         };
         let mut a = trainer(32, 0.05);
         let mut b = trainer(32, 0.05);
@@ -463,7 +476,11 @@ mod tests {
     fn a_degenerate_batch_is_clamped_and_still_steps() {
         for pop in [1usize, 3] {
             let mut t = trainer(pop, 0.05);
-            assert_eq!(t.config().batch(), 2, "pop {pop} must clamp to one mirrored pair");
+            assert_eq!(
+                t.config().batch(),
+                2,
+                "pop {pop} must clamp to one mirrored pair"
+            );
             let row = t.step_with(|batch| vec![1.0; batch.len()]);
             assert!(row.max_fitness.is_finite() && row.mean_fitness.is_finite());
         }

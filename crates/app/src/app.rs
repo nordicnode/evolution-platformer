@@ -639,7 +639,14 @@ impl EvoApp {
         // keyboard drops the pool of episodes rather than parking a second simulation
         // behind the one being played. Going back rebuilds it from the same packet.
         self.replay = None;
-        self.session = Some(play::Session::new(&self.editor.level, 1));
+        // Item 7: every human attempt is recorded as data until it ends. A completed one is
+        // written beside the champions (the play module owns the naming and the format); a death
+        // or an abandoned run writes nothing, because a demonstration has to reach the flag to be
+        // one. The directory is a working-directory sibling of `champions/` so a checkout's demos
+        // are inspectable without knowing an app-internal path.
+        let mut session = play::Session::new(&self.editor.level, 1);
+        session.capture_demos("demos");
+        self.session = Some(session);
         self.driver = None;
         self.thinking = self.options.think;
         if self.thinking {
@@ -660,15 +667,10 @@ impl EvoApp {
             self.thinking = true;
             return;
         }
-        let planned = evo::Driver::planned(
-            &self.editor.level,
-            1,
-            sim::plan::PlanConfig::default(),
-        );
+        let planned = evo::Driver::planned(&self.editor.level, 1, sim::plan::PlanConfig::default());
         let whole = planned.is_some();
-        self.driver = Some(
-            planned.unwrap_or_else(|| evo::Driver::local(evo::ThinkConfig::default())),
-        );
+        self.driver =
+            Some(planned.unwrap_or_else(|| evo::Driver::local(evo::ThinkConfig::default())));
         self.thinking = true;
         self.note = Some((
             if whole {
@@ -949,8 +951,7 @@ impl EvoApp {
             // A fresh run on a level somebody has just drawn starts from a walk of it; a run
             // handed a population or a champion already has the better starting point. See
             // `lab::RunPlan::warm_from_route`.
-            warm_from_route: self.options.resume.is_none()
-                && self.options.from_champion.is_none(),
+            warm_from_route: self.options.resume.is_none() && self.options.from_champion.is_none(),
         })
     }
 
@@ -997,7 +998,10 @@ impl EvoApp {
     /// writes: a level's champion and the control that continues it cannot name two files.
     fn continue_from_champion(&mut self) {
         let Some(lab) = &self.lab else {
-            self.note = Some(("start a run first: there is no champion saved yet".into(), 6.0));
+            self.note = Some((
+                "start a run first: there is no champion saved yet".into(),
+                6.0,
+            ));
             return;
         };
         let path = lab.champion_path();
@@ -4552,8 +4556,8 @@ mod tests {
     #[ignore = "plans the whole l11 route; run with --ignored for the headline check"]
     fn think_mode_solves_the_elements() {
         let ctx = Context::default();
-        let level = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../levels/l11-the-elements.json");
+        let level =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../levels/l11-the-elements.json");
         let mut app = app_on(&ctx, &level);
         app.options.think = true;
         app.enter_play();

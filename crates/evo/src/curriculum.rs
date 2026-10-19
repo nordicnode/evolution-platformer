@@ -35,6 +35,18 @@
 //! gets instead is [`CurriculumStep::note`], naming what happened, and a run whose
 //! population has changed underneath it.
 //!
+//! **Specialist fusion (SMARTER_AI_PLAN.md Item 9).** A campaign leaves one clone per leg, each
+//! fitted to a different crossing. [`fuse_specialists`] breeds those clones into each other with
+//! the shipped uniform crossover, and [`fused_seeding`] offers the result beside the whole-level
+//! genomes the caller already has. The experiment is *who the parents are*, not a new operator:
+//! crossover between two genomes stuck at the same wall mixes two failures, while crossover
+//! between two specialists mixes two successes. The gate is episodes to a validated win on
+//! `l11-the-elements` and `l10-the-gauntlet-ii`, fused seeding against the campaign's existing
+//! continuation (train the best single chain further) at equal total episodes. The kill criterion
+//! is the same measurement the other way: if fusion does not beat continuation, segment
+//! specialists do not compose, and the campaign keeps its current shape. Nothing here changes a
+//! campaign's default behaviour — fusion is a caller's choice.
+//!
 //! The premise needs an *easier level*, and a level somebody drew by hand is not always
 //! there: a run can stall on a level whose author is still sitting in front of it. What
 //! this module derives instead is the run's own **next move** ([`practice_level`],
@@ -46,11 +58,12 @@
 
 use std::path::{Path, PathBuf};
 
+use sim::rng::{next_f32, Rng};
 use sim::{Level, Rect};
 
 use crate::fitness::{EpisodeRunner, EvalConfig};
 use crate::ga::Trainer;
-use crate::genome::Genome;
+use crate::genome::{crossover, Genome};
 
 /// Generations spent on the easier level when a run stalls (§12 M5, finding 22).
 ///
@@ -815,10 +828,7 @@ pub fn practice_level_from(
 /// The name is derived from the checkpoint path rather than passed in, for the same
 /// reason [`curriculum_step`] does not name its own checkpoint: two front-ends with two
 /// naming conventions are two chances to disagree about which file is which.
-pub fn save_practice_level(
-    practice: &Level,
-    checkpoint_path: &Path,
-) -> Result<PathBuf, String> {
+pub fn save_practice_level(practice: &Level, checkpoint_path: &Path) -> Result<PathBuf, String> {
     // `<stem>.population.json` becomes `<stem>.practice.json`. `Path::with_extension`
     // is not this: it replaces only the *last* extension and would name the file
     // `<stem>.population.practice.json`, which is a name nobody would look for.
@@ -834,7 +844,8 @@ pub fn save_practice_level(
     });
     let path = checkpoint_path.with_file_name(format!("{stem}.practice.json"));
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
     practice.to_json_file(&path)?;
     Ok(path)
@@ -1135,6 +1146,139 @@ pub struct SegmentCampaign {
     pub steps: Vec<CurriculumStep>,
     /// The main level's record after the campaign, when the caller trains on it afterwards.
     pub solved: bool,
+    /// The per-leg clones the campaign fitted, in leg order — one per segment whose
+    /// demonstration produced a genotype. Item 9's raw material: each is a specialist for its
+    /// own crossing and nothing else, which is what makes crossing two of them an interesting
+    /// parent choice rather than a different draw from the same population.
+    pub specialists: Vec<Genome>,
+}
+
+impl SegmentCampaign {
+    /// The leg specialists, in leg order.
+    pub fn specialists(&self) -> &[Genome] {
+        &self.specialists
+    }
+}
+
+/// The knobs of specialist fusion (Item 9).
+///
+/// Deliberately two: how many children to breed, and how often a child is a cross rather than a
+/// copy. The crossover itself — per-gene uniform — is [`crate::genome::crossover`], unchanged.
+/// Fusion is about who the parents are, and a new operator would confound the two questions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FuseConfig {
+    /// Maximum fused children to breed. Zero is a legal request for none.
+    pub shares: usize,
+    /// Probability that a child is a cross of two specialists rather than a copy of one. `1.0`
+    /// — the default — crosses every child, which is the arm the item describes. Lower values
+    /// are for a caller that wants the specialists themselves to survive the seeding intact.
+    pub cross_rate: f32,
+}
+
+impl Default for FuseConfig {
+    fn default() -> Self {
+        FuseConfig {
+            shares: 8,
+            cross_rate: 1.0,
+        }
+    }
+}
+
+impl FuseConfig {
+    /// Clamp the knobs into the range the arithmetic needs.
+    pub fn sanitized(mut self) -> FuseConfig {
+        self.shares = self.shares.min(1_000);
+        self.cross_rate = self.cross_rate.clamp(0.0, 1.0);
+        self
+    }
+}
+
+/// **Breed the leg specialists into each other** (Item 9).
+///
+/// Every child is a cross of two *distinct* specialists (or, below `cross_rate` 1.0, a copy of
+/// one), using the shipped per-gene uniform crossover. Parents are walked in route order with a
+/// rotating partner, so two specialists that met at adjacent legs are crossed first and a
+/// campaign of `n` legs still produces all `n` as a first parent before any repeats. Fewer than
+/// two specialists yields no children rather than an error: one leg has nothing to compose.
+///
+/// **Ids belong to the caller.** [`crossover`] copies the first parent's id, and this function
+/// leaves it there: the trainer issues ids (they are part of every episode seed), exactly as it
+/// does for `mutate`, `reheat` and the archive's children. Fitness is cleared, because a child
+/// has not been judged.
+///
+/// The parents are read only; fusion never mutates its inputs.
+pub fn fuse_specialists(specialists: &[Genome], cfg: &FuseConfig, rng: &mut Rng) -> Vec<Genome> {
+    let cfg = cfg.sanitized();
+    if specialists.len() < 2 || cfg.shares == 0 {
+        return Vec::new();
+    }
+    let n = specialists.len();
+    let mut out = Vec::with_capacity(cfg.shares.min(n * 2).max(1));
+    for i in 0..cfg.shares {
+        let pa = i % n;
+        // Distinct by construction (`n >= 2`), and adjacent in route order on the first lap,
+        // which is the pairing the item is about: neighbour legs hand the body over to each
+        // other, so a cross of them is a whole crossing rather than two unrelated tricks.
+        let pb = (pa + 1 + (i / n) % (n - 1)) % n;
+        let child = if next_f32(rng) < cfg.cross_rate {
+            crossover(&specialists[pa], &specialists[pb], rng)
+        } else {
+            let mut copy = specialists[pa].clone();
+            copy.fitness = 0.0;
+            copy
+        };
+        out.push(child);
+    }
+    out
+}
+
+/// The seeding list a fused campaign offers: fused children first, then the caller's whole-level
+/// genomes, without duplicates by gene equality.
+///
+/// Order is deterministic and meaningful. The fused children lead because they are the arm being
+/// tested; the whole-level genomes follow as the continuation's own material, so a caller that
+/// takes the first *k* slots is running "fusion first, continuation after" rather than an
+/// interleaving nobody could attribute a win to. A genome whose genes already appear earlier is
+/// dropped, which is what stops a specialist that is *also* the campaign's best whole-level
+/// genome from spending two slots.
+pub fn fused_seeding(
+    campaign: &SegmentCampaign,
+    best_whole: &[Genome],
+    cfg: &FuseConfig,
+    rng: &mut Rng,
+) -> Vec<Genome> {
+    let specialists = campaign.specialists();
+    let mut out: Vec<Genome> = Vec::new();
+    for genome in fuse_specialists(specialists, cfg, rng)
+        .into_iter()
+        .chain(best_whole.iter().cloned())
+    {
+        // A candidate already in the output, or one that is just a leg specialist offered
+        // again as a whole-level genome, spends a slot on a policy the campaign already has.
+        if out.iter().any(|held| same_genes(held, &genome))
+            || specialists.iter().any(|s| same_genes(s, &genome))
+        {
+            continue;
+        }
+        out.push(genome);
+    }
+    out
+}
+
+/// Exact gene equality, for de-duplication: ids and recorded fitness are not genes, and two
+/// copies of one policy are one candidate however they are labelled.
+fn same_genes(a: &Genome, b: &Genome) -> bool {
+    a.shape == b.shape
+        && a.weights.len() == b.weights.len()
+        && a.biases.len() == b.biases.len()
+        && a.weights
+            .iter()
+            .zip(&b.weights)
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.biases
+            .iter()
+            .zip(&b.biases)
+            .all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// **Segment chaining (WP4):** train each leg as a practice level with the main level in the
@@ -1162,6 +1306,7 @@ pub fn segment_campaign(
         return Err("a segment campaign needs at least one segment".into());
     }
     let mut steps = Vec::with_capacity(segments.len());
+    let mut specialists: Vec<Genome> = Vec::new();
     for segment in segments {
         // **The demonstration for this leg only.** The plan's step 2 is explicit that a segment is
         // seeded from the planner's own actions over that span, not from a whole-route clone: the
@@ -1178,6 +1323,9 @@ pub fn segment_campaign(
             if let Ok(report) =
                 crate::imitate::clone_from_play(&play, trainer.config.shape.clone(), &fit)
             {
+                // Keep one copy as Item 9's raw material and inject the other as a warm parent:
+                // the campaign's default run is untouched, and fusion is a caller's choice.
+                specialists.push(report.genome.clone());
                 let _ = trainer.inject(report.genome);
             }
         }
@@ -1214,6 +1362,7 @@ pub fn segment_campaign(
         segments: segments.len(),
         steps,
         solved: trainer.best_ever().is_some_and(|b| b.result.solved()),
+        specialists,
     })
 }
 
@@ -1544,14 +1693,7 @@ mod tests {
         crate::fixture::level(
             name,
             &[
-                "......",
-                "......",
-                "......",
-                "......",
-                "......",
-                "......",
-                "######",
-                "######",
+                "......", "......", "......", "......", "......", "......", "######", "######",
             ],
             (1, 5),
             &[("goal", 2, 2)],
@@ -1683,7 +1825,9 @@ mod tests {
             }
         }
         assert!(
-            practice.name.contains("practice at tile (5, 5) to tile (11, 5)"),
+            practice
+                .name
+                .contains("practice at tile (5, 5) to tile (11, 5)"),
             "the name says where it starts and where the move ends: {:?}",
             practice.name
         );
@@ -1708,13 +1852,7 @@ mod tests {
         let main = crate::fixture::level(
             "two-stands",
             &[
-                "........",
-                "........",
-                "......#.",
-                "........",
-                "....#...",
-                "........",
-                "##....##",
+                "........", "........", "......#.", "........", "....#...", "........", "##....##",
                 "##....##",
             ],
             (0, 5),
@@ -1805,13 +1943,7 @@ mod tests {
         let main = crate::fixture::level(
             "spiked",
             &[
-                "........",
-                "........",
-                "........",
-                "........",
-                "........",
-                "...^....",
-                "########",
+                "........", "........", "........", "........", "........", "...^....", "########",
                 "########",
             ],
             (1, 5),
@@ -1957,8 +2089,7 @@ mod tests {
         // pit's near edge and dies there, so where it stood furthest is not a
         // question of which way a random policy wandered.
         let genome = Genome::zeros(1, crate::genome::default_shape());
-        let mut trainer =
-            Trainer::resume(tiny(), vec![genome], 0).expect("a population resumes");
+        let mut trainer = Trainer::resume(tiny(), vec![genome], 0).expect("a population resumes");
         trainer.step(&main);
         let practice = practice_level_for_stall(&trainer, &main)
             .expect("a population that crossed ground has somewhere to practise");
@@ -1976,8 +2107,8 @@ mod tests {
 
     #[test]
     fn a_planned_route_splits_into_ground_segments_that_are_all_playable_starts() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../levels/l2-first-gap.json");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../levels/l2-first-gap.json");
         let level = Level::from_json_file(&path).expect("the shipped level loads");
         let route = sim::plan::solve(
             &level,
@@ -1999,12 +2130,135 @@ mod tests {
         );
         for segment in &segments {
             assert!(
-                segment.level.spawn_stands_on_ground(segment.entry.0, segment.entry.1),
+                segment
+                    .level
+                    .spawn_stands_on_ground(segment.entry.0, segment.entry.1),
                 "segment {} starts on ground",
                 segment.index
             );
-            assert_eq!(segment.level.goal_tiles().first().copied(), Some(segment.exit));
+            assert_eq!(
+                segment.level.goal_tiles().first().copied(),
+                Some(segment.exit)
+            );
             assert!(segment.blocks() > 0);
         }
+    }
+
+    fn two_specialists(seed: u64) -> (Genome, Genome) {
+        let mut rng = sim::rng::rng_from_seed(seed);
+        (
+            Genome::random(1, crate::genome::default_shape(), &mut rng),
+            Genome::random(2, crate::genome::default_shape(), &mut rng),
+        )
+    }
+
+    #[test]
+    fn every_fused_gene_comes_from_one_of_two_distinct_specialists() {
+        let (a, b) = two_specialists(41);
+        let (a_before, b_before) = (a.clone(), b.clone());
+        let mut rng = sim::rng::rng_from_seed(42);
+        let children = fuse_specialists(
+            &[a.clone(), b.clone()],
+            &FuseConfig {
+                shares: 8,
+                cross_rate: 1.0,
+            },
+            &mut rng,
+        );
+        assert_eq!(children.len(), 8, "one child per requested share");
+        for child in &children {
+            assert_eq!(
+                child.shape, a.shape,
+                "fusion changes parents, never the shape"
+            );
+            assert_eq!(child.fitness, 0.0, "a child has not been judged");
+            for (i, gene) in child.weights.iter().enumerate() {
+                assert!(
+                    gene.to_bits() == a.weights[i].to_bits()
+                        || gene.to_bits() == b.weights[i].to_bits(),
+                    "weight {i} came from neither parent"
+                );
+            }
+            for (i, gene) in child.biases.iter().enumerate() {
+                assert!(
+                    gene.to_bits() == a.biases[i].to_bits()
+                        || gene.to_bits() == b.biases[i].to_bits(),
+                    "bias {i} came from neither parent"
+                );
+            }
+        }
+        // Two different parents crossed eight times: at least one child has genes from each,
+        // which is what distinguishes a cross from copying the first parent eight times.
+        assert!(children.iter().any(|c| c.weights != a.weights));
+        assert!(children.iter().any(|c| c.weights != b.weights));
+        // And the inputs are read only.
+        assert_eq!(a.weights, a_before.weights);
+        assert_eq!(a.biases, a_before.biases);
+        assert_eq!(b.weights, b_before.weights);
+        assert_eq!(b.biases, b_before.biases);
+    }
+
+    #[test]
+    fn one_specialist_has_nothing_to_compose() {
+        let (a, _) = two_specialists(43);
+        let mut rng = sim::rng::rng_from_seed(44);
+        assert!(
+            fuse_specialists(std::slice::from_ref(&a), &FuseConfig::default(), &mut rng).is_empty()
+        );
+        assert!(fuse_specialists(&[], &FuseConfig::default(), &mut rng).is_empty());
+        assert!(fuse_specialists(
+            &[a.clone(), a],
+            &FuseConfig {
+                shares: 0,
+                ..FuseConfig::default()
+            },
+            &mut rng
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_fused_seeding_order_is_deterministic_and_deduplicated() {
+        let (a, b) = two_specialists(45);
+        let mut rng = sim::rng::rng_from_seed(46);
+        let whole = Genome::random(9, crate::genome::default_shape(), &mut rng);
+        let campaign = SegmentCampaign {
+            segments: 2,
+            steps: Vec::new(),
+            solved: false,
+            specialists: vec![a.clone(), b.clone()],
+        };
+        // `a` is also offered as a whole-level genome: it must spend one slot, not two.
+        let best_whole = vec![a.clone(), whole.clone()];
+        let mut r1 = sim::rng::rng_from_seed(47);
+        let first = fused_seeding(&campaign, &best_whole, &FuseConfig::default(), &mut r1);
+        let mut r2 = sim::rng::rng_from_seed(47);
+        let second = fused_seeding(&campaign, &best_whole, &FuseConfig::default(), &mut r2);
+        assert_eq!(first.len(), second.len());
+        assert_eq!(
+            first.len(),
+            8 + 1,
+            "eight crosses, then the one new whole genome"
+        );
+        for (x, y) in first.iter().zip(&second) {
+            assert_eq!(
+                x.weights, y.weights,
+                "the same seed must give the same order"
+            );
+            assert_eq!(x.biases, y.biases);
+        }
+        for i in 0..first.len() {
+            for j in 0..i {
+                assert!(
+                    first[i].weights != first[j].weights || first[i].biases != first[j].biases,
+                    "candidate {i} duplicates candidate {j}"
+                );
+            }
+        }
+        assert_eq!(
+            first.last().expect("non-empty").weights,
+            whole.weights,
+            "whole-level genomes follow the fused children, in the caller's order"
+        );
     }
 }

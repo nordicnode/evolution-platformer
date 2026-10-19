@@ -84,6 +84,7 @@ impl PolishConfig {
     fn eval_config(&self) -> EvalConfig {
         EvalConfig {
             action_repeat: self.action_repeat,
+            cut_stuck_frames: 0,
         }
     }
 
@@ -198,10 +199,36 @@ pub fn polish(
     cfg: PolishConfig,
     validate: &[u64],
 ) -> PolishReport {
+    let slots = output_slots(champion);
+    polish_genes(level, champion, cfg, validate, &slots, "output")
+}
+
+/// Every gene of a genome, in slot order. The full-net CEM phase of Item 4 spends its budget
+/// here: the plateau case is not a mis-drawn action boundary, so freezing the strategy — which is
+/// the whole point of [`polish`] — would be freezing the thing that needs to move.
+pub fn full_slots(g: &Genome) -> Vec<usize> {
+    (0..g.n_genes()).collect()
+}
+
+/// **Polish an arbitrary gene set**, which is [`polish`] with its slot set named by the caller.
+///
+/// `what` labels the report's note ("output" for the shipped polish, "all" for a full-net CEM
+/// phase). Everything else is identical: mirrored perturbations, an elite mean, the elite spread
+/// as the next step, and the same held-out certification. The split exists so the mid-run phase
+/// and the after-run command are one search rather than two that could disagree about what
+/// "certified" means.
+pub fn polish_genes(
+    level: &Level,
+    champion: &Genome,
+    cfg: PolishConfig,
+    validate: &[u64],
+    slots: &[usize],
+    what: &str,
+) -> PolishReport {
     let cfg = cfg.sanitized();
     let eval = cfg.eval_config();
     let seeds = cfg.seeds();
-    let slots = output_slots(champion);
+    let slots = slots.to_vec();
     let mut rng = rng_from_seed(cfg.master_seed ^ 0xB01D_FACE_5EED_1234);
 
     let (original_score, _original_won, original_first) = judge(level, champion, &eval, &seeds);
@@ -323,7 +350,7 @@ pub fn polish(
 
     let note = match &candidate {
         Some(_) => format!(
-            "CEM polished {} output genes over {} generations: {:.1} -> {:.1} mean fitness, \
+            "CEM polished {} {what} genes over {} generations: {:.1} -> {:.1} mean fitness, \
              {} frames, {}/{} held-out episodes won",
             slots.len(),
             cfg.generations,

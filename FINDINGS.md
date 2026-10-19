@@ -5010,3 +5010,564 @@ terminal-only feature — the stall fallback of finding 22 and the resume that g
 it — is in the window as of finding 28, so every M3 and M5 watch behaviour is reachable
 from both front-ends.
 
+# Smarter, not slower: phase 1
+
+October 2026. The first pass over [SMARTER_AI_PLAN.md](SMARTER_AI_PLAN.md), whose
+rule is evidence before code. The plan's first tier is Item 1 (run the gates on
+the features that already exist), Item 2 (a batched forward pass), Item 5 (early
+termination) and Item 3 (sensors v14). This section records what the first two
+told us, the two pieces of code that do not depend on their outcome, why sensors
+v14 was built and measured in that pass and then removed from the tree, and why
+Item 8's narrower phase draw has no lever in this build.
+
+## Item 2: the forward pass is a quarter of a generation, not half
+
+The plan projects that the forward pass is "about half the cost of a generation"
+and that batching it should cut generation wall time by at least 25 %. The
+measurement is in `crates/evo/tests/performance.rs`, which is `#[ignore]`d
+because it measures a machine rather than asserting a result:
+
+```
+cargo test --release -p evo --test performance -- --ignored --nocapture
+```
+
+On the baseline machine (i5-9400, six cores, release, idle), `l9-wait-and-climb`
+at pop 200, generation 0:
+
+| shape | forward | decisions | forward CPU | share of the generation |
+|---|---|---|---|---|
+| 108 → 16 → 11, memoryless | 885.7 ns | 24 503 | 0.022 s | **26.0 %** of 0.014 s × 6 cores |
+| the same with feedback 16 | 972.9 ns | 24 503 | 0.024 s | **28.6 %** |
+
+The generation itself is 14 ms of wall time; 200 episodes and 97 819 frames.
+
+Two consequences. First, the plan's premise is wrong for this build: the sim,
+the observation and the episode driver own about three quarters of the CPU, and
+the network about a quarter. Second, the Item 2 gate is arithmetic: **a forward
+pass that cost nothing would save 26 %, so a 25 % generation improvement needs a
+batched pass that is essentially free.** A realistic 4–6× forward pass saves
+19–20 %, below the gate, though above the plan's 10 % kill line.
+
+**The batched pass was then built and measured against that gate, and killed by it.**
+`Genome::forward_block` evaluates `BLOCK_LANES` (four) genomes interleaved — one accumulator chain
+per lane, each in its own left-to-right order, so every lane is bit-for-bit the scalar pass —
+and `tests/performance.rs` times it beside `Genome::forward` on the same population:
+
+| shape | scalar | batched | speedup |
+|---|---|---|---|
+| 108 → 16 → 11, no memory | 1 015.0 ns | 892.9 ns | **1.14×** |
+| the same with feedback 16 (the reference level's timed shape) | 1 195.0 ns | 1 241.8 ns | **0.96×** |
+| 108 → 32 → 16 → 11 | 2 622.4 ns | 1 914.0 ns | 1.37× |
+
+On the same run the forward pass was **15 % of a generation** (1 174 ns/decision, 24 503
+decisions, 0.029 s of forward CPU against a 0.032 s generation on six cores). Better than a 1.14×
+forward pass therefore buys **about 2 % of generation wall time**, and on the shape the reference
+level actually uses — feedback 16 — the batched pass is *slower* than the scalar one, because each
+lane's recurrent state has to be copied into and out of the block scratch and the two extra `Vec`s
+there outweigh the interleaving.
+
+**Item 2 fails its kill criterion (10 %) by a factor of five and is not routed into
+`evaluate_population`.** The premise in the plan — "load the weight row once and apply it to every
+genome" — is false for this population: genomes do not share weights, so there is no row to reuse,
+and the only parallelism left is four independent scalar chains, which `dense` already keeps in
+flight *inside* one genome (`DENSE_ROW_BLOCK`). `forward_block` stays in the tree as the measured
+artifact with its bit-identity property test, and nothing calls it: the scalar path is what
+population evaluation uses, because the measurement says the scalar path is faster on the shape
+that matters. A later attempt should start from the 85 % the sim and the driver own, not from the
+multiply count — the observation builds three `Vec`s per decision, and that is where the headroom
+is.
+
+## Item 1: jump-timing is neutral on its two levels, so far
+
+`--jump-timing-share 0.5` against the default, pop 200, 300 generations,
+24 seeds, `train-cli bench` (the arm files were written under a shared name and
+the per-seed rows were lost when the second level overwrote the first; the
+summary lines below are from the run log):
+
+| level | default | `--jump-timing-share 0.5` |
+|---|---|---|
+| `l2-first-gap` | 24/24, median **2.0**, mean **2.0** | 24/24, median **2.0**, mean **1.9** |
+| `l4-rhythm` | 24/24, median **8.0**, mean **7.8** | 24/24, median **8.0**, mean **8.2** |
+
+The median does not move on either level, and the mean moves in opposite
+directions by less than half a generation. The arm **stays off** (the shipped
+default remains 0.0). A paired rerun with distinct arm names is still owed
+before the result is quoted as a sign test; the direction is already clear
+enough that no default should move on it.
+
+**The plan bonus on its own level, closed at twelve seeds.** `--plan-bonus 50` against the default
+on the `elements` protocol (pop 200, 2 000 generations, both arms complete):
+
+| arm | solved | first win |
+|---|---|---|
+| default | **0 of 12** | — |
+| `--plan-bonus 50` | **1 of 12** | seed 1, generation **863** |
+
+The paired sign test is **p = 1.0** on the one discordant seed, so the arm has **not** moved the
+plateau: one solve in twelve where the default has none is exactly the reading a single lucky
+seed produces, and seeds 2–12 are indistinguishable (the bonus arm's best fitness on the unsolved
+seeds is higher on seven of the eleven, lower on four — 1 341 against 1 136 on seed 11, 990 against
+1 093 on seed 2). The
+seed-1 solve reproduced bit-identically across two separate sweeps and across a rebuild, which
+says the run is deterministic rather than that the solve is robust. The knob stays off; the honest
+summary is that it is the only setting in this pass that has ever solved this level, and it does
+so once in twelve.
+
+## Item 4: lessons move gauntlet, CEM is a wash on tower
+
+Both halves are off by default, and both have now been run on a 12-seed protocol.
+
+**Mid-run lessons**, `--lesson-every 20` against the default on `gauntlet` (pop 200, 300
+generations): **8 seeds won by lessons, 3 by the default, 1 tie** (exact sign test p = 0.23),
+median first win **8 against 16** and mean 11.4 against 19.4. The direction is the one the plan
+predicts and the sample cannot establish it; the plan's own gate is `l11-the-elements`, which is
+still running.
+
+**Plateau CEM**, `--plateau-window 20` against the default on `tower`: **2 wins each, 8 ties,
+p = 1.0**, same solved count (9 of 12) and same median (53). It flipped seed 1 from unsolved to
+solved at 249 generations and seed 6 from solved at 146 to unsolved, which is a wash with a
+longer mean (83.4 against 78.3). No movement on the plateau it was written for.
+
+## Item 13: growth does not move the tower
+
+`--growth-units 4` against the default on the `tower` protocol (12 seeds, pop 200, 300
+generations) is a wash: 2 seeds won by growth, 1 by the default, 9 ties, exact sign test
+**p = 1.0**, and the growth arm **lost a solved seed** (seed 6: unsolved against the default's
+146). The operator inserted units at the stall, and the extra capacity bought nothing on the
+plateau it was grown for. The plan's kill criterion says grown capacity that does not move its
+plateau was never the constraint there; the operator stays behind `growth_units = 0`, with this
+reading recorded rather than the knob deleted, because the Item 13 gate names the resumed-l11
+clock test rather than the tower.
+
+## Item 3/12/13 groundwork: function-preserving input growth
+
+`Genome::grown_to_inputs` and `NetShape::with_inputs` are in
+`crates/evo/src/genome.rs`. They widen the observation by appending zero
+columns to each first-layer row, **before the recurrent columns**: layer 0
+reads `[observation; memory]`, so appending at the very end of the row would
+move the old memory weights onto new observation cells. The tests grow both a
+memoryless net and a feedback-16 net by six inputs and compare every output
+and the recurrent context bit for bit over a 24-decision sequence. This is the
+migration proof Items 3, 12 and 13 all need; it changes no default and no gene.
+
+## Item 3: sensors v14 was built, measured, and removed from the tree
+
+Sensors v14 was implemented in that pass — eight append-only columns (the nearest burning fuse's
+countdown and position, the nearest threat's velocity, the second mover's velocity and phase),
+`sensors::VERSION` 14, and a `ChampionFile::migrate_sensors` that grows a previous-layout file by
+zero columns. It is **not in this tree**: `sensors::VERSION` is 13, and there is no branch, stash
+or tag holding the attempt, so only the migration helpers (`NetShape::with_inputs`,
+`Genome::grown_to_inputs`, `ChampionFile::migrate_sensors`) and
+`crates/evo/tests/migration.rs` survive. It was not landed, for two independent reasons.
+
+The first is the plan's own rule 1. Item 2 measured the forward pass at **26 %** of a generation
+(see above), so a perfect batched pass would save 26 % and a realistic one 19–20 %, below the 25 %
+bar that Item 3 is gated on. The input growth costs about 7 % per decision at the current shape;
+spending it before Item 2 has banked more is exactly the trade the plan forbids.
+
+The second is the gate the previous attempt died on, and it is worth recording because it is a
+*test* finding rather than a sensor finding. At 108 inputs the paired warm-quarter canary passes.
+At 116 it failed on `l5-tightrope`: warm 199 generations against random's 168, with all five seeds
+solved. Neither gate level contains a walker, flyer, mover or crumble, so **all eight new columns
+read zero on both**, and the clone's own policy is unchanged — its mean fitness over eight episodes
+is the same to the hundredth at both widths (l2 260.80, l5 190.40). The flip is therefore the
+documented re-roll of every random population from finding 63, not a worse warm start: over twenty
+seeds the same gate reads warm 636 against random's 871 at 116, and 601 against 1 267 at 108, while
+the per-seed median is a wash at both widths (22 against 21.5, and 15.5 against 16). Five paired
+seeds of a heavy-tailed first-win total is a coin flip on this level, and it was passing at 108 on
+that coin flip. The canary is left as it is rather than tuned to the new draw; what the reading
+says is that **an append-only bump still re-rolls the gate**, because the trainer's mutants and
+random remainder are drawn from a longer genome.
+
+**Rebuilt a second time, and the failure reproduced.** The append-only half of v14 was written again
+from scratch — eight columns at 108–115: the nearest burning fuse's countdown and tile
+(`fuse_left, fuse_dx, fuse_dy`, read off `Sim`'s own fuse state through a new `Scene::fuses`), the
+nearest threat's velocity in body-speeds (`threat_vx, threat_vy`), and the second-nearest mover's
+velocity and cycle phase (`mover2_vx, mover2_vy, mover2_phase`). `sensors::VERSION` went to 14,
+`N_INPUTS` to 116, and the existing `ChampionFile::migrate_sensors` / `Genome::grown_to_inputs`
+pair carried a v13 champion across by zero-weight growth. The patch half was deliberately left out:
+drawing `ENC_ENEMY` into the 9×9 grid changes the *values* of 81 inputs every champion already
+reads, so a zero-weight growth is not policy-preserving on exactly the levels it is for, and the
+migration would stop being a proof.
+
+The canary failed with **the same numbers as the first attempt**: `l5-tightrope`, warm **199**
+generations against random's **168**, with all five seeds solved on both arms. Different eight
+columns, same width, same result. That rules out the explanation the previous pass recorded — that
+the flip was the documented re-roll of every random population rather than the extra inputs. The
+width is what moves the gate.
+
+Raising the canary to twelve seeds — a stronger test, run before the revert to see whether five
+seeds were simply a tail — failed on the other level for the same reason: `l2-first-gap`, warm
+**38** generations against random's **33**, 12 of 12 solved on both. That is the level where random
+is already fast, and it is exactly where the warm start's advantage lives; the two arms are paired
+on the same 48 random genomes, so the deficit is not a different draw of the population.
+
+**Why an append-only bump can still cost search.** Mutation is applied at
+`mutation_rate × n_genes`, so widening does not spread a fixed budget thinner — per-gene pressure is
+constant and the eight new columns are behaviourally dead on `l2` (no movers, enemies or crumbles).
+What changes is *which genes each draw mutates*: the trainer's RNG stream is a function of genome
+width, so every mutant in both arms is a different net. The warm arm's whole edge on a five-to-twenty
+generation level is smaller than that shift. An append-only sensor bump is therefore **behaviourally
+safe and search-unsafe**: it cannot change a policy, and it still changes what the search finds.
+
+**Verdict: reverted, fourth time.** `sensors::VERSION` is 13 and the vector is 108. Three independent
+reasons, none of them the eight columns' own merit — and the third is the one that should have been
+checked first: **the battery gate's premise is false**, because both levels it names already solve
+at generation 0 with the v13 default (`bat-crumble-bridge` 12/12, `bat-double-threat` 12/12, see
+**The gates, run**), so no perception change can move them. The other two: the plan's rule 1 is unmet (`Item 2` banked about 2 %, not
+the 15 % it required), and the canary the plan names as the stop condition reproduces. A future
+attempt needs a decision about the *test*, not the sensor layout: either pair the arms on the gene
+stream so both draw mutations for the same 108 positions, or accept the canary as the decision
+procedure and pay its cost in generations — and the battery gate still needs the pack retrain,
+which is machine time no code change substitutes for.
+
+What survives is the machinery the plan needs whichever bump lands first: `NetShape::with_inputs`,
+`Genome::grown_to_inputs` (zeros inserted **before** the recurrent columns, because layer 0 reads
+`[observation; memory]`), `Genome::grown_with_commitment`, and `ChampionFile::migrate_sensors`,
+which refuses anything but the immediately previous layout. `crates/evo/tests/migration.rs` proves
+the artifact chain on the real saved l11 champion (feedback 16): grown by the eight columns a next
+bump would append and fed the old cells followed by zeros, it replays to the same frame count,
+outcome, best x and progress, bit for bit. The sensor layout in this tree is v13/108, and the l11
+champion in `champions/` is current against it.
+
+## Item 8: there is no narrow phase draw to widen
+
+The item's premise is a training draw that is narrower than the phase space the validators sample.
+This build does not have one, in either half:
+
+* Training episodes are a function of `(master_seed, generation, trial)` under pairing, or
+  `(master_seed, generation, genome id, trial)` without it, and the sim draws the patrol's spawn
+  offset and direction and a flyer's position uniformly over the space a level permits. The
+  generation is part of the seed, so the world is re-rolled every generation and no phase can be
+  memorised. There is no range constant to widen.
+* Validation is already a fixed held-out set: `validation_seed` uses the `u32::MAX` generation
+  sentinel and a genome id no issued genome has, so two records meet the same twelve worlds
+  (`GaConfig::validation_episodes`), whatever the episode policy. It is compared on solve count
+  first, then mean, and `--stop-on-validated` already reports it in `train-cli bench`.
+
+So Item 8 has no implementation in this codebase and no default moves. The mechanism it was
+written to add — a hard practice draw, an honest exam, and a first-class gap — is already the
+shape of `common_episodes` plus `Validation`. What is genuinely missing is the *gap* itself: no
+run, champion or difficulty row computes a training-phase against held-out-phase reading, so the
+plan's step 3 is the one part of Item 8 that has no code at all. It is a reporting change with no
+training effect, and it is left for a pass that can re-take the table.
+
+## Item 10: the committee, its artifact and its gate
+
+`evo::Committee` runs one forward pass per member on the same observation, takes
+the majority action, and breaks a tie by the earliest member that voted for a
+tied action. Each member has its own `ActScratch`, so recurrent members keep
+their own memory; `Committee::validate` plays the vote and its best member on
+the same fixed seeds, and `CommitteeReport::passes` is the plan's rule (never
+worse than the best member on completion; equality passes). `showcase` turns the
+vote into a decision stream a viewer can replay.
+
+What was missing was the artifact, not the vote: the splash screen's own docs
+recorded that a committee assembled from whatever genomes happen to be in memory
+would be a different committee on every start. `CommitteeFile` is that artifact
+— format, level hash, sensor version, cadence, the run's master seed and its
+validation count, and the members in leaderboard order — with `save`/`load`,
+`check_compat` and a `validate` that plays the run's own fixed validation
+episodes. `train --committee <k>` writes one beside `champions/` and prints the
+gate's two counts; `train-cli committee --file ... --level ...` re-runs the gate
+from the file alone and exits non-zero if the vote lost. The file round trip and
+the cross-level refusal are pinned in `committee.rs`.
+
+The title screen now loads it: `Splash::open` prefers `committees/<level>.committee.json` when
+it validates, plays the vote through `CommitteeRun` on the file's cadence, and captions it with
+the gate's counts; a file that fails the gate, is missing, or is from another build falls
+through to the single champion and then to the scripted demo. The pack-wide gate (the committee
+against its best member across every level) is still a machine run.
+
+## Item 5: the early cut, and the scope of its guarantee
+
+`--cut-stuck <ticks>` ends an episode once the sim's own no-progress counter
+reaches that many frames and scores the part that was played. `0` is the
+default, so every run before the knob is bit-identical. Every term in `score` is
+monotone or one-shot, so the partial episode's score is the score of the ticks
+that happened; a body that could still escape would have scored more by playing
+on, and that is stated rather than hidden.
+
+The plan's hard rule is pinned on the case where it is a theorem: a genome of
+zeros walks into a wall and stands there, and the cut episode must score
+bit-identically to the played-out one while costing fewer frames
+(`the_no_progress_cut_scores_a_wall_stander_exactly_as_the_full_episode_does`).
+On a real level the cut does change the search, because a body that idles for
+the window and then escapes is cut before the escape: on `l9-wait-and-climb`,
+pop 200, seed 2, 20 generations, 120 idle frames raised the pass rate from
+**17 741 to 20 867 population-episodes per second (+18 %)** and changed the
+config's best genome. So the honest claim is a cheaper evaluation at the same
+episode count, with the champion-equality half of the gate failing on levels
+where late escapes matter. The knob stays off until an equal-episode arm says
+the cheaper reading is worth it.
+
+## Item 7: a recorded human run seeds a run
+
+`--from-demo <file>` loads a `HumanDemo` written by the playtest, checks its
+level hash, physics and sensor versions, cadence and that it reached the flag,
+fits it with the ordinary imitation code (no planner in the loop, on purpose),
+and seeds `pop / 4` slots like `--from-route`. Verified end to end on
+`l2-first-gap`: 139 decisions, 300 epochs, **95.0 % agreement**, two of eight
+slots seeded. The gate — a demonstration against the same run without one on a
+level where the default stalls — has not been run.
+
+## Item 11: the technique archive breeds
+
+`--technique-children <n>` draws a share of each generation's parents from the
+technique archive's cells instead of the leaderboard, with the same fine step
+the behaviour archive's children use (an incumbent is the best at one technique,
+and a coarse move destroys it). It is selection only: no fitness changes, no
+version moves, `0` by default, and a run reports the children spent beside the
+cells they came from. Pinned by
+`technique_children_are_bred_from_cells_and_off_is_off` on a pit level. The
+The 24-seed l11/battery arm has not been run; the cheap proxy on `gauntlet` (12 seeds) reads
+**5 wins for the share, 7 for the default, p = 0.77**, median 17.5 against 16 — no gain there, and
+no harm outside the noise either. A mechanism needs its own level, which is why the plan names
+l11 and a technique-gated battery level rather than the pack's third level.
+
+## Item 1: islands lose to one population of the same total size
+
+`train-cli islands --islands 4 --pop 50` against the default on the `tower` protocol (12 seeds,
+300 generations, stop at first win, migration every 25 generations): **9 seeds won by the default,
+1 by the islands, 2 ties**, exact sign test **p = 0.0215**, solved **9 of 12 against 5 of 12**,
+median first win **53 against 134**. The one seed islands gained (1) is one the default never
+solved; on all four seeds both solved (4, 8, 9, 11) the default was faster (38/120/53/64 against
+134/130/92/237), and islands never solved the five seeds the default did (2, 3, 6, 7, 12). The
+two ties are the two seeds neither arm solved (5, 10).
+
+The comparison is equal-budget in genomes an episode — 4 × 50 is the default's 200 — and that is
+also its confound: 50 is a quarter of the population size every other measurement in this file
+uses, and a 50-genome island has eight immigrants arriving into it per stall rather than eight
+into 200. So the reading says *this* islands configuration is a loss on a plateau, not that a ring
+of full-size populations would be one. A 4 × 200 arm is four times the budget and a different
+experiment.
+
+Two process notes. `islands` is its own command and does not write a bench arm, so the arm file
+this was compared with was assembled from the command's own log (per-seed first win, and the
+largest `best island maximum` each seed printed); the counts and the sign test above are read from
+it, and that derivation is the reason the row is not a `bench` file like the others. And the
+islands arm shows the plateau's own shape: best island maximum sat at 594 for 200 generations on
+seed 1 before one island broke through at 285.
+
+## WP8: snapshot probes are a wash on gauntlet
+
+`--snapshot-every 20 --snapshot-probes 4` against the default on the `gauntlet` protocol (12
+seeds, pop 200, 300 generations): **5 wins each, 2 ties, exact sign test p = 1.0**, solved 12 of
+12 in both, median first win **15.5 against 16.0** and mean 18.0 against 19.3. The probes are a
+small net gain in the medians and no gain at all in the paired direction.
+
+The probe batch is four extra genomes every 20 generations — 60 probe episodes against the
+protocol's 105 000 (200 genomes × 300 generations × the 1.75 episodes a raced walker level spends)
+— so this is an equal-episode comparison to within a rounding error, and the wash is a wash rather
+than a budget artefact.
+
+What `gauntlet` cannot say is whether the mechanism works where it was written for, since it has
+neither a deceptive pit nor a backtrack. That gate was then run on `bat-pit-bait` — see the next
+section, where the archive **loses**. `bat-backtrack` at 24 seeds and the stall-chain re-run are
+still unrun.
+
+## WP8 on its own level: the archive solves fewer seeds than the default
+
+The plan's gate for the snapshot archive is a deceptive battery level, and `bat-pit-bait` is one.
+The `tower` protocol's 300 generations solves **nothing** on this level (0 of 2 seeds in the probe,
+best fitness ~180 and stuck), so all three arms below ran **600 generations**, 12 seeds, pop 200,
+with `--level levels/bat-pit-bait.json`; the arm files record that override.
+
+| arm | solved | median first win | mean |
+|---|---|---|---|
+| default | **5 of 12** | 285 | 261.8 |
+| `--snapshot-every 20 --snapshot-probes 4` | **2 of 12** | 352 | 352.0 |
+| `--plan-bonus 50` | **3 of 12** | 307 | 231.0 |
+
+The paired sign test against the default is **4 win / 1 loss, p = 0.375** for the archive and **4
+win / 3 loss, p = 1.0** for the plan bonus. Neither is a win in direction, and the archive — the
+mechanism this level was chosen for — **loses three of the five seeds the default solves** (3, 5,
+10), gains one (2), and is slower on the fourth both solve (565 against 134); it leaves **ten**
+seeds unsolved where the default leaves seven. The one seed it wins by a large margin is seed 2
+(139 against the default's 455), which is the shape of a lucky restart rather than a mapped level.
+
+That is a stronger negative than the `gauntlet` wash, and it is not a budget artefact: 30 probe
+batches of four are 120 episodes against 120 000 genome-episodes (0.1 %), so the arm spent
+essentially the same episode count for half the solves. The archive's restarts are therefore not
+finding the pit's far side at this probe rate. Whether that is the mechanism or 120 probes being
+too few to map a 36 × 16 level is the open question, and answering it means either a denser probe
+rate as its own arm or a trainer change that pays for probes out of the generation's episodes —
+both measurable, neither run.
+
+**The plan bonus on the same level** is the second reading for that knob and it agrees with the
+first: 3 solves against 5, p = 1.0, median 307 against 285 — no gain, and its fastest solve (seed
+11, generation 70) is cancelled by seeds 2, 5, 10 and 12 going the other way.
+
+## Item 9: the fusion code exists and the CLI cannot reach it
+
+Auditing SMARTER_AI_PLAN.md against the tree, rather than against these notes, turned up a claim
+in the Item 9 row that was wrong: fusion is **not** unbuilt. `crates/evo/src/curriculum.rs` has
+`fuse_specialists` (neighbour legs crossed with the shipped uniform crossover, `FuseConfig`
+defaulting to 8 children at `cross_rate` 1.0) and `fused_seeding` (fused children first, then
+the caller's whole-level genomes, deduplicated by exact gene equality), and
+`the_fused_seeding_order_is_deterministic_and_deduplicated` pins the order. `segment_campaign`
+keeps one clone per leg in `SegmentCampaign` and writes each leg's population to
+`<stem>.segment-NN.population.json`, so the parents Item 9 names do reach disk.
+
+What is missing is the wire: `train-cli campaign` never calls `fused_seeding`, there is no
+`--fuse` share on any command, and the campaign's written artifact is one whole-level champion.
+So Item 9 is in exactly the state Item 6's flags were in before this pass — a reviewed mechanism
+with a test, unreachable from the command line — and its gate (fused seeding against the
+campaign's continuation, episodes to validated win on `l11` and `l10`) is unrun.
+
+## Item 6: seeding from another run's population is the first large win in this pass
+
+`--generalist <population.json> --generalist-share 0.25` against the default on the `tightrope`
+protocol (12 seeds, pop 200, 300 generations, stop at first win): **12 seeds won by generalist,
+0 by the default, 0 ties**, exact sign test **p = 0.0005**, median first win **2.0 against 8.0**
+and mean 1.9 against 8.7. Every one of the twelve seeds moved, ten of them by more than three
+generations, and the generalist's slowest seed (4 generations, seeds 2 and 11) is still only as
+slow as the default's fastest (4, seed 3).
+
+Two caveats are part of the reading rather than after it. The checkpoint is **not** the pack-wide
+generalist this item is written for: it is the final population of a 20-generation pop-64 run on
+`l2-first-gap`, the pack's *easiest* level, so part of the gain is a warm population rather than a
+*general* one, and `bench` prints the level-hash mismatch every time it is used. And the arm is
+capped at 25 % of generation zero, which is the plan's own clamp (`--from-route`'s earlier
+measurement says warming every slot is worse). What this establishes is that the warm-start
+plumbing is decisive on this level and cheap to use; what it does not establish is that a
+cross-pack checkpoint beats a same-level one, which needs `--save-population` from a suite run.
+
+Two defects were found on the way. `--generalist` and `--generalist-share` were parsed but missing
+from `TRAIN_OPTS`, so the documented arm was **unreachable from the CLI** — a run that passed them
+was refused as unknown. And a seeded `bench` arm still wrote `start: noise`: the arm file named
+only `--from-champion` and `--resume`, so a generalist, route, plan or demonstration seed produced
+a record indistinguishable from a cold one. `bench::start_of` now names all five seed sources and
+appends the generalist path and share, pinned by `an_arm_names_the_population_it_started_from`.
+The generalist arm was then **re-run after the fix and reproduced every per-seed row exactly**
+(same 12 wins, same 2.0 median, same 1.9 mean), so the reading above is the recorded one and not
+a log nobody can rebuild.
+
+## The four items this pass finished: 5, 6, 8 and 9
+
+The plan's remaining implementation work was Item 5's two halves, Item 6's rotation and refresh,
+Item 8's gap reading and Item 9's wire. All four are now in the tree with tests.
+
+**Item 5, step 1 (the band).** `--cut-stuck` used to cut on the stuck timer alone. It now keeps a
+cut only when the genome sits strictly below the selection cut (`--cut-margin`, default 0; a
+positive margin replays anything within that much score uncut). On `l9-wait-and-climb`, pop 200,
+20 generations, seed 2, debug build: **1 301 of 4 000 episodes cut, 1 845 population-episodes/s
+against 1 605 with the cut off (+15 %)**. The number is smaller than the old unconditional arm's
++18 % because the band replays the cuts that could have mattered — which is the point. The speed is
+real and the 12-seed `chain` gate (see **The gates, run**) shows what it costs: the arm solves two
+fewer seeds than the default, so the speed is not worth the solves.
+
+A finding falls straight out of the default: at a *win's* margin (**10 200**, the largest one-shot
+jump the score can make) **no episode on the plateau can be cut at all** — every genome sits
+within a win of the cut, every cut is replayed, and the run is 40 % slower than no cut (0 of 4 000
+cut, 1 021/s against 1 431/s). The plan's condition taken at its most conservative reading
+therefore deletes the saving it exists to collect, which is why the shipped default is the exact
+band and not a win.
+
+**Item 5, step 2 (the refund).** `--cut-refund` turns the ticks the cut did not play into whole
+episodes at the generation's mean episode length and spends them as one extra trial each on the
+genomes in the first quarter of ranks below the cut, in **one parallel pass** (a per-genome pass
+made the refund cost several times what the cut saved, and was measured before being replaced).
+The arm does not pay on `l9`: **1 478/s against 1 605/s with the cut off (-8 %)**, 1 327 episodes
+cut, 96 genomes re-read in a 6-generation probe — the refund's extra episodes cost more than the
+cut frames save at this level and population. Implemented, measured, and off.
+
+**Item 6, step 1 and 3.** `train-cli generalist --levels a,b,c` keeps one population trained across
+the pack in rotation, with the cursor derived from the checkpoint's own generation so a second
+invocation continues the cycle; `--refresh <champions dir>` puts the pack's own champions into the
+back slots, so the transfer runs both ways. Verified end to end: generation 4 → 6 across two
+invocations, a refresh at generation 6 that trains nothing, and a run seeded from the result
+(`seeded 8 generalist elite(s) into generation zero`). No paired arm yet; the mechanism the plan
+asked for exists.
+
+**Item 8, step 3.** A champion now carries its own `phase_gap` — training-draw wins and the
+held-out validation wins — and `train` prints `gap training 3/3 held-out 10/12 gap +0.17` beside
+the verdict it qualifies. Measured on a real run (`l3-gauntlet`, 3 generations): `train_wins 0/3`,
+`held_wins 0/12`, written into the file and preserved across a save/load. A suite is skipped on
+purpose: its validation set is one level's.
+
+**Item 9.** `campaign --fuse <N>` (and `--fuse-cross-rate`) breeds N crosses of the campaign's leg
+specialists with the shipped crossover and seeds them into generation zero before the whole-level
+phase. Verified: 4 legs → 4 crosses seeded, and a one-leg campaign refuses with "a cross needs two
+parents" rather than seeding a copy of one specialist. `Trainer::seed_donors` is the shared
+primitive under both this and the generalist share.
+
+## The gates, run
+
+Every item that has a gate has now been run on the repository's own protocol harness
+(`train-cli bench`, release build, 12 seeds, pop 200), not estimated from a single arm. The arms
+are recorded under `bench/`.
+
+**Item 5, the cut — fails the gate.** `chain` (`l9-wait-and-climb`, 12 seeds, 400 generations, stop
+at first win):
+
+| arm | solved | median | vs default |
+|---|---|---|---|
+| default | **11 of 12** | 100 | — |
+| `--cut-stuck 60` | 9 of 12 | 162 | 7–4, p = 0.55 |
+| `--cut-stuck 60 --cut-margin 10200` | 6 of 12 | 91.5 | 7–4, p = 0.55 |
+| `--cut-stuck 60 --cut-refund` | 9 of 12 | **87** | 5–7, p = 0.77 |
+
+The arm loses solves in every configuration and never wins the sign test: the band turns a 400-
+generation sweep into an 11-of-12 sweep into a 9-of-12 one and a 6-of-12 one, and the refund buys
+a better median while still solving two fewer seeds. Its speed is real (the `l9` episode count
+above) and it is not free: the episodes it declines to play are the ones a late-generation
+mutation would have needed. **Off is the default and stays the default.**
+
+**Item 6, the generalist — passes on transfer, and the difference between the two readings matters.**
+A 30-generation generalist rotated over `l2-first-gap` and `l3-gauntlet` only — **`l5-tightrope`
+held out** — seeded at a quarter share, then swept on `tightrope`, 12 seeds, 300 generations:
+
+| arm | solved | median | mean | vs default |
+|---|---|---|---|---|
+| default | 12 of 12 | 8.0 | 8.7 | — |
+| generalist, **held out** from its rotation | 12 of 12 | **4.0** | 4.3 | **10–1, p = 0.0117** |
+| generalist trained on tightrope too (retention, not transfer) | 12 of 12 | **0.0** | 0.0 | 12–0, p = 0.0005 |
+
+The middle row is the gate. The third row is the same checkpoint protocol with the graded level in
+its own rotation, and it is only retention: a population trained on a level trivially "starts"
+solving it, which says nothing about the item's claim. The held-out row says a generalist built from
+two *other* pack levels halves the generations to a solve on a level it has never trained on, and
+wins ten of the eleven discordant seeds.
+
+**Item 9, fused seeding — mechanism confirmed, effect unproven.** `campaign` on `l5-tightrope`
+(pop 64, 8 generations per leg, 20 on the whole level), `--fuse 4` against `--fuse 0`, 12 paired
+seeds: **11 of 12 solved against 10 of 12**, the one disagreement seed 7 (fused wins). A sign test
+over one discordant pair is p = 1.0, so the campaign effect is not established; what is established
+is that four crosses of five leg specialists enter generation zero and the whole-level phase then
+solves one seed more with a higher best fitness (11 388.8 against 11 378.3, 444 frames against 499).
+
+**Item 3, the battery — the gate's premise does not hold.** `train-cli battery` passes all seven
+`bat-*` levels (reach and plan), and the two the item names for its gate train to a solve under the
+**v13 default** at the `hazard-floor` protocol shape: `bat-crumble-bridge` **12 of 12 at
+generation 0**, `bat-double-threat` **12 of 12**, median 3.5. The item exists to move those two from
+unsolved-by-default to solved, and they are already solved at the first generation, so the gate
+cannot distinguish a policy that reads a fuse from one that does not. That is a finding about the
+battery, not about v14: the levels are a planner test (4 and 5 expansions), too short for a
+perception change to show up.
+
+**Item 2** has no arm to run: the gate is generation wall time, and the forward pass is 15 % of a
+generation with the batched pass slower than the scalar one on the reference shape, so the ceiling
+is ~2 % against a 25 % bar.
+
+## Where every item stands
+
+| item | code | measured |
+|---|---|---|
+| 1 jump-timing | shipped, off | neutral on l2/l4; stays off |
+| 1 plan bonus | shipped, off | elements: 1 solve in 12 (seed 1, gen 863) against the default's 0, p = 1.0; bat-pit-bait: 3 solves against 5, p = 1.0 — no movement on either |
+| 1 islands | shipped, off | tower, 4 × 50: 1 win / 9 losses, p = 0.02, median 134 vs 53 — a loss at equal genome budget |
+| 2 batched pass | built, measured, **killed**: `Genome::forward_block` is not routed into evaluation | 1.14× batched on the memoryless shape, **0.96×** on the reference level's feedback shape, against a 10 % kill line; forward pass is 15 % of a generation on this machine |
+| 3 sensors v14 | **not in the tree**, rebuilt once more and reverted; `sensors::VERSION` stays 13 at 108 inputs | **the gate's premise is false**: both levels it names are already solved by the v13 default (`bat-crumble-bridge` 12/12 at generation 0, `bat-double-threat` 12/12, median 3.5), so no sensor can move them; the warm canary also reproduces at the same width (l5 199 vs 168, l2 38 vs 33 at 12 seeds) |
+| 4 lessons + CEM | shipped, both off | gauntlet: lessons 8 wins / 3 losses, p = 0.23 (median 8 vs 16); tower CEM: 2/2, p = 1.0; l11 gates outstanding |
+| 5 early cut | shipped, off, with the band and the refund | **12-seed `chain` gate: fails on solves** — default 11/12, band 9/12, win-margin 6/12, refund 9/12; directions are 7–4 and 5–7, p = 0.55 / 0.77 |
+| WP8 snapshot probes | shipped, off | gauntlet: 5 wins / 5 losses, p = 1.0, median 15.5 vs 16; bat-pit-bait (600 gens): 2 solves against 5, 1 win / 4 losses, p = 0.375 — a loss on its own gate level, at 0.1 % more episodes |
+| 6 generalist seeding | shipped, off; `generalist` command keeps one population rotating across the pack and refreshes it from pack champions | **12-seed `tightrope` gate, level held out of the rotation: passes** — 12/12 solved at median 4.0 against the default's median 8.0, 10 wins / 1 loss, p = 0.0117 |
+| 7 human demo | shipped, on demand | 95 % clone agreement; stall gate outstanding |
+| 8 phase draw | no lever exists; the **gap reading** is now in the champion file and the train summary | measured 0/3 training vs 0/12 held-out on gauntlet |
+| 9 fused seeding | `campaign --fuse <N>` / `--fuse-cross-rate`, on the shared `Trainer::seed_donors` primitive | **12-seed campaign on `tightrope`: 11/12 solved against 10/12**, one discordant seed (7), p = 1.0 — mechanism confirmed, effect unproven |
+| 10 committee | shipped + file + gate command + title-screen display | pack gate outstanding |
+| 11 technique share | shipped, off | gauntlet: 5 wins / 7 losses, p = 0.77, median 17.5 vs 16; l11/battery gate outstanding |
+| 12 cadence head | shipped, off | gauntlet proxy: 7 wins / 5 losses, p = 0.77, median 12 vs 16; the plan's v14 arm-vs-arm gate is blocked with Item 3 |
+| 13 hidden growth | shipped, off | tower arm: 2 wins / 1 loss / 9 ties, p = 1.0, and one solved seed lost — no movement |
+

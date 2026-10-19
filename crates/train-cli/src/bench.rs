@@ -86,17 +86,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::args::Args;
-use crate::commands::{load_level, seeded_trainer, train_config, usage, TRAIN_OPTS};
+use crate::commands::{attach_plan, load_level, seeded_trainer, train_config, usage, TRAIN_OPTS};
 
 /// Options this subcommand adds to the `train` flags, which it also accepts (a bench arm
 /// *is* a training configuration; only the sweep around it is new).
-pub const BENCH_OPTS: &[&str] = &[
-    "protocol",
-    "arm",
-    "seeds",
-    "compare",
-    "list",
-];
+pub const BENCH_OPTS: &[&str] = &["protocol", "arm", "seeds", "compare", "list"];
 
 /// One named protocol: the sweep a recorded measurement was taken with.
 ///
@@ -196,6 +190,40 @@ fn unrecorded_start() -> String {
     "noise (recorded before the start field existed)".to_string()
 }
 
+/// **Where this arm's generation zero comes from**, named from the same flags
+/// [`seeded_trainer`](crate::commands::seeded_trainer) reads.
+///
+/// The five seeding flags are alternatives, and every one of them changes what a first-win
+/// generation means: a run that began from a route clone and one that began from noise are not
+/// the same measurement even when the label, the level and the seeds agree. `--generalist` is not
+/// one of the five — it seeds a share of generation zero *on top of* whatever the base is — so it
+/// is appended rather than chosen between.
+fn start_of(a: &Args) -> String {
+    let base = if let Some(path) = a.opt("from-champion") {
+        format!("champion {path}")
+    } else if let Some(path) = a.opt("resume") {
+        format!("checkpoint {path}")
+    } else if a.has_flag("from-route") {
+        "route clone".to_string()
+    } else if a.has_flag("from-plan") {
+        "timed plan".to_string()
+    } else if let Some(path) = a.opt("from-demo") {
+        format!("demonstration {path}")
+    } else {
+        "noise".to_string()
+    };
+    match a.opt("generalist") {
+        Some(path) => format!(
+            "{base} + generalist {path} ({:.0} % of generation zero)",
+            a.opt("generalist-share")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.0)
+                * 100.0
+        ),
+        None => base,
+    }
+}
+
 /// One seed's outcome inside an arm.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SeedRow {
@@ -233,6 +261,10 @@ pub struct BenchArm {
     pub hidden: Vec<usize>,
     /// Width of the recurrent state fed back into the next decision.
     pub feedback: usize,
+    /// Item 12's cadence head. Defaulted to `false` so every arm recorded before it existed
+    /// reads back as the fixed-cadence run it was.
+    #[serde(default)]
+    pub commitment: bool,
     pub mutation_sigma: f32,
     pub fine_children: usize,
     /// The fine scale's step as a fraction of `mutation_sigma` (`GaConfig::fine_sigma_scale`).
@@ -245,7 +277,30 @@ pub struct BenchArm {
     pub fine_sigma_scale: f32,
     pub immigrants: usize,
     pub archive_children: usize,
+    /// Item 5's cut. Defaulted to zero so an arm recorded before the field existed reads back as
+    /// the ordinary full-episode evaluation it actually ran.
+    #[serde(default)]
+    pub cut_stuck_frames: u32,
+    /// Item 13's growth operator: units per event and events per run. Defaulted to zero so an
+    /// arm taken before the operator existed reads back as the fixed-width run it was.
+    #[serde(default)]
+    pub growth_units: usize,
+    #[serde(default)]
+    pub growth_events: u32,
+    /// Item 11's share. Defaulted to zero so every arm recorded before the field existed reads
+    /// back as the leaderboard-only search it actually ran.
+    #[serde(default)]
+    pub technique_children: usize,
     pub archive_on_diversity: bool,
+    /// Selection-only plan bonus this arm ran with (`GaConfig::plan_bonus`). Defaulted to zero
+    /// for arms recorded before the first plan-bonus arm actually attached a guide.
+    #[serde(default)]
+    pub plan_bonus: f32,
+    /// Waypoints the planner attached, one per seed, in seed order. Empty when the arm had no
+    /// guide; a zero here beside a positive `plan_bonus` would mean the arm silently ran without
+    /// one, which is the failure this field exists to make visible.
+    #[serde(default)]
+    pub plan_waypoints: Vec<usize>,
     pub novelty_weight: f32,
     /// How pessimistically a genome's trials were ranked (`GaConfig::rank_pessimism`):
     /// `0.0` is the mean of its trials, `1.0` is its worst trial.
@@ -354,7 +409,8 @@ pub fn bench(a: &Args) -> Result<(), String> {
     let stop_on_validated = a.has_flag("stop-on-validated");
     if stop_on_validated && a.has_flag("no-validation") {
         return Err(
-            "usage: --stop-on-validated reads the validation set that --no-validation switches off".into(),
+            "usage: --stop-on-validated reads the validation set that --no-validation switches off"
+                .into(),
         );
     }
 
@@ -392,7 +448,10 @@ pub fn bench(a: &Args) -> Result<(), String> {
     let seeds = usage(a.usize_opt("seeds", protocol.seeds as usize))? as u32;
     let first_seed = usage(a.u64_opt("seed", 1))?;
     if generations == 0 {
-        return Err("usage: --generations must be at least 1: an arm with no generations measures nothing".into());
+        return Err(
+            "usage: --generations must be at least 1: an arm with no generations measures nothing"
+                .into(),
+        );
     }
     if seeds == 0 {
         return Err("usage: --seeds must be at least 1".into());
@@ -412,11 +471,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
     // How every seed of this arm began. `seeded_trainer` is the one place that decides it, so this
     // only has to *name* it — and it names it from the same two flags, so the file cannot disagree
     // with the run about where the population came from.
-    let start = match (a.opt("from-champion"), a.opt("resume")) {
-        (Some(path), _) => format!("champion {path}"),
-        (_, Some(path)) => format!("checkpoint {path}"),
-        _ => "noise".to_string(),
-    };
+    let start = start_of(a);
 
     if !quiet {
         println!(
@@ -434,7 +489,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
             }
         );
         println!(
-            "recipe  hidden [{}]  feedback {}  sigma {:.2}  fine {} x{:.2}  immigrants {}  qd {}{}  novelty {:.1}  rank {:.2}  trials {} ({})  episodes {}  action_repeat {}",
+            "recipe  hidden [{}]  feedback {}  sigma {:.2}  fine {} x{:.2}  immigrants {}  qd {}  tech {}  cut {}  growth {}x{}{}  novelty {:.1}  rank {:.2}  trials {} ({})  episodes {}  action_repeat {}",
             join_usize(&cfg.shape.hidden),
             cfg.shape.feedback,
             cfg.mutation_sigma,
@@ -442,6 +497,10 @@ pub fn bench(a: &Args) -> Result<(), String> {
             cfg.fine_sigma_scale,
             cfg.immigrants,
             cfg.archive_children,
+            cfg.technique_children,
+            cfg.cut_stuck_frames,
+            cfg.growth_units,
+            cfg.growth_events,
             if cfg.archive_on_diversity {
                 " (gated on a stall in both senses)"
             } else {
@@ -486,6 +545,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
     // cap runs out. `Trainer::step` is the only entry point, so no curriculum can fire and
     // the RNG stream is the trainer's own.
     let mut rows: Vec<SeedRow> = Vec::with_capacity(seeds as usize);
+    let mut plan_waypoints: Vec<usize> = Vec::new();
     for offset in 0..seeds {
         let seed = first_seed + offset as u64;
         let mut run = cfg.clone();
@@ -496,6 +556,12 @@ pub fn bench(a: &Args) -> Result<(), String> {
         // seed) is a whole class of question this tool has to be able to ask, and a sweep that
         // began its runs differently from the way a real run begins would answer a different one.
         let mut trainer = seeded_trainer(run, &level, a)?;
+        // The plan bonus is selection-only, but an arm that did not attach the guide is not the
+        // arm its label claims: `bench` used to accept `--plan-bonus` and never call this.
+        let effective = trainer.config.clone();
+        if let Some(waypoints) = attach_plan(&mut trainer, &level, a, &effective)? {
+            plan_waypoints.push(waypoints);
+        }
         let mut best_fitness = f32::NEG_INFINITY;
         let mut first_win: Option<u32> = None;
         for _ in 0..generations {
@@ -546,12 +612,19 @@ pub fn bench(a: &Args) -> Result<(), String> {
         seeds,
         hidden: cfg.shape.hidden.clone(),
         feedback: cfg.shape.feedback,
+        commitment: cfg.shape.commitment,
         mutation_sigma: cfg.mutation_sigma,
         fine_children: cfg.fine_children,
         fine_sigma_scale: cfg.fine_sigma_scale,
         immigrants: cfg.immigrants,
         archive_children: cfg.archive_children,
+        cut_stuck_frames: cfg.cut_stuck_frames,
+        growth_units: cfg.growth_units,
+        growth_events: cfg.growth_events,
+        technique_children: cfg.technique_children,
         archive_on_diversity: cfg.archive_on_diversity,
+        plan_bonus: cfg.plan_bonus,
+        plan_waypoints,
         novelty_weight: cfg.novelty_weight,
         rank: cfg.rank_pessimism,
         trials: cfg.effective_trials(&level),
@@ -650,7 +723,13 @@ fn reject_train_shape_flags(a: &Args) -> Result<(), String> {
     // of them has a meaning in a seed sweep: a detour would move the first win away from
     // the run's own, a suite is several levels rather than one, a chart is one seed's
     // history, and a wall clock would make the cap depend on the machine.
-    const REFUSED: &[&str] = &["suite", "curriculum", "curriculum-generations", "csv", "max-seconds"];
+    const REFUSED: &[&str] = &[
+        "suite",
+        "curriculum",
+        "curriculum-generations",
+        "csv",
+        "max-seconds",
+    ];
     for name in REFUSED {
         if a.opt(name).is_some() || a.has_flag(name) {
             return Err(format!(
@@ -778,10 +857,7 @@ fn compare(paths: &[String], quiet: bool) -> Result<(), String> {
         ));
     }
 
-    println!(
-        "compare {}\n        vs {}",
-        paths[0], paths[1]
-    );
+    println!("compare {}\n        vs {}", paths[0], paths[1]);
     println!(
         "protocol {}  level {} ({})  pop {} vs {}  generations {} vs {}  seeds {}\n",
         left.protocol,
@@ -838,7 +914,11 @@ fn compare(paths: &[String], quiet: bool) -> Result<(), String> {
                 "{seed:>6}  {:<12}  {:<10}  {:<10}",
                 label(l),
                 label(r),
-                if winner == "tie" { "tie".to_string() } else { winner.to_string() }
+                if winner == "tie" {
+                    "tie".to_string()
+                } else {
+                    winner.to_string()
+                }
             );
         }
     }
@@ -976,6 +1056,59 @@ mod tests {
     }
 
     #[test]
+    fn an_arm_names_the_population_it_started_from() {
+        // A fresh sweep is noise, and it says so.
+        assert_eq!(start_of(&a(&["bench", "--protocol", "chain"])), "noise");
+        // Every other way generation zero can be built is named, because none of them is
+        // comparable with noise on "first win".
+        assert!(start_of(&a(&[
+            "bench",
+            "--protocol",
+            "chain",
+            "--from-champion",
+            "c.json"
+        ]))
+        .contains("champion c.json"));
+        assert!(start_of(&a(&[
+            "bench",
+            "--protocol",
+            "chain",
+            "--resume",
+            "p.json"
+        ]))
+        .contains("checkpoint p.json"));
+        assert_eq!(
+            start_of(&a(&["bench", "--protocol", "chain", "--from-route"])),
+            "route clone"
+        );
+        assert_eq!(
+            start_of(&a(&["bench", "--protocol", "chain", "--from-plan"])),
+            "timed plan"
+        );
+        assert!(start_of(&a(&[
+            "bench",
+            "--protocol",
+            "chain",
+            "--from-demo",
+            "d.json"
+        ]))
+        .contains("demonstration d.json"));
+        // A generalist share is a modifier, not a sixth alternative: an arm that dropped it
+        // would report the same `noise` as the default and be quoted as one.
+        let seeded = start_of(&a(&[
+            "bench",
+            "--protocol",
+            "chain",
+            "--generalist",
+            "g.json",
+            "--generalist-share",
+            "0.25",
+        ]));
+        assert!(seeded.starts_with("noise + generalist g.json"), "{seeded}");
+        assert!(seeded.contains("25 %"), "{seeded}");
+    }
+
+    #[test]
     fn the_sign_test_matches_its_exact_known_cases() {
         // No disagreement: nothing to say.
         assert_eq!(sign_test_p(0, 0), 1.0);
@@ -1009,7 +1142,11 @@ mod tests {
             seen.push(p.name);
             let level = load_level(&wpath(p.level))
                 .unwrap_or_else(|e| panic!("protocol {} names {}: {e}", p.name, p.level));
-            assert!(!level.name.is_empty(), "protocol {}: level has no name", p.name);
+            assert!(
+                !level.name.is_empty(),
+                "protocol {}: level has no name",
+                p.name
+            );
             assert!(p.seeds > 0, "protocol {}: no seeds", p.name);
             assert!(p.generations > 0, "protocol {}: no generations", p.name);
             assert!(p.pop >= 2, "protocol {}: a population of {}", p.name, p.pop);
@@ -1060,6 +1197,7 @@ mod tests {
         let read_back = read_arm(&path.to_string_lossy()).expect("the arm's own file reads back");
         assert_eq!(read_back.protocol, "chain");
         assert_eq!(read_back.arm, "tiny");
+        assert_eq!(read_back.start, "noise");
         assert_eq!(read_back.pop, 16);
         assert_eq!(read_back.generations, 2);
         assert_eq!(read_back.seeds, 2);
@@ -1083,7 +1221,10 @@ mod tests {
             .all(|r| r.first_win.is_none_or(|g| g < read_back.generations)));
         let text = fs::read_to_string(&path).expect("file exists");
         for key in ["\"rank\"", "\"trials\"", "\"hidden\"", "\"mutation_sigma\""] {
-            assert!(text.contains(key), "the arm's file is missing {key}: {text}");
+            assert!(
+                text.contains(key),
+                "the arm's file is missing {key}: {text}"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1120,8 +1261,16 @@ mod tests {
             .expect_err("must be a usage error");
         assert!(err.contains("--pop"), "{err}");
         // An unknown protocol lists the known ones.
-        let err = bench(&a(&["bench", "--protocol", "nope", "--seeds", "1", "--generations", "1"]))
-            .expect_err("must be a usage error");
+        let err = bench(&a(&[
+            "bench",
+            "--protocol",
+            "nope",
+            "--seeds",
+            "1",
+            "--generations",
+            "1",
+        ]))
+        .expect_err("must be a usage error");
         assert!(err.contains("chain"), "{err}");
         // The list mode is a table and nothing else.
         assert!(bench(&a(&["bench", "--list"])).is_ok());

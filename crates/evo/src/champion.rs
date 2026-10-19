@@ -15,8 +15,8 @@ use sim::level::LEVEL_FORMAT_VERSION;
 use sim::sensors;
 use sim::{Level, SIM_VERSION};
 
-use crate::fitness::{EpisodeResult, FITNESS_VERSION};
-use crate::ga::GaConfig;
+use crate::fitness::{run_episode, EpisodeResult, FITNESS_VERSION};
+use crate::ga::{episode_seed_for, GaConfig, Validation};
 use crate::genome::{ActScratch, Genome, NetShape, MAX_FEEDBACK};
 
 pub const CHAMPION_FORMAT: &str = "evo-platformer-champion";
@@ -34,6 +34,10 @@ pub struct NetworkSpec {
     /// malformed one.
     #[serde(default)]
     pub feedback: usize,
+    /// Item 12's cadence head: one extra neuron after the action rows. Defaulted so every file
+    /// written before the head existed reads back as a fixed-cadence policy.
+    #[serde(default)]
+    pub commitment: bool,
     pub activation_hidden: String,
     pub activation_output: String,
     pub weights: Vec<f32>,
@@ -47,6 +51,7 @@ impl NetworkSpec {
             n_hidden: g.shape.hidden.clone(),
             n_outputs: g.shape.outputs,
             feedback: g.shape.feedback,
+            commitment: g.shape.commitment,
             activation_hidden: "tanh".into(),
             activation_output: "tanh".into(),
             weights: g.weights.clone(),
@@ -60,6 +65,7 @@ impl NetworkSpec {
             hidden: self.n_hidden.clone(),
             outputs: self.n_outputs,
             feedback: self.feedback,
+            commitment: self.commitment,
         }
     }
 
@@ -184,6 +190,96 @@ pub struct ChampionMetadata {
     pub outcome: String,
     pub trajectory_hash: String,
     pub training_config: TrainingSummary,
+    /// **Item 8, step 3: the training/held-out gap, per champion.**
+    ///
+    /// The two win rates a phase-memorising policy separates: how often the genome won the
+    /// episodes it was *trained* on, against how often it won the run's fixed validation set. A
+    /// positive reading means it wins more on the phases it saw than on the ones it did not, which
+    /// is the failure the narrow draw was suspected of and the thing a difficulty table could not
+    /// show before this field.
+    ///
+    /// `None` when there is nothing to compare against: a run with validation switched off, or a
+    /// level with nothing stochastic in it (where the generation's own episode already *is* the
+    /// held-out reading, so the gap is zero by construction and quoting it would be a number that
+    /// cannot move). Defaulted, so every champion written before the reading existed still loads.
+    #[serde(default)]
+    pub phase_gap: Option<PhaseGap>,
+}
+
+/// A champion's win rate on the phases it trained on against its rate on held-out phases.
+///
+/// Rates rather than counts at the comparison site, counts at the storage site: a reader needs
+/// `wins / episodes` to compare a 3-episode training draw with a 12-episode validation set, and a
+/// stored rate would round away the arithmetic that makes the number reproducible.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PhaseGap {
+    /// Episodes of the training draw that reached the flag.
+    pub train_wins: u32,
+    /// Episodes in the training draw.
+    pub train_episodes: u32,
+    /// Episodes of the held-out set that reached the flag.
+    pub held_wins: u32,
+    /// Episodes in the held-out set.
+    pub held_episodes: u32,
+}
+
+impl PhaseGap {
+    /// The record's win rate on the episodes it was selected on.
+    pub fn training_rate(&self) -> f32 {
+        ratio(self.train_wins, self.train_episodes)
+    }
+
+    /// The record's win rate on the run's fixed validation set.
+    pub fn held_rate(&self) -> f32 {
+        ratio(self.held_wins, self.held_episodes)
+    }
+
+    /// Positive when the policy wins more on the phases it saw. The reading itself.
+    pub fn gap(&self) -> f32 {
+        self.training_rate() - self.held_rate()
+    }
+}
+
+fn ratio(wins: u32, episodes: u32) -> f32 {
+    if episodes == 0 {
+        0.0
+    } else {
+        wins as f32 / episodes as f32
+    }
+}
+
+/// **Measure a record's training/held-out gap** (Item 8, step 3).
+///
+/// The training half is *replayed*, not remembered: the record's own generation and id derive the
+/// seeds it was judged on ([`episode_seed_for`]), so the same genome on the same trials is the
+/// honest training reading even for a champion loaded from a file. The held-out half is the
+/// trainer's own [`Validation`], which is the only place the validation seeds exist.
+///
+/// Costs `effective_trials` episodes, once, when a champion is written — never per generation.
+/// Returns `None` when there is no held-out reading to compare with.
+pub fn measure_phase_gap(
+    level: &Level,
+    genome: &Genome,
+    config: &GaConfig,
+    generation: u32,
+    held: Option<Validation>,
+) -> Option<PhaseGap> {
+    let held = held?;
+    let eval = config.eval_config();
+    let trials = config.effective_trials(level);
+    let mut train_wins = 0;
+    for trial in 0..trials {
+        let seed = episode_seed_for(config, generation, genome.id, trial);
+        if run_episode(level, genome, &eval, seed).won() {
+            train_wins += 1;
+        }
+    }
+    Some(PhaseGap {
+        train_wins,
+        train_episodes: trials,
+        held_wins: held.wins,
+        held_episodes: held.episodes,
+    })
 }
 
 /// The subset of [`GaConfig`] that shaped this champion.
@@ -302,6 +398,7 @@ impl ChampionFile {
                 checkpoints: result.checkpoints,
                 outcome: result.outcome.as_str().into(),
                 trajectory_hash: format!("{:016x}", result.trajectory_hash),
+                phase_gap: None,
                 training_config: TrainingSummary::from(config),
             },
         }
@@ -325,6 +422,68 @@ impl ChampionFile {
             ));
         }
         Ok(g)
+    }
+
+    /// **Carry a champion across an append-only sensor bump without changing its policy.**
+    ///
+    /// Item 3's migration, in the artifact rather than in the arithmetic: a champion whose
+    /// `sensor_version` is exactly the one before this build's is grown to the current vector by
+    /// [`Genome::grown_to_inputs`], which appends zero weights so every old input keeps its index
+    /// and every new input is unreadable. The metadata's `sensor_version` moves with it; the
+    /// recorded episode and its hash stay valid because the policy is unchanged.
+    ///
+    /// Deliberately narrow. Only the **previous** layout is migrated, and only in the growth
+    /// direction: a champion two bumps old would need two re-readings composed, and a champion
+    /// whose patch semantics changed under it (a bump that draws a new entity into the grid) is
+    /// not function-preserving on a level with one in the 9×9 patch. Refusing those is the whole
+    /// reason this returns `Err` rather than silently growing whatever it is handed.
+    ///
+    /// Returns `true` when the file was migrated, `false` when it was already current. The file
+    /// on disk is not rewritten: migration is a load-time reading, and a caller that wants the new
+    /// shape saved says so.
+    pub fn migrate_sensors(&mut self) -> Result<bool, String> {
+        if self.metadata.sensor_version == sensors::VERSION {
+            return Ok(false);
+        }
+        if self.metadata.sensor_version.checked_add(1) != Some(sensors::VERSION) {
+            return Err(format!(
+                "sensor_version mismatch: champion {} vs build {}; only the previous layout is \
+                 migrated, and this build cannot grow a v{} network",
+                self.metadata.sensor_version,
+                sensors::VERSION,
+                self.metadata.sensor_version
+            ));
+        }
+        if self.network.n_inputs > sensors::N_INPUTS {
+            return Err(format!(
+                "champion takes {} inputs but this build's sensors produce {}: a migration cannot \
+                 shrink an observation",
+                self.network.n_inputs,
+                sensors::N_INPUTS
+            ));
+        }
+        let old = self.to_genome()?;
+        let grown = old.grown_to_inputs(sensors::N_INPUTS)?;
+        self.network = NetworkSpec::from_genome(&grown);
+        self.metadata.sensor_version = sensors::VERSION;
+        Ok(true)
+    }
+
+    /// **Give a champion the cadence head without changing a decision.**
+    ///
+    /// Item 12's artifact-side migration: the network is grown by
+    /// [`Genome::grown_with_commitment`] (a zero output row, which reads as a four-tick
+    /// commitment), the spec is rewritten and the metadata's versions are left alone because
+    /// neither the senses nor the fitness moved. The recorded episode stays valid, and the test
+    /// in `tests/migration.rs` replays it to the same clock and frontier.
+    pub fn adopt_commitment(&mut self) -> Result<bool, String> {
+        if self.network.commitment {
+            return Ok(false);
+        }
+        let old = self.to_genome()?;
+        let grown = old.grown_with_commitment()?;
+        self.network = NetworkSpec::from_genome(&grown);
+        Ok(true)
     }
 
     /// Refuse anything this build cannot reproduce (§8).
@@ -402,7 +561,8 @@ impl ChampionFile {
             }
         }
         let json = self.to_json_pretty()?;
-        std::fs::write(path, json + "\n").map_err(|e| format!("cannot write {}: {e}", path.display()))
+        std::fs::write(path, json + "\n")
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 
     /// Load *and* validate against a level. Prefer this over [`from_json_str`]:
@@ -414,7 +574,10 @@ impl ChampionFile {
         let path = path.as_ref();
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let champ = ChampionFile::from_json_str(&src)
+        let mut champ =
+            ChampionFile::from_json_str(&src).map_err(|e| format!("{}: {e}", path.display()))?;
+        champ
+            .migrate_sensors()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         champ
             .check_compat(level)
@@ -436,7 +599,10 @@ impl ChampionFile {
         let path = path.as_ref();
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let champ = ChampionFile::from_json_str(&src)
+        let mut champ =
+            ChampionFile::from_json_str(&src).map_err(|e| format!("{}: {e}", path.display()))?;
+        champ
+            .migrate_sensors()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         champ
             .check_trainable()
@@ -495,14 +661,12 @@ impl ChampionFile {
 
 /// Drive a loaded champion through the shared episode driver, so "watch champion
 /// replay" (§10 Tier 2.8) and the round-trip test cannot drift from training.
-pub fn replay(
-    level: &Level,
-    champion: &ChampionFile,
-) -> Result<(Genome, EpisodeResult), String> {
+pub fn replay(level: &Level, champion: &ChampionFile) -> Result<(Genome, EpisodeResult), String> {
     champion.check_compat(level)?;
     let genome = champion.to_genome()?;
     let cfg = crate::fitness::EvalConfig {
         action_repeat: champion.metadata.action_repeat,
+        cut_stuck_frames: 0,
     };
     let result = crate::fitness::run_episode(level, &genome, &cfg, champion.metadata.episode_seed);
     Ok((genome, result))
@@ -537,6 +701,51 @@ mod tests {
         ChampionFile::new(&g, &r, level, 3, &cfg)
     }
 
+    /// **Item 8's reading is arithmetic, and it round-trips through the file.** A champion written
+    /// without a held-out reading says so (`None`), the field is optional on load, and when both
+    /// halves exist the gap is exactly `training − held-out` and the training half was measured on
+    /// the trials the run judged the record on.
+    #[test]
+    fn the_phase_gap_is_the_difference_between_the_two_win_rates_and_is_optional() {
+        let lv = level();
+        let mut rng = rng_from_seed(17);
+        let genome = Genome::random(3, default_shape(), &mut rng);
+        let cfg = GaConfig::default();
+
+        // No validation reading means no gap: a number over one half of the comparison would be
+        // a claim the run cannot make.
+        assert_eq!(measure_phase_gap(&lv, &genome, &cfg, 4, None), None);
+
+        let held = Validation {
+            wins: 2,
+            episodes: 4,
+            mean: 100.0,
+        };
+        let gap = measure_phase_gap(&lv, &genome, &cfg, 4, Some(held)).expect("both halves exist");
+        assert_eq!(gap.train_episodes, cfg.effective_trials(&lv));
+        assert_eq!(gap.held_wins, 2);
+        assert_eq!(gap.held_episodes, 4);
+        assert_eq!(gap.gap(), gap.training_rate() - gap.held_rate());
+        assert!((gap.held_rate() - 0.5).abs() < 1e-6);
+
+        // The reading survives a save and a load, and a file written before the field existed
+        // still parses with `None`.
+        let mut champ = champion_for(&lv, 2);
+        champ.metadata.phase_gap = Some(gap);
+        let text = champ.to_json_pretty().expect("serialises");
+        let back = ChampionFile::from_json_str(&text).expect("parses");
+        assert_eq!(back.metadata.phase_gap, Some(gap));
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let removed = value["metadata"]
+            .as_object_mut()
+            .expect("metadata is an object")
+            .remove("phase_gap");
+        assert!(removed.is_some(), "the field really is in the JSON");
+        let older = serde_json::to_string_pretty(&value).expect("serialises");
+        let old = ChampionFile::from_json_str(&older).expect("an older file still parses");
+        assert_eq!(old.metadata.phase_gap, None);
+    }
+
     /// The one line every front-end prints about a file says the clock as a **time** as well as a
     /// frame count, and both are that episode's own numbers.
     ///
@@ -557,7 +766,10 @@ mod tests {
             line.contains(&sim::format_time(frames)),
             "and the time is what a person races: {line}"
         );
-        assert_eq!(sim::format_time(frames), format!("{:.2}s", frames as f64 / 60.0));
+        assert_eq!(
+            sim::format_time(frames),
+            format!("{:.2}s", frames as f64 / 60.0)
+        );
     }
 
     #[test]
@@ -577,6 +789,7 @@ mod tests {
             &genome,
             &EvalConfig {
                 action_repeat: back.metadata.action_repeat,
+                cut_stuck_frames: 0,
             },
             back.metadata.episode_seed,
         );
@@ -600,7 +813,11 @@ mod tests {
         let champ = ChampionFile::new(&g, &r, &lv, 0, &cfg);
         let back = champ.to_genome().expect("genome rebuilds");
         let obs: Vec<Vec<f32>> = (0..32)
-            .map(|i| (0..sensors::N_INPUTS).map(|j| ((i * 31 + j) % 11) as f32 / 11.0 - 0.5).collect())
+            .map(|i| {
+                (0..sensors::N_INPUTS)
+                    .map(|j| ((i * 31 + j) % 11) as f32 / 11.0 - 0.5)
+                    .collect()
+            })
             .collect();
         assert!(actions_agree(&g, &back, &obs));
         assert_eq!(g.weights, back.weights);
@@ -639,10 +856,7 @@ mod tests {
         assert!(!older.contains("\"jumps\"") && !older.contains("\"checkpoints\""));
         let back = ChampionFile::from_json_str(&older).expect("an older file still parses");
         assert_eq!(back.metadata.jumps, 0, "and defaults to zero jumps");
-        assert_eq!(
-            back.metadata.checkpoints, 0,
-            "and to zero checkpoints"
-        );
+        assert_eq!(back.metadata.checkpoints, 0, "and to zero checkpoints");
     }
 
     /// The same guarantee as the provenance fields above, for the search knobs: a champion written
@@ -750,7 +964,10 @@ mod tests {
         // refused before anything can run, which is the property the test is about.
         let err = champ.check_compat(&lv).expect_err("must refuse");
         assert!(err.contains("weights"), "{err}");
-        assert!(champ.to_genome().is_err(), "and the shape check would catch it too");
+        assert!(
+            champ.to_genome().is_err(),
+            "and the shape check would catch it too"
+        );
     }
 
     /// A network with memory survives the file, and a file written before memory existed
@@ -765,7 +982,10 @@ mod tests {
         let cfg = GaConfig::default();
         let r = crate::fitness::run_episode(&lv, &g, &cfg.eval_config(), 3);
         let champ = ChampionFile::new(&g, &r, &lv, 0, &cfg);
-        assert_eq!(champ.network.feedback, 8, "the file records the state width");
+        assert_eq!(
+            champ.network.feedback, 8,
+            "the file records the state width"
+        );
 
         let json = champ.to_json_pretty().expect("serializes");
         let back = ChampionFile::from_json_str(&json).expect("parses");
@@ -786,7 +1006,10 @@ mod tests {
             .expect("network object")
             .remove("feedback");
         let old = ChampionFile::from_json_str(&old.to_string()).expect("an older file parses");
-        assert_eq!(old.network.feedback, 0, "absence means memoryless, not unreadable");
+        assert_eq!(
+            old.network.feedback, 0,
+            "absence means memoryless, not unreadable"
+        );
     }
 
     #[test]

@@ -58,6 +58,19 @@ pub struct NetShape {
     /// Defaulted on load so a shape written before this field existed reads back as it was.
     #[serde(default)]
     pub feedback: usize,
+    /// **Does the final layer carry one extra neuron that chooses the commitment length?**
+    ///
+    /// Item 12's head. `false` — the default — is a net that decides every `action_repeat` ticks,
+    /// exactly as every champion before this field did. `true` adds one output neuron after the
+    /// action rows; its value maps to 1, 2, 4 or 8 ticks of held action, and a zero value maps to
+    /// 4 — the shipped cadence — which is why a freshly grown head reproduces today's behaviour
+    /// before the search touches it.
+    ///
+    /// It is a field rather than a wider `outputs` because the action set is still eleven: argmax
+    /// must never be able to select the cadence as an action, and every action table in the
+    /// project reads `outputs` as "the actions".
+    #[serde(default)]
+    pub commitment: bool,
 }
 
 /// The v1 recipe, at the sensor layout's current width: 108 → 16 (tanh) → 11 (tanh, argmax),
@@ -68,6 +81,7 @@ pub fn default_shape() -> NetShape {
         hidden: vec![16],
         outputs: N_OUTPUTS,
         feedback: 0,
+        commitment: false,
     }
 }
 
@@ -128,16 +142,43 @@ impl NetShape {
         let fan_out = if l < self.hidden.len() {
             self.hidden[l]
         } else {
-            self.outputs
+            // The action outputs, plus the commitment head when the shape has one.
+            self.out_width()
         };
         (fan_in, fan_out)
     }
 
+    /// The same topology with a wider observation vector.
+    ///
+    /// Used by [`Genome::grown_to_inputs`]: growth adds observation columns and nothing else, so
+    /// the hidden layers, the outputs and the recurrent width are all carried over unchanged.
+    pub fn with_inputs(&self, new_inputs: usize) -> NetShape {
+        NetShape {
+            inputs: new_inputs,
+            ..self.clone()
+        }
+    }
+
+    /// Width of the final layer: the action outputs, plus one when the commitment head is on.
+    pub fn out_width(&self) -> usize {
+        self.outputs + usize::from(self.commitment)
+    }
+
+    /// The same topology with the cadence head present. See [`Genome::grown_with_commitment`].
+    pub fn with_commitment(&self) -> NetShape {
+        NetShape {
+            commitment: true,
+            ..self.clone()
+        }
+    }
+
     pub fn n_weights(&self) -> usize {
-        (0..self.n_layers()).map(|l| {
-            let (i, o) = self.layer(l);
-            i * o
-        }).sum()
+        (0..self.n_layers())
+            .map(|l| {
+                let (i, o) = self.layer(l);
+                i * o
+            })
+            .sum()
     }
 
     pub fn n_biases(&self) -> usize {
@@ -156,7 +197,7 @@ impl NetShape {
         self.hidden
             .iter()
             .copied()
-            .chain(std::iter::once(self.outputs))
+            .chain(std::iter::once(self.out_width()))
             .chain(std::iter::once(self.inputs + self.feedback))
             .chain(std::iter::once(self.feedback))
             .max()
@@ -238,8 +279,8 @@ impl ActScratch {
         if self.b.len() < w {
             self.b.resize(w, 0.0);
         }
-        if self.out.len() < shape.outputs {
-            self.out.resize(shape.outputs, 0.0);
+        if self.out.len() < shape.out_width() {
+            self.out.resize(shape.out_width(), 0.0);
         }
         // Grown from zero, so a scratch that has never been reset starts with no memory: a
         // `resize` fills with zeros, and an already-live vector is deliberately left alone —
@@ -351,8 +392,7 @@ impl Genome {
                 n_b
             ));
         }
-        if self.weights.iter().any(|w| !w.is_finite())
-            || self.biases.iter().any(|b| !b.is_finite())
+        if self.weights.iter().any(|w| !w.is_finite()) || self.biases.iter().any(|b| !b.is_finite())
         {
             return Err(format!("genome {} contains a non-finite gene", self.id));
         }
@@ -402,7 +442,15 @@ impl Genome {
                     dense(&input[..fan_in], out, self, w_off, b_off, fan_in, fan_out);
                     &out[..fan_out]
                 } else {
-                    dense(&input[..fan_in], &mut a[..fan_out], self, w_off, b_off, fan_in, fan_out);
+                    dense(
+                        &input[..fan_in],
+                        &mut a[..fan_out],
+                        self,
+                        w_off,
+                        b_off,
+                        fan_in,
+                        fan_out,
+                    );
                     fresh_a = true;
                     &a[..fan_out]
                 };
@@ -415,13 +463,29 @@ impl Genome {
                 if is_last {
                     dense(&a[..fan_in], out, self, w_off, b_off, fan_in, fan_out);
                 } else {
-                    dense(&a[..fan_in], &mut b[..fan_out], self, w_off, b_off, fan_in, fan_out);
+                    dense(
+                        &a[..fan_in],
+                        &mut b[..fan_out],
+                        self,
+                        w_off,
+                        b_off,
+                        fan_in,
+                        fan_out,
+                    );
                     fresh_a = false;
                 }
             } else if is_last {
                 dense(&b[..fan_in], out, self, w_off, b_off, fan_in, fan_out);
             } else {
-                dense(&b[..fan_in], &mut a[..fan_out], self, w_off, b_off, fan_in, fan_out);
+                dense(
+                    &b[..fan_in],
+                    &mut a[..fan_out],
+                    self,
+                    w_off,
+                    b_off,
+                    fan_in,
+                    fan_out,
+                );
                 fresh_a = true;
             }
             w_off += fan_in * fan_out;
@@ -437,6 +501,10 @@ impl Genome {
 
     /// Argmax over the action scores (§7.3). Ties go to the lowest index, so the
     /// mapping is deterministic without needing a tie-break RNG.
+    ///
+    /// The commitment head, when the shape has one, is deliberately outside the argmax: it is a
+    /// cadence, not an action, and letting it win an action vote would be a category error the
+    /// action table could not even express.
     pub fn act(&self, inputs: &[f32], s: &mut ActScratch) -> AgentAction {
         self.forward(inputs, s);
         let outputs = &s.out[..self.shape.outputs];
@@ -449,11 +517,387 @@ impl Genome {
         AgentAction::from_index(best)
     }
 
+    /// The commitment this genome chose on its last forward pass: 1, 2, 4 or 8 ticks.
+    ///
+    /// A shape without the head answers [`fitness::ACTION_REPEAT`] — the cadence every genome had
+    /// before the head existed. The encoding is four even bands of the tanh output's range, and
+    /// the middle band is 4: at zero the head asks for the shipped cadence, so a head grown with
+    /// zero weights is bit-identical to the fixed-cadence policy it came from.
+    pub fn commitment(&self, s: &ActScratch) -> u32 {
+        const TICKS: [u32; 4] = [1, 2, 4, 8];
+        if !self.shape.commitment {
+            return crate::fitness::ACTION_REPEAT;
+        }
+        let v = s.out[self.shape.outputs];
+        let band = (((v + 1.0) * 0.5) * TICKS.len() as f32).floor();
+        let idx = band.clamp(0.0, (TICKS.len() - 1) as f32) as usize;
+        TICKS[idx]
+    }
+
+    /// Act and read the cadence in one pass, which is what the episode runner needs: two calls
+    /// would run the network twice and could disagree about which decision they describe.
+    pub fn act_with_commitment(&self, inputs: &[f32], s: &mut ActScratch) -> (AgentAction, u32) {
+        let action = self.act(inputs, s);
+        (action, self.commitment(s))
+    }
+
+    /// **Grow hidden width without changing a single decision** (Item 13).
+    ///
+    /// Inserts `units` new neurons at the end of the first hidden layer. Their incoming rows are
+    /// zero and their biases are zero, and — the part that makes growth function-preserving —
+    /// every one of their **outgoing** weights is zero too. A neuron whose outgoing weight is zero
+    /// contributes exactly nothing to every layer above it, so the policy at the moment of growth
+    /// is bit-identical to the policy before it; the units are capacity the search can then spend.
+    ///
+    /// The old hidden units keep their indices, so the recurrent block (which reads the first
+    /// `feedback` activations of layer 0) keeps its meaning and its ordering. Later layers grow
+    /// their fan-in by `units` zeros, appended after the old incoming columns for the same reason.
+    ///
+    /// The caller owns the decision to grow and the caps on it (see `GaConfig::growth_units` and
+    /// `GaConfig::growth_events`); this function only guarantees that doing so is a no-op for
+    /// behaviour.
+    pub fn grown_hidden(&self, units: usize) -> Result<Genome, String> {
+        if units == 0 {
+            return Ok(self.clone());
+        }
+        if self.shape.hidden.is_empty() {
+            return Err("cannot grow a net with no hidden layer".into());
+        }
+        let mut new_shape = self.shape.clone();
+        new_shape.hidden[0] += units;
+        let n_layers = self.shape.n_layers();
+        let mut weights = Vec::with_capacity(new_shape.n_weights());
+        let mut biases = Vec::with_capacity(new_shape.n_biases());
+        let mut w_off = 0usize;
+        let mut b_off = 0usize;
+        for l in 0..n_layers {
+            let (fan_in, fan_out) = self.shape.layer(l);
+            if l == 0 {
+                // Existing rows, then `units` all-zero rows for the new neurons.
+                weights.extend_from_slice(&self.weights[w_off..w_off + fan_in * fan_out]);
+                weights.resize(weights.len() + fan_in * units, 0.0);
+                biases.extend_from_slice(&self.biases[b_off..b_off + fan_out]);
+                biases.resize(biases.len() + units, 0.0);
+            } else {
+                // Every row keeps its old incoming columns in order, then gains `units` zeros
+                // for the neurons inserted at the end of the previous hidden layer.
+                let added = if l == 1 { units } else { 0 };
+                for row in 0..fan_out {
+                    let start = w_off + row * fan_in;
+                    weights.extend_from_slice(&self.weights[start..start + fan_in]);
+                    if l == 1 {
+                        weights.resize(weights.len() + added, 0.0);
+                    }
+                }
+                biases.extend_from_slice(&self.biases[b_off..b_off + fan_out]);
+            }
+            w_off += fan_in * fan_out;
+            b_off += fan_out;
+        }
+        let grown = Genome {
+            id: self.id,
+            shape: new_shape,
+            weights,
+            biases,
+            fitness: self.fitness,
+        };
+        grown.validate()?;
+        Ok(grown)
+    }
+
+    /// **Add the cadence head without changing a single decision.**
+    ///
+    /// Item 12's migration, resting on Item 3's machinery: the final layer gains one output row
+    /// whose weights and bias are zero. A zero row scores `tanh(0) = 0`, and zero is the encoding
+    /// of a four-tick commitment — the cadence every genome had before the head — so the grown
+    /// genome holds each action for exactly as long as the old one did and the action argmax is
+    /// untouched. Every existing row keeps its weights in place; only the output layer's width
+    /// changes, because only its fan_out moved.
+    pub fn grown_with_commitment(&self) -> Result<Genome, String> {
+        if self.shape.commitment {
+            return Ok(self.clone());
+        }
+        let new_shape = self.shape.with_commitment();
+        let n_layers = self.shape.n_layers();
+        let last = n_layers - 1;
+        let mut weights = Vec::with_capacity(new_shape.n_weights());
+        let mut biases = Vec::with_capacity(new_shape.n_biases());
+        let mut w_off = 0usize;
+        let mut b_off = 0usize;
+        for l in 0..n_layers {
+            let (fan_in, fan_out) = self.shape.layer(l);
+            weights.extend_from_slice(&self.weights[w_off..w_off + fan_in * fan_out]);
+            w_off += fan_in * fan_out;
+            biases.extend_from_slice(&self.biases[b_off..b_off + fan_out]);
+            b_off += fan_out;
+            if l == last {
+                weights.resize(weights.len() + fan_in, 0.0);
+                biases.push(0.0);
+            }
+        }
+        let grown = Genome {
+            id: self.id,
+            shape: new_shape,
+            weights,
+            biases,
+            fitness: self.fitness,
+        };
+        grown.validate()?;
+        Ok(grown)
+    }
+
+    /// **Evaluate a block of genomes against one observation.**
+    ///
+    /// The batched entry point beside [`Genome::forward`] (SMARTER_AI_PLAN.md, Item 2). Four
+    /// genomes at a time are evaluated *interleaved*: each output row keeps its own accumulator
+    /// and its own left-to-right summation order, so every lane is bit-for-bit the scalar pass,
+    /// and the four sums are in flight together. That is the only kind of parallelism this pass
+    /// may use — a reassociated sum would move an argmax on a boundary.
+    ///
+    /// **What it does not buy, and why Item 2's premise had to be measured rather than assumed:**
+    /// the genomes in a population do not share weights. There is no row to load once and reuse
+    /// across lanes; every lane reads its own genome's row. So the batching here overlaps four
+    /// independent add chains (exactly what [`DENSE_ROW_BLOCK`] already does *inside* one genome)
+    /// rather than sharing loads. The benchmark in `tests/performance.rs` is the verdict.
+    ///
+    /// A trailing block of one to three genomes, or a block whose genomes disagree about their
+    /// shape, is evaluated by [`Genome::forward`] one at a time: still bit-identical, just not
+    /// batched. `scratches` must be index-aligned with `genomes`; each lane's recurrent state is
+    /// carried in its own scratch, so a block never mixes one genome's memory with another's.
+    pub fn forward_block(
+        genomes: &[Genome],
+        inputs: &[f32],
+        scratches: &mut [ActScratch],
+        block: &mut BlockScratch,
+    ) {
+        assert_eq!(
+            genomes.len(),
+            scratches.len(),
+            "a block needs one scratch per genome"
+        );
+        let mut i = 0usize;
+        while i < genomes.len() {
+            let end = (i + BLOCK_LANES).min(genomes.len());
+            let gs = &genomes[i..end];
+            let ss = &mut scratches[i..end];
+            let same_shape = gs.iter().all(|g| g.shape == gs[0].shape);
+            if gs.len() == BLOCK_LANES && same_shape {
+                forward_lanes4([&gs[0], &gs[1], &gs[2], &gs[3]], inputs, ss, block);
+            } else {
+                for (g, s) in gs.iter().zip(ss.iter_mut()) {
+                    g.forward(inputs, s);
+                }
+            }
+            i = end;
+        }
+    }
+
     /// Action scores as a plain vector. Convenience for tests and tooling.
     pub fn score_actions(&self, inputs: &[f32]) -> Vec<f32> {
         let mut s = ActScratch::new();
         self.forward(inputs, &mut s);
         s.out[..self.shape.outputs].to_vec()
+    }
+
+    /// **Grow the observation without changing the policy.**
+    ///
+    /// A genome read by a *wider* sensor vector is the same network with cells it has never
+    /// seen. Giving every appended column a zero weight is what makes that a fact rather than a
+    /// hope: a zero multiplies whatever the new sensor says to nothing, so every output, every
+    /// recurrent state and therefore every decision stays bit-for-bit what it was. The old
+    /// weights are not rescaled, reordered or re-seeded; they keep their index meaning inside
+    /// each row, which is the contract this function exists to serve.
+    ///
+    /// **Layer 0's zeros go before the recurrent columns, not at the very end of the row.** The
+    /// first layer reads `[observation; memory]`, so a row is `old_obs × old_inputs`, then the
+    /// feedback weights. Appending the new observation columns after those would put the old
+    /// memory weights on observation cells and leave the zeros reading the memory, which is a
+    /// different network with a different shape of lie. The insertion point is the end of the
+    /// observation, which is `old_inputs` cells into the row.
+    ///
+    /// The first layer is the only one whose fan-in depends on the observation; every later layer
+    /// is copied verbatim. Biases, the genome's identity and its recorded fitness come with it.
+    pub fn grown_to_inputs(&self, new_inputs: usize) -> Result<Genome, String> {
+        let old_inputs = self.shape.inputs;
+        if new_inputs < old_inputs {
+            return Err(format!(
+                "cannot shrink a genome's observation from {old_inputs} to {new_inputs} inputs: \
+                 growth is append-only, for the reason in `grown_to_inputs`"
+            ));
+        }
+        if new_inputs == old_inputs {
+            return Ok(self.clone());
+        }
+        let new_shape = self.shape.with_inputs(new_inputs);
+        let (old_fan_in, rows) = self.shape.layer(0);
+        let (new_fan_in, _) = new_shape.layer(0);
+        let feedback = self.shape.feedback_width();
+        let old_obs = old_fan_in - feedback;
+        let added = new_fan_in - old_fan_in;
+        debug_assert_eq!(added, new_inputs - old_inputs);
+
+        let mut weights = Vec::with_capacity(new_shape.n_weights());
+        for row in 0..rows {
+            let start = row * old_fan_in;
+            weights.extend_from_slice(&self.weights[start..start + old_obs]);
+            weights.resize(weights.len() + added, 0.0);
+            weights.extend_from_slice(&self.weights[start + old_obs..start + old_fan_in]);
+        }
+        weights.extend_from_slice(&self.weights[old_fan_in * rows..]);
+
+        let grown = Genome {
+            id: self.id,
+            shape: new_shape,
+            weights,
+            biases: self.biases.clone(),
+            fitness: self.fitness,
+        };
+        grown.validate()?;
+        Ok(grown)
+    }
+}
+
+/// How many genomes [`Genome::forward_block`] evaluates side by side.
+///
+/// Four, for the same reason [`DENSE_ROW_BLOCK`] is four: four independent accumulator chains
+/// hide the add latency of a row without reassociating any one row's sum. A machine with wider
+/// SIMD lanes does not get more from a larger block, because the lanes here are *genomes* and
+/// each one's arithmetic has to stay a scalar, ordered chain.
+pub const BLOCK_LANES: usize = 4;
+
+/// Reusable buffers for [`Genome::forward_block`].
+///
+/// Two activation buffers per lane, swapped per layer: `cur` is what the layer about to run
+/// reads and `next` is what it writes, so a block allocates nothing after the first call and
+/// never aliases a layer's input with its output.
+#[derive(Clone, Debug, Default)]
+pub struct BlockScratch {
+    cur: [Vec<f32>; BLOCK_LANES],
+    next: [Vec<f32>; BLOCK_LANES],
+}
+
+impl BlockScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// One layer, four genomes. See [`Genome::forward_block`].
+fn forward_lanes4(
+    gs: [&Genome; BLOCK_LANES],
+    inputs: &[f32],
+    scratches: &mut [ActScratch],
+    block: &mut BlockScratch,
+) {
+    let shape = &gs[0].shape;
+    let ins = shape.inputs;
+    let fb = shape.feedback_width();
+    let [s0, s1, s2, s3] = scratches else {
+        unreachable!("forward_lanes4 is called with exactly BLOCK_LANES scratches")
+    };
+    let ss = [s0, s1, s2, s3];
+    let BlockScratch { cur, next } = block;
+
+    for k in 0..BLOCK_LANES {
+        ss[k].ensure(shape);
+        cur[k].clear();
+        cur[k].extend_from_slice(&inputs[..ins]);
+        cur[k].extend_from_slice(&ss[k].ctx[..fb]);
+    }
+
+    let n_hidden = shape.hidden.len();
+    let mut w_off = 0usize;
+    let mut b_off = 0usize;
+    for l in 0..=n_hidden {
+        let (fan_in, fan_out) = shape.layer(l);
+        debug_assert_eq!(cur[0].len(), fan_in);
+        for buf in next.iter_mut() {
+            if buf.len() < fan_out {
+                buf.resize(fan_out, 0.0);
+            }
+        }
+        // `cur` and `next` are separate fields, so the layer can read one and write the other
+        // without any aliasing trick: the kernel takes them by slice, not by array of refs.
+        dense_lanes4(cur, gs, w_off, b_off, fan_in, fan_out, next);
+
+        if l == 0 {
+            // The first layer's own activations are the next decision's memory, copied before
+            // the buffers are swapped, exactly as the scalar pass copies them before it reuses
+            // its buffers.
+            let keep = fb.min(fan_out);
+            for k in 0..BLOCK_LANES {
+                ss[k].ctx[..keep].copy_from_slice(&next[k][..keep]);
+                ss[k].ctx[keep..].fill(0.0);
+            }
+        }
+        for k in 0..BLOCK_LANES {
+            // Truncate before swapping: `next` may still be carrying a wider buffer from an
+            // earlier layer, and a `Vec`'s *length* after the swap is what the next layer's
+            // assertion reads. The activations written above are exactly `fan_out` long.
+            next[k].truncate(fan_out);
+            std::mem::swap(&mut cur[k], &mut next[k]);
+        }
+        w_off += fan_in * fan_out;
+        b_off += fan_out;
+    }
+
+    let outputs = shape.out_width();
+    for k in 0..BLOCK_LANES {
+        ss[k].out[..outputs].copy_from_slice(&cur[k][..outputs]);
+    }
+}
+
+/// One dense layer for four genomes: the four sums step through the columns together, and each
+/// lane keeps its own accumulator and its own row order.
+fn dense_lanes4(
+    cur: &[Vec<f32>],
+    gs: [&Genome; BLOCK_LANES],
+    w_off: usize,
+    b_off: usize,
+    fan_in: usize,
+    fan_out: usize,
+    next: &mut [Vec<f32>],
+) {
+    let srcs: [&[f32]; BLOCK_LANES] = [
+        &cur[0][..fan_in],
+        &cur[1][..fan_in],
+        &cur[2][..fan_in],
+        &cur[3][..fan_in],
+    ];
+    debug_assert!(next.iter().all(|d| d.len() >= fan_out));
+    let [n0, n1, n2, n3] = next else {
+        unreachable!("dense_lanes4 is called with exactly BLOCK_LANES buffers")
+    };
+    for (r, ((o0, o1), (o2, o3))) in n0
+        .iter_mut()
+        .zip(n1.iter_mut())
+        .zip(n2.iter_mut().zip(n3.iter_mut()))
+        .take(fan_out)
+        .enumerate()
+    {
+        let base = w_off + r * fan_in;
+        let rows: [&[f32]; BLOCK_LANES] = [
+            &gs[0].weights[base..base + fan_in],
+            &gs[1].weights[base..base + fan_in],
+            &gs[2].weights[base..base + fan_in],
+            &gs[3].weights[base..base + fan_in],
+        ];
+        let mut acc = [
+            gs[0].biases[b_off + r],
+            gs[1].biases[b_off + r],
+            gs[2].biases[b_off + r],
+            gs[3].biases[b_off + r],
+        ];
+        for c in 0..fan_in {
+            acc[0] += rows[0][c] * srcs[0][c];
+            acc[1] += rows[1][c] * srcs[1][c];
+            acc[2] += rows[2][c] * srcs[2][c];
+            acc[3] += rows[3][c] * srcs[3][c];
+        }
+        *o0 = acc[0].tanh();
+        *o1 = acc[1].tanh();
+        *o2 = acc[2].tanh();
+        *o3 = acc[3].tanh();
     }
 }
 
@@ -813,6 +1257,202 @@ mod tests {
         }
     }
 
+    /// The batched pass is the scalar pass in a different order of *calls*, never of sums: every
+    /// output and every piece of recurrent state must be bit-identical, on a memoryless shape and
+    /// on a feedback shape, over a sequence of decisions (where memory makes the order matter).
+    #[test]
+    fn a_block_of_genomes_is_bit_identical_to_forwarding_them_one_at_a_time() {
+        let shapes = [
+            default_shape(),
+            NetShape {
+                hidden: vec![32, 16],
+                ..default_shape()
+            },
+            NetShape {
+                hidden: vec![8],
+                feedback: 8,
+                ..default_shape()
+            },
+        ];
+        let observations: Vec<[f32; N_INPUTS]> = (0..12u32)
+            .map(|i| {
+                let mut o = [0.0f32; N_INPUTS];
+                for (j, v) in o.iter_mut().enumerate() {
+                    *v = (((i * 31 + j as u32 * 7) % 29) as f32 / 14.5 - 1.0) * 0.9;
+                }
+                o
+            })
+            .collect();
+
+        for shape in shapes {
+            let mut rng = rng_from_seed(11);
+            let genomes: Vec<Genome> = (0..4)
+                .map(|i| Genome::random(i, shape.clone(), &mut rng))
+                .collect();
+            let mut scalar: Vec<ActScratch> = (0..4).map(|_| ActScratch::new()).collect();
+            let mut blocked: Vec<ActScratch> = (0..4).map(|_| ActScratch::new()).collect();
+            let mut block = BlockScratch::new();
+
+            for obs in &observations {
+                for (g, s) in genomes.iter().zip(scalar.iter_mut()) {
+                    g.forward(obs, s);
+                }
+                Genome::forward_block(&genomes, obs, &mut blocked, &mut block);
+                for k in 0..4 {
+                    assert_eq!(
+                        bits(genomes[k].last_outputs(&blocked[k])),
+                        bits(genomes[k].last_outputs(&scalar[k])),
+                        "{}: lane {k} disagreed on its scores",
+                        shape.label()
+                    );
+                    assert_eq!(
+                        bits(blocked[k].context()),
+                        bits(scalar[k].context()),
+                        "{}: lane {k} disagreed on its memory",
+                        shape.label()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A trailing block and a block of mixed shapes take the scalar path, which is what makes
+    /// batching a transport change rather than a policy one.
+    #[test]
+    fn a_partial_or_mixed_block_falls_back_to_scalar_with_identical_bits() {
+        let mut rng = rng_from_seed(12);
+        let mut genomes: Vec<Genome> = (0..6)
+            .map(|i| Genome::random(i, default_shape(), &mut rng))
+            .collect();
+        genomes.push(Genome::random(
+            6,
+            NetShape {
+                hidden: vec![8],
+                ..default_shape()
+            },
+            &mut rng,
+        ));
+        let obs: Vec<f32> = (0..N_INPUTS)
+            .map(|i| ((i * 13) % 17) as f32 / 8.5 - 1.0)
+            .collect();
+        let mut scalar: Vec<ActScratch> = (0..genomes.len()).map(|_| ActScratch::new()).collect();
+        let mut blocked: Vec<ActScratch> = (0..genomes.len()).map(|_| ActScratch::new()).collect();
+        let mut block = BlockScratch::new();
+        for (g, s) in genomes.iter().zip(scalar.iter_mut()) {
+            g.forward(&obs, s);
+        }
+        Genome::forward_block(&genomes, &obs, &mut blocked, &mut block);
+        for (k, g) in genomes.iter().enumerate() {
+            assert_eq!(
+                bits(g.last_outputs(&blocked[k])),
+                bits(g.last_outputs(&scalar[k]))
+            );
+        }
+    }
+
+    /// Item 12's migration proof: the cadence head is one all-zero output row, which is the
+    /// four-tick commitment, so the grown genome replays exactly the episode the old one did.
+    #[test]
+    fn growing_the_cadence_head_is_bit_identical_to_the_fixed_cadence() {
+        let level = crate::fixture::gap_runway("commitment-growth", 24, 22, &[(9, 3)]);
+        let mut rng = rng_from_seed(21);
+        let old = Genome::random(4, default_shape(), &mut rng);
+        let grown = old
+            .grown_with_commitment()
+            .expect("the head is an append-only row");
+        grown.validate().expect("grown genome validates");
+        assert_eq!(
+            grown.shape.outputs, old.shape.outputs,
+            "the action set did not move"
+        );
+        assert_eq!(grown.shape.out_width(), old.shape.out_width() + 1);
+        assert_eq!(grown.shape.n_weights(), old.shape.n_weights() + 16);
+        assert_eq!(grown.weights[..old.weights.len()], old.weights[..]);
+        assert!(grown.weights[old.weights.len()..].iter().all(|w| *w == 0.0));
+        assert_eq!(grown.biases.last(), Some(&0.0));
+
+        // Every decision now also reads a cadence, and at zero it must be the shipped four.
+        let obs = [0.25f32; N_INPUTS];
+        let mut s = ActScratch::new();
+        let (action, ticks) = grown.act_with_commitment(&obs, &mut s);
+        assert_eq!(ticks, crate::fitness::ACTION_REPEAT);
+        let mut plain = ActScratch::new();
+        assert_eq!(action, grown.act(&obs, &mut plain));
+
+        let cfg = crate::fitness::EvalConfig::default();
+        let a = crate::fitness::run_episode(&level, &old, &cfg, 9);
+        let b = crate::fitness::run_episode(&level, &grown, &cfg, 9);
+        assert_eq!(a.frames, b.frames);
+        assert_eq!(a.fitness.to_bits(), b.fitness.to_bits());
+        assert_eq!(a.trajectory_hash, b.trajectory_hash);
+        assert_eq!(a.outcome, b.outcome);
+    }
+
+    /// The four cadence bands, pinned at their boundaries: a head is only a mechanism if its
+    /// encoding is a fact a reader can check without running the search.
+    #[test]
+    fn the_commitment_head_encodes_four_bands_and_the_middle_one_is_four() {
+        let mut rng = rng_from_seed(22);
+        let g = Genome::random(5, default_shape().with_commitment(), &mut rng);
+        let mut s = ActScratch::new();
+        g.forward(&[0.0f32; N_INPUTS], &mut s);
+        let cases = [
+            (-1.0, 1),
+            (-0.5, 2),
+            (0.0, 4),
+            (0.5, 8),
+            (1.0, 8),
+            (0.999, 8),
+        ];
+        for (head, want) in cases {
+            s.out[g.shape.outputs] = head;
+            assert_eq!(g.commitment(&s), want, "head {head} should hold for {want}");
+        }
+        // A shape without the head cannot be asked: it answers the fixed cadence.
+        let plain = Genome::random(6, default_shape(), &mut rng);
+        let mut s2 = ActScratch::new();
+        plain.forward(&[0.0f32; N_INPUTS], &mut s2);
+        assert_eq!(plain.commitment(&s2), crate::fitness::ACTION_REPEAT);
+    }
+
+    /// Item 13's migration proof: the new hidden units have zero **outgoing** weights, so they
+    /// cannot reach an action, and the policy at the moment of growth is bit-identical.
+    #[test]
+    fn growing_the_hidden_width_is_bit_identical_to_the_policy_before_it() {
+        let level = crate::fixture::gap_runway("growth", 24, 22, &[(8, 3)]);
+        let mut rng = rng_from_seed(31);
+        let memory = NetShape {
+            feedback: 8,
+            ..default_shape()
+        };
+        let old = Genome::random(7, memory, &mut rng);
+        let grown = old.grown_hidden(4).expect("width grows");
+        grown.validate().expect("valid");
+        assert_eq!(grown.shape.hidden[0], old.shape.hidden[0] + 4);
+        assert_eq!(grown.shape.outputs, old.shape.outputs);
+        assert_eq!(grown.shape.feedback, old.shape.feedback);
+
+        let cfg = crate::fitness::EvalConfig::default();
+        let a = crate::fitness::run_episode(&level, &old, &cfg, 3);
+        let b = crate::fitness::run_episode(&level, &grown, &cfg, 3);
+        assert_eq!(a.frames, b.frames);
+        assert_eq!(a.outcome, b.outcome);
+        assert_eq!(a.best_x.to_bits(), b.best_x.to_bits());
+        assert_eq!(a.trajectory_hash, b.trajectory_hash);
+
+        // Zero units is a copy, and a net with no hidden layer refuses rather than inventing one.
+        assert_eq!(old.grown_hidden(0).expect("copy").weights, old.weights);
+        let flat = Genome::random(
+            8,
+            NetShape {
+                hidden: Vec::new(),
+                ..default_shape()
+            },
+            &mut rng,
+        );
+        assert!(flat.grown_hidden(1).is_err());
+    }
+
     #[test]
     fn default_shape_matches_the_plan() {
         let s = default_shape();
@@ -820,7 +1460,8 @@ mod tests {
         // plus the goal's vertical component and the leftward gap probe, plus the nearest
         // walker's heading, plus the route's next waypoint, plus the body's sub-tile phase,
         // plus v13's clock, next-event eta/position, mover velocity/phase and press timing)
-        // and eleven outputs
+        // and eleven
+        // outputs
         // (the plan's six, plus sprint, sprint_jump, retreat_jump and the two leftward
         // sprinting arms). The pin is the *recipe* — one hidden layer of sixteen,
         // argument-max output — with the two ends read from the sim so this test cannot
@@ -838,8 +1479,122 @@ mod tests {
         assert_eq!(s.n_weights(), N_INPUTS * 16 + 16 * 11);
         assert_eq!(s.n_biases(), 16 + 11);
         assert_eq!(s.n_genes(), N_INPUTS * 16 + 16 * 11 + 16 + 11);
-        assert_eq!(s.n_genes(), 1931, "the recipe's own gene count, written down");
+        assert_eq!(
+            s.n_genes(),
+            1931,
+            "the recipe's own gene count, written down"
+        );
         s.validate().expect("shape is valid");
+    }
+
+    /// The old observation followed by the new sensor cells: the only meaningful way to ask a
+    /// grown net the same question is to hand it the same old cells and something in the new
+    /// ones. The extras are deterministic so a failure is reproducible.
+    fn padded(obs: &[f32], new_inputs: usize, salt: f32) -> Vec<f32> {
+        let mut out = obs.to_vec();
+        for i in obs.len()..new_inputs {
+            out.push((i as f32 * 0.37 + salt).sin().clamp(-1.0, 1.0));
+        }
+        out
+    }
+
+    fn bits(samples: &[f32]) -> Vec<u32> {
+        samples.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// The function-preserving contract: growing the observation adds columns the policy cannot
+    /// read, so every score and every piece of memory must be bit-identical. The sequence of
+    /// calls matters for a recurrent net — the second decision reads what the first one left —
+    /// which is why this is an episode and not a single forward pass.
+    #[test]
+    fn growing_the_observation_is_bit_identical_for_the_same_policy() {
+        let added = 6;
+        for feedback in [0usize, 16] {
+            let shape = NetShape {
+                feedback,
+                ..default_shape()
+            };
+            let mut rng = rng_from_seed(31 + feedback as u64);
+            let g = Genome::random(7, shape.clone(), &mut rng);
+            let grown = g
+                .grown_to_inputs(N_INPUTS + added)
+                .expect("growth is append-only");
+            assert_eq!(grown.shape, shape.with_inputs(N_INPUTS + added));
+            assert_eq!(grown.id, g.id);
+            assert_eq!(grown.fitness, g.fitness);
+            assert_eq!(grown.biases, g.biases);
+
+            let mut old_scratch = ActScratch::new();
+            let mut new_scratch = ActScratch::new();
+            for step in 0..24 {
+                let mut obs = [0.0f32; N_INPUTS];
+                for (j, v) in obs.iter_mut().enumerate() {
+                    *v = (((step * 17 + j * 5) % 23) as f32 / 11.5 - 1.0).clamp(-1.0, 1.0);
+                }
+                let wide = padded(&obs, N_INPUTS + added, step as f32 * 0.61);
+                g.forward(&obs, &mut old_scratch);
+                grown.forward(&wide, &mut new_scratch);
+                assert_eq!(
+                    bits(grown.last_outputs(&new_scratch)),
+                    bits(g.last_outputs(&old_scratch)),
+                    "feedback {feedback}, step {step}: the grown net changed a decision"
+                );
+                assert_eq!(
+                    bits(new_scratch.context()),
+                    bits(old_scratch.context()),
+                    "feedback {feedback}, step {step}: the grown net changed its memory"
+                );
+            }
+        }
+    }
+
+    /// Where the zeros go, stated as an address: each layer-0 row keeps its old observation
+    /// weights, then six zeros, then the feedback weights that used to sit at the end of the row.
+    /// Appending the zeros after the feedback would put them on the wrong side of the insertion
+    /// point and quietly reinterpret the memory.
+    #[test]
+    fn growth_appends_zero_columns_and_keeps_every_old_weight() {
+        let shape = NetShape {
+            feedback: 4,
+            ..default_shape()
+        };
+        let mut rng = rng_from_seed(41);
+        let g = Genome::random(3, shape.clone(), &mut rng);
+        let grown = g.grown_to_inputs(N_INPUTS + 6).expect("growth");
+        let (old_fan_in, rows) = shape.layer(0);
+        let (new_fan_in, _) = grown.shape.layer(0);
+        let observation = old_fan_in - shape.feedback_width();
+        assert_eq!(new_fan_in - old_fan_in, 6);
+        for row in 0..rows {
+            let old_row = &g.weights[row * old_fan_in..(row + 1) * old_fan_in];
+            let new_row = &grown.weights[row * new_fan_in..(row + 1) * new_fan_in];
+            assert_eq!(&new_row[..observation], &old_row[..observation]);
+            assert!(
+                new_row[observation..observation + 6]
+                    .iter()
+                    .all(|w| *w == 0.0),
+                "row {row}'s new sensor columns are not all zero"
+            );
+            assert_eq!(&new_row[observation + 6..], &old_row[observation..]);
+        }
+        // The first layer is the only one whose fan-in moved.
+        let old_head = old_fan_in * rows;
+        assert_eq!(&grown.weights[new_fan_in * rows..], &g.weights[old_head..]);
+        assert_eq!(grown.biases, g.biases);
+        assert_eq!(grown.shape.hidden, g.shape.hidden);
+        assert_eq!(grown.shape.outputs, g.shape.outputs);
+        assert_eq!(grown.shape.feedback, g.shape.feedback);
+        assert_eq!(grown.shape.n_layers(), g.shape.n_layers());
+    }
+
+    #[test]
+    fn shrinking_the_observation_is_refused() {
+        let mut rng = rng_from_seed(43);
+        let g = Genome::random(5, default_shape(), &mut rng);
+        let err = g
+            .grown_to_inputs(N_INPUTS - 1)
+            .expect_err("growth cannot remove sensors");
+        assert!(err.contains("cannot shrink"), "{err}");
     }
 
     /// A shape that asks for memory buys exactly `feedback x hidden[0]` genes, and the width is
@@ -871,7 +1626,8 @@ mod tests {
         // genome built from this shape must still be sliceable by it.
         let mut rng = rng_from_seed(21);
         let g = Genome::random(1, s.clone(), &mut rng);
-        g.validate().expect("a clamped shape still builds a consistent genome");
+        g.validate()
+            .expect("a clamped shape still builds a consistent genome");
     }
 
     /// The whole point: an observation repeated is not necessarily the same decision, and a
@@ -898,17 +1654,20 @@ mod tests {
         let remembering = Genome::random(2, shape, &mut rng);
         let mut s = ActScratch::new();
         let cold = remembering.score_actions(&obs);
-        assert!(
-            s.context().is_empty(),
-            "a fresh scratch holds no thoughts"
-        );
+        assert!(s.context().is_empty(), "a fresh scratch holds no thoughts");
         remembering.forward(&obs, &mut s);
         let state_a = s.context().to_vec();
         assert_eq!(state_a.len(), 8);
-        assert!(state_a.iter().any(|v| *v != 0.0), "the state is the layer's output");
+        assert!(
+            state_a.iter().any(|v| *v != 0.0),
+            "the state is the layer's output"
+        );
         remembering.forward(&obs, &mut s);
         let warm = s.context().to_vec();
-        assert_ne!(warm, state_a, "the state moved, so the next decision differs");
+        assert_ne!(
+            warm, state_a,
+            "the state moved, so the next decision differs"
+        );
         assert_ne!(
             s.out[..N_OUTPUTS].to_vec(),
             cold,
@@ -1015,7 +1774,10 @@ mod tests {
         let obs = [0.0f32; N_INPUTS];
         let a = g.act(&obs, &mut s);
         assert!(AgentAction::ALL.contains(&a));
-        assert!(g.last_outputs(&s).iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+        assert!(g
+            .last_outputs(&s)
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= 1.0));
     }
 
     #[test]

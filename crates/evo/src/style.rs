@@ -257,6 +257,7 @@ mod tests {
             all_trials_won: true,
             death_pos: None,
             death_cause: None,
+            cut_early: false,
             seed: 1,
             trajectory_hash: 0,
         }

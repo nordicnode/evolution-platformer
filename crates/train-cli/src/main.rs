@@ -66,7 +66,12 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         }
         Err(ParseError::VersionRequested) => {
             println!("train-cli {VERSION}");
-            println!("sim {} / sensors v{} / fitness v{}", sim::SIM_VERSION, sim::sensors::VERSION, evo::FITNESS_VERSION);
+            println!(
+                "sim {} / sensors v{} / fitness v{}",
+                sim::SIM_VERSION,
+                sim::sensors::VERSION,
+                evo::FITNESS_VERSION
+            );
             return Ok(());
         }
         Err(ParseError::Bad(msg)) => {
@@ -85,10 +90,12 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         "break" => commands::break_my_level(&args),
         "replay" => commands::replay(&args),
         "score" => commands::score(&args),
+        "committee" => commands::committee(&args),
         "shortcut" => commands::shortcut(&args),
         "tas" => commands::tas(&args),
         "hunt" => commands::hunt(&args),
         "islands" => commands::islands(&args),
+        "generalist" => commands::generalist(&args),
         "segments" => commands::segments(&args),
         "campaign" => commands::campaign(&args),
         "styles" => commands::styles(&args),
@@ -147,6 +154,8 @@ COMMANDS:
               write the best trajectory as a replayable discovery artifact (WP14).
     islands   Train several independent populations with different settings and a ring of
               migrants, then write the best record (WP7).
+    generalist Keep one population trained across the pack in rotation, and refresh it from the
+              champions a pack run produced (Item 6). `--generalist` seeds a run from it.
     segments  Plan a level, split the route at its ground stands, and write one practice level
               per leg (WP4).
     campaign  Plan, split, and train the legs in order with the main level in the suite, then
@@ -157,6 +166,8 @@ COMMANDS:
     styles    Check a champion's winning route against the constrained style titles (WP15).
     score     Score a saved champion on one level or a suite of them: what one policy
               actually does on each, which is the read a suite's claim has to survive.
+    committee Validate a saved committee against its best member on the run's fixed
+              validation episodes (the Item 10 gate). Exits non-zero if the vote loses.
     play      Play a level yourself with the keyboard, in the terminal.
     render    Print ASCII frames of a level, for eyeballing physics and entities.
     sensors   Print the observation layout, the action table and the physics bible.
@@ -224,6 +235,31 @@ TRAIN OPTIONS:
                           gets a child with the take-off moved rather than a redrawn input
                           weight. 0.5 is the plan's arm; 0 is the shipped search and the
                           default until the 24-seed measurement lands.        [default 0.0]
+    --growth-units <N>    Item 13: hidden units added to the first layer each time the record has
+                          not improved for `--stagnation` generations. The new units have zero
+                          outgoing weights, so the policy is bit-identical at the moment of
+                          growth. 0 disables.                                  [default 0]
+    --growth-events <N>   Cap on growth events per run.                     [default 2]
+    --lesson-every <N>    Item 4: every N generations, plan the level, fit a clone to the
+                          states the run actually visits, and inject it as an ordinary child.
+                          0 disables; the clone must earn the record like any child. [default 0]
+    --plateau-window <N>  Item 4: generations without a record improvement before a bounded
+                          full-net CEM phase is spent. 0 disables.             [default 0]
+    --plateau-cem-generations <N>
+                          CEM generations per phase.                          [default 5]
+    --plateau-cem-events <N>
+                          Phases per run.                                     [default 1]
+    --generalist <PATH>   Item 6: a population checkpoint trained across the pack. A share of
+                          generation zero is seeded from it, behind the run's own starting
+                          material. Needs --generalist-share above zero.
+    --generalist-share <F>
+                          Share of generation zero taken from the generalist, clamped to 0.25.
+                                                                        [default 0.0]
+    --commitment          Build every genome with a twelfth output: a cadence head that chooses
+                          how many ticks (1, 2, 4 or 8) to hold each action. The head is a
+                          zero-initialised append-only row, so a genome migrated from a
+                          fixed-cadence champion plays exactly as it did until training moves
+                          it. Off by default (an arm until its equal-budget comparison lands).
     --mastery             After the record solves the level, keep evolving in a second phase that
                           ranks **winners by the clock** (the jump penalty is gone; the crowned
                           fitness still selects and validates the champion). **On by default**;
@@ -381,6 +417,14 @@ TRAIN OPTIONS:
                                                                                   [default 0]
     --plan-bonus-generations <N>
                           Generations over which --plan-bonus decays to zero.       [default 100]
+    --cut-stuck <N>       Item 5: end an episode after N no-progress ticks and score the part that
+                          was played. Score-preserving by construction; 0 disables.  [default 0]
+    --cut-margin <S>      Item 5: a cut is kept only when the genome could not reach the selection
+                          cut even with S more score; a genome closer than that is replayed
+                          uncut. Default 0: only a genome strictly below the cut is cut.
+    --cut-refund          Item 5: spend the ticks the cut saved on one extra trial for the genomes
+                          just below the selection cut, where ranking errors matter. Needs
+                          --cut-stuck.
     --snapshot-every <N>  Every N generations, start a batch of mutants from the least-visited
                           archived frontier state instead of spawn (WP8). A probe that wins from
                           a snapshot joins the population; it can never enter the record without
@@ -445,7 +489,10 @@ WATCH OPTIONS:
     --headless            Plain text frames, no keyboard. Implied without a TTY.
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
     --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --jump-timing-share,
-    --mastery, --no-mastery, --stagnation, --immigrants, --archive-children, --reheat-factor, --elite,
+    --commitment, --growth-units, --growth-events, --lesson-every, --plateau-window,
+    --plateau-cem-generations, --plateau-cem-events, --generalist, --generalist-share,
+    --mastery, --no-mastery, --stagnation,
+    --immigrants, --archive-children, --reheat-factor, --elite,
     --tournament, --crossover, --action-repeat, --feedback, --hidden, --rank-pessimism, --trials
                           As for `train`.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
@@ -591,8 +638,20 @@ SEGMENTS, CAMPAIGN AND ISLANDS OPTIONS:
     --generations         campaign/islands: generations of the whole-level phase. [default 30]
     --pop <N>             Population size.                          [default 200 native]
     --islands <N>         islands: independent populations, and the ring of migrants.  [default 4]
+    --levels <A,B,...>    generalist: the pack to rotate over, one generation per level in
+                          order. The cursor is the checkpoint's own generation, so a re-run
+                          continues the rotation instead of restarting it.
+    --refresh <DIR>       generalist: a directory of champions a pack run produced; the ones of
+                          the population's shape take the last slots (at most pop/4).
     --checkpoints <DIR>   campaign: where the per-leg population checkpoints are written.
                                                                        [default checkpoints]
+    --fuse <N>            campaign: breed N pairwise crosses of distinct leg specialists and seed
+                          them into generation zero before the whole-level phase (Item 9). The
+                          parents are what the item is about, so the shipped crossover runs
+                          unchanged. Needs at least two legs. 0 disables.        [default 0]
+    --fuse-cross-rate <R>
+                          campaign: probability a fused child is a cross of two legs rather than
+                          a copy of one. 1.0 crosses every child.       [default 1.0]
     --out <DIR>           Where the artifacts are written. campaigns and islands default to
                           `champions`; segments defaults to `segments` (one JSON per leg).
 
@@ -665,7 +724,10 @@ mod tests {
 
     #[test]
     fn an_unknown_subcommand_is_a_runtime_error() {
-        assert!(matches!(run(&args(&["frobnicate"])), Err(Failure::Error(_))));
+        assert!(matches!(
+            run(&args(&["frobnicate"])),
+            Err(Failure::Error(_))
+        ));
     }
 
     #[test]

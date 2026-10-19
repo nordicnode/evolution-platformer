@@ -186,6 +186,17 @@ pub struct GaConfig {
     /// shipped on. The archive itself keeps filling either way, which is what makes the panel's
     /// diversity reading honest at 0.
     pub archive_children: usize,
+    /// **Children bred from the technique archive (Item 11).** Each is a fine mutation of the
+    /// incumbent of a technique cell ([`crate::technique::TechniqueArchive::parents`]), picked
+    /// uniformly with the run's own RNG, so the draw is deterministic and the archive's signature
+    /// order is the only order involved. Selection only: no fitness changes, no version moves,
+    /// and a cell's occupant still earned its place on an ordinary episode.
+    ///
+    /// **Off by default, and gated.** The plan's arm is 24 paired seeds on `l11-the-elements` and
+    /// one technique-gated battery level, with occupied-cell diversity reported beside solve
+    /// times: rising diversity with no movement in solve time is a museum, not a mechanism. Zero
+    /// is bit-identical to the search before this field existed.
+    pub technique_children: usize,
     /// Breed those archive children only when the run is **out of ideas in both senses**: no
     /// new best for [`GaConfig::stagnation_generations`] *and* no new behavioural niche over the
     /// same window. False — the default — lets them trickle in every generation.
@@ -420,10 +431,76 @@ pub struct GaConfig {
     /// every genome in round one, so the recorded episode and its seed are exactly what a flat run
     /// would have recorded.
     pub race_episodes: bool,
+    /// **Function-preserving hidden growth (Item 13).** Units added to the first hidden layer
+    /// each time a growth event fires; 0 — the default — disables the operator entirely.
+    ///
+    /// Growth inserts neurons whose outgoing weights are zero, so the policy is bit-identical at
+    /// the moment it happens (`Genome::grown_hidden`). It exists for the case the first plan
+    /// kept open: a level that stalls specifically on capacity. No shipped level has been shown
+    /// to, which is why the default is off rather than a bigger net for everyone.
+    pub growth_units: usize,
+    /// How many growth events one run may fire. A cap rather than a cadence: an event fires when
+    /// the record has not improved for [`GaConfig::stagnation_generations`], and a run that grew
+    /// itself on every stall would inflate instead of solve.
+    pub growth_events: u32,
+    /// **Mid-run DAgger lessons (Item 4, step 1).** Every N generations, fit one clone to the
+    /// planner's route on this level and inject it as an ordinary child. 0 — the default —
+    /// disables the mechanism, because it spends a planning pass and an imitation fit from the
+    /// run's own budget and its equal-budget comparison has not been run.
+    ///
+    /// The clone enters through breeding like any other child: it starts at spawn, is scored on
+    /// the run's own episodes, and can never touch the record without earning it. The planner's
+    /// route is function-preserving with respect to nothing — it is a *teacher*, not a migration —
+    /// so a lesson that does not help is a cost, not a corruption.
+    pub lesson_every: u32,
+    /// **Plateau-triggered CEM phase (Item 4, step 2).** Generations without a record improvement
+    /// before a bounded full-net CEM phase is spent; 0 disables it.
+    pub plateau_window: u32,
+    /// CEM generations spent when the plateau trigger fires. Small on purpose: this is a slice of
+    /// the run's own episode budget, not a second trainer.
+    pub plateau_cem_generations: u32,
+    /// How many CEM phases one run may spend.
+    pub plateau_cem_events: u32,
+    /// **Standing-generalist seeding (Item 6).** Share of generation zero replaced by elites from
+    /// a population trained across the whole pack. 0 — the default — disables the source, so a
+    /// run without a generalist is bit-identical to one taken before the flag existed.
+    ///
+    /// Seeding, not training: the generalist's own cost is paid offline between pack runs, and
+    /// this only decides how many of the first generation's slots start from policies that have
+    /// already met spikes, decks and patrols. The share is a *fraction* and is clamped to a
+    /// quarter, like every other side-payment beside the main ranking.
+    pub generalist_share: f32,
     /// Root seed for the whole run.
     pub master_seed: u64,
     pub shape: NetShape,
     pub action_repeat: u32,
+    /// Item 5's early cut: end an episode after this many physics ticks with no progress and
+    /// score the part that was played (see [`EvalConfig::cut_stuck_frames`]). `0` — the default —
+    /// is the ordinary full episode, so a run is bit-identical to one taken before the knob
+    /// existed. The gate is wall-clock on the pack at the same champions.
+    pub cut_stuck_frames: u32,
+    /// **Item 5's band margin, in fitness units.** A stuck genome is only cut for good when even
+    /// its margin's worth of extra episode could not lift it to the genome that made the selection
+    /// cut; a genome closer than this is replayed **uncut** and its true score used instead.
+    ///
+    /// **Default 0.0: a genome at or above the cut is never cut, and one below it is.** That is
+    /// the plan's sentence with no extra slack — the stuck timer has already judged that the body
+    /// is not progressing, so its *remaining* progress is nothing by the trainer's own definition,
+    /// and the only thing the band adds is the guarantee that the saving is never taken from a
+    /// genome whose score already earned its place.
+    ///
+    /// A positive margin is the conservative setting, and it is much more expensive than it looks:
+    /// at a win's worth (10 200) **no episode on a plateau can be cut at all**, because every
+    /// genome on an unsolved level sits within a win of the cut and every cut is replayed. Measured
+    /// on `l9-wait-and-climb`: 0 of 4 000 episodes cut and the run 40 % slower than no cut. Raise
+    /// it only on a level where a late escape is the failure being guarded against.
+    pub cut_margin: f32,
+    /// **Spend what the cut saved** (Item 5, step 2): the ticks a cut episode did not play are
+    /// paid back to the generation as one extra trial for the genomes nearest the selection cut,
+    /// where a ranking error actually changes what is bred. Off by default like the cut itself,
+    /// and never on a suite — a suite's trial budget is per level and a single refund across the
+    /// pack would spend it on whichever level the cut happened to finish on.
+    pub cut_refund: bool,
 }
 
 impl Default for GaConfig {
@@ -444,6 +521,7 @@ impl Default for GaConfig {
             snapshot_probes: 4,
             fine_sigma_scale: 0.25,
             archive_children: 0,
+            technique_children: 0,
             archive_on_diversity: false,
             novelty_weight: 0.0,
             rank_pessimism: 0.0,
@@ -456,9 +534,19 @@ impl Default for GaConfig {
             validation_episodes: 12,
             common_episodes: true,
             race_episodes: true,
+            growth_units: 0,
+            growth_events: 2,
+            lesson_every: 0,
+            plateau_window: 0,
+            plateau_cem_generations: 5,
+            plateau_cem_events: 1,
+            generalist_share: 0.0,
             master_seed: 1,
             shape: default_shape(),
             action_repeat: fitness::ACTION_REPEAT,
+            cut_stuck_frames: 0,
+            cut_margin: 0.0,
+            cut_refund: false,
         }
     }
 }
@@ -467,6 +555,7 @@ impl GaConfig {
     pub fn eval_config(&self) -> EvalConfig {
         EvalConfig {
             action_repeat: self.action_repeat,
+            cut_stuck_frames: self.cut_stuck_frames,
         }
     }
 
@@ -581,6 +670,7 @@ impl GaConfig {
         self.fine_children = self.fine_children.min(extra_cap);
         self.immigrants = self.immigrants.min(extra_cap);
         self.archive_children = self.archive_children.min(extra_cap);
+        self.technique_children = self.technique_children.min(extra_cap);
         // The rarity bonus is an addition to the selection score, so it is bounded by what it
         // could pay: at 512 a maximally rare genome (an extreme of the grid with a population of
         // one) would out-earn the goal bonus, which would turn a tie-break into the objective.
@@ -590,7 +680,9 @@ impl GaConfig {
         // A shaping term, not a second objective: ten percent of the win bonus is the ceiling on
         // how much plan-following can ever be worth, and the decay makes it worth less each
         // generation. Above that a genome could prefer the plan's corridor to the flag.
-        self.plan_bonus = self.plan_bonus.clamp(0.0, crate::fitness::GOAL_BONUS * 0.10);
+        self.plan_bonus = self
+            .plan_bonus
+            .clamp(0.0, crate::fitness::GOAL_BONUS * 0.10);
         self.plan_bonus_generations = self.plan_bonus_generations.min(10_000);
         // A probe batch is a side-payment beside the population, like the fine/archive children:
         // a quarter of the population is the ceiling on how much of a generation can be spent
@@ -616,6 +708,26 @@ impl GaConfig {
         // shipped sigma of 0.30 already asks for 2.4 and lands on the ceiling, and a negative
         // factor would mean a batch thrown *towards* the champion, which is not a search move.
         self.reheat_factor = self.reheat_factor.clamp(0.0, 8.0);
+        // Growth is a one-way widening of a live shape. The same ceiling the shape itself has
+        // (`MAX_HIDDEN_WIDTH`) applies, and the event count is bounded because every event is a
+        // permanent cost paid by every later generation.
+        self.growth_units = self.growth_units.min(MAX_HIDDEN_WIDTH);
+        self.growth_events = self.growth_events.min(8);
+        if self.growth_units == 0 {
+            self.growth_events = 0;
+        }
+        // Lessons and CEM phases are bounded the same way: a cadence of 0 is off, and the phase
+        // count is capped because each one spends episodes from the run's budget.
+        self.lesson_every = self.lesson_every.min(10_000);
+        self.plateau_window = self.plateau_window.min(10_000);
+        self.plateau_cem_generations = self.plateau_cem_generations.min(100);
+        self.plateau_cem_events = self.plateau_cem_events.min(8);
+        if self.plateau_window == 0 {
+            self.plateau_cem_events = 0;
+        }
+        // A seeding share, like the fine/immigrant quotas: a quarter of generation zero is the
+        // ceiling on how much of a run can start somewhere other than this level's own history.
+        self.generalist_share = self.generalist_share.clamp(0.0, 0.25);
         // One generation is not stagnation, it is a generation; 0 disables the rule.
         if self.stagnation_generations == 1 {
             self.stagnation_generations = 2;
@@ -1116,12 +1228,7 @@ pub const VALIDATION_GENERATION: u32 = u32::MAX;
 /// The synthetic genome id is also `u32::MAX`: under `common_episodes` it is unused, and under the
 /// per-genome policy it is the one id no issued genome has (`next_id` would have to wrap).
 pub fn validation_seed(cfg: &GaConfig, index: u32) -> u64 {
-    episode_seed(
-        cfg.master_seed,
-        VALIDATION_GENERATION,
-        u32::MAX,
-        index,
-    )
+    episode_seed(cfg.master_seed, VALIDATION_GENERATION, u32::MAX, index)
 }
 
 /// How many contenders survive one round of a race: half of them, rounded up.
@@ -1149,10 +1256,7 @@ pub fn episodes_per_genome(levels: &[Level], pop: usize, cfg: &GaConfig) -> f32 
         .max()
         .unwrap_or(1);
     if !cfg.race_episodes || rounds <= 1 {
-        return levels
-            .iter()
-            .map(|l| cfg.effective_trials(l) as f32)
-            .sum();
+        return levels.iter().map(|l| cfg.effective_trials(l) as f32).sum();
     }
     let mut contenders = pop.max(1);
     let mut total = 0usize;
@@ -1597,9 +1701,9 @@ impl MapElitesArchive {
         } else {
             euclid_frac
         };
-        let p_bin = ((frac * ARCHIVE_PROGRESS_BINS as f32) as usize)
-            .min(ARCHIVE_PROGRESS_BINS - 1);
-        let c_bin = ((r.checkpoints + r.route_hops_closed) as usize).min(ARCHIVE_CHECKPOINT_BINS - 1);
+        let p_bin = ((frac * ARCHIVE_PROGRESS_BINS as f32) as usize).min(ARCHIVE_PROGRESS_BINS - 1);
+        let c_bin =
+            ((r.checkpoints + r.route_hops_closed) as usize).min(ARCHIVE_CHECKPOINT_BINS - 1);
         (p_bin, c_bin, Self::time_slot(level, r))
     }
 
@@ -1689,6 +1793,19 @@ pub struct Trainer {
     /// Snapshot probes started, and how many of those reached the flag from their start.
     snapshot_probes: u64,
     snapshot_wins: u64,
+    /// Item 13's growth events fired so far, capped by [`GaConfig::growth_events`].
+    growth_used: u32,
+    /// Item 4's budget counters: lessons injected and CEM phases spent.
+    lessons: usize,
+    cem_rounds: u32,
+    /// Item 11's counter: children bred from technique-archive cells, reported per run so the
+    /// arm's effect is separable from the ordinary search.
+    technique_bred: usize,
+    /// Item 5's counter: episodes this run ended early on the no-progress cut, reported so the
+    /// saving is a number rather than a claim.
+    cut_early: usize,
+    /// Item 5, step 2's counter: genomes re-read on an extra trial with the ticks the cut saved.
+    cut_refunds: usize,
 }
 
 impl Trainer {
@@ -1722,6 +1839,12 @@ impl Trainer {
             snapshots: crate::snapshots::SnapshotArchive::new(),
             snapshot_probes: 0,
             snapshot_wins: 0,
+            growth_used: 0,
+            lessons: 0,
+            cem_rounds: 0,
+            technique_bred: 0,
+            cut_early: 0,
+            cut_refunds: 0,
         }
     }
 
@@ -1793,6 +1916,12 @@ impl Trainer {
             snapshots: crate::snapshots::SnapshotArchive::new(),
             snapshot_probes: 0,
             snapshot_wins: 0,
+            growth_used: 0,
+            lessons: 0,
+            cem_rounds: 0,
+            technique_bred: 0,
+            cut_early: 0,
+            cut_refunds: 0,
         })
     }
 
@@ -1984,7 +2113,10 @@ impl Trainer {
         let mut ids: Vec<u32> = genomes.iter().map(|g| g.id).collect();
         ids.sort_unstable();
         if let Some(dup) = ids.windows(2).find(|w| w[0] == w[1]) {
-            return Err(format!("adopted population has duplicate genome id {}", dup[0]));
+            return Err(format!(
+                "adopted population has duplicate genome id {}",
+                dup[0]
+            ));
         }
         if let Some(max) = ids.last() {
             // Ids at or above the current `next_id` are the excursion's own; ids
@@ -2136,6 +2268,28 @@ impl Trainer {
     /// Read-only view of the technique archive and its firsts (WP13).
     pub fn technique(&self) -> &crate::technique::TechniqueArchive {
         &self.technique
+    }
+
+    /// How many children this run has bred from technique-archive cells (Item 11).
+    ///
+    /// A run-level reading rather than a per-generation one: the mechanism exists to spend a
+    /// *share* of the run's parents on a different criterion, so what an arm has to report is
+    /// that the share was spent at all, beside the diversity it bought. `0` on a run with the
+    /// share off, and on one that turned it on before any cell had an occupant.
+    pub fn technique_children_bred(&self) -> usize {
+        self.technique_bred
+    }
+
+    /// How many episodes this run ended on Item 5's no-progress cut. `0` unless
+    /// [`GaConfig::cut_stuck_frames`] is positive; the companion number to the wall-clock saving.
+    pub fn cut_early(&self) -> usize {
+        self.cut_early
+    }
+
+    /// How many genomes the run re-read on an extra trial with the ticks its cuts saved
+    /// ([`GaConfig::cut_refund`]). Zero when the refund is off, which is its default.
+    pub fn cut_refunds(&self) -> usize {
+        self.cut_refunds
     }
 
     /// The plan-proximity guide, when one was attached (WP5).
@@ -2341,8 +2495,140 @@ impl Trainer {
         }
     }
 
-    fn advance(&mut self, levels: &[Level], keep_population: bool) -> (GenerationReport, Vec<Genome>) {
-        let results = evaluate_suite(levels, &self.genomes, &self.config, self.generation);
+    /// **Item 5, step 1: the ranking-band condition.**
+    ///
+    /// The cut is a saving only if the genome could not have changed its band anyway. So after the
+    /// cheap pass the trainer reads the selection cut — the fitness of the genome at rank
+    /// `elite` — and replays **uncut** every genome that was cut while sitting within
+    /// [`GaConfig::cut_margin`] of it. Those results are the same scores the episode would have
+    /// earned anyway (the cut is defined to be score-preserving), so this changes the episode's
+    /// cost and never its meaning; what it changes is *which* genomes get to keep the saving.
+    ///
+    /// The replay is the same episode: `evaluate_suite` derives its seeds from the generation, the
+    /// trial and (under per-genome episodes) the id, all of which are unchanged here, so no world
+    /// is drawn twice.
+    fn reconsider_cuts(
+        &self,
+        levels: &[Level],
+        mut results: Vec<EpisodeResult>,
+    ) -> Vec<EpisodeResult> {
+        if results.is_empty() {
+            return results;
+        }
+        let elite = self
+            .config
+            .elite
+            .clamp(1, results.len().saturating_sub(1).max(1));
+        let mut scores: Vec<f32> = results.iter().map(|r| r.mean_fitness).collect();
+        scores.sort_by(|a, b| b.total_cmp(a));
+        let Some(cut_score) = scores.get(elite - 1).copied() else {
+            return results;
+        };
+        let margin = self.config.cut_margin.max(0.0);
+        let ambiguous: Vec<usize> = (0..results.len())
+            .filter(|&i| results[i].cut_early && results[i].mean_fitness + margin >= cut_score)
+            .collect();
+        if ambiguous.is_empty() {
+            return results;
+        }
+        let uncut = GaConfig {
+            cut_stuck_frames: 0,
+            ..self.config.clone()
+        };
+        let genomes: Vec<Genome> = ambiguous.iter().map(|&i| self.genomes[i].clone()).collect();
+        let full = evaluate_suite(levels, &genomes, &uncut, self.generation);
+        for (slot, &i) in ambiguous.iter().enumerate() {
+            if let Some(result) = full.get(slot) {
+                results[i] = result.clone();
+            }
+        }
+        results
+    }
+
+    /// **Item 5, step 2: spend what the cut saved.**
+    ///
+    /// The ticks a cut episode did not play are turned into whole episodes at this generation's
+    /// own mean episode length, and spent as **one extra trial each** on the genomes in the first
+    /// ranks *below* the selection cut — the ones where a ranking error changes what is bred. Each
+    /// refunded genome is re-read on `effective_trials + 1` episodes, flat (no racing), which keeps
+    /// trial 0 the episode a champion is recorded from and replaces only the selection mean.
+    ///
+    /// Deliberately one mechanism, not two: `--cut-refund` either spends the saving on trials or
+    /// it does not, so an arm that gains can be attributed to the trials rather than to a mix of
+    /// trials and a larger population.
+    fn spend_cut_refund(&mut self, levels: &[Level], results: &mut [EpisodeResult]) {
+        if results.is_empty() {
+            return;
+        }
+        // The runner's own guard, so "saved" means the frames this episode would have played.
+        let guard = sim::frame_budget(&levels[0]) + self.config.action_repeat.max(1) + 8;
+        let saved: u32 = results
+            .iter()
+            .filter(|r| r.cut_early)
+            .map(|r| guard.saturating_sub(r.frames))
+            .sum();
+        let played = results.iter().map(|r| r.frames).sum::<u32>() / results.len() as u32;
+        let budget = (saved / played.max(1)) as usize;
+        if budget == 0 {
+            return;
+        }
+        let mut order: Vec<usize> = (0..results.len()).collect();
+        order.sort_by(|&a, &b| {
+            results[b]
+                .mean_fitness
+                .total_cmp(&results[a].mean_fitness)
+                .then(a.cmp(&b))
+        });
+        let elite = self
+            .config
+            .elite
+            .min(order.len().saturating_sub(1));
+        let mut cfg = self.config.clone();
+        cfg.trials = self.config.effective_trials(&levels[0]) + 1;
+        cfg.auto_trials = false;
+        cfg.race_episodes = false;
+        // One parallel pass over the refunded band, not one pass per genome: a per-genome call
+        // would serialise the refund and make it cost several times what the cut saved. The cap
+        // is a quarter of the population, the same side-payment bound every other mechanism here
+        // obeys, so a refund can never take over the generation it is supposed to give back to.
+        let targets: Vec<usize> = order
+            .iter()
+            .skip(elite)
+            .take(budget.min(order.len() / 4))
+            .copied()
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let genomes: Vec<Genome> = targets.iter().map(|&i| self.genomes[i].clone()).collect();
+        let reads = evaluate_suite(levels, &genomes, &cfg, self.generation);
+        for (&i, result) in targets.iter().zip(reads) {
+            results[i] = result;
+            self.cut_refunds += 1;
+        }
+    }
+
+    fn advance(
+        &mut self,
+        levels: &[Level],
+        keep_population: bool,
+    ) -> (GenerationReport, Vec<Genome>) {
+        let mut results = evaluate_suite(levels, &self.genomes, &self.config, self.generation);
+        // **Item 5, step 1: a cut is only kept when it cannot change the ranking band.** A genome
+        // whose own score plus the margin reaches the genome that made the selection cut is
+        // replayed uncut, so the saving is never bought with an episode that could still have
+        // mattered.
+        if self.config.cut_stuck_frames > 0 {
+            results = self.reconsider_cuts(levels, results);
+            if self.config.cut_refund && levels.len() == 1 {
+                self.spend_cut_refund(levels, &mut results);
+            }
+        }
+        // Item 5's reading, taken here rather than recomputed later: the results are the only
+        // place a cut is visible, and `self.genomes` is about to be replaced by their children.
+        // Counted *after* the reconsideration, so a replay that was paid back is not claimed as a
+        // saving.
+        self.cut_early += results.iter().filter(|r| r.cut_early).count();
 
         debug_assert_eq!(results.len(), self.genomes.len());
         for (g, r) in self.genomes.iter_mut().zip(results.iter()) {
@@ -2433,11 +2719,8 @@ impl Trainer {
         // optimising for — the plan's "enter a second phase instead of stopping". Winners are then
         // ranked by frames; the crowned fitness in `results` is untouched, which is what keeps the
         // champion a claim about the level rather than about the league.
-        let league = self.config.mastery
-            && self
-                .best_ever
-                .as_ref()
-                .is_some_and(|b| b.result.solved());
+        let league =
+            self.config.mastery && self.best_ever.as_ref().is_some_and(|b| b.result.solved());
         self.mastery_active = league;
         let mut selection: Vec<f32> = if league {
             results
@@ -2471,13 +2754,8 @@ impl Trainer {
                 let eval = self.config.eval_config();
                 for (idx, genome) in self.genomes.iter().enumerate() {
                     let seed = episode_seed_for(&self.config, self.generation, genome.id, 0);
-                    let (_, fraction) = fitness::run_episode_guided(
-                        &levels[0],
-                        genome,
-                        &eval,
-                        seed,
-                        guide.clone(),
-                    );
+                    let (_, fraction) =
+                        fitness::run_episode_guided(&levels[0], genome, &eval, seed, guide.clone());
                     selection[idx] += weight * fraction;
                 }
             }
@@ -2604,8 +2882,7 @@ impl Trainer {
         // score: a genome that stomps five walkers to cross a pit is a worse champion and an
         // interesting ancestor, and both statements have to be able to be true at once.
         for (genome, result) in self.genomes.iter().zip(results.iter()) {
-            self.technique
-                .observe(self.generation, genome, result);
+            self.technique.observe(self.generation, genome, result);
         }
 
         // ---- the search's own bookkeeping: stagnation, then the 1/5th rule -----
@@ -2618,6 +2895,56 @@ impl Trainer {
         } else {
             self.stagnation = self.stagnation.saturating_add(1);
         }
+        // ---- Item 13: function-preserving growth on the plateau ----------------
+        //
+        // The trigger is the same stall counter the immigrant batch and the derived practice
+        // detour read, and the caps are the run's (`growth_units`, `growth_events`). Every genome
+        // is grown in place, the run's shape moves with them (breeding stamps the config's shape
+        // onto children), and the record and the fastest agent are grown too — otherwise the
+        // record re-insertion in `breed` would put an old-shape genome back into a new-shape
+        // population. The archives are **cleared**: their incumbents are old-shape genomes, and
+        // regrowing them would either lose the behaviour they were kept for or produce a cell key
+        // that no longer describes the net. A cleared archive refills from the grown population.
+        if self.config.growth_units > 0
+            && self.growth_used < self.config.growth_events
+            && self.config.stagnation_generations > 0
+            && self.stagnation >= self.config.stagnation_generations
+            && !self.config.shape.hidden.is_empty()
+        {
+            let units = self.config.growth_units;
+            let mut grown: Vec<Genome> = Vec::with_capacity(self.genomes.len());
+            let mut ok = true;
+            for g in &self.genomes {
+                match g.grown_hidden(units) {
+                    Ok(g) => grown.push(g),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                self.genomes = grown;
+                self.config.shape.hidden[0] += units;
+                if let Some(record) = self.best_ever.as_mut() {
+                    record.genome = record
+                        .genome
+                        .grown_hidden(units)
+                        .expect("the population grew, so the record can");
+                }
+                if let Some(fast) = self.fastest_agent.as_mut() {
+                    fast.genome = fast
+                        .genome
+                        .grown_hidden(units)
+                        .expect("the population grew, so its fastest agent can");
+                }
+                self.archive = MapElitesArchive::new();
+                self.technique = crate::technique::TechniqueArchive::new();
+                self.growth_used += 1;
+                // A growth event is a change to the search, so the plateau window restarts.
+                self.stagnation = 0;
+            }
+        }
         if self.config.adaptive_sigma {
             self.tune_sigma(&results);
         }
@@ -2626,19 +2953,32 @@ impl Trainer {
         // which is the only thing "the suite fell" can mean. Zero on a single-level run by
         // construction (`suite_wins` is only raised for a suite of more than one level), so `wins`
         // keeps its old meaning there. On a suite this is exactly `solved`.
-        let suite_solved = if levels.len() > 1 {
-            solved
-        } else {
-            0
-        };
+        let suite_solved = if levels.len() > 1 { solved } else { 0 };
+
+        // ---- Item 4, step 2: a bounded full-net CEM phase on the plateau ----------
+        //
+        // The record, not the generation's best: the record is the point the run has proved. The
+        // phase spends `plateau_cem_generations` generations of a small mirrored CEM over every
+        // gene (the strategy included — this is the plateau case, not a mis-drawn boundary), and
+        // a winner is adopted only if `polish_genes` certifies it on held-out validation seeds.
+        // Certification is the same rule the after-run `polish` command applies, because it is the
+        // same function.
+        if self.config.plateau_window > 0
+            && self.cem_rounds < self.config.plateau_cem_events
+            && self.stagnation >= self.config.plateau_window
+        {
+            self.spend_cem_phase(&levels[0]);
+        }
 
         let (immigrants, archive_children) = self.breed(&order, &selection);
+        // ---- Item 4, step 1: a mid-run lesson, injected through breeding ----------
+        if self.config.lesson_every > 0 && self.generation % self.config.lesson_every == 0 {
+            self.inject_lesson(&levels[0]);
+        }
         // Snapshot exploration happens *after* breeding, so a probe that wins from a frontier is
         // in the population the next generation evaluates rather than being overwritten by the
         // children this generation just made.
-        if self.config.snapshot_every > 0
-            && self.generation % self.config.snapshot_every == 0
-        {
+        if self.config.snapshot_every > 0 && self.generation % self.config.snapshot_every == 0 {
             self.snapshot_probe(&levels[0]);
         }
         let archive_bits = self.archive.occupied();
@@ -2811,7 +3151,13 @@ impl Trainer {
                 // pass, so the same genome cannot appear in two lanes.
                 let pick = (rng.next_u32() as usize) % pool.len();
                 let index = pool.swap_remove(pick);
-                lanes.push(lane(index, best_k + n, LaneKind::Random, report, population));
+                lanes.push(lane(
+                    index,
+                    best_k + n,
+                    LaneKind::Random,
+                    report,
+                    population,
+                ));
             }
         }
 
@@ -2937,9 +3283,9 @@ impl Trainer {
                 // earlier generation, so a child-vs-parent comparison against it would be
                 // mixing generations — and the rule is trying to measure exactly that noise.
                 parents.push(NO_PARENT);
-            }            // The counter restarts with the batch, so the population gets the whole
-            // `stagnation_generations` to do something with it before more arrives: a
-            // population flooded with reheats every generation is just a random restart.
+            } // The counter restarts with the batch, so the population gets the whole
+              // `stagnation_generations` to do something with it before more arrives: a
+              // population flooded with reheats every generation is just a random restart.
             self.stagnation = 0;
         }
         budget -= immigrants;
@@ -2966,10 +3312,7 @@ impl Trainer {
         //    generation's episodes.
         let mut archive_children = 0usize;
         if self.config.archive_children > 0 && self.archive_is_due() {
-            let slots = self
-                .config
-                .archive_children
-                .min(budget.saturating_sub(1));
+            let slots = self.config.archive_children.min(budget.saturating_sub(1));
             for incumbent in self.archive_parents(slots) {
                 let mut child = incumbent;
                 // A **fine** step, for the reason the archive exists: an incumbent is the best
@@ -2988,6 +3331,35 @@ impl Trainer {
                 next.push(child);
                 parents.push(NO_PARENT);
                 archive_children += 1;
+            }
+        }
+
+        // 4b. Technique-archive children (Item 11). A share of the parents is drawn from the
+        //     archive's cells rather than from the leaderboard, so a genome kept for *how* it
+        //     moved gets to breed even while its scalar fitness is behind the selection cut. The
+        //     step is fine for the same reason the behaviour archive's is: an incumbent is the
+        //     best at one technique, and the coarse move destroys the technique it was kept for.
+        if self.config.technique_children > 0 {
+            let incumbents = self.technique.parents();
+            if !incumbents.is_empty() {
+                // Keep one slot for the coarse fill, and never exceed the population: the
+                // archive blocks above bound themselves by `budget`, which is a *budget* rather
+                // than a count of the slots still free.
+                let room = pop_size.saturating_sub(next.len()).saturating_sub(1);
+                let slots = self.config.technique_children.min(room);
+                for _ in 0..slots {
+                    let pick = (next_f32(&mut self.rng) * incumbents.len() as f32) as usize;
+                    let mut child = incumbents[pick.min(incumbents.len() - 1)].genome.clone();
+                    let genes = 1 + (next_f32(&mut self.rng) * FINE_GENE_MAX as f32) as usize;
+                    mutate_few(&mut child, genes, fine_sigma, &mut self.rng);
+                    child.id = self.next_id;
+                    child.fitness = 0.0;
+                    child.shape = shape.clone();
+                    self.next_id += 1;
+                    next.push(child);
+                    parents.push(NO_PARENT);
+                    self.technique_bred += 1;
+                }
             }
         }
 
@@ -3049,6 +3421,160 @@ impl Trainer {
         (immigrants, archive_children)
     }
 
+    /// One bounded full-net CEM phase on the plateau (Item 4, step 2).
+    ///
+    /// Extracted so the trigger and the spend are separable: a caller that wants to test the
+    /// phase (or a future `--plateau-phase-now` diagnostic) does not have to manufacture a stall.
+    /// Returns whether a phase was actually spent; the cap lives with the caller.
+    ///
+    /// The record, not the generation's best, is the point the run has proved. The phase spends
+    /// `plateau_cem_generations` generations of a small mirrored CEM over **every** gene — the
+    /// strategy included, because this is the plateau case rather than a mis-drawn action boundary
+    /// — and adopts the winner only if `polish_genes` certifies it on held-out validation seeds,
+    /// which is the same certification the after-run `polish` command applies because it is the
+    /// same function. Adoption replaces the last breeding slot with a fresh id: the winner must
+    /// still be scored by the next generation like any child.
+    fn spend_cem_phase(&mut self, level: &Level) -> bool {
+        if self.config.plateau_window == 0 || self.cem_rounds >= self.config.plateau_cem_events {
+            return false;
+        }
+        let Some(record) = self.best_ever.as_ref().map(|b| b.genome.clone()) else {
+            return false;
+        };
+        let eval_seeds: Vec<u64> = (0..4).map(|i| validation_seed(&self.config, i)).collect();
+        let polish_cfg = crate::polish::PolishConfig {
+            generations: self.config.plateau_cem_generations,
+            batch: 8,
+            elite: 2,
+            sigma: 0.10,
+            min_sigma: 0.005,
+            trials: 2,
+            master_seed: self.config.master_seed
+                ^ (self.generation as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            action_repeat: self.config.action_repeat,
+        };
+        let slots = crate::polish::full_slots(&record);
+        let report =
+            crate::polish::polish_genes(level, &record, polish_cfg, &eval_seeds, &slots, "all");
+        self.cem_rounds += 1;
+        if let Some(mut winner) = report.genome {
+            winner.id = self.next_id;
+            self.next_id += 1;
+            winner.fitness = 0.0;
+            winner.shape = self.config.shape.clone();
+            if let Some(last) = self.genomes.last_mut() {
+                *last = winner;
+            }
+        }
+        self.stagnation = 0;
+        true
+    }
+
+    /// **Seed generation zero from a standing generalist population** (Item 6).
+    ///
+    /// `elites` is the generalist population's current members, in its own order. The share is
+    /// [`GaConfig::generalist_share`]; the seeded genomes take the **last** slots so the run's own
+    /// starting material (a route clone, a champion shell) keeps the front, and each gets a fresh
+    /// id because ids are part of every episode seed. The clones are exact policies, not
+    /// perturbations: this is a seeding source, and a generalist that is resampled on arrival is
+    /// just noise with a longer story.
+    ///
+    /// Refuses a member of another shape rather than quietly skipping it: a mixed-shape population
+    /// would poison the first breeding pass, which stamps the run's shape over genes sliced from
+    /// a different one.
+    pub fn seed_generalist(&mut self, elites: &[Genome]) -> Result<usize, String> {
+        if elites.is_empty() || self.config.generalist_share <= 0.0 {
+            return Ok(0);
+        }
+        let pop = self.config.pop_size;
+        let want = ((pop as f32) * self.config.generalist_share).round() as usize;
+        self.seed_donors(elites, want)
+    }
+
+    /// **Seed the last `want` slots from a list of donor genomes** (Items 6 and 9).
+    ///
+    /// The one implementation behind both seeding sources: a generalist share and a campaign's
+    /// fused leg crosses differ in *where the donors came from*, not in what seeding one does, so
+    /// the shape check, the fresh id, the zero fitness and the "donors take the back slots" rule
+    /// live here once. [`Trainer::seed_generalist`] is the fraction-shaped caller;
+    /// `train-cli campaign --fuse` is the count-shaped one.
+    ///
+    /// Donors are cloned exactly: this is a seeding source, not a perturbation, and a donor that
+    /// is resampled on arrival is noise with a longer story. Ids are reissued because ids are part
+    /// of every episode seed, so a donor must be judged on the seeded run's own episodes rather
+    /// than on the ones it earned its fitness on.
+    pub fn seed_donors(&mut self, donors: &[Genome], want: usize) -> Result<usize, String> {
+        if donors.is_empty() || want == 0 {
+            return Ok(0);
+        }
+        for g in donors {
+            if g.shape != self.config.shape {
+                return Err(format!(
+                    "seeded genome {} is {} but this run asks for {}: a seeding source cannot \
+                     differ in shape from the population it seeds",
+                    g.id,
+                    g.shape.label(),
+                    self.config.shape.label()
+                ));
+            }
+            g.validate()?;
+        }
+        let pop = self.config.pop_size;
+        let want = want.min(pop.saturating_sub(1)).min(donors.len());
+        let start = pop - want;
+        for slot in start..pop {
+            let mut clone = donors[(slot - start) % donors.len()].clone();
+            clone.id = self.next_id;
+            self.next_id += 1;
+            clone.fitness = 0.0;
+            self.genomes[slot] = clone;
+            if let Some(parent) = self.parent_fitness.get_mut(slot) {
+                *parent = NO_PARENT;
+            }
+        }
+        Ok(want)
+    }
+
+    /// **Fit one mid-run lesson and inject it as an ordinary child** (Item 4, step 1).
+    ///
+    /// The planner runs on the level with a generation-derived seed; `from_plan` walks the route
+    /// and then fits a clone to every state the *student* actually reaches (its own DAgger pass),
+    /// which is the property the plan asks for — lessons target the states the run really visits,
+    /// not a corridor it never walks. The clone is given a fresh id and zero fitness and takes the
+    /// last breeding slot, so it is scored next generation like every other child and cannot
+    /// disturb the record without earning it.
+    ///
+    /// A plan that cannot be found is not an error for the run: it is a level where this teacher
+    /// has nothing to say, and the counter simply does not move. The alternative — refusing the
+    /// whole training run because one lesson could not be planned — would make an experimental
+    /// teaching flag a hard dependency on the oracle.
+    fn inject_lesson(&mut self, level: &Level) {
+        let eval = self.config.eval_config();
+        let shape = self.config.shape.clone();
+        let seed = episode_seed_for(&self.config, self.generation, self.next_id, 0);
+        let cfg = crate::imitate::ImitateConfig {
+            prefer_agreement: true,
+            ..Default::default()
+        };
+        if let Ok((_, report, _)) = crate::imitate::from_plan(
+            level,
+            seed,
+            &eval,
+            shape,
+            &cfg,
+            sim::plan::PlanConfig::default(),
+        ) {
+            let mut clone = report.genome;
+            clone.id = self.next_id;
+            self.next_id += 1;
+            clone.fitness = 0.0;
+            if let Some(last) = self.genomes.last_mut() {
+                *last = clone;
+                self.lessons += 1;
+            }
+        }
+    }
+
     /// Up to `want` archive incumbents to breed from this generation.
     ///
     /// **Deterministic, and deliberately so.** The cells are walked from an offset that moves
@@ -3072,7 +3598,11 @@ impl Trainer {
         let stride = (entries.len() / take).max(1);
         let offset = (self.generation as usize) % entries.len();
         (0..take)
-            .map(|i| entries[(offset + i * stride) % entries.len()].genome.clone())
+            .map(|i| {
+                entries[(offset + i * stride) % entries.len()]
+                    .genome
+                    .clone()
+            })
             .collect()
     }
 
@@ -3119,7 +3649,6 @@ fn lane(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3135,7 +3664,10 @@ mod tests {
             "the default rate must be one of the rungs: {MUTATION_RATES:?}"
         );
         for pair in MUTATION_RATES.windows(2) {
-            assert!(pair[0] < pair[1], "the ladder must rise: {MUTATION_RATES:?}");
+            assert!(
+                pair[0] < pair[1],
+                "the ladder must rise: {MUTATION_RATES:?}"
+            );
         }
         for rate in MUTATION_RATES {
             assert!((0.03..=0.10).contains(&rate), "{rate} is outside §7.5");
@@ -3152,6 +3684,83 @@ mod tests {
     /// evolution; a flat runway cannot, because it is solved by a constant policy.
     fn pit_level() -> Level {
         crate::fixture::gap_runway("ga-pit-fixture", 24, 22, &[(10, 3)])
+    }
+
+    /// The wall-stander fixture Item 5's score-identity test uses, so a cut can be produced on
+    /// demand: the all-zero genome runs right and stops against the wall.
+    fn wall_level() -> Level {
+        let rows = [
+            "............",
+            "............",
+            "............",
+            "......#.....",
+            "......#.....",
+            "......#.....",
+            "############",
+            "############",
+        ];
+        crate::fixture::level("ga-wall-stander", &rows, (1, 5), &[("goal", 10, 5)])
+    }
+
+    /// **Item 5, step 1.** When every genome in the population is stuck against the same wall,
+    /// every one of them is within a win of the selection cut, so every cut is replayed uncut and
+    /// the run claims **no** saving. That is the rule working: a cut that could still have changed
+    /// its band is not a saving, and a population that has not learned to move is exactly where the
+    /// old unconditional timer used to cut everything.
+    #[test]
+    fn a_cut_that_could_still_reach_the_selection_cut_is_replayed_uncut() {
+        let level = wall_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 3,
+            cut_stuck_frames: 30,
+            ..GaConfig::default()
+        };
+        let mut run = Trainer::new(cfg.clone());
+        for (i, genome) in run.genomes.iter_mut().enumerate() {
+            *genome = Genome::zeros(i as u32, cfg.shape.clone());
+        }
+        run.step(&level);
+        assert_eq!(
+            run.cut_early(),
+            0,
+            "a population stuck at one score is entirely inside the band, so nothing is cut "
+        );
+    }
+
+    /// **Item 5, step 2.** Saved ticks become whole episodes at this generation's own mean length,
+    /// and they are spent as one extra trial each on genomes below the selection cut.
+    #[test]
+    fn the_refund_spends_saved_ticks_on_extra_trials_near_the_cut() {
+        let level = wall_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 3,
+            cut_refund: true,
+            ..GaConfig::default()
+        };
+        let mut run = Trainer::new(cfg.clone());
+        let eval = cfg.eval_config();
+        let mut results: Vec<EpisodeResult> = run
+            .genomes
+            .iter()
+            .enumerate()
+            .map(|(i, g)| crate::fitness::run_episode(&level, g, &eval, 100 + i as u64))
+            .collect();
+        // Two episodes that stopped twenty frames in, as a cut would.
+        for result in results.iter_mut().take(2) {
+            result.cut_early = true;
+            result.frames = 20;
+        }
+        run.spend_cut_refund(std::slice::from_ref(&level), &mut results);
+        assert!(
+            run.cut_refunds() > 0,
+            "the saved frames have to buy at least one extra trial"
+        );
+        assert!(
+            run.cut_refunds() <= results.len() / 2,
+            "a refund may not re-judge more than half the population"
+        );
     }
 
     #[test]
@@ -3195,11 +3804,8 @@ mod tests {
             "the chart belongs to the run, not to the population"
         );
         assert_eq!(
-            run.best_ever().map(|b| (
-                b.generation,
-                b.result.fitness,
-                b.genome.id
-            )),
+            run.best_ever()
+                .map(|b| (b.generation, b.result.fitness, b.genome.id)),
             best_before,
             "the champion is the best of *this* level's evaluations"
         );
@@ -3226,7 +3832,10 @@ mod tests {
 
         let mut short = ok.clone();
         short.pop();
-        assert!(run.adopt(short).unwrap_err().contains("cannot adopt 3 genomes"));
+        assert!(run
+            .adopt(short)
+            .unwrap_err()
+            .contains("cannot adopt 3 genomes"));
 
         let mut dupes = ok.clone();
         dupes[2].id = dupes[0].id;
@@ -3242,7 +3851,10 @@ mod tests {
         // Every refusal left the population it already had.
         run.adopt(ok.clone()).expect("the original still fits");
         assert_eq!(run.genomes.len(), 4);
-        assert_eq!(run.genomes.iter().map(|g| g.id).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            run.genomes.iter().map(|g| g.id).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -3257,7 +3869,10 @@ mod tests {
         let mut trainer = Trainer::new(cfg);
         let genome = trainer.genomes[0].clone();
         let cells = trainer.seed_snapshots(&level, &genome);
-        assert!(cells > 0, "a full episode must archive at least its spawn state");
+        assert!(
+            cells > 0,
+            "a full episode must archive at least its spawn state"
+        );
         assert_eq!(trainer.snapshot_stats(), (0, 0));
         assert_eq!(trainer.snapshots().len(), cells);
     }
@@ -3305,7 +3920,10 @@ mod tests {
             .expect("the flat runway is plannable");
         let waypoints = trainer.seed_plan(&level, &route);
         assert!(waypoints >= 2, "spawn and flag are two waypoints at least");
-        let guide = trainer.plan_guide().cloned().expect("the guide is attached");
+        let guide = trainer
+            .plan_guide()
+            .cloned()
+            .expect("the guide is attached");
 
         // The planner's own route, replayed under its guide, reaches all of it.
         let mut replay = sim::Sim::new(&level, route.seed);
@@ -3322,15 +3940,21 @@ mod tests {
             }
         }
         let (reached, total) = replay.plan_progress();
-        assert_eq!(replay.outcome(), sim::Outcome::Won, "the route wins its level");
+        assert_eq!(
+            replay.outcome(),
+            sim::Outcome::Won,
+            "the route wins its level"
+        );
         assert_eq!(total, waypoints);
-        assert_eq!(reached, total, "the route the guide came from must traverse it");
+        assert_eq!(
+            reached, total,
+            "the route the guide came from must traverse it"
+        );
 
         let genome = trainer.genomes[0].clone();
         let eval = cfg.eval_config();
         let plain = fitness::run_episode(&level, &genome, &eval, 3);
-        let (guided, fraction) =
-            fitness::run_episode_guided(&level, &genome, &eval, 3, guide);
+        let (guided, fraction) = fitness::run_episode_guided(&level, &genome, &eval, 3, guide);
         assert_eq!(guided.fitness, plain.fitness, "the guide adds no fitness");
         assert_eq!(
             guided.trajectory_hash, plain.trajectory_hash,
@@ -3380,6 +4004,170 @@ mod tests {
                  which is not \"nowhere near solving it\""
             );
         }
+    }
+
+    /// Item 13's trigger and cap: growth fires on the plateau, moves the run's declared shape
+    /// with the population, and never fires more often than the cap. The bit-identity of the
+    /// grown policy is pinned in `genome::tests`; this is the training-side contract.
+    #[test]
+    fn growth_fires_on_a_plateau_and_stops_at_its_cap() {
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 3,
+            stagnation_generations: 2,
+            growth_units: 4,
+            growth_events: 1,
+            ..GaConfig::default()
+        };
+        let mut run = Trainer::new(cfg);
+        let before = run.config.shape.hidden[0];
+        assert_eq!(before, 16);
+
+        // A fresh run has not plateaued yet, so a step does not grow it.
+        run.step(&level);
+        assert_eq!(run.config.shape.hidden[0], before, "no stall, no growth");
+
+        // Stand the stall counter where the trigger reads it, then step once.
+        run.stagnation = 2;
+        run.step(&level);
+        assert_eq!(run.config.shape.hidden[0], before + 4);
+        assert!(run.genomes.iter().all(|g| g.shape.hidden[0] == before + 4));
+        assert!(run
+            .best_ever()
+            .is_some_and(|b| b.genome.shape.hidden[0] == before + 4));
+
+        // The cap is one event: another forced stall grows nothing.
+        run.stagnation = 2;
+        run.step(&level);
+        assert_eq!(run.config.shape.hidden[0], before + 4);
+    }
+
+    /// Item 4's two triggers are budgeted mechanisms, not decorations: a lesson cadence fires a
+    /// clone into the breeding slot, and a plateau spends exactly one CEM phase under a cap of
+    /// one. Both are off by default elsewhere.
+    /// Item 6's seeding contract: the share lands in the **last** slots, keeps the run's own
+    /// starting material in front, gives every seeded genome a fresh id (ids are part of the
+    /// episode seed), and refuses a source of another shape.
+    #[test]
+    fn generalist_seeding_fills_the_last_slots_and_refuses_another_shape() {
+        let mut run = Trainer::new(GaConfig {
+            pop_size: 8,
+            master_seed: 4,
+            generalist_share: 0.25,
+            ..GaConfig::default()
+        });
+        let front: Vec<u32> = run.genomes[..6].iter().map(|g| g.id).collect();
+        let elites: Vec<Genome> = run.genomes[..2].to_vec();
+        let seeded = run.seed_generalist(&elites).expect("same shape");
+        assert_eq!(seeded, 2);
+        assert_eq!(
+            run.genomes[..6].iter().map(|g| g.id).collect::<Vec<_>>(),
+            front,
+            "the run's own start keeps the front slots"
+        );
+        assert!(run.genomes[6..].iter().all(|g| g.id >= 8));
+        assert!(run.genomes[6..].iter().all(|g| g.shape == run.config.shape));
+
+        let mut rng = rng_from_seed(5);
+        let other = Genome::random(
+            99,
+            NetShape {
+                hidden: vec![8],
+                ..default_shape()
+            },
+            &mut rng,
+        );
+        assert!(
+            run.seed_generalist(&[other]).is_err(),
+            "mixed shapes are refused"
+        );
+
+        let mut off = Trainer::new(GaConfig {
+            pop_size: 8,
+            ..GaConfig::default()
+        });
+        assert_eq!(off.seed_generalist(&elites).expect("off"), 0);
+    }
+
+    /// Item 9's seeding primitive is the same one Item 6 uses, with a **count** rather than a
+    /// fraction: a campaign asks for k fused crosses, not for a share of a population that was
+    /// never trained on the whole level. The slots seeded, the fresh ids and the shape refusal are
+    /// the contract either way, so this pins the count-shaped caller on its own.
+    #[test]
+    fn seed_donors_fills_a_count_of_slots_and_refuses_another_shape() {
+        let mut run = Trainer::new(GaConfig {
+            pop_size: 10,
+            master_seed: 6,
+            ..GaConfig::default()
+        });
+        let front: Vec<u32> = run.genomes[..7].iter().map(|g| g.id).collect();
+        let donors: Vec<Genome> = run.genomes[..3].to_vec();
+        let seeded = run.seed_donors(&donors, 3).expect("same shape");
+        assert_eq!(seeded, 3);
+        assert_eq!(
+            run.genomes[..7].iter().map(|g| g.id).collect::<Vec<_>>(),
+            front,
+            "the run's own start keeps the front slots"
+        );
+        // Exact policies, not perturbations, each with an id no genome had before.
+        for (donor, slot) in donors.iter().zip(&run.genomes[7..]) {
+            assert_eq!(donor.weights, slot.weights);
+            assert_eq!(donor.biases, slot.biases);
+            assert!(slot.id >= 10, "a donor is re-identified: {}", slot.id);
+            assert_eq!(slot.fitness, 0.0, "a donor earns its score here");
+        }
+        // Asking for more than there are donors is a clamp, not a panic (the population can never
+        // be filled past its own last slot), and zero or an empty list is zero.
+        assert_eq!(run.seed_donors(&donors, 999).expect("clamped"), 3);
+        assert_eq!(run.seed_donors(&donors, 0).expect("none"), 0);
+        assert_eq!(run.seed_donors(&[], 3).expect("no donors"), 0);
+
+        let mut rng = rng_from_seed(11);
+        let other = Genome::random(
+            42,
+            NetShape {
+                hidden: vec![32],
+                ..default_shape()
+            },
+            &mut rng,
+        );
+        assert!(
+            run.seed_donors(&[other], 1).is_err(),
+            "mixed shapes are refused"
+        );
+    }
+
+    #[test]
+    fn lessons_and_cem_phases_fire_only_when_configured_and_within_their_caps() {
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 9,
+            lesson_every: 1,
+            plateau_window: 2,
+            plateau_cem_generations: 1,
+            plateau_cem_events: 1,
+            ..GaConfig::default()
+        };
+        let mut run = Trainer::new(cfg);
+        run.step(&level);
+        // The lesson is best-effort: a level the planner cannot route leaves the counter at zero,
+        // and the fixture is small enough that either answer is legitimate. What may not happen is
+        // an injected genome that is not in the run's shape or a panic on failure.
+        assert!(run.lessons <= 1);
+        assert!(run.genomes.iter().all(|g| g.shape == run.config.shape));
+
+        // The CEM phase is budgeted, not tied to a manufactured stall in the trigger test: spend
+        // it directly and check the cap and the population's shape.
+        assert!(run.spend_cem_phase(&level), "the first phase is spent");
+        assert_eq!(run.cem_rounds, 1);
+        assert!(run.genomes.iter().all(|g| g.shape == run.config.shape));
+        assert!(
+            !run.spend_cem_phase(&level),
+            "the cap refuses the second phase"
+        );
+        assert_eq!(run.cem_rounds, 1, "the phase cap is one");
     }
 
     #[test]
@@ -3672,7 +4460,10 @@ mod tests {
 
         // The split is what the plan asks for: the top of the ranking, plus
         // outsiders. The champion lane must be the ranking's first entry.
-        assert_eq!(lanes[0].genome_id, report.results[report.ranking[0]].genome_id);
+        assert_eq!(
+            lanes[0].genome_id,
+            report.results[report.ranking[0]].genome_id
+        );
         assert!(lanes.iter().take(2).all(|l| l.kind == LaneKind::Best));
         assert!(lanes.iter().skip(2).all(|l| l.kind == LaneKind::Random));
     }
@@ -3888,6 +4679,7 @@ mod tests {
             best_stand: None,
             suite_wins: 0,
             death_cause: None,
+            cut_early: false,
             all_trials_won: false,
             death_pos: None,
             seed: 0,
@@ -4368,7 +5160,11 @@ mod tests {
         };
         let trainer = Trainer::new(cfg.clone());
         let results = evaluate_population(&level, &trainer.genomes, &cfg, 0);
-        assert_eq!(cfg.effective_trials(&level), 1, "the fixture has no walkers");
+        assert_eq!(
+            cfg.effective_trials(&level),
+            1,
+            "the fixture has no walkers"
+        );
         assert!(
             results.iter().all(|r| r.worst_trial == r.mean_fitness),
             "one episode is its own floor"
@@ -4523,7 +5319,10 @@ mod tests {
             means[0].min(means[1]),
             "the aggregate is the worst level"
         );
-        assert_eq!(split.fitness, single.fitness, "the representative is trial 0 of level 0");
+        assert_eq!(
+            split.fitness, single.fitness,
+            "the representative is trial 0 of level 0"
+        );
 
         let (both, _) = suite_score(&[flat.clone(), flat], &g, &cfg, 0);
         assert_eq!(both.suite_wins, 2, "two levels, two wins");
@@ -4609,7 +5408,8 @@ mod tests {
             master_seed: 3,
             ..GaConfig::default()
         };
-        let mut seeded = Trainer::from_champion(cfg.clone(), champion.clone()).expect("seeds a run");
+        let mut seeded =
+            Trainer::from_champion(cfg.clone(), champion.clone()).expect("seeds a run");
 
         assert_eq!(seeded.genomes.len(), 12);
         assert_eq!(
@@ -4651,17 +5451,22 @@ mod tests {
             ..cfg
         };
         let err = Trainer::from_champion(wider, champion).unwrap_err();
-        assert!(err.contains("two shapes") || err.contains("one shape"), "{err}");
+        assert!(
+            err.contains("two shapes") || err.contains("one shape"),
+            "{err}"
+        );
         assert!(
             err.contains(&default_shape().label()),
             "the refusal names the net the champion is: {err}"
         );
         assert!(
-            err.contains(&NetShape {
-                hidden: vec![32],
-                ..default_shape()
-            }
-            .label()),
+            err.contains(
+                &NetShape {
+                    hidden: vec![32],
+                    ..default_shape()
+                }
+                .label()
+            ),
             "and the net the run asked for: {err}"
         );
     }
@@ -4742,7 +5547,10 @@ mod tests {
             ..GaConfig::default()
         }
         .sanitized(None);
-        assert_eq!(hot.rank_pessimism, 1.0, "pessimism is a fraction of a genome's own gap");
+        assert_eq!(
+            hot.rank_pessimism, 1.0,
+            "pessimism is a fraction of a genome's own gap"
+        );
         let cold = GaConfig {
             rank_pessimism: -1.0,
             ..GaConfig::default()
@@ -4771,9 +5579,17 @@ mod tests {
         // The two in the populated cell share it three ways (2 of 3), the solitary one does not.
         let crowded = weight * (1.0 - 2.0 / 3.0);
         let solitary = weight * (1.0 - 1.0 / 3.0);
-        assert!((scores[0] - paired.mean_fitness - crowded).abs() < 1e-4, "{}", scores[0]);
+        assert!(
+            (scores[0] - paired.mean_fitness - crowded).abs() < 1e-4,
+            "{}",
+            scores[0]
+        );
         assert!((scores[1] - 90.0 - crowded).abs() < 1e-4, "{}", scores[1]);
-        assert!((scores[2] - alone.mean_fitness - solitary).abs() < 1e-4, "{}", scores[2]);
+        assert!(
+            (scores[2] - alone.mean_fitness - solitary).abs() < 1e-4,
+            "{}",
+            scores[2]
+        );
         let bonus = |i: usize| scores[i] - results[i].mean_fitness;
         assert!(
             bonus(2) > bonus(1),
@@ -4876,7 +5692,12 @@ mod tests {
         );
         assert_eq!(
             a.ranking,
-            ranked_by(&a.results.iter().map(|r| r.mean_fitness).collect::<Vec<f32>>()),
+            ranked_by(
+                &a.results
+                    .iter()
+                    .map(|r| r.mean_fitness)
+                    .collect::<Vec<f32>>()
+            ),
             "a plain run is ranked by the recorded fitness"
         );
         // The genome that would be saved as this run's champion is the best **real** episode of
@@ -4942,7 +5763,10 @@ mod tests {
             .iter()
             .filter(|c| gene_distance(&best, c) == 0)
             .count();
-        assert!(copies > 0, "a zero-rate coarse child must be a copy of a parent");
+        assert!(
+            copies > 0,
+            "a zero-rate coarse child must be a copy of a parent"
+        );
     }
 
     /// **The timing share spends its fine slots on the jump boundary and nothing else.**
@@ -5020,7 +5844,11 @@ mod tests {
             ..GaConfig::default()
         };
         let mut t = Trainer::new(cfg.clone());
-        assert_eq!(t.mutation_sigma(), cfg.mutation_sigma, "a run starts where it was told");
+        assert_eq!(
+            t.mutation_sigma(),
+            cfg.mutation_sigma,
+            "a run starts where it was told"
+        );
         for _ in 0..40 {
             t.step(&level);
         }
@@ -5202,7 +6030,10 @@ mod tests {
         // and the sweep this test guards is about where the batch lands, not about the last bit
         // of a product.
         let near = |got: f32, want: f32| (got - want).abs() < 1e-5;
-        assert!(near(at(0.30, 1.0), 0.30), "the default is the run's own step");
+        assert!(
+            near(at(0.30, 1.0), 0.30),
+            "the default is the run's own step"
+        );
         assert!(near(at(0.30, 0.5), 0.15), "a cooler reheat is half of it");
         assert!(near(at(0.30, 2.0), 0.60));
         assert!(near(at(0.30, 3.0), 0.90));
@@ -5213,7 +6044,6 @@ mod tests {
         // And a factor of zero is the floor rather than no reheat at all: a batch thrown at zero
         // would be a copy of the anchor in every gene, which is not a search move.
         assert_eq!(at(0.30, 0.0), MUTATION_SIGMA_RANGE[0]);
-
     }
 
     /// Breed one plateau batch on a fixture that cannot improve, and hand back the anchor the
@@ -5242,7 +6072,10 @@ mod tests {
         for _ in 0..2 {
             report = t.step(&level);
         }
-        assert_eq!(report.immigrants, cfg.immigrants, "the batch must have fired");
+        assert_eq!(
+            report.immigrants, cfg.immigrants,
+            "the batch must have fired"
+        );
         // The anchor is the run's best-ever as it stood when the batch was bred — the same genome,
         // since nothing has been scored since (which is why the batch could fire at all).
         let anchor = t
@@ -5284,7 +6117,10 @@ mod tests {
         let factor = GaConfig::default().reheat_factor;
         assert!(factor > 1.0, "this test is about the hot end");
         let (anchor, batch) = a_plateau_batch(factor);
-        let mean = batch.iter().map(|c| gene_correlation(&anchor, c)).sum::<f32>()
+        let mean = batch
+            .iter()
+            .map(|c| gene_correlation(&anchor, c))
+            .sum::<f32>()
             / batch.len() as f32;
         // Theory: sigma_genes / sqrt(sigma_genes^2 + step^2) with sigma_genes about 0.15 and a
         // step of 0.90 is about 0.16. The threshold is far below the estimate and far above zero,
@@ -5335,7 +6171,10 @@ mod tests {
             );
         }
         let report = t.step(&level);
-        assert_eq!(report.immigrants, cfg.immigrants, "the threshold is inclusive");
+        assert_eq!(
+            report.immigrants, cfg.immigrants,
+            "the threshold is inclusive"
+        );
 
         // The breed order is elites, fine, immigrants, coarse, so the reheated batch sits in
         // slots elite..elite + immigrants. Each one is a long walk from the anchor that keeps
@@ -5427,7 +6266,8 @@ mod tests {
             .map(|_| fixed.step(&level).mutation_sigma)
             .collect();
         assert_ne!(
-            fixed_sigmas, run().0,
+            fixed_sigmas,
+            run().0,
             "a self-tuning run and a fixed one produced the same size throughout"
         );
     }
@@ -5503,6 +6343,51 @@ mod tests {
         // And the archive itself is still filled: what the knob controls is the breeding, not
         // the record.
         assert!(off.archive().occupied() > 0);
+    }
+
+    /// Item 11's mechanism, end to end: a share of the parents comes from technique cells once a
+    /// cell has an occupant, the population is not overfilled, and the knob at zero breeds none
+    /// while the record still fills.
+    #[test]
+    fn technique_children_are_bred_from_cells_and_off_is_off() {
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 24,
+            master_seed: 9,
+            technique_children: 3,
+            ..GaConfig::default()
+        };
+        let mut on = Trainer::new(cfg.clone());
+        for _ in 0..4 {
+            on.step(&level);
+        }
+        assert!(
+            on.technique().occupied() > 0,
+            "the fixture has to fill a technique cell before the share can breed from one"
+        );
+        assert!(
+            on.technique_children_bred() > 0,
+            "no child came from a technique cell in a run whose archive holds {} of them",
+            on.technique().occupied()
+        );
+        assert_eq!(
+            on.genomes.len(),
+            cfg.pop_size,
+            "the technique share must not overfill the population"
+        );
+
+        let mut off = Trainer::new(GaConfig {
+            technique_children: 0,
+            ..cfg
+        });
+        for _ in 0..4 {
+            off.step(&level);
+        }
+        assert_eq!(off.technique_children_bred(), 0, "off is off");
+        assert!(
+            off.technique().occupied() > 0,
+            "the record still fills; only the breeding is switched off"
+        );
     }
 
     /// A walker level is judged on more than one patrol phase, a walker-free one is not, and an
@@ -5631,7 +6516,8 @@ mod tests {
             auto_trials: false,
             ..cfg.clone()
         };
-        let one_result = evaluate_population(&level, std::slice::from_ref(&genome), &one, generation);
+        let one_result =
+            evaluate_population(&level, std::slice::from_ref(&genome), &one, generation);
         assert_eq!(one.effective_trials(&level), 1);
         assert_eq!(one_result[0].mean_fitness, scores[0]);
     }
@@ -5671,7 +6557,10 @@ mod tests {
         );
         // A different generation is still a different world, so nothing can be memorised by rote.
         let next = evaluate_population(&level, &trainer.genomes, &cfg, generation + 1);
-        assert_ne!(seeds[0], next[0].seed, "the phase re-rolls every generation");
+        assert_ne!(
+            seeds[0], next[0].seed,
+            "the phase re-rolls every generation"
+        );
 
         // And the arm it replaces really does hand out different episodes, one per genome.
         let unpaired = GaConfig {
@@ -5687,10 +6576,7 @@ mod tests {
         // The trainer's own helper is the one answer to "which episode", so it must agree with
         // what each arm just did rather than with one of them.
         assert_eq!(episode_seed_for(&cfg, generation, 3, 0), seeds[0]);
-        assert_eq!(
-            episode_seed_for(&unpaired, generation, 3, 0),
-            own_seeds[3]
-        );
+        assert_eq!(episode_seed_for(&unpaired, generation, 3, 0), own_seeds[3]);
     }
 
     /// Racing **yields** to the episode policy rather than quietly overruling it: a run that asks
@@ -5709,8 +6595,14 @@ mod tests {
             ..GaConfig::default()
         };
         let run = asked.sanitized(None);
-        assert!(!run.common_episodes, "the episode policy is the request that wins");
-        assert!(!run.race_episodes, "and a race that cannot be sounded is not run");
+        assert!(
+            !run.common_episodes,
+            "the episode policy is the request that wins"
+        );
+        assert!(
+            !run.race_episodes,
+            "and a race that cannot be sounded is not run"
+        );
         // The pairing default is what makes that reading unambiguous: `false` here is somebody
         // having asked, never a default.
         assert!(GaConfig::default().common_episodes);
@@ -5744,7 +6636,10 @@ mod tests {
         let trainer = Trainer::new(cfg.clone());
         let genomes = &trainer.genomes;
         let trials = cfg.effective_trials(&level);
-        assert_eq!(trials, 3, "a walker level's budget is what a race is spent against");
+        assert_eq!(
+            trials, 3,
+            "a walker level's budget is what a race is spent against"
+        );
 
         let flat = evaluate_population(&level, genomes, &cfg, generation);
         let raced_cfg = GaConfig {
@@ -5782,7 +6677,12 @@ mod tests {
         assert_eq!(raced.len(), flat.len());
         for (r, f) in raced.iter().zip(&flat) {
             assert_eq!(r.genome_id, f.genome_id);
-            assert_eq!((r.fitness, r.seed), (f.fitness, f.seed), "genome {}", f.genome_id);
+            assert_eq!(
+                (r.fitness, r.seed),
+                (f.fitness, f.seed),
+                "genome {}",
+                f.genome_id
+            );
             assert_eq!(r.outcome, f.outcome);
         }
         // The episode counts per round are asserted above from what the code spent rather than from
@@ -6066,6 +6966,7 @@ mod tests {
             best_stand: None,
             suite_wins: 0,
             death_cause: None,
+            cut_early: false,
             all_trials_won: false,
             death_pos: None,
             seed: 1,
@@ -6094,7 +6995,10 @@ mod tests {
             MapElitesArchive::time_slot(&level, &slow),
             "the fixture's two paces have to land in different finish bands for this to prove anything"
         );
-        assert!(MapElitesArchive::time_slot(&level, &fast) > 0, "a win is not slot zero");
+        assert!(
+            MapElitesArchive::time_slot(&level, &fast) > 0,
+            "a win is not slot zero"
+        );
 
         let mut archive = MapElitesArchive::new();
         let genomes = vec![Genome::zeros(101, shape.clone()), Genome::zeros(102, shape)];

@@ -42,8 +42,8 @@ use crossterm::terminal::{
 };
 use evo::{
     curriculum_step, practice_level_for_stall, practice_step, save_practice_level, ChampionFile,
-    EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, MUTATION_RATES, PopulationFile,
-    ShowcaseLane, Trainer, DEFAULT_CURRICULUM_GENERATIONS,
+    EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, PopulationFile, ShowcaseLane, Trainer,
+    DEFAULT_CURRICULUM_GENERATIONS, MUTATION_RATES,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
 use render::chart::{
@@ -73,11 +73,14 @@ const WATCH_OPTS: &[&str] = &[
     "crossover",
     "fine-children",
     "jump-timing-share",
+    "commitment",
     "mastery",
     "no-mastery",
     "stagnation",
     "immigrants",
     "reheat-factor",
+    "growth-units",
+    "growth-events",
     "adaptive-sigma",
     "action-repeat",
     "feedback",
@@ -150,7 +153,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
     let best_k = usage(a.usize_opt("best", 4))?;
     let random_k = usage(a.usize_opt("random", 4))?;
     if best_k + random_k == 0 {
-        return Err("usage: --best and --random cannot both be zero: nothing would be drawn".into());
+        return Err(
+            "usage: --best and --random cannot both be zero: nothing would be drawn".into(),
+        );
     }
     let death_window = usage(a.usize_opt("death-window", 25))? as u32;
     let out_dir = a.string("out", "champions");
@@ -163,9 +168,10 @@ pub fn watch(a: &Args) -> Result<(), String> {
         Some(path) => Some(load_level(path)?),
         None => None,
     };
-    let curriculum_generations =
-        usage(a.usize_opt("curriculum-generations", DEFAULT_CURRICULUM_GENERATIONS as usize))?
-            as u32;
+    let curriculum_generations = usage(a.usize_opt(
+        "curriculum-generations",
+        DEFAULT_CURRICULUM_GENERATIONS as usize,
+    ))? as u32;
     if curriculum_level.is_some() && curriculum_generations == 0 {
         return Err("usage: --curriculum-generations must be at least 1".into());
     }
@@ -210,16 +216,14 @@ pub fn watch(a: &Args) -> Result<(), String> {
         // Snapped to the same ladder the `m`/`M` keys walk, so the rate the run
         // starts at is a rate the viewer can get back to and the value on screen is
         // always the value in the config (§10 Tier 2.9).
-        mutation_rate: nearest_mut_rate(usage(a.f32_opt(
-            "mut-rate",
-            GaConfig::default().mutation_rate,
-        ))?),
+        mutation_rate: nearest_mut_rate(usage(
+            a.f32_opt("mut-rate", GaConfig::default().mutation_rate),
+        )?),
         mutation_sigma: usage(a.f32_opt("mut-sigma", 0.30))?,
         fine_children: usage(a.usize_opt("fine-children", 8))?,
-        jump_timing_share: usage(a.f32_opt(
-            "jump-timing-share",
-            GaConfig::default().jump_timing_share,
-        ))?,
+        jump_timing_share: usage(
+            a.f32_opt("jump-timing-share", GaConfig::default().jump_timing_share),
+        )?,
         // The same default as `train` and the window: after the record solves, the second phase
         // ranks winners by the clock. `--no-mastery` is the plain run.
         mastery: !a.has_flag("no-mastery"),
@@ -235,10 +239,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
         crossover_rate: usage(a.f32_opt("crossover", 0.75))?,
         // And the ranking rule, for the same reason: a watched run and a trained run with the same
         // flags have to be the same run, or the panel is showing numbers no table can quote.
-        rank_pessimism: usage(a.f32_opt(
-            "rank-pessimism",
-            GaConfig::default().rank_pessimism,
-        ))?,
+        rank_pessimism: usage(a.f32_opt("rank-pessimism", GaConfig::default().rank_pessimism))?,
         action_repeat: usage(a.usize_opt("action-repeat", 4))? as u32,
         // As in `train`: the width of the recurrent state and the capacity of the hidden layers,
         // both defaulted from the trainer's own shape rather than from a second copy here, and both
@@ -247,6 +248,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
         shape: evo::NetShape {
             hidden: crate::commands::parse_hidden(a, &GaConfig::default().shape.hidden)?,
             feedback: usage(a.usize_opt("feedback", GaConfig::default().shape.feedback))?,
+            commitment: a.has_flag("commitment"),
             ..GaConfig::default().shape
         },
         // As in `train`: the patrol rule lives in the trainer (`GaConfig::effective_trials`), so
@@ -317,11 +319,8 @@ pub fn watch(a: &Args) -> Result<(), String> {
             if let Some(note) = checkpoint.level_note(&level) {
                 println!("note    {note}");
             }
-            let mut trainer = Trainer::resume(
-                cfg.clone(),
-                checkpoint.to_genomes()?,
-                checkpoint.generation,
-            )?;
+            let mut trainer =
+                Trainer::resume(cfg.clone(), checkpoint.to_genomes()?, checkpoint.generation)?;
             if let Some(record) = checkpoint.best_genome()? {
                 trainer.seed_record_from_checkpoint(&level, record)?;
             }
@@ -386,7 +385,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
         }
         let mut runners: Vec<EpisodeRunner> = lanes
             .iter()
-            .map(|lane| EpisodeRunner::new(&level, population[lane.index].clone(), &eval, lane.seed))
+            .map(|lane| {
+                EpisodeRunner::new(&level, population[lane.index].clone(), &eval, lane.seed)
+            })
             .collect();
 
         let ctx = GenCtx {
@@ -575,8 +576,7 @@ fn resolve_level(a: &Args, levels_dir: &str, champion_path: Option<&str>) -> Res
         (None, Some(path)) => {
             let raw =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-            let champion =
-                ChampionFile::from_json_str(&raw).map_err(|e| format!("{path}: {e}"))?;
+            let champion = ChampionFile::from_json_str(&raw).map_err(|e| format!("{path}: {e}"))?;
             find_level_by_hash(levels_dir, &champion.metadata.level_hash)?.ok_or_else(|| {
                 format!(
                     "no level in {levels_dir} hashes to {} (champion was trained on {:?}); pass --level",
@@ -1168,7 +1168,10 @@ fn render_frame(f: &Frame, cols: usize, rows: usize, l: Layout) -> String {
     // first generation there is no archive to report, and `diversity 0/48` beside a live run would
     // read as a population that had collapsed rather than one that has not started.
     if f.search.archive_children > 0 {
-        search.push_str(&format!("   +{} from the archive", f.search.archive_children));
+        search.push_str(&format!(
+            "   +{} from the archive",
+            f.search.archive_children
+        ));
     }
     if f.search.archive_bits > 0 {
         search.push_str(&format!(
@@ -1430,7 +1433,8 @@ fn animate_lanes(
             },
         )?;
 
-        if screen.budget_exhausted() || runners.iter().all(|r| r.is_finished()) || stepped >= budget {
+        if screen.budget_exhausted() || runners.iter().all(|r| r.is_finished()) || stepped >= budget
+        {
             return Ok(());
         }
         // Wall-clock pacing for human eyes only, exactly like `play`: the sim has no
@@ -1607,6 +1611,7 @@ fn watch_champion(
     let genome = champion.to_genome()?;
     let eval = EvalConfig {
         action_repeat: champion.metadata.action_repeat.max(1),
+        cut_stuck_frames: 0,
     };
     let lanes = vec![LaneInfo {
         label: '1',
@@ -1754,7 +1759,11 @@ fn finish_training(
     // alternate screen and vanishes with it.
     screen.close();
     println!();
-    println!("watched {} ({} generations)", level.name, trainer.history().len());
+    println!(
+        "watched {} ({} generations)",
+        level.name,
+        trainer.history().len()
+    );
     // The clock, before the best agent rather than after it: what a viewer carries away from a
     // watching session is *how quickly* the level was solved, and `best` below is a different
     // record — the highest-scoring genome, which is not always the quickest win.
@@ -1800,10 +1809,17 @@ fn finish_training(
     Ok(())
 }
 
-fn finish_champion(screen: &mut Screen, level: &Level, champion: &ChampionFile) -> Result<(), String> {
+fn finish_champion(
+    screen: &mut Screen,
+    level: &Level,
+    champion: &ChampionFile,
+) -> Result<(), String> {
     screen.close();
     println!();
-    println!("watched champion {} on {}", champion.metadata.genome_id, level.name);
+    println!(
+        "watched champion {} on {}",
+        champion.metadata.genome_id, level.name
+    );
     println!("        {}", champion.summary());
     Ok(())
 }
@@ -1815,7 +1831,10 @@ fn oracle_line(level: &Level) -> String {
     } else {
         format!(
             "NOT beatable as built: {}",
-            report.diagnosis.as_deref().unwrap_or("no explanation available")
+            report
+                .diagnosis
+                .as_deref()
+                .unwrap_or("no explanation available")
         )
     }
 }
@@ -2056,12 +2075,18 @@ mod tests {
             key_action(KeyCode::Char('q'), KeyModifiers::NONE),
             KeyAction::Quit
         );
-        assert_eq!(key_action(KeyCode::Esc, KeyModifiers::NONE), KeyAction::Quit);
+        assert_eq!(
+            key_action(KeyCode::Esc, KeyModifiers::NONE),
+            KeyAction::Quit
+        );
         assert_eq!(
             key_action(KeyCode::Char('c'), KeyModifiers::CONTROL),
             KeyAction::Quit
         );
-        assert_eq!(key_action(KeyCode::F(7), KeyModifiers::NONE), KeyAction::None);
+        assert_eq!(
+            key_action(KeyCode::F(7), KeyModifiers::NONE),
+            KeyAction::None
+        );
     }
 
     #[test]
@@ -2645,7 +2670,11 @@ mod tests {
         assert_eq!(usable_size(0, 40), (HEADLESS_COLS, HEADLESS_ROWS));
         assert_eq!(usable_size(80, 0), (HEADLESS_COLS, HEADLESS_ROWS));
         assert_eq!(usable_size(120, 40), (120, 40));
-        assert_eq!(usable_size(20, 12), (20, 12), "a small terminal is still a terminal");
+        assert_eq!(
+            usable_size(20, 12),
+            (20, 12),
+            "a small terminal is still a terminal"
+        );
     }
     #[test]
     fn a_paused_or_unfollowed_view_says_so() {
@@ -2820,14 +2849,16 @@ mod tests {
         // an id from the checkpoint, never a fresh one, and never a generation
         // earlier than the checkpoint's own.
         let level = load_level(&stalled).expect("level loads");
-        let champion = evo::ChampionFile::load_for_level(
-            resumed_out.join("l5-tightrope.json"),
-            &level,
-        )
-        .expect("the resumed run saved a champion for this level");
+        let champion =
+            evo::ChampionFile::load_for_level(resumed_out.join("l5-tightrope.json"), &level)
+                .expect("the resumed run saved a champion for this level");
+        // Either a member of the handed population or a child bred from it, whose id is issued
+        // after every checkpoint id. What must not happen is a champion from a *fresh* run, whose
+        // ids would start at zero and fall at or below the checkpoint's last id.
+        let last = ids.iter().copied().max().unwrap_or(0);
         assert!(
-            ids.contains(&champion.metadata.genome_id),
-            "champion id {} is not one of the resumed population's {:?}",
+            ids.contains(&champion.metadata.genome_id) || champion.metadata.genome_id > last,
+            "champion id {} did not come from the resumed run (population {:?})",
             champion.metadata.genome_id,
             ids
         );
@@ -2852,8 +2883,11 @@ mod tests {
             &wpath("levels/l5-tightrope.json"),
             "--pop",
             "2",
+            // Short enough that the run does not reach a stall. The point of this case is that
+            // *configuring nothing* writes nothing; a stall's derived practice detour is a
+            // separate mechanism with its own test above.
             "--generations",
-            "30",
+            "5",
             "--out",
             &out,
             "--headless",
@@ -2874,7 +2908,10 @@ mod tests {
             &wpath("levels/does-not-exist.json"),
             "--headless",
         ]);
-        assert!(watch(&resumed_args).is_err(), "a missing curriculum level is an error");
+        assert!(
+            watch(&resumed_args).is_err(),
+            "a missing curriculum level is an error"
+        );
 
         // Zero detour generations would be a silent no-op.
         let zero_args = a(&[
@@ -2946,7 +2983,10 @@ mod tests {
         );
         assert_eq!(trace.generation, report.generation);
         assert_eq!(trace.max_fitness, report.max_fitness);
-        assert!(!trace.points.is_empty(), "a route has at least one position");
+        assert!(
+            !trace.points.is_empty(),
+            "a route has at least one position"
+        );
 
         // The same episode, driven independently.
         let mut runner =
@@ -2959,7 +2999,11 @@ mod tests {
             (p.x, p.y)
         };
         let scored = runner.result();
-        assert_eq!(trace.won, scored.won(), "the record agrees about the outcome");
+        assert_eq!(
+            trace.won,
+            scored.won(),
+            "the record agrees about the outcome"
+        );
         assert_eq!(
             trace.frames(),
             scored.frames,
@@ -3098,7 +3142,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(solved.contains("record 3/3: gen 97  max 400.0  solved"), "{solved}");
+        assert!(
+            solved.contains("record 3/3: gen 97  max 400.0  solved"),
+            "{solved}"
+        );
 
         // The record row is paid for out of the chart and the scene, exactly like
         // the stall and genius rows: the frame keeps its height either way.
@@ -3182,11 +3229,7 @@ mod tests {
 
     /// A one-lane generation, ready to animate: the smallest real call into
     /// [`animate_lanes`], with a headless screen capped at `frames` draws.
-    fn animate_one(
-        level: &Level,
-        frames: usize,
-        live: LiveState,
-    ) -> (LiveState, u32, u32) {
+    fn animate_one(level: &Level, frames: usize, live: LiveState) -> (LiveState, u32, u32) {
         use evo::Genome;
         let cfg = GaConfig {
             pop_size: 4,
@@ -3221,11 +3264,7 @@ mod tests {
         let mut live = live;
         let mut runners = vec![EpisodeRunner::new(level, genome.clone(), &eval, 1)];
         animate_lanes(&mut screen, level, &mut runners, &lanes, &ctx, &mut live).expect("draws");
-        (
-            live,
-            runners[0].sim().stats().frames,
-            screen.drawn as u32,
-        )
+        (live, runners[0].sim().stats().frames, screen.drawn as u32)
     }
 
     #[test]
@@ -3244,11 +3283,17 @@ mod tests {
         // Paused: the same three draws, no physics at all. The budget must not be
         // consumed either, or unpausing would dump the viewer into the next
         // generation having seen nothing.
-        let paused = LiveState { paused: true, ..speed };
+        let paused = LiveState {
+            paused: true,
+            ..speed
+        };
         let (live, frames, drawn) = animate_one(&level, 3, paused);
         assert_eq!(frames, 0, "pause must freeze the physics");
         assert_eq!(drawn, 3);
-        assert!(live.paused, "still paused after the loop: nothing resumed it");
+        assert!(
+            live.paused,
+            "still paused after the loop: nothing resumed it"
+        );
     }
 
     // -- end to end -----------------------------------------------------------
@@ -3396,7 +3441,10 @@ mod tests {
     fn watch_rejects_unknown_options_and_impossible_arguments() {
         assert!(watch(&a(&["watch", "--level", "x.json", "--poop", "1"])).is_err());
         assert!(watch(&a(&["watch"])).is_err());
-        assert!(watch(&a(&["watch", "--level", "x.json", "--best", "0", "--random", "0"])).is_err());
+        assert!(watch(&a(&[
+            "watch", "--level", "x.json", "--best", "0", "--random", "0"
+        ]))
+        .is_err());
         assert!(watch(&a(&["watch", "--level", "x.json", "--frames", "0"])).is_err());
         assert!(watch(&a(&["watch", "--level", "/nonexistent/level.json"])).is_err());
     }

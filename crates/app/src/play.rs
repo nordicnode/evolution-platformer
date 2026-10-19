@@ -14,11 +14,23 @@
 //!   per rendered frame. A frame that takes 30 ms must advance the physics 30 ms
 //!   worth, or the game would slow down on a busy machine — and the terminal
 //!   playtest's one-tick-per-frame behaviour would be a *different game*.
+//!
+//! # Recording the player's own run (SMARTER_AI_PLAN.md, Item 7)
+//!
+//! A human playthrough is the strongest demonstration this project can collect, so the session
+//! records it: at every decision block the sim's observation and the action the player was
+//! holding are appended to [`Session::demo_decisions`] once capture has been enabled. The
+//! recording is written as an [`evo::HumanDemo`] on the tick a run **touches the flag** — never on a death or an abandoned
+//! attempt, because a demonstration that ends in a pit teaches the pit — and only when a
+//! destination has been set with [`Session::capture_demos`]. The splash's scripted run and the
+//! ghost go through [`Session::advance_actions`] without ever calling [`Session::advance`], so an
+//! AI episode is never recorded as a human one. The write is automatic: there is no key for it,
+//! which is the same bargain the window's champion save makes at the end of a run.
 
 use std::cmp::Ordering;
 
 use egui::{Context, Key};
-use evo::{EpisodeRunner, EvalConfig, FastWin, Genome};
+use evo::{DemoDecision, EpisodeRunner, EvalConfig, FastWin, Genome, HumanDemo};
 use sim::{AgentAction, Level, Outcome, Sim};
 
 use crate::view::AgentAnim;
@@ -176,6 +188,12 @@ pub struct Session {
     /// showing off, and it can stay quiet about it), so the splash builds its
     /// session and then mutes it with [`Session::set_audible`].
     audible: bool,
+    /// The decision records of the current human attempt (Item 7), and where a completed one is
+    /// written. `demo_dir` is `None` unless a front-end asked for capture, which is what keeps a
+    /// headless test of the session from writing into the repository.
+    demo_decisions: Vec<DemoDecision>,
+    demo_dir: Option<std::path::PathBuf>,
+    demo_written: bool,
     /// The quickest *playthrough* that has touched the flag in this session, if any.
     ///
     /// The player's own record, kept for the reason the run keeps the AI's ([`FastWin`]): a
@@ -202,6 +220,9 @@ impl Session {
             anim_clock: 0.0,
             ear: crate::sound::Ear::new(),
             audible: true,
+            demo_decisions: Vec::new(),
+            demo_dir: None,
+            demo_written: false,
             best: None,
         }
     }
@@ -213,6 +234,16 @@ impl Session {
         if !audible {
             crate::sound::set_ambience(0.0, 0.0);
         }
+    }
+
+    /// **Record human playthroughs into `dir`** (Item 7).
+    ///
+    /// Called by the window with the run's output directory. Until it is called the session
+    /// records nothing at all: capture is opt-in so a test or a scripted session cannot litter the
+    /// working tree, and `None` is reported by [`Session::demo`] rather than an empty demo being
+    /// passed around as if it were a run.
+    pub fn capture_demos(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.demo_dir = Some(dir.into());
     }
 
     /// Tell the sound thread how close this body is to water and lava. Called
@@ -297,12 +328,16 @@ impl Session {
         let clock = self.clock;
         let best = self.best;
         let audible = self.audible;
+        let demo_dir = self.demo_dir.clone();
         let spec = self.ghost.as_ref().map(|g| g.spec.clone());
         let visible = self.ghost.as_ref().map(|g| g.visible).unwrap_or(true);
         *self = Session::new(level, self.seed);
         self.clock = clock;
         self.best = best;
         self.audible = audible;
+        // A restart is a new attempt, so the recorder starts over — but the destination the
+        // front-end asked for is a property of the session, not of the attempt.
+        self.demo_dir = demo_dir;
         if let Some(spec) = spec {
             self.attach_ghost(spec);
             if let Some(ghost) = &mut self.ghost {
@@ -495,6 +530,19 @@ impl Session {
                 self.prev_ghost = Some((g.x, g.y));
             }
             let action = decide(&self.sim);
+            // Item 7: the state the player saw and the key they held, on the same cadence the AI
+            // decides on. Recorded **before** the step, so the observation is the one the action
+            // was chosen from rather than the one it produced.
+            if self.demo_dir.is_some()
+                && !self.sim.outcome().is_finished()
+                && self.sim.stats().frames % sim::DECISION_TICKS == 0
+            {
+                self.demo_decisions.push(DemoDecision {
+                    tick: self.sim.stats().frames,
+                    action: action.index() as u8,
+                    observation: self.sim.observation().to_vec(),
+                });
+            }
             self.sim.step(action);
             if audible {
                 self.ear.observe(&self.sim, 1.0);
@@ -540,11 +588,46 @@ impl Session {
         if stepped > 0 {
             // And the stopwatch stops on the tick the episode ended on, whatever frame carried it.
             self.note_win();
+            self.save_demo_once();
             // The death pause starts the moment the outcome turns, measured in wall
             // clock because the sim's own count has stopped with the episode.
             if self.sim.outcome().is_finished() && self.finished_wall.is_none() {
                 self.finished_wall = Some(self.clock);
             }
+        }
+    }
+
+    /// Write the completed playthrough once, into the configured directory (Item 7).
+    ///
+    /// Only a run that **reached the flag** is written: a death is a demonstration of the pit, and
+    /// an abandoned attempt is not a demonstration at all. The file is `<stem>.demo.json` under the
+    /// session's capture directory, the same naming the level's own artifacts use.
+    fn save_demo_once(&mut self) {
+        if self.demo_written || self.sim.outcome() != Outcome::Won {
+            return;
+        }
+        let Some(dir) = self.demo_dir.clone() else {
+            return;
+        };
+        if self.demo_decisions.is_empty() {
+            return;
+        }
+        self.demo_written = true;
+        let demo = HumanDemo::from_decisions(
+            self.sim.level(),
+            self.seed,
+            true,
+            sim::DECISION_TICKS,
+            std::mem::take(&mut self.demo_decisions),
+        );
+        let path = HumanDemo::path_for(self.sim.level());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            dir.join(path.file_name().unwrap_or(path.as_os_str()))
+        };
+        if let Err(err) = demo.save(&path) {
+            eprintln!("playtest demonstration not saved: {err}");
         }
     }
 
@@ -563,6 +646,8 @@ impl Session {
         }
         self.started = true;
         let action = keys.action();
+        // A decided *before* the frame, held for all of it: the human path is the one that is a
+        // demonstration. The AI paths call `advance_actions` directly and are never recorded.
         self.advance_actions(dt, |_| action);
     }
 
@@ -1048,6 +1133,72 @@ mod tests {
         assert_eq!(again.sim().outcome(), sim::Outcome::Won);
         assert_eq!(again.frames(), frames, "the same episode, watched twice");
         assert_eq!(again.best(), Some(frames - 1), "the quicker win stands");
+    }
+
+    /// **A won playthrough is a demonstration; a death is not** (Item 7).
+    ///
+    /// The file has to be the one the fitter can read back, on the cadence the AI decides on, and
+    /// only a run that reached the flag may produce one — an attempt that fell in the pit is a
+    /// demonstration of the pit.
+    #[test]
+    fn a_won_playthrough_is_recorded_as_a_demo_and_a_death_is_not() {
+        let level = shipped("l1-flat-run");
+        let dir = std::env::temp_dir().join(format!("evo-play-demo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session = Session::new(&level, 1);
+        session.capture_demos(&dir);
+        let keys = Keys {
+            right: true,
+            ..Keys::default()
+        };
+        for _ in 0..1200 {
+            session.advance(1.0 / 60.0, keys);
+            if session.sim().outcome().is_finished() {
+                break;
+            }
+        }
+        assert_eq!(session.sim().outcome(), sim::Outcome::Won);
+        let path = dir.join("l1-flat-run.demo.json");
+        assert!(
+            path.exists(),
+            "a completed playthrough writes its demonstration"
+        );
+        let demo = HumanDemo::load(&path).expect("the demonstration reads back");
+        demo.check_compat(&level).expect("it is this build's demo");
+        assert!(demo.won);
+        assert!(!demo.decisions.is_empty());
+        assert_eq!(demo.decisions[0].tick, 0);
+        assert!(
+            demo.decisions
+                .iter()
+                .all(|d| d.observation.len() == sim::sensors::N_INPUTS),
+            "every decision carries the state the player saw"
+        );
+        assert!(
+            demo.decisions.windows(2).all(|w| w[1].tick > w[0].tick),
+            "decisions are on the cadence and in order"
+        );
+
+        // And the negative half: the same recorder on a run that dies leaves no file.
+        let pit = shipped("l2-first-gap");
+        let dead_dir =
+            std::env::temp_dir().join(format!("evo-play-demo-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dead_dir);
+        let mut dead = Session::new(&pit, 1);
+        dead.capture_demos(&dead_dir);
+        for _ in 0..1200 {
+            dead.advance(1.0 / 60.0, keys);
+            if dead.sim().outcome().is_finished() {
+                break;
+            }
+        }
+        assert_eq!(dead.sim().outcome(), sim::Outcome::Died);
+        assert!(
+            !dead_dir.join("l2-first-gap.demo.json").exists(),
+            "a death is not a demonstration"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dead_dir);
     }
 
     /// The clock is a race timer: it waits for the first input rather than billing
