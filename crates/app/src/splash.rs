@@ -50,12 +50,22 @@ use crate::play::{self, Keys};
 use crate::theme;
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 
-/// The lockup. Two lines rather than one, because a logo is stacked: nine letters across a
-/// window this wide at a size worth reading draw a banner, and two lines draw a *title*.
+/// The lockup is the game's logo itself: the approved wordmark, drawn as art rather than
+/// set as type.
+///
+/// It used to be the words EVOLUTION PLATFORMER lettered in the window's monospace with a
+/// bevel, which said what the program *is* and nothing about the game it had become. The
+/// game is called One Two Hundred now, and it has a logo — chunky pixel letters cycling the
+/// game's own palette on a strip of its own ground — so the front door carries the logo the
+/// way a box carries its cover art: as a picture, embedded in the binary
+/// (`crates/app/assets/logo.png`), not redrawn in a font that happens to be nearby. A
+/// redrawn logo is a second logo, and the two would drift.
 ///
 /// The eyebrow is the genre line a box would carry above its name; the subtitle is the hook.
-/// The words are the window's own, so the taskbar and the splash agree.
-const TITLE_LINES: [&str; 2] = ["EVOLUTION", "PLATFORMER"];
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+/// The logo's own aspect, width over height, so its rectangle on screen is the picture's
+/// shape rather than a guess at it.
+const LOGO_ASPECT: f32 = 1515.0 / 420.0;
 const EYEBROW: &str = "AN ARTIFICIAL-LIFE PLATFORMER";
 const SUBTITLE: &str = "a population learns to beat the level you draw";
 /// The menu's own help line: how to move between the doors, and how to take one.
@@ -86,14 +96,22 @@ pub enum Action {
 /// game?" in the first second: a camera that starts on the runner and pulls back to the level
 /// says *a person, in a place* in a way a wide shot from the first frame does not.
 const PULLBACK: f32 = 1.8;
-/// When the title starts appearing, how long each letter takes, and how far it rises.
+/// When the logo starts arriving, and how long its whole entrance takes.
 ///
-/// Per letter rather than per line: the reveal is the animation, and a title that assembles
-/// itself is one of the few things that reads as *designed* at this size.
-const TITLE_AT: f32 = 0.30;
-const LETTER_IN: f32 = 0.045;
-const LETTER_FADE: f32 = 0.45;
-const LETTER_RISE: f32 = 10.0;
+/// The logo arrives as one gesture rather than letter by letter: it is a picture, and a
+/// picture that assembles itself piece by piece reads as a loading screen. The entrance is
+/// the game's own motion rather than a user interface's (see [`logo_pose`]): the mark
+/// falls the last stretch under gravity, lands on its ground strip with a squash and a
+/// puff of dust, and then sways almost imperceptibly for as long as the screen is up — a
+/// sign standing in the world, subject to the same weather as everything else in it.
+const LOGO_AT: f32 = 0.30;
+const LOGO_FADE: f32 = 0.95;
+/// The fraction of the entrance that is the fall; the rest is the landing's settle.
+const LOGO_FALL: f32 = 0.62;
+/// How far above its resting place the logo starts its fall.
+const LOGO_DROP: f32 = 46.0;
+/// The deepest the landing squash takes the mark, as a fraction of its height.
+const LOGO_SQUASH: f32 = 0.075;
 /// When the menu arrives. After the title has finished assembling: a screen that is still
 /// revealing its name while it offers its doors is still assembling itself at the moment it
 /// invites the viewer to choose.
@@ -121,26 +139,22 @@ const GROUND_LINE: f32 = 0.60;
 /// The seed of the splash's episode, so the splash is the same splash every launch.
 const SEED: u64 = 4;
 
-/// The game's own palette, and it is the *window's* palette rather than this screen's.
+/// The screen's share of the game's palette, taken from the logo's own paint box.
 ///
-/// These six were local colours that happened to sit close to the panels' — close enough to
-/// look deliberate, far enough that an edit to one side never reached the other. The window
-/// is one palette applied once ([`crate::theme::apply`]), so the splash reads it the way
-/// every other surface does: the title takes the accent, its shadow the frame's own darkest
-/// surface, and the small print the dim text. Two of the six are *replaced* rather than
-/// renamed — the title stopped being a cream of its own and became the accent, because a
-/// screen with one thing on it wants one ink for the thing it is about.
-const TITLE_INK: Color32 = theme::ACCENT;
-/// The top edge of the title's bevel: the gold, lifted towards the sun.
-const TITLE_LIGHT: Color32 = Color32::from_rgb(255, 246, 208);
-const TITLE_SHADE: Color32 = theme::SHELL;
-/// The eyebrow over the title, and the rule under it: the metal, not the sun.
-const EYEBROW_INK: Color32 = theme::GOLD_EDGE;
+/// The logo's letters are outlined in one dark plum and shadowed in one flat slate, and the
+/// menu below it wears the same two, so the plate on the stage reads as furniture from the
+/// same object rather than as a dialog that wandered in from the editor. The bright fills
+/// live on the doors themselves (see [`Door::colour`]): each door carries one of the
+/// palette families the logo cycles — gold, vermilion, water — and the selected row is
+/// *filled* with it, the way a letter of the wordmark is.
+/// The outline every letter of the logo wears, and the menu plate with it.
+const PLUM: Color32 = Color32::from_rgb(44, 24, 36);
+/// The logo's hard shadow: flat slate, offset, never blurred.
+const SLATE: Color32 = Color32::from_rgb(86, 100, 124);
 /// The tagline is read on the *sky*, so it is the window's dark screen ink rather than its
 /// cream: a pale line over a pale-blue sky was the one piece of type on this screen that had
 /// to be read twice. Dark navy on sky is 8.7:1 and belongs to the same palette.
 const SUBTITLE_INK: Color32 = Color32::from_rgb(24, 34, 46);
-const RULE_INK: Color32 = theme::GOLD_EDGE;
 /// Small print on the stage: the *screen* ink, because the band under the level is dark.
 /// The old footer used the chrome's dim ink and was 1.3:1 on it — a caption nobody could read.
 const FOOT_INK: Color32 = theme::SCREEN_INK_DIM;
@@ -191,6 +205,11 @@ struct Door {
     action: Action,
     blurb: &'static str,
     key: &'static str,
+    /// The door's own colour out of the logo's cycle: the mid tone of one palette family,
+    /// bright enough to fill a row and dark enough to hold dark type. The selected row is
+    /// filled with it, so the cursor's position is said in the logo's language — a bright
+    /// letter among plain ones — rather than in the editor's.
+    colour: Color32,
 }
 
 const DOORS: [Door; 3] = [
@@ -199,18 +218,21 @@ const DOORS: [Door; 3] = [
         action: Action::Edit,
         blurb: "draw a level, tile by tile",
         key: "ANY KEY",
+        colour: Color32::from_rgb(255, 214, 102),
     },
     Door {
         name: "PLAY",
         action: Action::Play,
         blurb: "take the keyboard and play it",
         key: "P",
+        colour: Color32::from_rgb(244, 128, 52),
     },
     Door {
         name: "EVOLVE",
         action: Action::Evolve,
         blurb: "train a population to beat it",
         key: "E",
+        colour: Color32::from_rgb(66, 154, 192),
     },
 ];
 
@@ -237,6 +259,11 @@ pub struct Splash {
     /// go. Two cursors that could disagree would be a menu that shows one thing and does
     /// another.
     selected: usize,
+    /// The logo, decoded and uploaded on the first frame that draws it.
+    ///
+    /// Lazy because a texture needs the context, and the splash is built before the window
+    /// hands it one. One upload for the screen's whole life: the picture never changes.
+    logo: Option<egui::TextureHandle>,
 }
 
 /// What is running the level in the picture.
@@ -321,6 +348,7 @@ impl Splash {
             clock: 0.0,
             hold: 0.0,
             selected: 0,
+            logo: None,
         }
     }
 
@@ -335,6 +363,7 @@ impl Splash {
             clock: 0.0,
             hold: 0.0,
             selected: 0,
+            logo: None,
         }
     }
 
@@ -420,6 +449,30 @@ impl Splash {
         }
     }
 
+    /// The logo as a texture, decoded and uploaded on first use.
+    ///
+    /// Nearest filtering, like the atlas: the picture is pixel art, and a smoothed logo
+    /// over a nearest-neighbour world would be two rendering decisions on one screen.
+    fn logo_texture(&mut self, ctx: &Context) -> egui::TextureHandle {
+        if let Some(handle) = &self.logo {
+            return handle.clone();
+        }
+        let decoded = image::load_from_memory(LOGO_PNG).expect("the embedded logo decodes");
+        let rgba = decoded.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            rgba.as_raw(),
+        );
+        let handle = ctx.load_texture(
+            "one-two-hundred-logo",
+            image,
+            egui::TextureOptions::NEAREST,
+        );
+        self.logo = Some(handle.clone());
+        handle
+    }
+
     /// Draw the screen, and say which way the viewer asked to go — or `None` if they have not
     /// asked yet.
     ///
@@ -469,7 +522,8 @@ impl Splash {
             .to_screen(0.0, (self.level.height - 1) as f32, rect)
             .y;
         stage(&painter, rect, floor);
-        lockup(&painter, ctx, rect, self.clock);
+        let logo = self.logo_texture(ctx);
+        lockup(&painter, rect, self.clock, &logo);
 
         let panel = menu_panel(rect);
         let from_menu = menu(
@@ -755,218 +809,206 @@ fn champion_file(
     })
 }
 
-/// How far one letter of the title has arrived: 0 not yet, 1 fully there.
+/// How far the logo's entrance has run: 0 not yet, 1 fully landed and settled.
 ///
-/// A pure function of the clock and the letter's index, so the reveal can be tested without a
-/// screen, and so the last letter's arrival is a fact about the timing constants rather than
-/// something to eyeball. The index runs across *both* lines, so the second line assembles
-/// after the first: a title that arrives as one gesture rather than two.
-fn letter_in(clock: f32, index: usize) -> f32 {
-    let at = TITLE_AT + index as f32 * LETTER_IN;
-    ((clock - at) / LETTER_FADE).clamp(0.0, 1.0)
+/// A pure function of the clock, so the reveal can be tested without a screen, and so the
+/// logo being settled before the invitation arrives is a fact about the timing constants
+/// rather than something to eyeball.
+fn logo_in(clock: f32) -> f32 {
+    ((clock - LOGO_AT) / LOGO_FADE).clamp(0.0, 1.0)
 }
 
-/// How many letters the lockup has, spaces included: the reveal's own clock.
-fn title_letters() -> usize {
-    TITLE_LINES.iter().map(|line| line.chars().count()).sum()
+/// The size the logo is drawn at: the screen's subject, sized from the window.
+///
+/// Wide enough to be the thing the screen is *about* — a logo a third of the window wide
+/// is a caption — and capped, because past a size the picture is just nearer, not bigger
+/// in any way that matters. The height follows from the picture's own aspect.
+fn logo_size(rect: Rect) -> Vec2 {
+    let width = (rect.width() * 0.54).clamp(400.0, 740.0);
+    Vec2::new(width, width / LOGO_ASPECT)
 }
 
-/// The size of the title: one number for both lines, and the biggest type in the window.
+/// Where the logo's top edge sits at rest, as a fraction of the window's height.
 ///
-/// Sized from the window's height rather than fixed, because the title *is* the screen's
-/// subject: at 92 points "PLATFORMER" is about 600 wide, which is a logo in the middle of a
-/// 1360-point window rather than a caption over one.
-fn title_size(rect: Rect) -> f32 {
-    (rect.height() * 0.115).clamp(36.0, 96.0)
+/// High enough that the sky above it is a margin rather than a second subject, low enough
+/// that the mark, its tagline and the level's floor stack without touching.
+const LOGO_TOP: f32 = 0.098;
+
+/// Where the logo is and how it is shaped at `clock`: its vertical offset from rest
+/// (negative is above it) and its height as a fraction of itself.
+///
+/// The entrance is the game's own motion, not an easing curve off a user interface shelf.
+/// The mark *falls* the last stretch under gravity — the distance closes with the square
+/// of the time, so it arrives faster than it left, which is the whole difference between
+/// falling and sliding — lands with the squash every landing in this game has, and then
+/// breathes: a two-point sway on a slow period, the smallest motion that keeps a sign
+/// standing in a living scene from reading as pasted onto it. Both halves are timed off
+/// the one ramp ([`logo_in`]), so the reveal stays one number a test can reason about.
+fn logo_pose(clock: f32) -> (f32, f32) {
+    let p = logo_in(clock);
+    if p <= 0.0 {
+        return (-LOGO_DROP, 1.0);
+    }
+    if p >= 1.0 {
+        // Settled: the sway. Slow and small, there to be felt rather than watched.
+        let sway = ((clock - LOGO_AT - LOGO_FADE) * std::f32::consts::TAU / 3.4).sin();
+        return (sway * 1.6, 1.0);
+    }
+    if p < LOGO_FALL {
+        let t = p / LOGO_FALL;
+        return (-LOGO_DROP * (1.0 - t * t), 1.0);
+    }
+    // The landing squash: a fast dip to the deepest point, then a slower recovery with a
+    // breath of overshoot above full height before it rests — the shape of every landing
+    // the physics in this game draws.
+    let s = (p - LOGO_FALL) / (1.0 - LOGO_FALL);
+    let squash = if s < 0.28 {
+        let u = s / 0.28;
+        LOGO_SQUASH * (1.0 - (1.0 - u) * (1.0 - u))
+    } else {
+        let u = (s - 0.28) / 0.72;
+        LOGO_SQUASH * (1.0 - u) - 0.018 * (u * std::f32::consts::PI).sin() * (1.0 - u)
+    };
+    (0.0, 1.0 - squash)
 }
 
-/// The baseline of the lockup's first line, as a fraction of the window's height.
+/// The lockup: the eyebrow, the logo and the tagline, arriving in that order.
 ///
-/// High enough that the sky above it is a horizon rather than a margin, low enough that the
-/// two lines, the rule and the tagline clear the level's floor.
-const TITLE_TOP_LINE: f32 = 0.185;
-/// The vertical rhythm of the lockup: the second line's distance from the first, then the
-/// rule's and the tagline's, as fractions of the title's own size.
-const TITLE_LEAD: f32 = 0.88;
-const RULE_LEAD: f32 = 0.55;
-const SUBTITLE_LEAD: f32 = 0.97;
-
-/// The title, its eyebrow, its rule and the tagline: the whole lockup, revealed in order.
-///
-/// One `painter.text` per letter rather than one per line, because the reveal is the
-/// animation and a galley can only be drawn whole. The advances come from the font
-/// ([`egui::epaint::Fonts::glyph_width`]), so the letters land exactly where a single call
-/// would have put them, plus the letterspacing that makes type at this size read as a mark
-/// rather than as a line of prose.
-///
-/// Every letter is drawn four times: a drop shadow, a dark outline in eight directions, the
-/// gold body, and a cream edge lifted a point and a half. Two of those are the whole of the
-/// outline — this is a pixel game, and an offset shadow with a hard outline is the way a
-/// pixel game puts a logo on a picture. The bevel is what stops the gold reading as flat
-/// yellow: the top of every stroke catches the light the sun is drawn with.
-fn lockup(painter: &Painter, ctx: &Context, rect: Rect, clock: f32) {
-    let size = title_size(rect);
+/// The picture does the talking. Around it, two lines of the pixel face the logo is set in
+/// (see [`crate::theme::pixel_font`]): the genre line above, in the sky's dark ink, and the
+/// hook below it. Nothing else is drawn up here — the old lockup's rule and diamond went
+/// away with the set type, because jewellery around a picture is a frame competing with
+/// its subject.
+fn lockup(painter: &Painter, rect: Rect, clock: f32, logo: &egui::TextureHandle) {
     let centre = rect.center().x;
-    let top = rect.top() + rect.height() * TITLE_TOP_LINE;
 
     eyebrow(painter, rect, clock);
 
-    // A warm bloom behind the words, so the gold has light behind it rather than sky. Twelve
-    // concentric discs at a few percent each: cheap, and it is the difference between type on
-    // a background and type *in* a scene.
-    let bloom_at = Pos2::new(centre, top + size * 0.55);
-    for step in 0..14 {
-        let t = step as f32 / 13.0;
-        let radius = size * (2.6 - 1.9 * t);
-        let alpha = (3.0 + 2.0 * t) as u8;
-        painter.circle_filled(
-            bloom_at,
-            radius,
-            Color32::from_rgba_unmultiplied(255, 240, 196, alpha),
-        );
-    }
-
-    let font = FontId::monospace(size);
-    let spacing = size * 0.055;
-    let mut index = 0;
-    for (line, text) in TITLE_LINES.iter().enumerate() {
-        let advances: Vec<f32> = text
-            .chars()
-            .map(|c| ctx.fonts(|f| f.glyph_width(&font, c)))
-            .collect();
-        let width: f32 = advances.iter().sum::<f32>()
-            + spacing * (text.chars().count().saturating_sub(1)) as f32;
-        let y = top + line as f32 * size * TITLE_LEAD;
-        let mut x = centre - width * 0.5;
-        for (char_index, ch) in text.chars().enumerate() {
-            let arrived = letter_in(clock, index);
-            index += 1;
-            if arrived > 0.0 {
-                let ink = arrived.powf(0.7);
-                let at = Pos2::new(x, y + (1.0 - arrived) * LETTER_RISE);
-                if ch != ' ' {
-                    letter(painter, ctx, at, ch, &font, ink);
-                }
-            }
-            x += advances[char_index] + spacing;
-        }
-    }
-
-    // The rule, growing from the middle out as the second line lands, with a gold diamond at
-    // its centre: the one piece of jewellery on the screen, and what stops a stack of type
-    // over a landscape from reading as a caption.
-    // The rule grows from the middle as the title's last letter lands, and the tagline
-    // follows it — timed off the reveal itself rather than off a second guess at it.
-    let settled = TITLE_AT + title_letters() as f32 * LETTER_IN;
-    let grown = ((clock - settled + 0.15) / 0.7).clamp(0.0, 1.0);
-    if grown > 0.0 {
-        let y = top + size * (TITLE_LEAD + RULE_LEAD);
-        let half = size * 2.4 * grown;
-        let gap = 12.0;
-        let stroke = Stroke::new(2.0_f32, RULE_INK.gamma_multiply(grown));
-        painter.line_segment(
-            [Pos2::new(centre - half, y), Pos2::new(centre - gap, y)],
-            stroke,
-        );
-        painter.line_segment(
-            [Pos2::new(centre + gap, y), Pos2::new(centre + half, y)],
-            stroke,
-        );
-        let gem = [
-            Pos2::new(centre, y - 5.0),
-            Pos2::new(centre + 5.0, y),
-            Pos2::new(centre, y + 5.0),
-            Pos2::new(centre - 5.0, y),
-        ];
-        painter.add(egui::Shape::convex_polygon(
-            gem.to_vec(),
-            TITLE_INK.gamma_multiply(grown),
-            Stroke::new(1.0_f32, TITLE_LIGHT.gamma_multiply(grown * 0.8)),
-        ));
-    }
-
-    // And the sentence under it, in the sky's own dark ink rather than the window's cream: a
-    // pale line over a pale-blue sky has to be read twice, and dark-on-sky is 8.7:1.
-    let arrived = ((clock - settled - 0.25) / 0.6).clamp(0.0, 1.0);
+    let arrived = logo_in(clock);
     if arrived > 0.0 {
-        painter.text(
-            Pos2::new(centre, top + size * (TITLE_LEAD + SUBTITLE_LEAD)),
-            Align2::CENTER_CENTER,
-            SUBTITLE,
-            FontId::proportional((size * 0.20).clamp(14.0, 19.0)),
-            SUBTITLE_INK.gamma_multiply(arrived),
+        // Solid almost at once: a thing that is falling should not look like a ghost, so
+        // the fade is only there to keep the first frame from being a pop.
+        let ink = (arrived / 0.18).clamp(0.0, 1.0);
+        let size = logo_size(rect);
+        let (offset, squash_y) = logo_pose(clock);
+        let squash_x = 1.0 + (1.0 - squash_y) * 0.6;
+        let drawn = Vec2::new(size.x * squash_x, size.y * squash_y);
+        // Bottom-anchored through the whole entrance: the mark falls *onto* its ground
+        // strip and squashes *into* it, so the strip stays planted where it lands and
+        // only the top of the picture moves.
+        let bottom = rect.top() + rect.height() * LOGO_TOP + size.y + offset;
+        let dest = Rect::from_min_max(
+            Pos2::new(centre - drawn.x * 0.5, bottom - drawn.y),
+            Pos2::new(centre + drawn.x * 0.5, bottom),
         );
-    }
-}
+        // A warm bloom behind the mark, so the colours have light behind them rather than
+        // flat sky. Fourteen concentric discs at a few percent each: cheap, and it is the
+        // difference between a picture on a background and a picture *in* a scene.
+        for step in 0..14 {
+            let t = step as f32 / 13.0;
+            let radius = size.x * (0.52 - 0.36 * t);
+            let alpha = ((3.0 + 2.0 * t) * ink) as u8;
+            painter.circle_filled(
+                dest.center(),
+                radius,
+                Color32::from_rgba_unmultiplied(255, 240, 196, alpha),
+            );
+        }
+        painter.image(
+            logo.id(),
+            dest,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            // A pure alpha fade rather than a gamma multiply: the multiply darkens as it
+            // thins, so the mark's first frames would read as a grey watermark instead of
+            // as the picture arriving.
+            Color32::from_rgba_unmultiplied(255, 255, 255, (ink * 255.0) as u8),
+        );
+        landing_dust(painter, dest, clock);
 
-/// One letter of the title: shadow, outline, gold body, lit edge.
-fn letter(
-    painter: &Painter,
-    ctx: &Context,
-    at: Pos2,
-    ch: char,
-    font: &FontId,
-    ink: f32,
-) {
-    let glyph = |offset: Vec2, colour: Color32| {
-        painter.text(
-            at + offset,
-            Align2::LEFT_CENTER,
-            ch,
-            font.clone(),
-            colour.gamma_multiply(ink),
-        );
-    };
-    // The drop shadow sits low and to the right, the way the sun in this game comes from the
-    // upper left: one offset, so a hundred letters do not each invent their own light.
-    glyph(
-        Vec2::new(4.0, 6.0),
-        Color32::from_rgba_unmultiplied(10, 14, 20, 170),
-    );
-    for dx in [-2.0, 0.0, 2.0] {
-        for dy in [-2.0, 0.0, 2.0] {
-            if dx != 0.0 || dy != 0.0 {
-                glyph(Vec2::new(dx, dy), TITLE_SHADE);
-            }
+        // And the sentence under it, in the sky's own dark ink rather than the window's
+        // cream: a pale line over a pale-blue sky has to be read twice, and dark-on-sky is
+        // 8.7:1. It follows the logo in, timed off the landing rather than off the clock's
+        // start, so the two never arrive half over each other.
+        let tagline = ((clock - LOGO_AT - LOGO_FADE * 0.55) / 0.6).clamp(0.0, 1.0);
+        if tagline > 0.0 {
+            painter.text(
+                Pos2::new(centre, dest.bottom() + 30.0),
+                Align2::CENTER_CENTER,
+                SUBTITLE,
+                theme::pixel_font(13.0),
+                SUBTITLE_INK.gamma_multiply(tagline),
+            );
         }
     }
-    glyph(Vec2::ZERO, TITLE_INK);
-    // The lit top edge: the gold, lifted towards the sun. Drawn over the body rather than
-    // under it, so the bevel is on the *inside* of the stroke.
-    glyph(Vec2::new(0.0, -1.5), TITLE_LIGHT.gamma_multiply(0.55));
-    let _ = ctx;
 }
 
-/// The genre line above the title, between two short rules.
+/// The puff of dust the landing kicks up, along the logo's base.
 ///
-/// Small, letterspaced and gold: it is the part of a box that says what the game *is*, and at
-/// this size the only way it reads is as a label rather than as a sentence.
+/// Alive for half a second from the moment the fall ends, and a pure function of the
+/// clock like everything else on this screen: three pixel squares a side, thrown outward
+/// and a little upward, growing and thinning as they go. It is the dust the runner kicks
+/// up, said at the size this picture needs — the punctuation that makes the landing a
+/// landing in the game's world rather than an animation over it.
+fn landing_dust(painter: &Painter, dest: Rect, clock: f32) {
+    let impact = LOGO_AT + LOGO_FADE * LOGO_FALL;
+    let age = clock - impact;
+    if !(0.0..=0.5).contains(&age) {
+        return;
+    }
+    let fade = 1.0 - age / 0.5;
+    let ink = Color32::from_rgba_unmultiplied(246, 242, 230, (150.0 * fade) as u8);
+    for side in [-1.0_f32, 1.0] {
+        for i in 0..3 {
+            let f = i as f32;
+            let out = 4.0 + age * (46.0 + f * 12.0);
+            let x = if side < 0.0 {
+                dest.left() + 10.0 - out
+            } else {
+                dest.right() - 10.0 + out
+            };
+            let y = dest.bottom() - 3.0 - age * (12.0 + f * 5.0) - f * 2.0;
+            let size = 3.0 + age * 12.0 + f * 1.5;
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(x - size * 0.5, y - size * 0.5), Vec2::splat(size)),
+                CornerRadius::ZERO,
+                ink,
+            );
+        }
+    }
+}
+
+/// The genre line above the logo, between two short rules.
+///
+/// Small and in the pixel face, because it is part of the same sign: the line a box carries
+/// over its name to say what the game *is*. Dark on the sky for the subtitle's reason — it
+/// has to be read, not just be present.
 fn eyebrow(painter: &Painter, rect: Rect, clock: f32) {
     let arrived = ((clock - 0.10) / 0.55).clamp(0.0, 1.0);
     if arrived <= 0.0 {
         return;
     }
-    let ink = EYEBROW_INK.gamma_multiply(arrived * 0.9);
-    let font = FontId::monospace((rect.height() * 0.0155).clamp(10.0, 13.0));
-    let spacing = 3.0;
-    let widths: Vec<f32> = EYEBROW
-        .chars()
-        .map(|c| painter.layout_no_wrap(c.to_string(), font.clone(), ink).size().x)
-        .collect();
-    let width: f32 = widths.iter().sum::<f32>() + spacing * (widths.len() - 1) as f32;
-    let y = rect.top() + rect.height() * 0.115;
-    let mut x = rect.center().x - width * 0.5;
-    for (index, ch) in EYEBROW.chars().enumerate() {
-        if ch != ' ' {
-            painter.text(Pos2::new(x, y), Align2::LEFT_CENTER, ch, font.clone(), ink);
-        }
-        x += widths[index] + spacing;
-    }
-    let rule = Stroke::new(1.5_f32, EYEBROW_INK.gamma_multiply(arrived * 0.55));
-    let left = rect.center().x - width * 0.5 - 16.0;
-    let right = rect.center().x + width * 0.5 + 16.0;
-    painter.line_segment([Pos2::new(left - 78.0, y), Pos2::new(left, y)], rule);
-    painter.line_segment([Pos2::new(right, y), Pos2::new(right + 78.0, y)], rule);
+    let ink = SUBTITLE_INK.gamma_multiply(arrived * 0.9);
+    let font = theme::pixel_font(11.0);
+    let y = rect.top() + rect.height() * 0.066;
+    let centre = rect.center().x;
+    let galley = painter.layout_no_wrap(EYEBROW.to_string(), font.clone(), ink);
+    painter.text(Pos2::new(centre, y), Align2::CENTER_CENTER, EYEBROW, font, ink);
+    let half = galley.size().x * 0.5;
+    let rule = Stroke::new(2.0_f32, SUBTITLE_INK.gamma_multiply(arrived * 0.5));
+    painter.line_segment(
+        [
+            Pos2::new(centre - half - 84.0, y),
+            Pos2::new(centre - half - 14.0, y),
+        ],
+        rule,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(centre + half + 14.0, y),
+            Pos2::new(centre + half + 84.0, y),
+        ],
+        rule,
+    );
 }
 
 /// The stage: the band under the level's floor, darkened to a near-black gradient.
@@ -1009,9 +1051,6 @@ fn stage(painter: &Painter, rect: Rect, floor: f32) {
 fn menu_is_up(clock: f32) -> bool {
     clock >= HINT_AT + DOORS_LAG
 }
-
-/// The gap after each glyph of letterspaced type: about a fifth of a capital.
-const SPACING: f32 = 3.0;
 
 /// How far the menu has arrived: 0 not yet, 1 settled.
 ///
@@ -1101,71 +1140,53 @@ fn menu(
 
 /// The menu panel and everything in it.
 ///
-/// A menu plate from a Nintendo game: a warm white card in a thick chocolate outline, a blue
-/// `SELECT` tab on its top edge, a gold band under the cursor and a blinking red pointer. Rounded
-/// corners and a hard drop shadow rather than a flat rectangle — the plate is a physical toy lying
-/// on the picture, which is the whole of the look this window and its title screen share.
+/// The plate is dressed the way the logo is: a warm white face in a thick plum outline
+/// with a hard slate shadow under it, square-ish corners, and a grass tab on its top edge
+/// naming what it is. The rows are set in the logo's pixel face, and the chosen row is
+/// *filled* with its door's colour out of the logo's cycle and rimmed in white at the top,
+/// the way a letter of the wordmark is filled and rimmed — so the cursor's position is the
+/// brightest thing on the plate, and it is bright in the game's colours rather than in the
+/// editor's gold.
 fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clock: f32) {
     let ink = |colour: Color32| colour.gamma_multiply(arrived);
     let shift = Vec2::new(0.0, (1.0 - arrived) * 12.0);
     let panel = panel.translate(shift);
-    let radius = CornerRadius::same(theme::RADIUS_LG);
+    let radius = CornerRadius::same(4);
 
-    // The tab: a blue ribbon on the box's top edge, the way a menu screen labels itself. It is
-    // drawn first so the box's outline closes over its bottom and the tab reads as stuck *onto*
-    // the plate rather than as a second panel floating above it.
+    // The tab: a tab of the lawn's own green stuck on the box's top edge, the way a menu
+    // screen labels itself. It is drawn first so the box's outline closes over its bottom
+    // and the tab reads as stuck *onto* the plate rather than as a second panel floating
+    // above it. Its shadow is the logo's slate, hard and offset.
     let tab_w = 196.0;
     let tab = Rect::from_min_size(
         Pos2::new(panel.center().x - tab_w * 0.5, panel.top() - 26.0),
         Vec2::new(tab_w, 36.0),
     );
-    painter.rect_filled(
-        tab.translate(Vec2::new(0.0, 2.0)),
-        CornerRadius::same(8),
-        ink(Color32::from_rgba_unmultiplied(74, 52, 32, 110)),
-    );
-    painter.rect_filled(tab, CornerRadius::same(8), ink(theme::RIBBON));
+    painter.rect_filled(tab.translate(Vec2::new(4.0, 4.0)), radius, ink(SLATE));
+    painter.rect_filled(tab, radius, ink(Color32::from_rgb(104, 186, 68)));
     painter.rect_stroke(
         tab,
-        CornerRadius::same(8),
-        Stroke::new(2.5_f32, ink(theme::OUTLINE)),
+        radius,
+        Stroke::new(3.0_f32, ink(PLUM)),
         egui::StrokeKind::Inside,
     );
-    let tab_font = FontId::monospace(12.0);
-    let tab_text = "SELECT";
-    let tab_text_w = spaced_width(painter, tab_text, &tab_font);
-    spaced(
-        painter,
-        Pos2::new(
-            tab.center().x - tab_text_w * 0.5,
-            panel.top() - 8.0,
-        ),
-        tab_text,
-        tab_font,
+    painter.text(
+        tab.center(),
+        Align2::CENTER_CENTER,
+        "SELECT",
+        theme::pixel_font(10.0),
         ink(Color32::WHITE),
-        2.5,
     );
 
-    // The box: a warm white plate with a soft brown shadow, a coin-gold hairline inside and a
-    // thick chocolate outline on it. Three rings, and none of them black: this is the same plate
-    // the window's own panels are cut from, which is what makes the title screen and the editor
-    // look like two rooms of one house.
-    painter.rect_filled(
-        panel.translate(Vec2::new(0.0, 5.0)),
-        radius,
-        ink(Color32::from_rgba_unmultiplied(74, 52, 32, 110)),
-    );
+    // The box: a warm white plate with the logo's hard slate shadow and thick plum
+    // outline. Two rings rather than the chrome's three — the logo has no gold hairline,
+    // and the plate is dressed as the logo's furniture, not the editor's.
+    painter.rect_filled(panel.translate(Vec2::new(6.0, 7.0)), radius, ink(SLATE));
     painter.rect_filled(panel, radius, ink(PANEL_FACE));
-    painter.rect_stroke(
-        panel.shrink(5.0),
-        CornerRadius::same(theme::RADIUS),
-        Stroke::new(1.5_f32, ink(theme::GOLD_EDGE.gamma_multiply(0.8))),
-        egui::StrokeKind::Inside,
-    );
     painter.rect_stroke(
         panel,
         radius,
-        Stroke::new(3.0_f32, ink(theme::OUTLINE)),
+        Stroke::new(4.0_f32, ink(PLUM)),
         egui::StrokeKind::Inside,
     );
 
@@ -1177,58 +1198,56 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clo
         let line = line_rect(panel, index);
         let chosen = index == selected;
         if chosen {
-            // The chosen line is a coin-gold bar with the window's own rounded corner — the
-            // same gold a selected tool wears, so "this is the one that is on" is one idea in
-            // both rooms.
+            // The chosen line is a filled band in the door's own colour, outlined in the
+            // logo's plum and rimmed with white along the top: a letter of the wordmark,
+            // laid on its side as a row.
             let band = line.shrink2(Vec2::new(6.0, 3.0));
-            painter.rect_filled(
-                band.translate(Vec2::new(0.0, 2.0)),
-                CornerRadius::same(theme::RADIUS),
-                ink(theme::GOLD_EDGE.gamma_multiply(0.55)),
-            );
-            painter.rect_filled(band, CornerRadius::same(theme::RADIUS), ink(theme::ACCENT));
+            painter.rect_filled(band, radius, ink(door.colour));
             painter.rect_filled(
                 Rect::from_min_size(
                     Pos2::new(band.left() + 8.0, band.top() + 2.0),
-                    Vec2::new((band.width() - 16.0).max(0.0), 1.0),
+                    Vec2::new((band.width() - 16.0).max(0.0), 2.0),
                 ),
-                CornerRadius::same(theme::RADIUS),
-                ink(Color32::from_white_alpha(110)),
+                CornerRadius::ZERO,
+                ink(Color32::from_white_alpha(140)),
+            );
+            painter.rect_stroke(
+                band,
+                radius,
+                Stroke::new(2.0_f32, ink(PLUM)),
+                egui::StrokeKind::Inside,
             );
         }
         let name_ink = if chosen {
-            theme::OUTLINE
+            PLUM
         } else {
-            theme::OUTLINE.gamma_multiply(0.82)
+            PLUM.gamma_multiply(0.78)
         };
-        let key_ink = theme::TEXT_DIM;
-        // The cursor: the runner's own red, pointing at the line, blinking.
+        // The cursor: a solid plum triangle pointing at the line, blinking.
         if chosen && blink {
-            let cursor = cursor_points(Pos2::new(panel.left() + 24.0, line.center().y));
+            let cursor = cursor_points(Pos2::new(panel.left() + 27.0, line.center().y));
             painter.add(egui::Shape::convex_polygon(
                 cursor.to_vec(),
-                ink(theme::RUN),
+                ink(PLUM),
                 Stroke::NONE,
             ));
         }
-        spaced_shadowed(
-            painter,
-            Pos2::new(panel.left() + 48.0, line.center().y),
+        painter.text(
+            Pos2::new(panel.left() + 52.0, line.center().y),
+            Align2::LEFT_CENTER,
             door.name,
-            FontId::monospace(21.0),
+            theme::pixel_font(15.0),
             ink(name_ink),
-            ink(Color32::from_white_alpha(0)),
-            2.0,
         );
-        let key_font = FontId::monospace(11.0);
-        let galley = painter.layout_no_wrap(door.key.to_string(), key_font, ink(key_ink));
+        let key_font = theme::pixel_font(8.0);
+        let galley = painter.layout_no_wrap(door.key.to_string(), key_font, ink(theme::TEXT_DIM));
         painter.galley(
             Pos2::new(
                 panel.right() - 20.0 - galley.size().x,
                 line.center().y - galley.size().y * 0.5,
             ),
             galley,
-            ink(key_ink),
+            ink(theme::TEXT_DIM),
         );
     }
 
@@ -1247,85 +1266,27 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clo
         Pos2::new(panel.left() + 24.0, top + 6.0 + DESC_H * 0.5),
         Align2::LEFT_CENTER,
         DOORS[selected].blurb,
-        FontId::proportional(13.0),
+        theme::pixel_font(9.0),
         ink(theme::TEXT_DIM),
     );
-}
-
-/// How wide a letterspaced run is: the sum of its glyphs plus the gaps between them.
-fn spaced_width(painter: &Painter, text: &str, font: &FontId) -> f32 {
-    let widths: Vec<f32> = text
-        .chars()
-        .map(|c| {
-            painter
-                .layout_no_wrap(c.to_string(), font.clone(), Color32::WHITE)
-                .size()
-                .x
-        })
-        .collect();
-    widths.iter().sum::<f32>() + SPACING * (widths.len().saturating_sub(1)) as f32
-}
-
-/// Letterspaced type drawn from a left-centre anchor, one glyph at a time.
-///
-/// The window's fonts are proportional-ish at this size, so letterspacing has to be applied by
-/// hand: a run of characters is laid out with a fixed gap after each, which is what makes a
-/// menu's capitals read as a *sign* rather than as a sentence.
-fn spaced(
-    painter: &Painter,
-    at: Pos2,
-    text: &str,
-    font: FontId,
-    colour: Color32,
-    spacing: f32,
-) -> f32 {
-    let mut x = at.x;
-    for c in text.chars() {
-        let galley = painter.layout_no_wrap(c.to_string(), font.clone(), colour);
-        let advance = galley.size().x;
-        if c != ' ' {
-            painter.galley(Pos2::new(x, at.y - galley.size().y * 0.5), galley, colour);
-        }
-        x += advance + spacing;
-    }
-    x - at.x - spacing
 }
 
 /// The cursor: a solid pixel triangle pointing at the chosen line.
 fn cursor_points(at: Pos2) -> [Pos2; 3] {
     [
-        Pos2::new(at.x - 5.0, at.y - 6.0),
-        Pos2::new(at.x + 5.0, at.y),
-        Pos2::new(at.x - 5.0, at.y + 6.0),
+        Pos2::new(at.x - 6.0, at.y - 7.0),
+        Pos2::new(at.x + 6.0, at.y),
+        Pos2::new(at.x - 6.0, at.y + 7.0),
     ]
-}
-
-/// Letterspaced text with a one-pixel drop shadow: a menu line's own type.
-fn spaced_shadowed(
-    painter: &Painter,
-    at: Pos2,
-    text: &str,
-    font: FontId,
-    colour: Color32,
-    shadow: Color32,
-    spacing: f32,
-) {
-    spaced(
-        painter,
-        at + Vec2::new(2.0, 2.0),
-        text,
-        font.clone(),
-        shadow,
-        spacing,
-    );
-    spaced(painter, at, text, font, colour, spacing);
 }
 
 /// The blinking invitation under the box, and the keys that move the cursor.
 ///
 /// "PRESS ENTER" rather than "press any key": the screen has a cursor now, so the honest
 /// invitation is the key that takes it. Any *other* key still leaves for the editor, which is
-/// what the Edit line's own `ANY KEY` chip says.
+/// what the Edit line's own `ANY KEY` chip says. Gold on a plum shadow, in the pixel face:
+/// the way a game's score line is printed over the picture, and in the type its logo is set
+/// in, so the invitation belongs to the same sign as the box above it.
 fn prompt(painter: &Painter, rect: Rect, clock: f32) {
     let arrived = ((clock - HINT_AT - DOORS_LAG - 0.15) / 0.45).clamp(0.0, 1.0);
     if arrived <= 0.0 {
@@ -1333,26 +1294,28 @@ fn prompt(painter: &Painter, rect: Rect, clock: f32) {
     }
     let blink = (clock * 1.5).fract() < 0.66;
     if blink {
-        let font = FontId::monospace(14.0);
-        let text = "PRESS ENTER TO START";
-        let width = spaced_width(painter, text, &font);
-        // Gold on a brown shadow, the way a game's score line is printed over the picture: the
-        // shadow is the outline's own colour, so the words belong to the same sign as the box.
-        spaced_shadowed(
-            painter,
-            Pos2::new(rect.center().x - width * 0.5, rect.bottom() - 62.0),
-            text,
+        let font = theme::pixel_font(13.0);
+        let at = Pos2::new(rect.center().x, rect.bottom() - 62.0);
+        painter.text(
+            at + Vec2::new(2.0, 2.0),
+            Align2::CENTER_CENTER,
+            "PRESS ENTER TO START",
+            font.clone(),
+            PLUM.gamma_multiply(arrived),
+        );
+        painter.text(
+            at,
+            Align2::CENTER_CENTER,
+            "PRESS ENTER TO START",
             font,
             theme::ACCENT.gamma_multiply(arrived),
-            theme::OUTLINE.gamma_multiply(arrived),
-            SPACING,
         );
     }
     painter.text(
         Pos2::new(rect.center().x, rect.bottom() - 42.0),
         Align2::CENTER_CENTER,
         MENU_HINT,
-        FontId::monospace(10.0),
+        theme::pixel_font(9.0),
         Color32::from_rgb(222, 204, 172).gamma_multiply(arrived),
     );
 }
@@ -1718,36 +1681,30 @@ mod tests {
         );
     }
 
-    /// The title is fully revealed before the invitation arrives to be read.
+    /// The logo is fully revealed before the invitation arrives to be read.
     ///
-    /// Both halves matter: a letter that is still arriving when the "press any key" line is
+    /// Both halves matter: a mark that is still arriving when the "press enter" line is
     /// solid is a screen that is still assembling itself while it tells you to leave, and a
-    /// reveal that takes longer than a person waits is a title nobody reads.
+    /// reveal that takes longer than a person waits is a logo nobody reads.
     #[test]
-    fn the_title_arrives_before_the_invitation() {
-        let last = title_letters() - 1;
+    fn the_logo_arrives_before_the_invitation() {
+        assert_eq!(logo_in(0.0), 0.0, "the logo is up before the clock is");
         assert_eq!(
-            letter_in(0.0, 0),
+            logo_in(LOGO_AT - 0.01),
             0.0,
-            "the title is up before the clock is"
+            "the logo arrives before its moment"
         );
-        assert!(letter_in(0.0, last) == 0.0);
-        for index in 0..title_letters() {
-            assert!(
-                letter_in(TITLE_AT + index as f32 * LETTER_IN - 0.01, index) == 0.0,
-                "letter {index} arrives early"
-            );
-            let done = TITLE_AT + index as f32 * LETTER_IN + LETTER_FADE;
-            assert_eq!(
-                letter_in(done + 0.01, index),
-                1.0,
-                "letter {index} never settles"
-            );
-            assert!(
-                done < HINT_AT,
-                "letter {index} is still arriving at {done:.2}s, after the invitation at {HINT_AT}s"
-            );
-        }
+        let done = LOGO_AT + LOGO_FADE;
+        assert_eq!(logo_in(done + 0.01), 1.0, "the logo never settles");
+        assert!(
+            done < HINT_AT,
+            "the logo is still arriving at {done:.2}s, after the invitation at {HINT_AT}s"
+        );
+        // Halfway through the fade it is halfway there: the reveal is a ramp, not a cut,
+        // because a picture that snaps in at full strength reads as a pop rather than as a
+        // landing.
+        let mid = logo_in(LOGO_AT + LOGO_FADE * 0.5);
+        assert!(mid > 0.4 && mid < 0.6, "halfway reads {mid}");
     }
 
     /// The screen is a doorway: a key or a click opens the game, and an event in the first
@@ -1759,6 +1716,7 @@ mod tests {
     #[test]
     fn a_key_or_a_click_opens_the_door_and_an_early_one_does_not() {
         let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
         let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
@@ -1830,6 +1788,7 @@ mod tests {
     #[test]
     fn the_named_keys_open_the_activity_they_name() {
         let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
         let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
@@ -2102,31 +2061,31 @@ mod tests {
         assert!(menu_panel(tall).bottom() > panel.bottom());
     }
 
-    /// The screen draws the world and the words, and both of them change with the clock.
+    /// The screen draws the world, the logo and the words, and the world changes with the
+    /// clock.
     ///
     /// Read back the way the renderer left it — the tessellated shapes, counted by which
     /// texture they sampled — rather than by asking the code that drew them: the world is a
-    /// great many atlas quads and the words are a great many glyphs from the font texture, and
-    /// a clock that stops moving either of them is the one bug a splash can have that a
-    /// person would notice immediately.
+    /// great many atlas quads, the logo is a quad sampling its own texture, and the words are
+    /// a great many glyphs from the font texture, and a clock that stops moving any of them
+    /// is the one bug a splash can have that a person would notice immediately.
     #[test]
     fn the_splash_draws_the_world_and_the_words() {
         let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
         let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let size = Vec2::new(1360.0, 800.0);
         let rect = Rect::from_min_size(Pos2::ZERO, size);
-        // The line the title is drawn on. Counting glyphs *here* rather than counting all of
-        // them is what makes this a test of the reveal: the footer and the four keys are on
-        // the screen from the first frame, and a count of every glyph in the window would be
-        // a count of those.
-        // The lockup's own band: the eyebrow, both title lines and the tagline under them,
-        // and nothing the footer or the menu contributes.
+        // The lockup's own band: the logo and the tagline under it, and nothing the footer
+        // or the menu contributes. Counting *here* rather than counting everything is what
+        // makes this a test of the reveal: the footer is on the screen from the first frame,
+        // and a count of every glyph in the window would be a count of that.
         let line = Rect::from_min_size(
             Pos2::new(rect.left(), rect.height() * 0.08),
             Vec2::new(rect.width(), rect.height() * 0.32),
         );
-        let counts = |clock: f32| -> (usize, usize, usize) {
+        let counts = |clock: f32| -> (usize, usize, usize, usize) {
             let mut splash = {
                 let mut splash = Splash::scripted();
                 while splash.clock() < clock {
@@ -2143,13 +2102,29 @@ mod tests {
                     splash.show(ctx, &atlas, &sprites);
                 },
             );
-            let (mut world, mut words, mut title) = (0, 0, 0);
+            // The frame just drawn uploaded the logo; its id is how its quad is known from
+            // every other quad on the screen.
+            let logo_id = splash.logo.as_ref().map(|handle| handle.id());
+            let (mut world, mut words, mut title, mut logo) = (0, 0, 0, 0);
             for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
                 let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
                     continue;
                 };
                 if mesh.texture_id == atlas.texture_id() {
                     world += mesh.vertices.len() / 4;
+                    continue;
+                }
+                if Some(mesh.texture_id) == logo_id {
+                    for quad in mesh.vertices.chunks(4) {
+                        if quad.len() < 4 {
+                            continue;
+                        }
+                        let centre =
+                            quad.iter().fold(Pos2::ZERO, |a, v| a + v.pos.to_vec2()) / 4.0;
+                        if line.contains(centre) {
+                            logo += 1;
+                        }
+                    }
                     continue;
                 }
                 if mesh.texture_id != egui::TextureId::default() {
@@ -2161,8 +2136,8 @@ mod tests {
                     }
                     // A *word* is a quad that samples a glyph. A quad that samples the font
                     // atlas's white pixel is a filled shape — the sunbeams and the vignette
-                    // the sky is drawn with are meshes too, and they land on the title's own
-                    // line, so counting them would count scenery as type.
+                    // the sky is drawn with are meshes too, and they land on the lockup's own
+                    // band, so counting them would count scenery as type.
                     if quad[0].uv == egui::epaint::WHITE_UV {
                         continue;
                     }
@@ -2173,11 +2148,10 @@ mod tests {
                     }
                 }
             }
-            (world, words, title)
+            (world, words, title, logo)
         };
 
-        let letters = title_letters();
-        let (world, words, title) = counts(2.4);
+        let (world, words, title, logo) = counts(2.4);
         assert!(
             world > 40,
             "the splash drew {world} sprite quads: the world is not on the screen"
@@ -2187,12 +2161,17 @@ mod tests {
             "the splash drew {words} glyph quads: the words are not on the screen"
         );
         assert!(
-            title >= letters,
-            "{title} glyphs on the title's line for a {letters}-letter title"
+            logo >= 1,
+            "the splash drew {logo} logo quads on the lockup's band: the logo is not on the screen"
         );
-        let (_, _, early) = counts(0.0);
-        assert_eq!(early, 0, "the title is already up at the first frame");
-        let (later_world, _, _) = counts(6.0);
+        assert!(
+            title >= 30,
+            "{title} glyphs on the lockup's band: the tagline alone is more than that"
+        );
+        let (_, _, early_words, early_logo) = counts(0.0);
+        assert_eq!(early_words, 0, "the tagline is already up at the first frame");
+        assert_eq!(early_logo, 0, "the logo is already up at the first frame");
+        let (later_world, _, _, _) = counts(6.0);
         assert!(
             later_world != world,
             "the world is the same picture at 2.4s and 6.0s: nothing in it is running"

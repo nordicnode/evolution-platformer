@@ -29,8 +29,8 @@
 //! a second window can call it again without harm.
 
 use egui::{
-    Color32, Context, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Theme, ThemePreference,
-    Visuals,
+    Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke,
+    TextStyle, Theme, ThemePreference, Visuals,
 };
 
 /// The *display* surfaces: the darkest colour in the window, and what the two things you
@@ -239,6 +239,26 @@ pub const RIBBON: Color32 = Color32::from_rgb(43, 133, 214);
 /// forty points).
 pub const PRESS_SINK: f32 = 2.0;
 
+/// The pixel face: Press Start 2P, the type the game's logo is set in.
+///
+/// The window's HUD type is egui's monospace, which is right for readings and wrong for a
+/// *sign*: the title screen's menu is the one surface in the window that is a game's front
+/// door rather than a tool's furniture, and a front door is lettered in the same face as the
+/// name over it. The font is embedded (OFL, see `assets/OFL.txt`) rather than loaded from
+/// the assets directory, for the logo's own reason: it is part of the game's identity, not
+/// part of a tileset a person can swap with `--assets`.
+pub const PIXEL_FONT_BYTES: &[u8] = include_bytes!("../assets/press-start-2p.ttf");
+
+/// The family the pixel face is registered under (see [`apply`]).
+pub fn pixel_family() -> FontFamily {
+    FontFamily::Name("pixel".into())
+}
+
+/// A font id in the pixel face at `size`.
+pub fn pixel_font(size: f32) -> FontId {
+    FontId::new(size, pixel_family())
+}
+
 /// The heading size. Named rather than inlined so the canvas and the panels agree.
 pub const HEADING_SIZE: f32 = 19.0;
 /// The small print's size: units, hints, the status bar.
@@ -258,6 +278,21 @@ pub fn apply(ctx: &Context) {
     // a cream window. That is not a hypothetical: it is what the level-details window did the first
     // time it was rendered, which is what turned this line up.
     ctx.set_theme(ThemePreference::Light);
+
+    // The pixel face, registered alongside egui's own families and otherwise unused by the
+    // theme: only the title screen asks for it, by name, through [`pixel_font`]. Installed
+    // here rather than there because a font is a property of the context, and `apply` is
+    // the one place this window installs properties of the context.
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "press-start-2p".to_owned(),
+        FontData::from_static(PIXEL_FONT_BYTES).into(),
+    );
+    fonts
+        .families
+        .insert(pixel_family(), vec!["press-start-2p".to_owned()]);
+    ctx.set_fonts(fonts);
+
     let mut style = (*ctx.style()).clone();
 
     style.visuals = visuals();

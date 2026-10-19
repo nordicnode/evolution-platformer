@@ -242,10 +242,10 @@ fn discard_guard(dirty: bool, armed: Option<u64>, hash: u64) -> (bool, Option<u6
 /// second question asked of a title; the app's name trails, where a title bar puts it.
 fn window_title_for(mode: Mode, doc: &str) -> String {
     match mode {
-        Mode::Edit => format!("{doc} — evolution platformer"),
-        Mode::Play => format!("{doc} — playtest — evolution platformer"),
-        Mode::Evolve => format!("{doc} — evolve — evolution platformer"),
-        Mode::Replay => format!("{doc} — replay — evolution platformer"),
+        Mode::Edit => format!("{doc} — one two hundred"),
+        Mode::Play => format!("{doc} — playtest — one two hundred"),
+        Mode::Evolve => format!("{doc} — evolve — one two hundred"),
+        Mode::Replay => format!("{doc} — replay — one two hundred"),
     }
 }
 
@@ -260,7 +260,7 @@ pub fn run(
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1360.0, 800.0])
         .with_min_inner_size([900.0, 560.0])
-        .with_title("evolution platformer");
+        .with_title("one two hundred");
     // The runner, at four times its sixteen pixels: the size a taskbar's icon slot wants, cut
     // from the game's own art rather than drawn twice (AUDIT.md F5). No icon at all when the
     // assets cannot be read — the atlas load below reports *that* failure in full, and a second
@@ -273,7 +273,7 @@ pub fn run(
         ..Default::default()
     };
     eframe::run_native(
-        "evolution platformer",
+        "one two hundred",
         options,
         Box::new(move |cc| {
             let app = EvoApp::new(cc, level, assets, screenshot, lab, splash)?;
@@ -2050,7 +2050,7 @@ impl EvoApp {
 
     /// Keep the OS window title on the document.
     ///
-    /// The title bar was the constant `"evolution platformer"` for the life of the window, so
+    /// The title bar was the constant `"one two hundred"` for the life of the window, so
     /// the two windows a person most often has open — a level and the level it was copied
     /// from — were indistinguishable in a taskbar, a window list or a bundle of screenshots
     /// (AUDIT.md B5). Sent only when the string changes: a viewport command per frame is a
@@ -4948,7 +4948,7 @@ mod tests {
 
     /// The title bar names the document first, then the mode, then the game.
     ///
-    /// The bug this pins: the title was the constant `"evolution platformer"` for the life of
+    /// The bug this pins: the title was the constant `"one two hundred"` for the life of
     /// the window, so two open levels were indistinguishable in a taskbar — and the part a
     /// narrow taskbar keeps is the left-hand end, which was the part that never changed
     /// (AUDIT.md B5).
@@ -4956,7 +4956,7 @@ mod tests {
     fn the_window_title_leads_with_the_document_and_names_the_mode() {
         let edit = window_title_for(Mode::Edit, "l1-flat-run.json");
         assert!(edit.starts_with("l1-flat-run.json"), "{edit}");
-        assert!(edit.ends_with("evolution platformer"), "{edit}");
+        assert!(edit.ends_with("one two hundred"), "{edit}");
         // Every mode says which of the four things this window is doing, and no two agree: a
         // window in play and a window in evolve have to be told apart in a taskbar too.
         let titles: Vec<String> = Mode::ALL
