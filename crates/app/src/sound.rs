@@ -79,6 +79,10 @@ enum Wave {
     Square,
     Sine,
     Saw,
+    /// The soft one: most of a sine's roundness with enough edge to stay
+    /// audible under the bass. What the melody is played on, because a square
+    /// lead over a marching bass is a circus and the game is not one.
+    Triangle,
 }
 
 impl Wave {
@@ -94,6 +98,7 @@ impl Wave {
             }
             Wave::Sine => (phase * std::f32::consts::TAU).sin(),
             Wave::Saw => 2.0 * p - 1.0,
+            Wave::Triangle => 2.0 * (2.0 * p - 1.0).abs() - 1.0,
         }
     }
 }
@@ -185,92 +190,118 @@ fn midi(m: i32) -> f32 {
     440.0 * 2f32.powf((m - 69) as f32 / 12.0)
 }
 
-/// The menu music: an original tune built the way the memorable ones are, a
-/// singable lead with a hook that repeats and answers itself, over the
-/// four chords half of pop music shares (I–V–vi–IV in C), with a walking
-/// bass and a soft arpeggio filling the air the way the underwater themes
-/// do. Eight bars, sixty-four eighth-note steps at 132 BPM, looped.
+/// The menu music, second arrangement. The first was a bassline and then a
+/// tune, and both read as a circus: a square lead marching in quarter notes
+/// over a root-and-fifth oom-pah bass is the carnival recipe, whatever the
+/// notes are. This one is built for flow instead:
 ///
-/// The lead is two four-bar phrases. The first climbs to the high C, spills
-/// back down and lands on the tonic; the second asks the same question and
-/// answers it a step higher, ending on the high C held, which is what makes
-/// the loop's restart feel like a chorus coming round rather than a tape
-/// rewinding.
+/// - the lead is a triangle wave (round, flute-ish) playing a mostly
+///   stepwise eighth-note line with syncopation in it, phrases that run
+///   two bars before they breathe;
+/// - the bass rolls root–fifth–octave–fifth in eighths under it, a pulse
+///   rather than a march;
+/// - the arpeggio is quieter and smoother, chord tones cycling without
+///   accent;
+/// - the tempo is up a touch, 140 BPM, and the key is G, which sits
+///   brighter than C on small speakers.
+///
+/// Still an original melody, still two phrases where the second opens like
+/// the first and answers it differently, still exactly sixty-four steps.
 fn music_loop() -> Vec<f32> {
-    const STEP_SECS: f32 = 60.0 / 132.0 / 2.0;
+    const STEP_SECS: f32 = 60.0 / 140.0 / 2.0;
     let step = (STEP_SECS * RATE as f32) as usize;
     let mut parts: Vec<(usize, Vec<f32>)> = Vec::new();
 
-    // (start step, MIDI note, length in steps). C5=72, E5=76, G5=79, A5=81,
-    // B5=83, C6=84, D6=86.
-    let lead: [(usize, i32, usize); 28] = [
-        // Phrase A: C G Am F.
-        (0, 76, 2),
+    // (start step, MIDI note, length in steps). G major: B4=71, D5=74,
+    // E5=76, F#5=78, G5=79, A5=81, B5=83, D6=86.
+    let lead: [(usize, i32, usize); 40] = [
+        // Bars 1-2 (G, D): the line spills upward, then settles stepwise.
+        (0, 74, 1),
+        (1, 76, 1),
         (2, 79, 2),
-        (4, 84, 3),
-        (7, 83, 1),
-        (8, 81, 2),
-        (10, 79, 2),
-        (12, 76, 4),
-        (16, 77, 2),
-        (18, 81, 2),
-        (20, 79, 2),
+        (4, 78, 1),
+        (5, 76, 1),
+        (6, 74, 2),
+        (8, 71, 1),
+        (9, 74, 1),
+        (10, 78, 2),
+        (12, 76, 1),
+        (13, 74, 1),
+        (14, 71, 2),
+        // Bars 3-4 (Em, C): one leap to the top, then a long way down by steps.
+        (16, 76, 1),
+        (17, 79, 1),
+        (18, 83, 2),
+        (20, 81, 1),
+        (21, 79, 1),
         (22, 76, 2),
-        (24, 74, 2),
-        (26, 76, 2),
-        (28, 72, 4),
-        // Phrase B: C G F G, the same opening, a higher answer.
-        (32, 76, 2),
+        (24, 74, 1),
+        (25, 76, 1),
+        (26, 79, 2),
+        (28, 76, 4),
+        // Bars 5-6 (G, D): the same opening, a tail that lingers instead.
+        (32, 74, 1),
+        (33, 76, 1),
         (34, 79, 2),
-        (36, 84, 3),
-        (39, 86, 1),
-        (40, 83, 2),
-        (42, 81, 2),
-        (44, 79, 4),
-        (48, 81, 2),
-        (50, 83, 2),
-        (52, 84, 2),
-        (54, 86, 2),
-        (56, 83, 2),
-        (58, 79, 2),
-        (60, 84, 4),
+        (36, 81, 1),
+        (37, 79, 1),
+        (38, 76, 2),
+        (40, 78, 1),
+        (41, 76, 1),
+        (42, 74, 2),
+        (44, 71, 4),
+        // Bars 7-8 (C, G): the climb once more, ending on the tonic, held.
+        (48, 76, 1),
+        (49, 79, 1),
+        (50, 81, 2),
+        (52, 79, 1),
+        (53, 78, 1),
+        (54, 76, 1),
+        (55, 74, 1),
+        (56, 79, 6),
     ];
     for (at, m, len) in lead {
         parts.push((
             at * step,
-            note(midi(m), STEP_SECS * len as f32 * 0.96, 0.21, Wave::Square),
+            note(midi(m), STEP_SECS * len as f32 * 0.98, 0.23, Wave::Triangle),
+        ));
+        // A sine shadow at the same pitch takes the remaining edge off.
+        parts.push((
+            at * step,
+            note(midi(m), STEP_SECS * len as f32 * 0.98, 0.07, Wave::Sine),
         ));
     }
 
-    // One chord per bar: roots in MIDI (C3=48, G2=43, A2=45, F2=41) and the
-    // third's quality, which the arpeggio needs and the bass does not.
+    // One chord per bar: G, D, Em, C, twice. Roots in MIDI (G2=43, D2=38,
+    // E2=40, C3=48) and the third's quality for the arpeggio.
     let bars: [(i32, bool); 8] = [
+        (43, true),
+        (38, true),
+        (40, false),
         (48, true),
         (43, true),
-        (45, false),
-        (41, true),
+        (38, true),
         (48, true),
-        (43, true),
-        (41, true),
         (43, true),
     ];
     for (bar, (root, major)) in bars.iter().enumerate() {
         let base = bar * 8;
-        // The bass walks: root, fifth, root, fifth, quarter notes.
-        for (i, off) in [0, 7, 0, 7].iter().enumerate() {
+        // The rolling bass: root, fifth, octave, fifth, in eighths, triangle
+        // so it pulses rather than stamps.
+        for (i, off) in [0, 7, 12, 7, 0, 7, 12, 7].iter().enumerate() {
             parts.push((
-                (base + i * 2) * step,
-                note(midi(root + off), STEP_SECS * 1.9, 0.26, Wave::Square),
+                (base + i) * step,
+                note(midi(root + off), STEP_SECS * 0.95, 0.17, Wave::Triangle),
             ));
         }
-        // The arpeggio breathes over the top: chord tones rising and
-        // falling, one per eighth, sine and quiet.
+        // The arpeggio: chord tones cycling smoothly two octaves up, sine,
+        // quieter than everything else on purpose.
         let third = if *major { 4 } else { 3 };
-        let tones = [0, third, 7, 12, 7, third, 0, third];
+        let tones = [0, third, 7, 12, third, 7, 12, third];
         for (i, off) in tones.iter().enumerate() {
             parts.push((
                 (base + i) * step,
-                note(midi(root + 24 + off), STEP_SECS * 0.95, 0.055, Wave::Sine),
+                note(midi(root + 24 + off), STEP_SECS * 0.95, 0.04, Wave::Sine),
             ));
         }
     }
@@ -582,7 +613,7 @@ mod tests {
     fn the_music_loop_is_bounded_and_loops_on_a_whole_step() {
         let samples = music_loop();
         assert!(samples.iter().all(|s| s.abs() <= 1.0));
-        let step = (60.0 / 132.0 / 2.0 * RATE as f32) as usize;
+        let step = (60.0 / 140.0 / 2.0 * RATE as f32) as usize;
         assert_eq!(
             samples.len(),
             step * 64,
@@ -599,7 +630,7 @@ mod tests {
         // the note table, so a rewrite that loses the repetition fails here
         // even if every note is still in range.
         let samples = music_loop();
-        let step = (60.0 / 132.0 / 2.0 * RATE as f32) as usize;
+        let step = (60.0 / 140.0 / 2.0 * RATE as f32) as usize;
         let energy = |from: usize, to: usize| -> f32 {
             samples[from..to].iter().map(|s| s * s).sum()
         };
