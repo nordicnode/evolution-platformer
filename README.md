@@ -2,6 +2,10 @@
   <img src="docs/images/logo.png" alt="One Two Hundred" width="720">
 </p>
 
+<p align="center">
+  <a href="https://github.com/nordicnode/evolution-platformer/actions/workflows/ci.yml"><img src="https://github.com/nordicnode/evolution-platformer/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+</p>
+
 # One Two Hundred
 
 A 2D platformer you build yourself, and an AI that learns to beat what you built.
