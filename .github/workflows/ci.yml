@@ -34,6 +34,12 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Sound is synthesised, but rodio still builds cpal, and cpal's Linux
+      # backend needs ALSA's development headers to link. The runner image
+      # ships the runtime library without the .pc file the build script wants.
+      - name: Install ALSA development headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
       # Cargo's registry and the incremental build artifacts, keyed on the lockfile:
       # a dependency change re-downloads, a source-only change reuses the compile.
       - name: Cache cargo registry and build output
