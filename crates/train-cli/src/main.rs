@@ -80,9 +80,19 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         "es" => commands::es(&args),
         "watch" => watch::watch(&args),
         "reach" => commands::reach(&args),
+        "battery" => commands::battery(&args),
+        "codex" => commands::codex(&args),
+        "break" => commands::break_my_level(&args),
         "replay" => commands::replay(&args),
         "score" => commands::score(&args),
         "shortcut" => commands::shortcut(&args),
+        "tas" => commands::tas(&args),
+        "hunt" => commands::hunt(&args),
+        "islands" => commands::islands(&args),
+        "segments" => commands::segments(&args),
+        "campaign" => commands::campaign(&args),
+        "styles" => commands::styles(&args),
+        "think" => commands::think(&args),
         "play" => commands::play(&args),
         "render" => commands::render(&args),
         "sensors" => commands::sensors(&args),
@@ -122,8 +132,29 @@ COMMANDS:
     watch     Train with the evolution on screen: chart, best-4 + random-4 agents per
               generation, speed control, pause, death markers, genius splash (M3).
     reach     Check that a level is beatable in principle (jump-reachability oracle).
+    battery   Run the §9 adversarial battery: every bat-* level must be both reachable and
+              routable by the timed planner, reported together with its timings.
+    codex     Detect what a champion's winning episode discovered and record it in the level's
+              trick codex, with a replay (WP16).
+    break     "Break my level": the intended route, a champion's route diff, its discoveries, and
+              what a non-goal hunt finds beyond the flag (WP16).
     replay    Re-simulate a saved champion and confirm it reproduces its trajectory.
     shortcut  Diff a champion's route against the level's intended route (WP14).
+    tas       Polish a champion's win to tick precision and write a machine-polished route
+              artifact (WP12). It never writes a champion and never claims a route it did not
+              replay.
+    hunt      Search a non-goal objective (height, airtime, speed, ground-free distance) and
+              write the best trajectory as a replayable discovery artifact (WP14).
+    islands   Train several independent populations with different settings and a ring of
+              migrants, then write the best record (WP7).
+    segments  Plan a level, split the route at its ground stands, and write one practice level
+              per leg (WP4).
+    campaign  Plan, split, and train the legs in order with the main level in the suite, then
+              finish on the whole level (WP4).
+    think     Play a level with the model-based controller: search the real simulator a few
+              decision blocks ahead at every step, so the agent waits for a mover or a
+              patrol instead of sampling actions. Writes the trajectory it took.
+    styles    Check a champion's winning route against the constrained style titles (WP15).
     score     Score a saved champion on one level or a suite of them: what one policy
               actually does on each, which is the read a suite's claim has to survive.
     play      Play a level yourself with the keyboard, in the terminal.
@@ -195,7 +226,8 @@ TRAIN OPTIONS:
                           default until the 24-seed measurement lands.        [default 0.0]
     --mastery             After the record solves the level, keep evolving in a second phase that
                           ranks **winners by the clock** (the jump penalty is gone; the crowned
-                          fitness still selects and validates the champion). `--stop-on-win`
+                          fitness still selects and validates the champion). **On by default**;
+                          `--no-mastery` restores the crowned-fitness-only run. `--stop-on-win`
                           remains the way to stop at the first solve for a measurement run.
     --polish              **Refine a champion's output layer instead of training.** Reads the
                           genome from --from-champion, freezes every hidden gene, and runs a
@@ -340,6 +372,20 @@ TRAIN OPTIONS:
                           not a solver: on l11 a 97%-agreement clone dies before the first deck.
     --plan-depth <N>      Expansions the timed planner may make.                    [default 32]
     --plan-beam <N>       Nodes carried into each expansion.                        [default 64]
+    --plan-bonus <S>      Selection-only fitness paid for the fraction of the planned route a
+                          genome reaches, decaying linearly to zero over
+                          --plan-bonus-generations. This never enters the recorded fitness or
+                          a champion file; it costs one extra episode per genome while it is
+                          alive. Single `--level` only: one guide describes one route, so a
+                          suite is refused rather than shaped on its first level alone.
+                                                                                  [default 0]
+    --plan-bonus-generations <N>
+                          Generations over which --plan-bonus decays to zero.       [default 100]
+    --snapshot-every <N>  Every N generations, start a batch of mutants from the least-visited
+                          archived frontier state instead of spawn (WP8). A probe that wins from
+                          a snapshot joins the population; it can never enter the record without
+                          a spawn-started validation. 0 disables the archive.              [default 0]
+    --snapshot-probes <N> Mutants per snapshot batch.                               [default 4]
     --warm <N>            How many of the population's slots the clone fills; the rest are random,
                           and that remainder is the design rather than slack. Measured, six
                           seeds at pop 64 per arm: a quarter of the population solves every
@@ -399,7 +445,7 @@ WATCH OPTIONS:
     --headless            Plain text frames, no keyboard. Implied without a TTY.
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
     --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --jump-timing-share,
-    --mastery, --stagnation, --immigrants, --archive-children, --reheat-factor, --elite,
+    --mastery, --no-mastery, --stagnation, --immigrants, --archive-children, --reheat-factor, --elite,
     --tournament, --crossover, --action-repeat, --feedback, --hidden, --rank-pessimism, --trials
                           As for `train`.
     --curriculum <PATH>   Easier level to fall back to when the run stalls.
@@ -505,6 +551,72 @@ SCORE OPTIONS:
                           level is judged on the trainer's own trial count (three patrol
                           phases where it has walkers), and a level counts as solved only
                           when every one of its trials won.
+
+CODEX OPTIONS (codex, break):
+    --champion <PATH>     Champion whose winning episode is read. A codex records what one
+                          route found, so a lost episode records nothing.
+    --level <PATH>        Level to read it on (default: the one matching its hash).
+    --levels-dir <DIR>    Directory the hash is looked up in.            [default levels]
+    --codex-dir <DIR>     The codex directory *itself* (default champions/codex), not a
+                          champions directory: `--codex-dir champions/codex` writes
+                          champions/codex/<level>.json, never a doubled codex/codex.
+    --seed <N>            Episode seed; defaults to the champion's recorded episode.
+    --dry-run             Print what would be recorded and write nothing.
+
+    `codex` stores a tick-resolution replay with every entry, which is why it is a command
+    rather than something every watched generation pays for. `break` is the level-design
+    report: the intended route, the champion's route diff, its discoveries, and a non-goal
+    hunt beyond the flag. Its hunt objective is --objective height|airtime|speed|distance
+    (default height), searched under --depth/--beam.
+
+TAS AND HUNT OPTIONS:
+    --champion <PATH>     tas: the champion whose win is polished to tick precision.
+    --level <PATH>        Level to run on (hunt), or to replay the champion on (tas).
+    --levels-dir <DIR>    Directory the champion's level hash is looked up in.
+    --seed <N>            Episode seed (default: the champion's own recorded episode).
+    --out <PATH>          Output **file**, not a directory: a tas/hunt artifact is one route.
+                          Default <level>-tas.json / <level>-hunt.json in the working
+                          directory. The route is replayed and hash-checked before writing;
+                          an artifact that would not reproduce is refused rather than saved.
+    --iterations <N>      tas: polish candidates to try.
+    --shift <N>           tas: how many frames a candidate may move one press.
+    --patience <N>        tas: candidates without an improvement before stopping.
+    --depth/--beam        hunt: planner budget for the non-goal search.
+    --objective <NAME>    hunt: height (default), airtime, speed or distance.
+
+SEGMENTS, CAMPAIGN AND ISLANDS OPTIONS:
+    --level <PATH>        Level to plan (all three).
+    --depth/--beam        Planner budget for the route the segments are cut from.
+    --segment-generations  campaign: generations spent on each practice leg.  [default 40]
+    --generations         campaign/islands: generations of the whole-level phase. [default 30]
+    --pop <N>             Population size.                          [default 200 native]
+    --islands <N>         islands: independent populations, and the ring of migrants.  [default 4]
+    --checkpoints <DIR>   campaign: where the per-leg population checkpoints are written.
+                                                                       [default checkpoints]
+    --out <DIR>           Where the artifacts are written. campaigns and islands default to
+                          `champions`; segments defaults to `segments` (one JSON per leg).
+
+STYLES OPTIONS:
+    --champion <PATH>     Champion whose winning route is checked against the titles.
+    --level <PATH>        Level to check it on (default: the one matching its hash).
+    --levels-dir <DIR>    Directory the hash is looked up in.            [default levels]
+    --seed <N>            Episode seed (default: the champion's recorded episode).
+
+THINK OPTIONS:
+    --level <PATH>        Level the AI should think about.                [required]
+    --seed <N>            Episode seed.                                      [default 1]
+    --plan                 Use the whole-route timed planner. It searches the real sim for a
+                          route (movers and cooldowns included), replays it to prove it
+                          wins, and then plays those actions. This is the mode that solves
+                          a level whose answer is a wait.
+    --plan-depth <N>       Planner expansions.                              [default 32]
+    --plan-beam <N>        Nodes carried into each expansion.              [default 64]
+    --horizon <N>          Local controller only: decision blocks simulated ahead at every
+                          step. Longer sees spike landings; it cannot see a whole deck
+                          cycle, which is what --plan is for.                [default 12]
+    --beam <N>            Local controller only: candidates kept per block.  [default 24]
+    --out <PATH>          Write the thought as JSON (a directory gets <level>-think.json).
+    --trace               Print every decision's position, velocity and aim.
 
 PLAY OPTIONS:
     --level <PATH>        Level to play.                                [required]

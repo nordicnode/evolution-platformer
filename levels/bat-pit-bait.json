@@ -1,0 +1,37 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 3,
+  "name": "bat-pit-bait",
+  "width": 36,
+  "height": 16,
+  "spawn": {
+    "x": 30,
+    "y": 13
+  },
+  "tiles": [
+    "....................................",
+    "....................................",
+    "....................................",
+    "....................................",
+    "....................................",
+    "....................................",
+    "........#####.......................",
+    "................####################",
+    "..#####.............................",
+    "....................................",
+    "........#####.......................",
+    "....................................",
+    "..............#####.................",
+    "....................................",
+    "####################################",
+    "####################################"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 34,
+      "y": 6
+    }
+  ],
+  "_notes": "battery: a deceptive near route. The ground line runs straight toward the flag's column and dead-ends six tiles below it; the real route climbs floating shelves that start to the left of the spawn and comes back right along the high shelf. Expected failure of a v13 run: geodesic progress rewards the ground line. Verified solvable by the reach oracle and the timed planner."
+}

@@ -35,6 +35,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "fine-sigma-scale",
     "jump-timing-share",
     "mastery",
+    "no-mastery",
     "polish",
     "polish-generations",
     "polish-batch",
@@ -63,6 +64,10 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "from-plan",
     "plan-depth",
     "plan-beam",
+    "plan-bonus",
+    "plan-bonus-generations",
+    "snapshot-every",
+    "snapshot-probes",
     "warm",
     "clone-epochs",
     "route-seed",
@@ -97,6 +102,64 @@ const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose", "timed", 
 const REPLAY_OPTS: &[&str] = &["champion", "level", "levels-dir"];
 const SCORE_OPTS: &[&str] = &["champion", "level", "suite", "levels-dir", "seed"];
 const SHORTCUT_OPTS: &[&str] = &["champion", "level", "levels-dir", "seed"];
+const HUNT_OPTS: &[&str] = &["level", "seed", "depth", "beam", "objective", "out"];
+const SEGMENTS_OPTS: &[&str] = &["level", "seed", "depth", "beam", "out"];
+const CAMPAIGN_OPTS: &[&str] = &[
+    "level",
+    "seed",
+    "depth",
+    "beam",
+    "segment-generations",
+    "generations",
+    "pop",
+    "out",
+    "checkpoints",
+];
+const STYLES_OPTS: &[&str] = &["champion", "level", "levels-dir", "seed"];
+const THINK_OPTS: &[&str] = &[
+    "level",
+    "seed",
+    "horizon",
+    "beam",
+    "out",
+    "trace",
+    "plan",
+    "plan-depth",
+    "plan-beam",
+];
+const ISLANDS_OPTS: &[&str] = &[
+    "level",
+    "generations",
+    "islands",
+    "pop",
+    "seed",
+    "out",
+    "migration-every",
+    "stop-on-win",
+];
+const TAS_OPTS: &[&str] = &[
+    "champion",
+    "level",
+    "levels-dir",
+    "seed",
+    "out",
+    "iterations",
+    "shift",
+    "patience",
+];
+const BATTERY_OPTS: &[&str] = &["levels-dir", "seed", "depth", "beam", "verbose"];
+const CODEX_OPTS: &[&str] = &["champion", "level", "levels-dir", "codex-dir", "seed", "dry-run"];
+const BREAK_OPTS: &[&str] = &[
+    "level",
+    "champion",
+    "levels-dir",
+    "seed",
+    "depth",
+    "beam",
+    "objective",
+    "codex-dir",
+    "dry-run",
+];
 const PLAY_OPTS: &[&str] = &["level", "seed"];
 const RENDER_OPTS: &[&str] = &["level", "steps", "stride", "action", "seed"];
 const SENSORS_OPTS: &[&str] = &[];
@@ -322,6 +385,16 @@ pub fn train(a: &Args) -> Result<(), String> {
         a.opt("feedback").is_some(),
         a.opt("rank-pessimism").is_some(),
     );
+    if suite && cfg.plan_bonus > 0.0 {
+        // One guide describes one level's route, and the ranking loop prices it on `levels[0]`.
+        // Accepting the pair would shape a suite with a bonus that only the first level can earn,
+        // which is a flag silently doing half of what it says.
+        return Err(
+            "usage: --plan-bonus follows one level's plan; a suite ranks by its worst level, so \
+             pass a single --level"
+                .into(),
+        );
+    }
     // What the header prints, when the header prints the *shape* of the search space: the
     // trainer's own clamps applied first, because a header that quotes `--hidden 1000` while the
     // run trains at 64 would be exactly the sort of number this file's comments exist to prevent.
@@ -345,8 +418,18 @@ pub fn train(a: &Args) -> Result<(), String> {
         }
         println!(
             "ga      pop {}  elite {}  tournament {}  sigma {:.2}  rate {:.3}  crossover {:.2}  action_repeat {}  trials {}",
-            cfg.pop_size, cfg.elite, cfg.tournament, cfg.mutation_sigma,
-            cfg.mutation_rate, cfg.crossover_rate, cfg.action_repeat, cfg.trials
+            cfg.pop_size,
+            cfg.elite,
+            cfg.tournament,
+            cfg.mutation_sigma,
+            cfg.mutation_rate,
+            cfg.crossover_rate,
+            cfg.action_repeat,
+            // The **effective** count, not the flag: a patrol level is judged on three phases
+            // even when `--trials` is left at 1, and a header that printed the flag made that
+            // invisible (the l11 run that won once said "trials 1" while the rule it named
+            // would have said three).
+            cfg.effective_trials(&levels[0])
         );
         // The net itself, which no line above describes: `ga` is the population, `search` is how
         // the population moves, and this is what it moves *in*. `--hidden` and `--feedback` are
@@ -369,7 +452,7 @@ pub fn train(a: &Args) -> Result<(), String> {
             );
         }
         // The episode budget is per level and comes from the trainer's own rule (three patrol
-        // phases where a level has walkers, one where it does not), so a suite prints what each
+        // phases where a level has a patrol, one where it does not), so a suite prints what each
         // level actually costs rather than the flag's single number.
         if suite {
             let per: Vec<String> = levels
@@ -397,9 +480,9 @@ pub fn train(a: &Args) -> Result<(), String> {
             cfg.stagnation_generations,
             cfg.archive_children
         );
-        if cfg.trials > 1 && level.walkers.is_empty() {
+        if cfg.trials > 1 && !level.has_patrols() {
             println!(
-                "note    --trials {} on a level with no walkers: every trial is the same episode,\n         so this only multiplies the cost",
+                "note    --trials {} on a level with no patrols: every trial is the same episode,\n         so this only multiplies the cost",
                 cfg.trials
             );
         }
@@ -436,6 +519,26 @@ pub fn train(a: &Args) -> Result<(), String> {
     // to "what did this table measure".
     let mut trainer = seeded_trainer(cfg, &level, a)?;
     let effective = trainer.config.clone();
+    // **Plan-guided selection (WP5).** The guide is the planner's own trajectory; the bonus is
+    // selection-only and decays to zero, so the champion and every recorded reading stay v9.
+    if effective.plan_bonus > 0.0 {
+        let plan_cfg = sim::plan::PlanConfig {
+            depth: usage(a.usize_opt("plan-depth", sim::plan::PlanConfig::default().depth as usize))?
+                as u32,
+            beam: usage(a.usize_opt("plan-beam", sim::plan::PlanConfig::default().beam))?,
+            ..sim::plan::PlanConfig::default()
+        };
+        let route = sim::plan::solve(&level, effective.master_seed, plan_cfg).ok_or_else(|| {
+            "--plan-bonus was asked for but the planner found no route, so there is nothing to \
+             follow"
+                .to_string()
+        })?;
+        let waypoints = trainer.seed_plan(&level, &route);
+        println!(
+            "plan    {} waypoints attached at bonus {:.0}, decaying to zero over {} generations",
+            waypoints, effective.plan_bonus, effective.plan_bonus_generations
+        );
+    }
     let started = Instant::now();
     let mut solved_at: Option<u32> = None;
     let mut generation_secs: Vec<f64> = Vec::with_capacity(generations);
@@ -705,6 +808,37 @@ pub fn train(a: &Args) -> Result<(), String> {
         trainer.archive().occupied(),
         evo::ARCHIVE_BEHAVIOUR_CELLS
     );
+    // **Technique (WP13).** Reporting only, and on its own line because nothing in the crowned
+    // fitness reads it: the archive keeps genomes for *how* they moved, and the firsts are the
+    // named thresholds a presentation can talk about. A zero here is a finding about the pack, not
+    // an error — the baseline may simply never stomp a walker as transport.
+    let technique = trainer.technique();
+    let totals = technique.seen();
+    println!(
+        "tech    {} technique cells | longest stomp chain {}, wall jumps {}, springs {}, crumble tiles burned {}, longest flight {:.2}s, peak speed {:.2}",
+        technique.occupied(),
+        totals.max_stomp_chain,
+        totals.wall_jumps,
+        totals.springs,
+        totals.crumble_burned,
+        totals.max_air_ticks as f32 * sim::DT,
+        totals.peak_speed
+    );
+    for first in technique.firsts().iter().take(6) {
+        println!(
+            "first   {} (gen {}, genome {}) — {}",
+            first.name, first.generation, first.genome_id, first.line
+        );
+    }
+    if effective.snapshot_every > 0 {
+        let (probes, wins) = trainer.snapshot_stats();
+        println!(
+            "snapshot {} frontier cells | {} probes started from one | {} won from there",
+            trainer.snapshots().len(),
+            probes,
+            wins
+        );
+    }
     // The clock, and on its own line because it is the one reading here that is *not* about the
     // search: since fitness v8 a win is paid for the time it did not spend, so the number the
     // population was rewarded for is a number the terminal owes a reader. It is the run's own record
@@ -924,7 +1058,11 @@ pub(crate) fn seeded_trainer(
         if let Some(note) = checkpoint.level_note(level) {
             println!("note    {note}");
         }
-        Trainer::resume(cfg, checkpoint.to_genomes()?, checkpoint.generation)
+        let mut trainer = Trainer::resume(cfg, checkpoint.to_genomes()?, checkpoint.generation)?;
+        if let Some(record) = checkpoint.best_genome()? {
+            trainer.seed_record_from_checkpoint(level, record)?;
+        }
+        Ok(trainer)
     } else if let Some(path) = from_champion {
         let champion = ChampionFile::load_seed(path)?;
         let note = champion.level_note(level);
@@ -937,7 +1075,11 @@ pub(crate) fn seeded_trainer(
             champion.summary(),
             genome.n_genes()
         );
-        Trainer::from_champion(cfg, genome)
+        let mut trainer = Trainer::from_champion(cfg, genome.clone())?;
+        // The champion's own recorded episode is the one reading this build can reproduce, and
+        // it is what lets a seeded run keep the record (and arm the league) from generation 0.
+        trainer.seed_record(level, genome, champion.metadata.episode_seed)?;
+        Ok(trainer)
     } else {
         Ok(Trainer::new(cfg))
     }
@@ -1144,7 +1286,23 @@ pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
         crossover_rate: usage(a.f32_opt("crossover", default.crossover_rate))?,
         fine_children: usage(a.usize_opt("fine-children", default.fine_children))?,
         jump_timing_share: usage(a.f32_opt("jump-timing-share", default.jump_timing_share))?,
-        mastery: a.has_flag("mastery"),
+        // **On by default**, matching the window: a run that solves and then spends thousands of
+        // generations on the crowned score is not improving the clock at all, and the second
+        // phase only arms once the record has solved, so learning is unchanged. `--mastery`
+        // remains accepted as the explicit spelling; `--no-mastery` is the old behaviour.
+        mastery: !a.has_flag("no-mastery"),
+        // Plan-proximity selection shaping (WP5). Off by default: it costs one extra episode per
+        // genome per generation while the bonus is alive, and the plan is only worth following on
+        // a level the planner can route.
+        plan_bonus: usage(a.f32_opt("plan-bonus", default.plan_bonus))?,
+        plan_bonus_generations: usage(a.usize_opt(
+            "plan-bonus-generations",
+            default.plan_bonus_generations as usize,
+        ))? as u32,
+        // Snapshot exploration (WP8). 0 is the shipped default: the archive is a separate
+        // experimental arm and costs episodes only while its cadence is set.
+        snapshot_every: usage(a.usize_opt("snapshot-every", default.snapshot_every as usize))? as u32,
+        snapshot_probes: usage(a.usize_opt("snapshot-probes", default.snapshot_probes))?,
         // How big the fine scale's step is, as a fraction of `--mut-sigma`. A fine child moves one
         // to three genes, so it is local in count; this is what makes it local in size too. See
         // `GaConfig::fine_sigma_scale` — the archive's children use the same step.
@@ -1470,6 +1628,84 @@ fn reachability_line(level: &Level) -> String {
 // ---------------------------------------------------------------------------
 // reach
 // ---------------------------------------------------------------------------
+
+/// **The adversarial battery (§9), as one command.**
+///
+/// Every `bat-*` level in the pack is asked the two questions a level has to answer before a
+/// training run on it can mean anything: *is it beatable in principle* (the reach oracle) and
+/// *can the timed planner route it*. The two are reported together, with the planner's own
+/// expansion count and wall time, because the battery's job is to be a permanent regression gate
+/// — a default change that makes one of these levels unroutable should say so here rather than
+/// inside a 500-generation run that quietly never wins.
+///
+/// It is deliberately separate from `reach --all`: that command covers the pack, whose members
+/// are rungs on a difficulty ladder; these are probes for one skill each, and the plan's gate
+/// asks about them as a set.
+pub fn battery(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(BATTERY_OPTS))?;
+    let dir = a.string("levels-dir", "levels");
+    let verbose = a.has_flag("verbose");
+    let seed = usage(a.u64_opt("seed", 1))?;
+    let defaults = sim::plan::PlanConfig::default();
+    let cfg = sim::plan::PlanConfig {
+        depth: usage(a.usize_opt("depth", defaults.depth as usize))? as u32,
+        beam: usage(a.usize_opt("beam", defaults.beam))?,
+        ..defaults
+    };
+    let mut paths: Vec<PathBuf> = pack_levels(&dir)?
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with("bat-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!("no bat-*.json battery levels found in {dir:?}"));
+    }
+
+    println!(
+        "battery {} level(s) from {dir} | planner depth {}, beam {}",
+        paths.len(),
+        cfg.depth,
+        cfg.beam
+    );
+    let mut failures = 0usize;
+    for path in &paths {
+        let level = load_level(&path.to_string_lossy())?;
+        let reach = reach::report(&level);
+        let started = std::time::Instant::now();
+        let plan = sim::plan::plan_level(&level, seed, cfg);
+        let secs = started.elapsed().as_secs_f32();
+        let ok = reach.goal_reached && plan.route.is_some();
+        if !ok {
+            failures += 1;
+        }
+        println!(
+            "{} {:22} reach {:<5} plan {:<5} {:>5} expansions {:>6.2}s",
+            if ok { "OK  " } else { "FAIL" },
+            level.name,
+            if reach.goal_reached { "yes" } else { "no" },
+            if plan.route.is_some() { "yes" } else { "no" },
+            plan.expanded,
+            secs
+        );
+        if verbose || !ok {
+            if let Some(why) = &reach.diagnosis {
+                println!("       reach: {why}");
+            }
+            println!("       plan:  {}", plan.note);
+        }
+    }
+    if failures > 0 {
+        return Err(format!(
+            "{failures} of {} battery level(s) failed the gate",
+            paths.len()
+        ));
+    }
+    Ok(())
+}
 
 pub fn reach(a: &Args) -> Result<(), String> {
     usage(a.reject_unknown(REACH_OPTS))?;
@@ -1806,6 +2042,840 @@ pub fn shortcut(a: &Args) -> Result<(), String> {
                 .map(|s| format!(", first skipped stand {s}"))
                 .unwrap_or_default()
         );
+    }
+    Ok(())
+}
+
+/// **TAS polish (WP12).** Take a validated champion's own episode to one action per tick and run a
+/// deterministic local search over tick substitutions and press shifts.
+///
+/// The result is written as a route artifact, never as a champion: it is labelled machine-polished,
+/// it records the one seed it is true under, and it carries the final state hash so a replay can
+/// prove it walked the same line.
+pub fn tas(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(TAS_OPTS))?;
+    let champion_path = usage(a.required_path("champion"))?;
+    let raw = fs::read_to_string(&champion_path)
+        .map_err(|e| format!("cannot read {champion_path}: {e}"))?;
+    let champion =
+        ChampionFile::from_json_str(&raw).map_err(|e| format!("{champion_path}: {e}"))?;
+    let genome = champion.to_genome()?;
+    let level = match a.opt("level") {
+        Some(path) => load_level(path)?,
+        None => find_level_by_hash(
+            &a.string("levels-dir", "levels"),
+            &champion.metadata.level_hash,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "no level in {} matches this champion's hash; name one with --level",
+                a.string("levels-dir", "levels")
+            )
+        })?,
+    };
+    champion.check_compat(&level)?;
+    let eval = EvalConfig {
+        action_repeat: champion.metadata.action_repeat,
+    };
+    let episode_seed = usage(a.u64_opt("seed", champion.metadata.episode_seed))?;
+    let defaults = evo::tas::TasConfig::default();
+    let cfg = evo::tas::TasConfig {
+        iterations: usage(a.usize_opt("iterations", defaults.iterations))?,
+        seed: usage(a.u64_opt("seed", defaults.seed))?,
+        shift: usage(a.usize_opt("shift", defaults.shift as usize))? as u32,
+        patience: usage(a.usize_opt("patience", defaults.patience))?,
+    };
+    let route = evo::tas::route_from_genome(&level, &genome, &eval, episode_seed);
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!("start   {}", route.note);
+    if !route.won() {
+        return Err(route.note);
+    }
+    let report = evo::tas::polish(&level, &route, cfg);
+    println!("{}", report.line());
+    // The artifact is a claim only if it replays. Check here, before writing, so a broken search
+    // cannot leave a file behind that looks like a route.
+    let played = evo::tas::play(&level, report.route.seed, &report.route.actions);
+    if !played.won() {
+        return Err(format!(
+            "tas produced a route that does not win on replay ({} at {} frames); not written",
+            played.outcome.as_str(),
+            played.frames
+        ));
+    }
+    if played.final_state_hash != report.route.final_state_hash {
+        return Err(format!(
+            "tas route replays to state {:016x} but records {:016x}; not written",
+            played.final_state_hash, report.route.final_state_hash
+        ));
+    }
+    let path = a
+        .opt("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}-tas.json", level.name)));
+    let path_str = path.display().to_string();
+    fs::write(&path, report.route.to_json_pretty()?)
+        .map_err(|e| format!("cannot write {path_str}: {e}"))?;
+    println!(
+        "wrote   {} ({} frames, machine-polished, seed {})",
+        path_str, report.route.frames, report.route.seed
+    );
+    Ok(())
+}
+
+/// **Segment distillation (WP4).** Plan the level, split the route at the ground stands it lands
+/// on, and write one practice level per leg.
+///
+/// This is the artifact half of the package: each segment is a level with its spawn at the
+/// segment's entry and its flag at its exit, plus the planner's block actions for that span. The
+/// campaign that trains them in sequence is `curriculum::plan_segments` plus the existing detour
+/// machinery; writing the levels first is what makes the split reviewable — a human can open a
+/// segment and check that it is one crossing rather than a whole level wearing a smaller name.
+pub fn segments(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(SEGMENTS_OPTS))?;
+    let level_path = usage(a.required_path("level"))?;
+    let level = load_level(&level_path)?;
+    let seed = usage(a.u64_opt("seed", 1))?;
+    let cfg = sim::plan::PlanConfig {
+        depth: usage(a.usize_opt("depth", sim::plan::PlanConfig::default().depth as usize))? as u32,
+        beam: usage(a.usize_opt("beam", sim::plan::PlanConfig::default().beam))?,
+        ..sim::plan::PlanConfig::default()
+    };
+    let outcome = sim::plan::plan_level(&level, seed, cfg);
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!("{}", outcome.note);
+    let route = outcome
+        .route
+        .ok_or_else(|| format!("no planned route, so there are no segments: {}", outcome.note))?;
+    let segments = evo::plan_segments(&level, &route)?;
+    let out_dir = a.string("out", "segments");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("cannot create {out_dir}: {e}"))?;
+    let stem = Path::new(&level_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| level.name.clone());
+    println!("segments {}", segments.len());
+    for segment in &segments {
+        let path = Path::new(&out_dir).join(format!(
+            "{stem}-segment-{:02}.json",
+            segment.index + 1
+        ));
+        segment.level.to_json_file(&path)?;
+        println!(
+            "  {:02}  ({}, {}) -> ({}, {})  blocks {}..{}  {} frames  {}",
+            segment.index + 1,
+            segment.entry.0,
+            segment.entry.1,
+            segment.exit.0,
+            segment.exit.1,
+            segment.start_block,
+            segment.end_block,
+            segment.frames,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// **Deliberate play.** The model-based controller looks at the real simulator instead of
+/// sampling actions: at every decision block it searches the level's own physics a few blocks
+/// ahead and takes the step that is still alive and closest to the route's next landing.
+///
+/// This is the missing half of the agent. The GA has no model — it can only tell whether a
+/// finished episode scored — while this has the world itself, so `wait` is a candidate and a
+/// mover's arrival is something it can see. The trajectory is written as JSON so the same
+/// episode can be replayed or used as a demonstration.
+pub fn think(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(THINK_OPTS))?;
+    let level_path = usage(a.required_path("level"))?;
+    let level = load_level(&level_path)?;
+    let seed = usage(a.u64_opt("seed", 1))?;
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    let started = Instant::now();
+    // **Two kinds of deliberation, one command.** The default is the local controller:
+    // cheap enough to run while a window is open, and it discovers waits and jump
+    // timings from the physics. `--plan` is the timed planner, which searches whole
+    // routes and therefore sees a deck's whole schedule; it costs seconds to a minute
+    // and is the answer of record on a level the local horizon cannot untangle.
+    let (report, actions, searched) = if a.has_flag("plan") {
+        let plan_cfg = sim::plan::PlanConfig {
+            depth: usage(a.usize_opt(
+                "plan-depth",
+                sim::plan::PlanConfig::default().depth as usize,
+            ))? as u32,
+            beam: usage(a.usize_opt("plan-beam", sim::plan::PlanConfig::default().beam))?,
+            ..sim::plan::PlanConfig::default()
+        };
+        let outcome = sim::plan::plan_level(&level, seed, plan_cfg);
+        println!("plan    {} ({:.1}s)", outcome.note, started.elapsed().as_secs_f32());
+        let route = outcome
+            .route
+            .ok_or_else(|| format!("no timed route: {}", outcome.note))?;
+        let eval = EvalConfig::default();
+        let play = evo::timed_play(&level, &route, &eval);
+        println!("replay  {}", play.note);
+        let actions: Vec<AgentAction> = play.decisions.iter().map(|d| d.action).collect();
+        // The walk's own final state, for the one reading `RoutePlay` does not carry: a
+        // route is a claim about the flag, and `best_x` is what a person uses to see
+        // where a failed one stopped.
+        let mut final_sim = sim::Sim::new(&level, seed);
+        for decision in &play.decisions {
+            for _ in 0..eval.action_repeat.max(1) {
+                if final_sim.outcome().is_finished() {
+                    break;
+                }
+                final_sim.step(decision.action);
+            }
+        }
+        let report = evo::ThinkReport {
+            actions: actions.clone(),
+            outcome: play.outcome,
+            frames: play.frames,
+            best_x: final_sim.stats().best_x,
+            route_hops_closed: play.hops_closed,
+            replans: 0,
+            trail: Vec::new(),
+            death_cause: None,
+            note: format!(
+                "planned a whole route in {} decisions and walked it in {} frames",
+                actions.len(),
+                play.frames
+            ),
+        };
+        (report, actions, Some(("whole route", plan_cfg.depth, plan_cfg.beam)))
+    } else {
+        let cfg = evo::ThinkConfig {
+            horizon: usage(a.usize_opt("horizon", evo::ThinkConfig::default().horizon as usize))?
+                as u32,
+            beam: usage(a.usize_opt("beam", evo::ThinkConfig::default().beam))?,
+            ..evo::ThinkConfig::default()
+        };
+        let report = evo::think(&level, seed, cfg);
+        let actions = report.actions.clone();
+        (report, actions, Some(("local horizon", cfg.horizon, cfg.beam)))
+    };
+    println!("{}", evo::navigate::describe(&level, &report));
+    if let Some(cause) = report.death_cause {
+        println!("death   {cause}");
+    }
+    if let Some((what, first, second)) = searched {
+        println!(
+            "search  {}: {} / {}, {:.1}s",
+            what,
+            first,
+            second,
+            started.elapsed().as_secs_f32()
+        );
+    }
+    if a.has_flag("trace") {
+        for frame in &report.trail {
+            println!(
+                "  {:4}  x {:6.2} y {:6.2} vx {:+.3} vy {:+.3} {:<18} stand {:?} grounded {} aim ({:.1}, {:.1})",
+                frame.frames,
+                frame.x,
+                frame.y,
+                frame.vx,
+                frame.vy,
+                frame.action.name(),
+                frame.stand,
+                frame.grounded,
+                frame.aim.0,
+                frame.aim.1
+            );
+        }
+    }
+    if let Some(out) = a.opt("out") {
+        let path = PathBuf::from(out);
+        let stem = Path::new(&level_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| level.name.clone());
+        let path = if path.extension().is_some() {
+            path
+        } else {
+            path.join(format!("{stem}-think.json"))
+        };
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let actions: Vec<u32> = actions.iter().map(|a| a.index() as u32).collect();
+        let body = serde_json::json!({
+            "format": "evo-platformer-thought",
+            "level": level.name,
+            "level_hash": level.content_hash_string(),
+            "seed": seed,
+            "outcome": report.outcome.as_str(),
+            "frames": report.frames,
+            "best_x": report.best_x,
+            "actions": actions,
+            "note": report.note,
+        });
+        fs::write(&path, serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        println!("wrote   {}", path.display());
+    }
+    Ok(())
+}
+
+/// **Style titles (WP15).** Check a champion's own winning route against every constrained
+/// category the verifier can prove, and print the titles it holds.
+///
+/// One candidate can hold several titles; a title nobody holds is printed as unclaimed rather
+/// than omitted, because "the champion sprints" is a result about the level.
+pub fn styles(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(STYLES_OPTS))?;
+    let champion_path = usage(a.required_path("champion"))?;
+    let raw = fs::read_to_string(&champion_path)
+        .map_err(|e| format!("cannot read {champion_path}: {e}"))?;
+    let champion =
+        ChampionFile::from_json_str(&raw).map_err(|e| format!("{champion_path}: {e}"))?;
+    let genome = champion.to_genome()?;
+    let level = match a.opt("level") {
+        Some(path) => load_level(path)?,
+        None => find_level_by_hash(
+            &a.string("levels-dir", "levels"),
+            &champion.metadata.level_hash,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "no level in {} matches this champion's hash; name one with --level",
+                a.string("levels-dir", "levels")
+            )
+        })?,
+    };
+    champion.check_compat(&level)?;
+    let eval = EvalConfig {
+        action_repeat: champion.metadata.action_repeat,
+    };
+    let seed = usage(a.u64_opt("seed", champion.metadata.episode_seed))?;
+    let result = run_episode(&level, &genome, &eval, seed);
+    let route = evo::tas::route_from_genome(&level, &genome, &eval, seed);
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!(
+        "champion genome {}: {} in {} frames, {} jumps, {} wall jump(s)",
+        genome.id,
+        result.outcome.as_str(),
+        result.frames,
+        result.jumps,
+        result.wall_jumps
+    );
+    if !route.won() {
+        return Err(format!(
+            "the champion does not win on this seed, so no style title can be checked: {}",
+            route.note
+        ));
+    }
+    for style in evo::Style::ALL {
+        let check = evo::style::check(style, &route, &result);
+        println!(
+            "  {:<14} {:<9} {}",
+            style.title(),
+            if check.eligible { "held" } else { "not held" },
+            match check.reason {
+                Some(reason) => reason,
+                None => format!("{} ({})", style.constraint(), check.score),
+            }
+        );
+    }
+    Ok(())
+}
+
+/// **Segment campaign (WP4).** Plan the level, split it into legs, train each leg with the main
+/// level in the suite, then spend the remaining budget on the whole level.
+///
+/// This is the package's usable form: a run that cannot learn the whole route is given one
+/// crossing at a time without ever being allowed to forget the crossing before it. The per-leg
+/// checkpoints are written beside the run for inspection, and the final champion is written by
+/// the same [`ChampionFile`] path as every other run — a campaign is a training schedule, not a
+/// different kind of result.
+pub fn campaign(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(CAMPAIGN_OPTS))?;
+    let level_path = usage(a.required_path("level"))?;
+    let level = load_level(&level_path)?;
+    let seed = usage(a.u64_opt("seed", 1))?;
+    let plan_cfg = sim::plan::PlanConfig {
+        depth: usage(a.usize_opt("depth", sim::plan::PlanConfig::default().depth as usize))? as u32,
+        beam: usage(a.usize_opt("beam", sim::plan::PlanConfig::default().beam))?,
+        ..sim::plan::PlanConfig::default()
+    };
+    let outcome = sim::plan::plan_level(&level, seed, plan_cfg);
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!("{}", outcome.note);
+    let route = outcome
+        .route
+        .ok_or_else(|| format!("no planned route, so there is no campaign: {}", outcome.note))?;
+    let segments = evo::plan_segments(&level, &route)?;
+    let segment_generations = usage(a.usize_opt("segment-generations", 40))? as u32;
+    let main_generations = usage(a.usize_opt("generations", 200))?;
+    let pop = usage(a.usize_opt("pop", 200))?;
+    let checkpoints = a.string("checkpoints", "checkpoints");
+    fs::create_dir_all(&checkpoints)
+        .map_err(|e| format!("cannot create {checkpoints}: {e}"))?;
+    let base = GaConfig {
+        pop_size: pop,
+        master_seed: seed,
+        // The campaign is a mastery-shaped run: the league arms when the record solves and the
+        // crowned fitness still governs the champion.
+        mastery: true,
+        ..GaConfig::default()
+    }
+    .sanitized(None);
+    let mut trainer = Trainer::new(base.clone());
+    let stem = Path::new(&level_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| level.name.clone());
+    let checkpoint = Path::new(&checkpoints).join(format!("{stem}.campaign.population.json"));
+    println!(
+        "campaign {} segments × {} generations, then {} generations on the whole level (pop {})",
+        segments.len(),
+        segment_generations,
+        main_generations,
+        pop
+    );
+    let started = Instant::now();
+    let campaign = evo::segment_campaign(
+        &mut trainer,
+        &level,
+        &route,
+        &segments,
+        segment_generations,
+        &checkpoint,
+        base.mutation_rate,
+    )?;
+    for (i, step) in campaign.steps.iter().enumerate() {
+        println!(
+            "  leg {:02}/{}  {}",
+            i + 1,
+            campaign.segments,
+            step.note(&level.name)
+        );
+    }
+    println!(
+        "segments done in {:.1} s; training the whole level",
+        started.elapsed().as_secs_f64()
+    );
+    for generation in 0..main_generations {
+        let report = trainer.step(&level);
+        if generation % 10 == 0 || generation + 1 == main_generations {
+            println!(
+                "generation {:5}  max {:10.1}  won {}  solved {}",
+                report.generation, report.max_fitness, report.wins, report.solved
+            );
+        }
+    }
+    let best = trainer
+        .best_ever()
+        .ok_or_else(|| "the campaign produced no record".to_string())?;
+    let champion = ChampionFile::new(&best.genome, &best.result, &level, best.generation, &base);
+    let out_dir = a.string("out", "champions");
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("cannot create {out_dir}: {e}"))?;
+    let out = Path::new(&out_dir).join(format!("{stem}-campaign.json"));
+    champion.save(&out)?;
+    println!(
+        "best    fitness {:.1}, {} frames, won {}\nwrote   {} ({:.1} s)",
+        best.result.mean_fitness,
+        best.result.frames,
+        best.result.won(),
+        out.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// **Islands (WP7).** Run several independent populations with their own settings and a ring of
+/// migrants, then write the best record any island found.
+///
+/// Single-population training remains the default; this is the arm the plan's equal-episode gate
+/// needs. Each island is a normal [`evo::Trainer`], so everything recorded about it — champion
+/// validation, mastery, the technique archive — behaves exactly as it does in a one-population run.
+pub fn islands(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(ISLANDS_OPTS))?;
+    let level_path = usage(a.required_path("level"))?;
+    let level = load_level(&level_path)?;
+    let generations = usage(a.usize_opt("generations", 300))?;
+    let count = usage(a.usize_opt("islands", 4))?;
+    let pop = usage(a.usize_opt("pop", 200))?;
+    let seed = usage(a.u64_opt("seed", 1))?;
+    let migration_every =
+        usage(a.usize_opt("migration-every", 25))? as u32;
+    let mut base = GaConfig {
+        pop_size: pop,
+        master_seed: seed,
+        ..GaConfig::default()
+    };
+    base = base.sanitized(None);
+    let plan = evo::IslandConfig {
+        islands: count.clamp(1, 12),
+        migration_every,
+        base: base.clone(),
+    };
+    let mut ring = evo::Islands::new(plan);
+    let started = Instant::now();
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!(
+        "islands {}  pop {} each  migration every {} generations  seed {}",
+        ring.islands.len(),
+        base.pop_size,
+        migration_every,
+        seed
+    );
+    for generation in 0..generations {
+        let step = ring.step(&level);
+        if generation % 10 == 0 || generation + 1 == generations {
+            let best = step
+                .reports
+                .iter()
+                .map(|r| r.max_fitness)
+                .fold(f32::NEG_INFINITY, f32::max);
+            println!(
+                "generation {:5}  best island maximum {:10.1}  solved {}",
+                step.generation,
+                best,
+                step.reports.iter().map(|r| r.solved).sum::<usize>()
+            );
+        }
+        if a.has_flag("stop-on-win") && ring.solved() {
+            println!("solved after {} generations", generation + 1);
+            break;
+        }
+    }
+    let Some((island, best)) = ring.best() else {
+        return Err("no island produced a record".into());
+    };
+    let champion = ChampionFile::new(
+        &best.genome,
+        &best.result,
+        &level,
+        best.generation,
+        &base,
+    );
+    let out_dir = a.string("out", "champions");
+    let stem = Path::new(&level_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| level.name.clone());
+    let out = Path::new(&out_dir).join(format!("{stem}-islands.json"));
+    champion.save(&out)?;
+    println!(
+        "best    island {island}: fitness {:.1}, {} frames, won {}\nwrote   {} ({:.1} s)",
+        best.result.mean_fitness,
+        best.result.frames,
+        best.result.won(),
+        out.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// **Trick hunt (WP14).** Search a non-goal objective and write the trajectory as a discovery
+/// artifact.
+///
+/// The hunt never claims the level is solved: it reports the best reading of its objective (height,
+/// airtime, speed or ground-free distance) and the trajectory that produced it. The artifact is a
+/// [`evo::tas::TasRoute`] of kind [`evo::tas::TasKind::Discovered`], so it replays through the same
+/// machinery as every other route and cannot be mistaken for a champion.
+pub fn hunt(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(HUNT_OPTS))?;
+    let level = load_level(&usage(a.required_path("level"))?)?;
+    let objective = match a.string("objective", "height").as_str() {
+        "height" => sim::plan::HuntObjective::Height,
+        "airtime" | "air" => sim::plan::HuntObjective::Airtime,
+        "speed" => sim::plan::HuntObjective::Speed,
+        "distance" | "ground-free-distance" => sim::plan::HuntObjective::GroundFreeDistance,
+        other => {
+            return Err(format!(
+                "unknown hunt objective {other:?} (height, airtime, speed, distance)"
+            ))
+        }
+    };
+    let cfg = sim::plan::PlanConfig {
+        depth: usage(a.usize_opt("depth", sim::plan::PlanConfig::default().depth as usize))? as u32,
+        beam: usage(a.usize_opt("beam", sim::plan::PlanConfig::default().beam))?,
+        ..sim::plan::PlanConfig::default()
+    };
+    let seed = usage(a.u64_opt("seed", 1))?;
+    let outcome = sim::plan::hunt(&level, seed, cfg, objective);
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!("{}", outcome.note);
+    let Some(route) = outcome.route else {
+        return Err(outcome.note);
+    };
+    // The planner speaks in decision blocks; a TAS artifact speaks in physics ticks. Expanding
+    // here is what makes the two the same trajectory rather than a route that replays one tick
+    // out of every four.
+    let repeat = evo::ACTION_REPEAT;
+    let tick_actions: Vec<AgentAction> = route
+        .actions
+        .iter()
+        .flat_map(|action| std::iter::repeat_n(*action, repeat as usize))
+        .collect();
+    let artifact = evo::tas::route_from_actions(&level, seed, &tick_actions, outcome.note.clone());
+    // A discovery is only a discovery if it replays. Check the hash before writing, exactly as
+    // TAS polish does, so an artifact in the wild always describes a trajectory this build runs.
+    let played = evo::tas::play(&level, seed, &artifact.actions);
+    if played.final_state_hash != artifact.final_state_hash {
+        return Err(format!(
+            "hunt trajectory replays to state {:016x} but records {:016x}; not written",
+            played.final_state_hash, artifact.final_state_hash
+        ));
+    }
+    let path = a
+        .opt("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}-hunt.json", level.name)));
+    let path_str = path.display().to_string();
+    fs::write(&path, artifact.to_json_pretty()?)
+        .map_err(|e| format!("cannot write {path_str}: {e}"))?;
+    println!(
+        "wrote   {} ({} blocks, {} frames, {} objective {:.3})",
+        path_str,
+        artifact.actions.len(),
+        artifact.frames,
+        outcome.objective.as_str(),
+        outcome.best
+    );
+    Ok(())
+}
+
+/// **The trick codex (WP16).** Detect what a champion's winning episode discovered, print it, and
+/// record it in the level's codex.
+///
+/// A codex entry carries a tick-resolution replay, which is why this is a command rather than
+/// something a watched run does on every generation: the evidence is worth a full re-run of one
+/// episode, and only a new find is worth keeping.
+pub fn codex(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(CODEX_OPTS))?;
+    let champion_path = usage(a.required_path("champion"))?;
+    let raw = fs::read_to_string(&champion_path)
+        .map_err(|e| format!("cannot read {champion_path}: {e}"))?;
+    let champion =
+        ChampionFile::from_json_str(&raw).map_err(|e| format!("{champion_path}: {e}"))?;
+    let genome = champion.to_genome()?;
+    let level = match a.opt("level") {
+        Some(path) => load_level(path)?,
+        None => find_level_by_hash(
+            &a.string("levels-dir", "levels"),
+            &champion.metadata.level_hash,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "no level in {} matches this champion's hash; name one with --level",
+                a.string("levels-dir", "levels")
+            )
+        })?,
+    };
+    champion.check_compat(&level)?;
+    let eval = EvalConfig {
+        action_repeat: champion.metadata.action_repeat,
+    };
+    let seed = usage(a.u64_opt("seed", champion.metadata.episode_seed))?;
+    let result = run_episode(&level, &genome, &eval, seed);
+    println!("level   {} ({})", level.name, level.content_hash_string());
+    println!(
+        "episode {} in {} frames, {}",
+        result.outcome.as_str(),
+        result.frames,
+        if result.won() {
+            "a win"
+        } else {
+            "not a win — a codex records what a route found, so a loss has nothing to record"
+        }
+    );
+    let found = evo::detect_discoveries(&level, &genome, &result, &eval, 0, true);
+    if found.is_empty() {
+        println!("found   nothing this build can name; the route used no catalogued technique and no shortcut");
+        return Ok(());
+    }
+    for discovery in &found {
+        println!(
+            "found   {} — {} ({} frames, genome {})",
+            discovery.name, discovery.line, discovery.frames, discovery.genome_id
+        );
+    }
+    // The replay is the entry's evidence and `detect` has already replayed it to check it; say
+    // which of the two answers the journal will carry rather than implying one.
+    let with_evidence = found.iter().filter(|d| !d.replay.is_empty()).count();
+    println!(
+        "replay  {with_evidence} of {} find(s) carries tick actions that replay to the flag",
+        found.len()
+    );
+
+    // Keyed on the **level's** file stem, which is the same key the window uses for its codex
+    // and for every other artifact: a champion named `<level>-seeded.json` is a policy on the
+    // same level and belongs in the same journal, not a second one named after the file.
+    let stem = a
+        .opt("level")
+        .and_then(|path| Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()))
+        .or_else(|| {
+            Path::new(&champion_path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| level.name.clone());
+    // `--codex-dir` names the codex directory itself (the same one `<out>/codex/` is by default),
+    // so a caller who points it at an existing journal keeps writing to that journal.
+    let dir = a.string("codex-dir", &format!("champions/{}", evo::CODEX_DIR));
+    let path = evo::Codex::path_in(Path::new(&dir), &stem);
+    let mut journal = evo::Codex::load(&level, &path)?;
+    let new = journal.record_all(found);
+    if a.has_flag("dry-run") {
+        println!("dry run: would record {new:?} in {}", path.display());
+        return Ok(());
+    }
+    journal.save(&path)?;
+    println!(
+        "codex   {} entr{} in {} (new: {})",
+        journal.len(),
+        if journal.len() == 1 { "y" } else { "ies" },
+        path.display(),
+        if new.is_empty() {
+            "none".to_string()
+        } else {
+            new.join(", ")
+        }
+    );
+    Ok(())
+}
+
+/// **"Break my level" (WP16).** The level-design QA report: what the intended route is, what a
+/// champion actually walked, what it skipped, what it discovered, and what a non-goal hunt finds
+/// beyond the flag.
+///
+/// It is deliberately the same machinery the rest of the tree uses — `shortcut` for the diff,
+/// the technique table for the names, `plan::hunt` for the trick — presented as one answer to the
+/// question a level author asks: *what does this level actually teach?*
+pub fn break_my_level(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(BREAK_OPTS))?;
+    let champion = match a.opt("champion") {
+        Some(path) => {
+            let raw = fs::read_to_string(path)
+                .map_err(|e| format!("cannot read {path}: {e}"))?;
+            Some((path.to_string(), ChampionFile::from_json_str(&raw)?))
+        }
+        None => None,
+    };
+    let level = match (a.opt("level"), &champion) {
+        (Some(path), _) => load_level(path)?,
+        (None, Some((_, champion))) => find_level_by_hash(
+            &a.string("levels-dir", "levels"),
+            &champion.metadata.level_hash,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "no level in {} matches this champion's hash; name one with --level",
+                a.string("levels-dir", "levels")
+            )
+        })?,
+        (None, None) => return Err("usage: break needs --level (or --champion)".to_string()),
+    };
+    let seed = usage(a.u64_opt("seed", champion.as_ref().map_or(1, |(_, c)| c.metadata.episode_seed)))?;
+    let intended = evo::shortcut::intended_route(&level);
+    println!("level    {} ({})", level.name, level.content_hash_string());
+    println!(
+        "intended {} stands, {} hops",
+        intended.len(),
+        intended.len().saturating_sub(1)
+    );
+
+    let mut discoveries: Vec<evo::Discovery> = Vec::new();
+    if let Some((path, champion)) = &champion {
+        champion.check_compat(&level)?;
+        let genome = champion.to_genome()?;
+        let eval = EvalConfig {
+            action_repeat: champion.metadata.action_repeat,
+        };
+        let result = run_episode(&level, &genome, &eval, seed);
+        let report = evo::trace_shortcut(&level, &genome, &eval, seed);
+        println!(
+            "champion {}: {} in {} frames",
+            path,
+            result.outcome.as_str(),
+            result.frames
+        );
+        println!("walked   {:?}", report.visited);
+        println!("skipped  {:?}", report.skipped);
+        println!("shortcut {:.0}% — {}", report.skip_percent(), report.note);
+        discoveries = evo::detect_discoveries(&level, &genome, &result, &eval, 0, false);
+        if discoveries.is_empty() {
+            println!("found    no catalogued technique or shortcut");
+        } else {
+            for discovery in &discoveries {
+                println!("found    {} — {}", discovery.name, discovery.line);
+            }
+        }
+    } else {
+        println!("champion none — pass --champion for the route diff; hunting anyway");
+    }
+
+    // The hunt is the half that is not about the flag: a trajectory that does more of one thing
+    // than the intended route does. It is the report's "what else is here".
+    let objective = match a.string("objective", "height").as_str() {
+        "height" => sim::plan::HuntObjective::Height,
+        "airtime" | "air" => sim::plan::HuntObjective::Airtime,
+        "speed" => sim::plan::HuntObjective::Speed,
+        "distance" | "ground-free-distance" => sim::plan::HuntObjective::GroundFreeDistance,
+        other => {
+            return Err(format!(
+                "unknown hunt objective {other:?} (height, airtime, speed, distance)"
+            ))
+        }
+    };
+    let cfg = sim::plan::PlanConfig {
+        depth: usage(a.usize_opt("depth", sim::plan::PlanConfig::default().depth as usize))? as u32,
+        beam: usage(a.usize_opt("beam", sim::plan::PlanConfig::default().beam))?,
+        ..sim::plan::PlanConfig::default()
+    };
+    let hunt = sim::plan::hunt(&level, seed, cfg, objective);
+    println!("hunt     {}", hunt.note);
+    if let Some(route) = &hunt.route {
+        println!(
+            "trick    {} blocks, {} frames, {} {:.3}",
+            route.actions.len(),
+            route.frames,
+            hunt.objective.as_str(),
+            hunt.best
+        );
+    }
+
+    // The same journal `codex` writes, keyed on the level rather than the champion file: the
+    // report is about the level, so a champion named `<level>-seeded.json` lands in the same
+    // codex as the run that produced the shipped champion.
+    if a.opt("codex-dir").is_some() || a.has_flag("dry-run") {
+        let stem = |path: &str| {
+            Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+        };
+        let stem = a
+            .opt("level")
+            .and_then(stem)
+            .or_else(|| a.opt("champion").and_then(stem))
+            .unwrap_or_else(|| level.name.clone());
+        let dir = a.string("codex-dir", &format!("champions/{}", evo::CODEX_DIR));
+        let path = evo::Codex::path_in(Path::new(&dir), &stem);
+        if discoveries.is_empty() {
+            println!("codex    nothing this build can name; {} untouched", path.display());
+        } else if a.has_flag("dry-run") {
+            let mut journal = evo::Codex::load(&level, &path)?;
+            let new = journal.record_all(discoveries);
+            println!("dry run: would record {new:?} in {}", path.display());
+        } else {
+            let mut journal = evo::Codex::load(&level, &path)?;
+            let new = journal.record_all(discoveries);
+            journal.save(&path)?;
+            println!(
+                "codex    {} (new: {})",
+                path.display(),
+                if new.is_empty() {
+                    "none".to_string()
+                } else {
+                    new.join(", ")
+                }
+            );
+        }
     }
     Ok(())
 }

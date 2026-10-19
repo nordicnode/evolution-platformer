@@ -13,15 +13,22 @@
 pub mod autoshape;
 pub mod champion;
 pub mod curriculum;
+pub mod discovery;
 pub mod es;
 pub mod fitness;
 pub mod ga;
 pub mod genome;
 pub mod imitate;
+pub mod islands;
+pub mod navigate;
 pub mod polish;
 pub mod population;
 pub mod route_play;
 pub mod shortcut;
+pub mod snapshots;
+pub mod style;
+pub mod tas;
+pub mod technique;
 
 pub use autoshape::{apply as apply_auto_shape, scan as scan_level_shape, AutoShape};
 pub use polish::{polish, output_slots, PolishConfig, PolishReport};
@@ -30,11 +37,23 @@ pub use champion::{
     CHAMPION_FORMAT, CHAMPION_VERSION,
 };
 pub use curriculum::{
-    curriculum_step, next_stand, practice_level, practice_level_for_stall, practice_step,
-    save_practice_level, stuck_point, CurriculumStep, DEFAULT_CURRICULUM_GENERATIONS,
+    curriculum_step, next_stand, plan_segments, practice_level, practice_level_between,
+    practice_level_for_stall, practice_step, save_practice_level, segment_campaign, stuck_point,
+    CurriculumStep, PlanSegment, SegmentCampaign, DEFAULT_CURRICULUM_GENERATIONS,
 };
 pub use es::{EsConfig, EsRow, EsTrainer};
 pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};
+pub use discovery::{
+    detect as detect_discoveries, shortcut_name, Codex, Discovery, DiscoveryKind, CODEX_DIR,
+    CODEX_FORMAT, CODEX_VERSION,
+};
+pub use islands::{IslandConfig, IslandStep, Islands};
+pub use navigate::{
+    aim_point, play as think, planned_actions, Driver, ThinkConfig, ThinkReport,
+};
+pub use snapshots::{SnapshotArchive, SnapshotCell, SnapshotKey};
+pub use style::{Style, StyleCheck, StyleTitle};
+pub use technique::{TechniqueArchive, TechniqueEntry, TechniqueFirst, TechniqueSignature};
 pub use fitness::{
     run_episode, score, EpisodeResult, EpisodeRunner, EvalConfig, ACTION_REPEAT, FITNESS_VERSION,
     SPEED_BONUS,
@@ -52,6 +71,7 @@ pub use imitate::{
 };
 pub use route_play::{replay, timed_play, Decision, RoutePlay};
 pub use shortcut::{intended_route, trace as trace_shortcut, ShortcutReport};
+pub use tas::{polish as tas_polish, play as tas_play, route_from_genome, TasConfig, TasKind, TasReport, TasRoute};
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///

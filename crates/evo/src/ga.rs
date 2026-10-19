@@ -110,6 +110,26 @@ pub struct GaConfig {
     /// is an ordinary run, which is what stops a mastery flag from changing how a level is first
     /// learned. `false` reproduces every pre-WP11 run bit for bit.
     pub mastery: bool,
+    /// **Plan-proximity selection bonus (WP5).** Fitness units paid, at generation 0, to a
+    /// genome for the fraction of a planned route's waypoints it reaches. `0.0` — the default —
+    /// skips the mechanism entirely, so a run without a plan is bit-identical to a pre-WP5 run.
+    ///
+    /// The bonus is **selection only**: the recorded champion keeps the v9 reading, and a guided
+    /// episode is re-scored from spawn, so no champion can become a plan-mimic whose win depends
+    /// on having been started down the plan. The weight decays linearly to zero over
+    /// [`GaConfig::plan_bonus_generations`], which makes the final selection pressure the
+    /// unshaped objective — the plan's own mitigation against reward hacking.
+    pub plan_bonus: f32,
+    /// Generations over which [`GaConfig::plan_bonus`] decays to zero. 0 disables the decay
+    /// (constant bonus), which is useful only for a diagnostic arm.
+    pub plan_bonus_generations: u32,
+    /// **Snapshot exploration cadence (WP8).** Every N generations a small batch of mutants is
+    /// started from the least-visited archived frontier state instead of spawn. 0 — the default —
+    /// disables the archive entirely, so a run without the flag spends no extra episodes.
+    pub snapshot_every: u32,
+    /// Mutants per snapshot probe. They are injected into the population only when they reach the
+    /// flag from the snapshot; otherwise the states they reach are what the archive keeps.
+    pub snapshot_probes: usize,
     /// The fine scale's **step**, as a multiple of [`GaConfig::mutation_sigma`]. `0.25` at the
     /// shipped sigma is 0.075, which is the size a "fine" child was always meant to be.
     ///
@@ -298,7 +318,7 @@ pub struct GaConfig {
     /// the exact gentle temperature does not matter. See `REVIEW.md` §4 for the tables.
     pub reheat_factor: f32,
     /// Episodes per genome, averaged. 1 lets [`GaConfig::effective_trials`] decide from the
-    /// level (three where there are walkers, one where there are not); 2 or more is taken as
+    /// level (three where there are patrols, one where there are not); 2 or more is taken as
     /// the operator's own answer everywhere.
     pub trials: u32,
     /// Take [`GaConfig::recommended_trials_for`]'s advice for a level whose `trials` is still
@@ -418,6 +438,10 @@ impl Default for GaConfig {
             fine_children: 8,
             jump_timing_share: 0.0,
             mastery: false,
+            plan_bonus: 0.0,
+            plan_bonus_generations: 100,
+            snapshot_every: 0,
+            snapshot_probes: 4,
             fine_sigma_scale: 0.25,
             archive_children: 0,
             archive_on_diversity: false,
@@ -461,16 +485,21 @@ impl GaConfig {
     /// the cost of a generation to compute a mean of one number is exactly the mistake the warning
     /// in `train-cli` is printed to prevent.
     pub fn recommended_trials_for(level: &Level) -> u32 {
-        if level.walkers.is_empty() {
-            1
-        } else {
+        // **Any patrol, not only a walker.** Chasers and flyers draw a phase from the episode
+        // seed exactly as walkers do, and `l11-the-elements` has a chaser but no walker: it was
+        // judged on one phase per generation while the auto-shape scan was already setting
+        // pessimism for its `patrols`, so a champion could be saved on a world it happened to
+        // meet rather than a policy that handles the patrol.
+        if level.has_patrols() {
             3
+        } else {
+            1
         }
     }
 
     /// How many episodes this genome will actually be judged on, on this level.
     ///
-    /// **A walker level is a stochastic level, and one episode cannot measure a stochastic
+    /// **A patrol level is a stochastic level, and one episode cannot measure a stochastic
     /// policy.** `episode_seed` mixes in the generation (finding 14), so a genome's patrol
     /// phase is re-rolled every generation: an elite can be handed a phase it never solved and
     /// fall out of the run, and — the reason this is wired rather than left as a suggestion —
@@ -478,10 +507,14 @@ impl GaConfig {
     /// of two hundred happened to walk into the flag. `l6-marathon`, the longest level in the
     /// pack, was won in **generation 6 of 300** at pop 200 by exactly that accident.
     ///
+    /// A **chaser or a flyer draws a phase just as a walker does** (`Level::has_patrols`). The
+    /// rule used to count only walkers, so `l11-the-elements` — one chaser, no walkers — was
+    /// trained on one phase per generation and saved champions that won on the phase they met.
+    ///
     /// So a run whose `trials` is still the default `1` takes [`GaConfig::auto_trials`]'s
-    /// recommendation on a level with walkers in it, and `trials` set to anything else (2 or
+    /// recommendation on a level with patrols in it, and `trials` set to anything else (2 or
     /// more) is the operator's own answer and is used everywhere. The costly reading is the
-    /// other way round: on a level with no walkers every trial is the same episode, so the
+    /// other way round: on a level with no patrols every trial is the same episode, so the
     /// recommendation is 1 and nothing is doubled.
     pub fn effective_trials(&self, level: &Level) -> u32 {
         if self.trials > 1 {
@@ -554,6 +587,16 @@ impl GaConfig {
         // The bound is a ceiling on a knob, not a policy about its value — the arm that was
         // measured used 16.
         self.novelty_weight = self.novelty_weight.clamp(0.0, NOVELTY_WEIGHT_MAX);
+        // A shaping term, not a second objective: ten percent of the win bonus is the ceiling on
+        // how much plan-following can ever be worth, and the decay makes it worth less each
+        // generation. Above that a genome could prefer the plan's corridor to the flag.
+        self.plan_bonus = self.plan_bonus.clamp(0.0, crate::fitness::GOAL_BONUS * 0.10);
+        self.plan_bonus_generations = self.plan_bonus_generations.min(10_000);
+        // A probe batch is a side-payment beside the population, like the fine/archive children:
+        // a quarter of the population is the ceiling on how much of a generation can be spent
+        // somewhere other than the main ranking.
+        self.snapshot_probes = self.snapshot_probes.min((self.pop_size / 4).max(1));
+        self.snapshot_every = self.snapshot_every.min(10_000);
         // Pessimism is a fraction of the gap between the mean and the floor, so both ends are
         // meaningful and nothing outside `0.0..=1.0` is a statement about a genome: above one the
         // ranking would prefer a genome whose floor is *worse* than any trial it ran.
@@ -1329,6 +1372,14 @@ fn selection_scores(
         .collect()
 }
 
+/// Do two genomes describe the same network, ignoring id and fitness?
+///
+/// Ids are bookkeeping (they seed episodes) and fitness is a reading of the last evaluation; the
+/// record-retention rule cares only about the genes, because those are what a run proved.
+pub(crate) fn same_genes(a: &Genome, b: &Genome) -> bool {
+    a.shape == b.shape && a.weights == b.weights && a.biases == b.biases
+}
+
 /// The mastery league's selection score (WP11): winners on the clock, everyone else on progress.
 ///
 /// The two halves exist because a league is a *second* search, not a second objective. A genome
@@ -1625,6 +1676,19 @@ pub struct Trainer {
     /// Whether the last generation was ranked by the **mastery league** (WP11): the record was
     /// solved and [`GaConfig::mastery`] is on, so the winners are being ordered by frames.
     mastery_active: bool,
+    /// The technique archive (WP13): incumbents keyed by *how* a genome moved rather than how
+    /// far. Reporting and presentation only; selection never reads it.
+    technique: crate::technique::TechniqueArchive,
+    /// Optional plan-proximity guide (WP5). `None` means no plan was offered, which is the state
+    /// every run is in unless `seed_plan` was called; the bonus is then absent rather than zero,
+    /// so a planless run takes no extra episodes.
+    plan_guide: Option<sim::PlanGuide>,
+    /// Frontier states exploration can start from (WP8). Empty unless `snapshot_every` is set and
+    /// the run has stood somewhere.
+    snapshots: crate::snapshots::SnapshotArchive,
+    /// Snapshot probes started, and how many of those reached the flag from their start.
+    snapshot_probes: u64,
+    snapshot_wins: u64,
 }
 
 impl Trainer {
@@ -1653,6 +1717,11 @@ impl Trainer {
             fastest: None,
             fastest_agent: None,
             mastery_active: false,
+            technique: crate::technique::TechniqueArchive::new(),
+            plan_guide: None,
+            snapshots: crate::snapshots::SnapshotArchive::new(),
+            snapshot_probes: 0,
+            snapshot_wins: 0,
         }
     }
 
@@ -1719,6 +1788,11 @@ impl Trainer {
             fastest: None,
             fastest_agent: None,
             mastery_active: false,
+            technique: crate::technique::TechniqueArchive::new(),
+            plan_guide: None,
+            snapshots: crate::snapshots::SnapshotArchive::new(),
+            snapshot_probes: 0,
+            snapshot_wins: 0,
         })
     }
 
@@ -1784,6 +1858,105 @@ impl Trainer {
         Trainer::resume(config, genomes, 0)
     }
 
+    /// Seed the run's record from a **checkpoint's** best-ever genome.
+    ///
+    /// A population checkpoint carries the cohort, not the lineage that solved the level: the
+    /// record can be a mutation that won once and then fell out of the population. Resuming
+    /// without it gives the run no winner to breed and no record to arm the league from — the
+    /// l11 checkpoint at generation 20,614 had a best population fitness of 1,392 against the
+    /// 11,658 winner it was written after. The genome is re-evaluated here on a fixed seed so the
+    /// record is a reading of this build rather than a number copied from a file; if it wins, the
+    /// mastery league can arm from the first resumed generation.
+    pub fn seed_record_from_checkpoint(
+        &mut self,
+        level: &Level,
+        genome: Genome,
+    ) -> Result<(), String> {
+        let seed = self.config.master_seed ^ 0xC0FF_EE00_1234_5678;
+        self.seed_record(level, genome, seed)
+    }
+
+    /// **Attach the planner's route as a proximity guide (WP5).**
+    ///
+    /// The route is replayed from spawn and the body's centre is sampled once per decision block,
+    /// with the flag appended, so the guide is the trajectory the planner actually produces and
+    /// not the oracle's stand graph — the two disagree exactly where shaping falls back to a
+    /// straight line, which is the gap this package exists to fill. Reached waypoints are monotone
+    /// inside the sim, so a body that backtracks keeps the credit it earned.
+    ///
+    /// Returns the waypoint count. The guide is only consulted when [`GaConfig::plan_bonus`] is
+    /// positive; attaching one to a run with a zero bonus costs nothing and changes no episode.
+    pub fn seed_plan(&mut self, level: &Level, route: &sim::plan::TimedRoute) -> usize {
+        let repeat = self.config.action_repeat.max(1);
+        let mut sim = sim::Sim::new(level, route.seed);
+        let mut points = vec![sim.player().aabb().center()];
+        for action in &route.actions {
+            for _ in 0..repeat {
+                if sim.outcome().is_finished() {
+                    break;
+                }
+                sim.step(*action);
+            }
+            let point = sim.player().aabb().center();
+            if points.last().is_none_or(|last: &(f32, f32)| {
+                (last.0 - point.0).abs() + (last.1 - point.1).abs() > 0.5
+            }) {
+                points.push(point);
+            }
+            if sim.outcome().is_finished() {
+                break;
+            }
+        }
+        if let Some(goal) = level.goals.first() {
+            points.push(goal.center());
+        }
+        let count = points.len();
+        self.plan_guide = Some(sim::PlanGuide {
+            points,
+            // Three quarters of a tile: a body that is on the route reads progress, and a body
+            // that merely passes near it does not. The plan's own waypoints are decision-block
+            // positions, not tiles, so this is a radius around a point rather than a cell.
+            radius: 0.75,
+        });
+        count
+    }
+
+    /// Seed the run's record from a genome and the episode it is claimed to have won.
+    ///
+    /// Used when the claim is a **champion file**, whose recorded seed is the one episode a
+    /// third party can reproduce. Replaying that seed rather than inventing one is what makes
+    /// `--from-champion` keep the record it started from: without this the first generation's
+    /// ranking replaced the record immediately, the league could not arm, and a run seeded from
+    /// a solved champion behaved like a fresh population that happened to be near a solution.
+    ///
+    /// The episode is re-run rather than trusted: the champion file's numbers are provenance,
+    /// and this build's simulator is the reader.
+    pub fn seed_record(&mut self, level: &Level, genome: Genome, seed: u64) -> Result<(), String> {
+        genome.validate()?;
+        if genome.shape != self.config.shape {
+            return Err(format!(
+                "the checkpoint's record is {} but this run asks for {}",
+                genome.shape.label(),
+                self.config.shape.label()
+            ));
+        }
+        let eval = self.config.eval_config();
+        let result = fitness::run_episode(level, &genome, &eval, seed);
+        let better = self
+            .best_ever
+            .as_ref()
+            .is_none_or(|held| result.mean_fitness > held.result.mean_fitness);
+        if better {
+            self.best_ever = Some(BestEver {
+                generation: self.generation,
+                result,
+                genome,
+                validated: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Replace the population with `genomes`, keeping everything the **run** owns.
     ///
     /// This is what a curriculum step returns through (§12 M5): the excursion trains
@@ -1820,10 +1993,69 @@ impl Trainer {
             self.next_id = self.next_id.max(max.saturating_add(1));
         }
         self.genomes = genomes;
+        // **An adopted population may not contain the run's record.** A practice excursion starts
+        // from the current population, trains on a derived level and hands its survivors back; the
+        // main run's best-ever genome is not one of them unless it happened to survive. Carrying it
+        // across is what stops a detour from erasing the only winning lineage — the failure the
+        // stall checkpoint above measured. The record is inserted in the weakest slot and re-scored
+        // next generation; `breed` keeps it there from then on.
+        if let Some(record) = self.best_ever.as_ref().map(|b| b.genome.clone()) {
+            if !self.genomes.iter().any(|g| same_genes(g, &record)) {
+                let mut copy = record;
+                if self.genomes.iter().any(|g| g.id == copy.id) {
+                    copy.id = self.next_id;
+                    self.next_id += 1;
+                }
+                copy.fitness = 0.0;
+                if let Some(slot) = self
+                    .genomes
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.fitness.total_cmp(&b.fitness))
+                    .map(|(i, _)| i)
+                {
+                    self.genomes[slot] = copy;
+                }
+            }
+        }
         // An adopted population arrives without its parents (they belong to the excursion),
         // so the 1/5th rule starts over rather than comparing against a lineage that is not
         // in this run.
         self.parent_fitness = vec![NO_PARENT; self.config.pop_size];
+        Ok(())
+    }
+
+    /// Put one genome into the population, replacing its weakest slot.
+    ///
+    /// This is the migration primitive (WP7). It is not [`Trainer::adopt`] and must not be:
+    /// an island that adopted a migrant's whole population would throw away everything it had
+    /// learned. The migrant gets a fresh id if its old one is already in use, so genome ids — and
+    /// therefore episode seeds — stay unique within the receiving island. The run's record is not
+    /// touched: a migrant enters the search, never the championship.
+    pub fn inject(&mut self, mut genome: Genome) -> Result<(), String> {
+        genome.validate()?;
+        if genome.shape != self.config.shape {
+            return Err(format!(
+                "cannot migrate a {} genome into a {} island",
+                genome.shape.label(),
+                self.config.shape.label()
+            ));
+        }
+        if self.genomes.iter().any(|g| g.id == genome.id) {
+            genome.id = self.next_id;
+            self.next_id += 1;
+        }
+        genome.fitness = 0.0;
+        if let Some(slot) = self
+            .genomes
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.fitness.total_cmp(&b.fitness))
+            .map(|(i, _)| i)
+        {
+            self.genomes[slot] = genome;
+            self.parent_fitness[slot] = NO_PARENT;
+        }
         Ok(())
     }
 
@@ -1899,6 +2131,111 @@ impl Trainer {
     /// Read-only view of the run's MAP-Elites quality-diversity archive.
     pub fn archive(&self) -> &MapElitesArchive {
         &self.archive
+    }
+
+    /// Read-only view of the technique archive and its firsts (WP13).
+    pub fn technique(&self) -> &crate::technique::TechniqueArchive {
+        &self.technique
+    }
+
+    /// The plan-proximity guide, when one was attached (WP5).
+    pub fn plan_guide(&self) -> Option<&sim::PlanGuide> {
+        self.plan_guide.as_ref()
+    }
+
+    /// Frontier states the run has archived (WP8).
+    pub fn snapshots(&self) -> &crate::snapshots::SnapshotArchive {
+        &self.snapshots
+    }
+
+    /// `(probes started, probes that won from their snapshot)`.
+    pub fn snapshot_stats(&self) -> (u64, u64) {
+        (self.snapshot_probes, self.snapshot_wins)
+    }
+
+    /// Fill the archive by replaying a **spawn-started** episode and taking a state at every
+    /// decision block. This is the only admission path that can see the whole world: a probe
+    /// started from a snapshot can only archive states after its own start, so the first frontier
+    /// must come from a full episode.
+    pub fn seed_snapshots(&mut self, level: &Level, genome: &Genome) -> usize {
+        let eval = self.config.eval_config();
+        let seed = episode_seed_for(&self.config, self.generation, genome.id, 0);
+        let mut runner = fitness::EpisodeRunner::new(level, genome.clone(), &eval, seed);
+        while !runner.is_finished() {
+            runner.step();
+            if runner.sim().stats().frames % self.config.action_repeat == 0 {
+                self.snapshots.observe(runner.sim(), self.generation);
+            }
+        }
+        self.snapshots.len()
+    }
+
+    /// **Start a probe batch from the least-visited snapshot (WP8).**
+    ///
+    /// Each probe is a mutated copy of the run's best genome, run from the archived state. A probe
+    /// that reaches the flag is injected into the population — it has proved it can finish from a
+    /// frontier the spawn-started search had not reached this generation — while a probe that
+    /// merely gets further is what extends the archive for the next probe. No probe can enter the
+    /// record directly: its episode started mid-level and is not a replayable champion.
+    pub fn snapshot_probe(&mut self, level: &Level) {
+        if self.snapshots.is_empty() {
+            let Some(anchor) = self
+                .best_ever
+                .as_ref()
+                .map(|b| b.genome.clone())
+                .or_else(|| {
+                    self.genomes
+                        .iter()
+                        .max_by(|a, b| a.fitness.total_cmp(&b.fitness))
+                        .cloned()
+                })
+            else {
+                return;
+            };
+            self.seed_snapshots(level, &anchor);
+        }
+        let anchor = self
+            .best_ever
+            .as_ref()
+            .map(|b| b.genome.clone())
+            .or_else(|| {
+                self.genomes
+                    .iter()
+                    .max_by(|a, b| a.fitness.total_cmp(&b.fitness))
+                    .cloned()
+            });
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let eval = self.config.eval_config();
+        for _ in 0..self.config.snapshot_probes {
+            let Some((_, snapshot)) = self.snapshots.sample() else {
+                break;
+            };
+            let mut child = anchor.clone();
+            child.id = self.next_id;
+            self.next_id += 1;
+            crate::genome::mutate(
+                &mut child,
+                self.config.mutation_sigma,
+                self.config.mutation_rate,
+                &mut self.rng,
+            );
+            let seed = episode_seed_for(&self.config, self.generation, child.id, 0);
+            let (result, final_sim) =
+                fitness::run_episode_from_snapshot_sim(&child, &eval, seed, &snapshot);
+            self.snapshot_probes += 1;
+            if result.won() {
+                self.snapshot_wins += 1;
+                child.fitness = result.mean_fitness;
+                let _ = self.inject(child);
+            }
+            // A probe's final state is a frontier too: it may be past the archived start even
+            // when it did not finish, which is exactly the state the next probe should try.
+            if result.progress_pixels > 0.0 {
+                self.snapshots.observe(&final_sim, self.generation);
+            }
+        }
     }
 
     pub fn history(&self) -> &[GenRow] {
@@ -2102,7 +2439,7 @@ impl Trainer {
                 .as_ref()
                 .is_some_and(|b| b.result.solved());
         self.mastery_active = league;
-        let selection: Vec<f32> = if league {
+        let mut selection: Vec<f32> = if league {
             results
                 .iter()
                 .map(|r| league_score(r, budget_frames))
@@ -2117,6 +2454,34 @@ impl Trainer {
         } else {
             results.iter().map(|r| r.mean_fitness).collect()
         };
+        // **Plan proximity (WP5).** The bonus is added *after* the ranking policy has been
+        // applied, so it biases every arm the same way and never rewrites a recorded result. Its
+        // weight decays linearly to zero over `plan_bonus_generations`, which is what makes the
+        // last generations select on the unshaped objective; at generation >= the window the
+        // loop is skipped entirely, so a late run is bit-identical to one without a plan.
+        if let Some(guide) = &self.plan_guide {
+            let window = self.config.plan_bonus_generations;
+            let decay = if window == 0 {
+                1.0
+            } else {
+                (1.0 - self.generation as f32 / window as f32).clamp(0.0, 1.0)
+            };
+            let weight = self.config.plan_bonus * decay;
+            if weight > 0.0 {
+                let eval = self.config.eval_config();
+                for (idx, genome) in self.genomes.iter().enumerate() {
+                    let seed = episode_seed_for(&self.config, self.generation, genome.id, 0);
+                    let (_, fraction) = fitness::run_episode_guided(
+                        &levels[0],
+                        genome,
+                        &eval,
+                        seed,
+                        guide.clone(),
+                    );
+                    selection[idx] += weight * fraction;
+                }
+            }
+        }
         let mut order: Vec<usize> = (0..results.len()).collect();
         order.sort_by(|&a, &b| selection[b].total_cmp(&selection[a]).then(a.cmp(&b)));
 
@@ -2125,7 +2490,12 @@ impl Trainer {
         // genome rather than the best one, and a champion is a claim about the level that must not
         // be made by the strangest genome in the generation. At `novelty_weight` 0 the two indices
         // are the same one, by the same tie-break (lowest index wins a tie).
-        let winner = if self.config.novelty_weight > 0.0 {
+        let winner = if league {
+            // In the league the fastest winner *is* the record candidate. Under the crowned
+            // objective a faster episode can score lower (it may jump more), which is exactly the
+            // genome the league exists to keep.
+            order[0]
+        } else if self.config.novelty_weight > 0.0 {
             (0..results.len())
                 .max_by(|&a, &b| {
                     results[a]
@@ -2161,12 +2531,22 @@ impl Trainer {
         // genome that actually solved the level — and since `--stop-on-win` saves the record, that
         // is the difference between shipping a champion and shipping a near-miss.
         let record_solved = self.best_ever.as_ref().is_some_and(|b| b.result.solved());
+        // Under the league the record is challenged on the clock, not on the crowned score: a
+        // faster winner with a couple more jumps is a better league genome even when v9 likes it
+        // less. Validation still decides whether it may be recorded (`keep` below).
+        let record_key = |r: &EpisodeResult| {
+            if league {
+                league_score(r, budget_frames)
+            } else {
+                r.mean_fitness
+            }
+        };
         if self.best_ever.is_none()
             || (best_result.solved() && !record_solved)
             || self
                 .best_ever
                 .as_ref()
-                .is_some_and(|b| best_result.mean_fitness > b.result.mean_fitness)
+                .is_some_and(|b| record_key(&best_result) > record_key(&b.result))
         {
             let candidate = self.genomes[winner].clone();
             // Many copies of one deterministic episode would cost episodes to learn nothing
@@ -2184,13 +2564,20 @@ impl Trainer {
                 }),
                 _ => None,
             };
-            let keep = supersedes(
-                &best_result,
-                candidate_reading,
-                self.best_ever
-                    .as_ref()
-                    .map(|b| (&b.result, held_reading.or(b.validated))),
-            );
+            let keep = if league && best_result.won() {
+                // The league's verdict is the clock, but a fast genome that fails a held-out
+                // episode is not a champion. With no validation set (a deterministic level) the
+                // generation's own winning episode is the whole reading.
+                candidate_reading.is_none_or(|v| v.wins == v.episodes)
+            } else {
+                supersedes(
+                    &best_result,
+                    candidate_reading,
+                    self.best_ever
+                        .as_ref()
+                        .map(|b| (&b.result, held_reading.or(b.validated))),
+                )
+            };
             if keep {
                 self.best_ever = Some(BestEver {
                     generation: self.generation,
@@ -2213,6 +2600,13 @@ impl Trainer {
         // the reading rather than of the search.
         self.archive
             .observe(&levels[0], &self.genomes, &results, self.generation);
+        // The technique archive is reporting-only and deliberately independent of the selection
+        // score: a genome that stomps five walkers to cross a pit is a worse champion and an
+        // interesting ancestor, and both statements have to be able to be true at once.
+        for (genome, result) in self.genomes.iter().zip(results.iter()) {
+            self.technique
+                .observe(self.generation, genome, result);
+        }
 
         // ---- the search's own bookkeeping: stagnation, then the 1/5th rule -----
         //
@@ -2239,6 +2633,14 @@ impl Trainer {
         };
 
         let (immigrants, archive_children) = self.breed(&order, &selection);
+        // Snapshot exploration happens *after* breeding, so a probe that wins from a frontier is
+        // in the population the next generation evaluates rather than being overwritten by the
+        // children this generation just made.
+        if self.config.snapshot_every > 0
+            && self.generation % self.config.snapshot_every == 0
+        {
+            self.snapshot_probe(&levels[0]);
+        }
         let archive_bits = self.archive.occupied();
         let archive_time_bits = self.archive.time_bands();
 
@@ -2610,6 +3012,38 @@ impl Trainer {
             parents.push((self.genomes[pa].fitness + self.genomes[pb].fitness) * 0.5);
         }
 
+        // **The record is a breeder, not only a memory.** A generation's ranking is about the
+        // episodes it was just judged on; the run's best-ever genome is the one point the whole
+        // run has proved. Those are usually the same genome, but not always — a tournament, a
+        // novelty score, a validation that promoted a candidate the generation ranked lower — and
+        // when they diverge the record can simply fall out of the population. That is not a
+        // hypothetical: on `l11-the-elements` a winner at generation 17,212 was gone by the stall
+        // checkpoint at 20,614, whose best genome scored 1.4k. The run kept the champion in
+        // `best_ever` and could never breed it again, which is how a solved level spends thirty
+        // thousand generations without winning a second time.
+        //
+        // One slot guarantees it cannot happen. The copy is exact (same genes), re-scored next
+        // generation like any other genome, and only inserted when the record is not already in
+        // the offspring, so a run whose record is its elite is bit-identical to before.
+        if let Some(record) = self.best_ever.as_ref().map(|b| b.genome.clone()) {
+            if !next.iter().any(|g| same_genes(g, &record)) {
+                let mut copy = record;
+                if next.iter().any(|g| g.id == copy.id) {
+                    // Ids are part of every episode seed, so two genomes in one population may
+                    // not share one. The genes are what the record is; the id is bookkeeping.
+                    copy.id = self.next_id;
+                    self.next_id += 1;
+                }
+                copy.fitness = 0.0;
+                if let Some(last) = next.last_mut() {
+                    *last = copy;
+                    if let Some(parent) = parents.last_mut() {
+                        *parent = NO_PARENT;
+                    }
+                }
+            }
+        }
+
         self.genomes = next;
         self.parent_fitness = parents;
         (immigrants, archive_children)
@@ -2812,6 +3246,100 @@ mod tests {
     }
 
     #[test]
+    fn seeding_snapshots_archives_states_from_a_spawn_started_episode() {
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            snapshot_every: 2,
+            snapshot_probes: 2,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg);
+        let genome = trainer.genomes[0].clone();
+        let cells = trainer.seed_snapshots(&level, &genome);
+        assert!(cells > 0, "a full episode must archive at least its spawn state");
+        assert_eq!(trainer.snapshot_stats(), (0, 0));
+        assert_eq!(trainer.snapshots().len(), cells);
+    }
+
+    #[test]
+    fn a_snapshot_probe_batch_starts_from_a_frontier_and_never_crowns() {
+        let level = pit_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            snapshot_every: 1,
+            snapshot_probes: 2,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg);
+        let genome = trainer.genomes[0].clone();
+        let cells = trainer.seed_snapshots(&level, &genome);
+        assert!(cells > 0);
+        trainer.snapshot_probe(&level);
+        let (probes, _wins) = trainer.snapshot_stats();
+        assert_eq!(probes, 2, "the configured batch ran");
+        assert!(
+            trainer.snapshots().len() >= cells,
+            "a probe may only extend the archive"
+        );
+        assert!(
+            trainer.best_ever().is_none(),
+            "a snapshot-started episode is not a spawn-started record, so it cannot crown one"
+        );
+    }
+
+    #[test]
+    fn a_plan_guide_is_priced_once_and_never_enters_the_recorded_episode() {
+        // The guide's contribution is a *selection* bonus, not fitness: the same genome on the
+        // same seed must record the same score and the same trajectory with or without it, or a
+        // champion would become a plan-mimic that cannot be replayed from its own file.
+        let level = crate::fixture::gap_runway("ga-plan-fixture", 30, 22, &[]);
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 5,
+            plan_bonus: 50.0,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg.clone());
+        let route = sim::plan::solve(&level, cfg.master_seed, sim::plan::PlanConfig::default())
+            .expect("the flat runway is plannable");
+        let waypoints = trainer.seed_plan(&level, &route);
+        assert!(waypoints >= 2, "spawn and flag are two waypoints at least");
+        let guide = trainer.plan_guide().cloned().expect("the guide is attached");
+
+        // The planner's own route, replayed under its guide, reaches all of it.
+        let mut replay = sim::Sim::new(&level, route.seed);
+        replay.set_plan_guide(guide.clone());
+        for action in &route.actions {
+            for _ in 0..sim::DECISION_TICKS {
+                if replay.outcome().is_finished() {
+                    break;
+                }
+                replay.step(*action);
+            }
+            if replay.outcome().is_finished() {
+                break;
+            }
+        }
+        let (reached, total) = replay.plan_progress();
+        assert_eq!(replay.outcome(), sim::Outcome::Won, "the route wins its level");
+        assert_eq!(total, waypoints);
+        assert_eq!(reached, total, "the route the guide came from must traverse it");
+
+        let genome = trainer.genomes[0].clone();
+        let eval = cfg.eval_config();
+        let plain = fitness::run_episode(&level, &genome, &eval, 3);
+        let (guided, fraction) =
+            fitness::run_episode_guided(&level, &genome, &eval, 3, guide);
+        assert_eq!(guided.fitness, plain.fitness, "the guide adds no fitness");
+        assert_eq!(
+            guided.trajectory_hash, plain.trajectory_hash,
+            "and no physics, so the episode is the same episode"
+        );
+        assert!((0.0..=1.0).contains(&fraction));
+    }
+
+    #[test]
     fn a_random_population_does_not_already_win_a_level_with_a_pit() {
         // Anti-vacuity guard for the smoke test: if generation 0 already solved the level,
         // "the GA solves the level" would prove nothing about evolution.
@@ -2821,6 +3349,7 @@ mod tests {
         // clears it by luck now and then, and a single frozen seed reads as "never" for a
         // level where it happens. Measured at 0.5.0, winners per 24 genomes across seeds
         // 1..12: 1, 1, 0, 0, 1, 1, 0, 2, 0, 1, 2, 1 — never more than a twelfth of the
+
         // population. What no seed shows is a population that has *solved* the level: a
         // genome that does not cross the pit banks about 155 of the 10 337 a winner scores,
         // because on this fixture there is no partial credit past the pit.
@@ -3346,6 +3875,13 @@ mod tests {
             progress_pixels: 0.0,
             best_x: 0.0,
             stomps: 0,
+            max_stomp_chain: 0,
+            wall_jumps: 0,
+            springs: 0,
+            crumble_burned: 0,
+            max_air_ticks: 0,
+            max_air_distance: 0.0,
+            peak_speed: 0.0,
             jumps: 0,
             checkpoints: 0,
             route_hops_closed: 0,
@@ -3465,6 +4001,97 @@ mod tests {
         // And a plain run is not in the league: the flag is off by default and the selection path
         // only reaches `league_score` when both it and a solved record hold.
         assert!(!GaConfig::default().mastery);
+    }
+
+    /// **The record survives both a detour and a generation.**
+    ///
+    /// This is the regression the l11 checkpoint exposed: a winner at generation 17,212 was gone
+    /// from the population by 20,614, so the run could not breed it again and spent thousands of
+    /// generations with no second win. `adopt` must carry the record back from a practice
+    /// excursion, and `breed` must keep it in the offspring even when the generation's ranking
+    /// does not.
+    #[test]
+    fn the_best_ever_genome_is_never_lost_from_the_breeding_population() {
+        let level = flat_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            elite: 2,
+            master_seed: 21,
+            ..GaConfig::default()
+        };
+        let mut t = Trainer::new(cfg);
+        t.step(&level);
+        let record = t
+            .best_ever()
+            .expect("a scored run has a record")
+            .genome
+            .clone();
+
+        // Eight strangers, as a practice excursion's survivors would be: none of them is the
+        // record, and their ids are disjoint from the run's own.
+        let mut rng = rng_from_seed(99);
+        let strangers: Vec<Genome> = (0..8u32)
+            .map(|i| Genome::random(10_000 + i, default_shape(), &mut rng))
+            .collect();
+
+        t.adopt(strangers).expect("a full population adopts");
+        assert!(
+            t.genomes.iter().any(|g| same_genes(g, &record)),
+            "`adopt` let a practice excursion erase the run's record"
+        );
+
+        // And if the record is removed again — the shape a stale checkpoint or a hand-built
+        // population has — one generation of breeding puts it back before anything is evaluated.
+        let mut rng = rng_from_seed(101);
+        t.genomes = (0..8u32)
+            .map(|i| Genome::random(20_000 + i, default_shape(), &mut rng))
+            .collect();
+        let order: Vec<usize> = (0..8).collect();
+        let selection = vec![0.0f32; 8];
+        t.breed(&order, &selection);
+        assert!(
+            t.genomes.iter().any(|g| same_genes(g, &record)),
+            "`breed` dropped the run's record from the next generation"
+        );
+    }
+
+    /// **A run seeded from a champion starts with that champion's record.**
+    ///
+    /// `from_champion` builds the population and leaves the record empty, so the first
+    /// generation's best genome — an unsolved reheat — would become the record and the league
+    /// would never arm. `seed_record` replays the episode the champion file names, which is the
+    /// one episode the file can reproduce, and installs it as the record.
+    #[test]
+    fn a_run_seeded_from_a_champion_keeps_the_record_it_came_from() {
+        let level = flat_level();
+        let cfg = GaConfig {
+            pop_size: 8,
+            elite: 2,
+            master_seed: 33,
+            ..GaConfig::default()
+        };
+        let mut source = Trainer::new(cfg.clone());
+        for _ in 0..4 {
+            source.step(&level);
+        }
+        let best = source
+            .best_ever()
+            .expect("a scored run has a record")
+            .clone();
+
+        let mut seeded =
+            Trainer::from_champion(cfg, best.genome.clone()).expect("a champion seeds a run");
+        assert!(
+            seeded.best_ever().is_none(),
+            "fixture: the population is seeded but the record is not"
+        );
+        seeded
+            .seed_record(&level, best.genome.clone(), best.result.seed)
+            .expect("a champion of this shape seeds the record");
+        let record = seeded.best_ever().expect("the champion became the record");
+        assert_eq!(record.result.seed, best.result.seed);
+        assert!(same_genes(&record.genome, &best.genome));
+        assert_eq!(record.result.outcome, best.result.outcome);
     }
 
     /// **`won` is one episode; `solved` is all of them.** The distinction the trial rule exists for,
@@ -4890,12 +5517,32 @@ mod tests {
         let mut cfg = GaConfig::default();
         let walker_level = crate::fixture::walker_runway("trials-plate", 24, 22, 8);
 
-        // A level with no walker: every trial is the same episode, so nothing is doubled.
-        assert!(pit_level().walkers.is_empty());
+        // A level with no patrol: every trial is the same episode, so nothing is doubled.
+        assert!(!pit_level().has_patrols());
         assert_eq!(cfg.effective_trials(&pit_level()), 1);
         // A level with one: the recommendation applies while `trials` is left at its default.
-        assert!(!walker_level.walkers.is_empty());
+        assert!(walker_level.has_patrols());
         assert_eq!(cfg.effective_trials(&walker_level), 3);
+        // **A chaser is a patrol too.** `l11-the-elements` has a chaser and no walker, which is
+        // why it used to be judged on one phase while its auto-shape scan already called it
+        // stochastic. The two answers have to be the same answer.
+        let chaser = crate::fixture::level(
+            "trials-chaser",
+            &[
+                "........................",
+                "........................",
+                "........................",
+                "........................",
+                "........................",
+                "........................",
+                "########################",
+                "........................",
+            ],
+            (1, 5),
+            &[("chaser", 8, 5), ("goal", 22, 5)],
+        );
+        assert!(chaser.has_patrols());
+        assert_eq!(cfg.effective_trials(&chaser), 3, "a chaser draws a phase");
 
         // An explicit number is honoured everywhere, including on the walker level.
         cfg.trials = 4;
@@ -5406,6 +6053,13 @@ mod tests {
             progress_pixels: progress,
             best_x: progress / 16.0,
             stomps: 0,
+            max_stomp_chain: 0,
+            wall_jumps: 0,
+            springs: 0,
+            crumble_burned: 0,
+            max_air_ticks: 0,
+            max_air_distance: 0.0,
+            peak_speed: 0.0,
             jumps: 4,
             checkpoints,
             route_hops_closed: 0,

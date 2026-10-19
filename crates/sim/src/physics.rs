@@ -589,7 +589,7 @@ impl Physics {
 /// population's fastest learned behaviour was one the game could only perform to the
 /// right. Both directions now have the same two gears, which is what makes the pack's
 /// difficulty a fact about the *level* rather than about which way it happens to face.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum AgentAction {
     /// Accelerate right.
@@ -713,6 +713,11 @@ pub struct TickContact {
     /// A jump left the ground: a ground jump, a buffered one, or a wall jump. The
     /// episode counts these, which is what the per-jump fitness term is charged on.
     pub jumped: bool,
+    /// The jump in [`TickContact::jumped`] was taken **off a wall** rather than the ground.
+    ///
+    /// Reporting only (WP13): the fitness does not distinguish the two, but a technique archive
+    /// cannot tell a wall climb from a staircase without it.
+    pub wall_jumped: bool,
     pub hit_wall: bool,
     pub hit_ceiling: bool,
     pub touched_spike: bool,
@@ -1249,6 +1254,7 @@ impl PlayerState {
                 self.jump_hold_ticks = ph.min_jump_hold;
                 self.jump_buffer = 0;
                 contact.jumped = true;
+                contact.wall_jumped = true;
             } else {
                 self.jump_buffer -= 1;
             }

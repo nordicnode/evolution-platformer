@@ -18,15 +18,17 @@
 //! trainer it hosts is the same `evo` the headless driver uses.
 //!
 //! The run the window hosts can be the terminal's run, not a simplified one: `--pop`,
-//! `--seed`, `--generations`, `--champions`, `--resume` and `--curriculum` are
-//! `train-cli watch`'s flags with the same meanings, so a run started in the window is a
-//! run the terminal can resume and a checkpoint written by either front-end is readable
-//! by the other.
+//! `--seed`, `--generations`, `--champions`, `--resume`, `--from-champion` and `--curriculum`
+//! are `train-cli`'s flags with the same meanings, so a run started in the window is a run
+//! the terminal can resume and a checkpoint — or a champion — written by either front-end is
+//! readable by the other. Once the window is open, the evolution panel's *Continue champion*
+//! (or `C`) is the same starting point without a command line.
 //!
 //! ```text
 //! evo-app [--level levels/l6-marathon.json] [--assets assets] [--splash] [--play]
 //!         [--evolve] [--replay] [--pop 200] [--seed 1] [--generations 300]
 //!         [--champions champions] [--resume champions/l5-tightrope.population.json]
+//!         [--from-champion champions/l5-tightrope.json]
 //!         [--curriculum levels/l3-gauntlet.json] [--curriculum-generations 40]
 //!         [--screenshot out.png]
 //! ```
@@ -67,6 +69,11 @@ OPTIONS:
                           when --champions holds one that won, and a demo run otherwise.
     --no-splash           Skip the title screen and open the editor on the first frame.
     --play                Open in the playtest, with the clock running from the spawn.
+    --think               Open in the playtest with the AI's deliberate controller at the
+                          keys: it plans the level with the real simulator and plays the
+                          route, instead of waiting for a population to find it. The plan
+                          is computed once at the start (a few seconds on a hard level).
+                          `T` in any playtest turns the same controller on and off.
     --evolve              Open in the evolution view and start training at once.
     --replay              Open in the replay of the run's quickest win: it starts a run
                           like --evolve, takes it to its cap when one was given, and then
@@ -83,6 +90,12 @@ OPTIONS:
                           its checkpoint.                     [default champions]
     --resume <PATH>       Start from a population checkpoint instead of a fresh
                           population (as `train-cli watch --resume` does).
+    --from-champion <PATH>
+                          Start a new population from one saved champion (as
+                          `train-cli train --from-champion` does): the genome in slot 0
+                          and reheated copies of it behind, with its recorded episode
+                          as the run's first record. Not with --resume: one names a
+                          population and the other a genome.
     --curriculum <PATH>   Easier level to fall back to on the first stall.
     --curriculum-generations <N>
                           Generations to spend there before returning.
@@ -136,6 +149,10 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
             // would never score anything: both are refused rather than clamped, because a
             // scripted `--generations 0` is a mistake in the script, not a preference.
             "--play" => lab.play = true,
+            "--think" => {
+                lab.play = true;
+                lab.think = true;
+            }
             "--evolve" => lab.evolve = true,
             // `--replay` is `--evolve` plus one thing done afterwards, so it is not an
             // error to ask for both: whichever lands, the run is started and the replay is
@@ -159,6 +176,9 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
             }
             "--champions" => lab.champions = PathBuf::from(value("--champions")?),
             "--resume" => lab.resume = Some(PathBuf::from(value("--resume")?)),
+            "--from-champion" => {
+                lab.from_champion = Some(PathBuf::from(value("--from-champion")?))
+            }
             // The easier level is *not* read here: whether it exists is the app's answer,
             // because it is the run that needs it, and a run that is never started must
             // not fail over a file it would never have opened.
@@ -175,8 +195,17 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
         i += 1;
     }
 
+    // Two answers to "where does this run start" are a mistake in the command line, not a
+    // precedence rule: a population and a genome cannot both be the seed, and the terminal
+    // refuses the same pair rather than silently picking one.
+    if lab.resume.is_some() && lab.from_champion.is_some() {
+        return Err(
+            "usage: --resume and --from-champion name different starting points; pass one".into(),
+        );
+    }
+
     // The default level is resolved relative to the workspace root, so the binary
-    // works whether it is launched from there or from anywhere else.
+    // works whether it was launched from there or from anywhere else.
     let level = level.unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../levels/l1-flat-run.json")
     });

@@ -63,6 +63,13 @@ const CHART_PANEL_HEIGHT: f32 = 150.0;
 /// window's idea of "a movement" was already set.
 const MODE_FADE: f32 = 0.18;
 
+/// How long a discovery card stays on screen, slow-motion included.
+///
+/// Ten seconds rather than the genius note's six: a genius note is a jump in a number and can be
+/// read at a glance, while a find is a name, a sentence and a route to watch. It is still a
+/// moment rather than a dialog — it fades without being dismissed, and the codex keeps it.
+const DISCOVERY_SECONDS: f32 = 10.0;
+
 /// Points per tile the follow camera zooms to.
 ///
 /// Following means looking at one agent, and the whole-level fit would make that
@@ -119,6 +126,13 @@ pub struct LabOptions {
     /// physics with the clock running, which is what a person who drew a level wants next — and
     /// `--evolve` is how a script asks for both `--play` and a run to beat.
     pub play: bool,
+    /// Open with the AI's **deliberate** controller at the keys: plan the level with the
+    /// real simulator and play the plan, instead of waiting for a population to find it.
+    ///
+    /// This is the System-2 half of the agent. It does not replace a run — a run is still
+    /// how a fast policy is bred — but it is the answer on a level where a reflex has no
+    /// timing to learn from, and `T` in any playtest turns it on and off.
+    pub think: bool,
     /// Open in the evolution view rather than the editor.
     pub evolve: bool,
     /// Open in the replay of the run's quickest win rather than the editor.
@@ -142,6 +156,10 @@ pub struct LabOptions {
     /// Start the run from a population checkpoint instead of a fresh population, as
     /// `train-cli watch --resume` does.
     pub resume: Option<PathBuf>,
+    /// Start a **new** population from one saved champion, as `train-cli train
+    /// --from-champion` does. The alternative to [`LabOptions::resume`], not a second step:
+    /// a checkpoint is a population and a champion is one genome.
+    pub from_champion: Option<PathBuf>,
     /// Easier level to fall back to when the run stalls (§12 M5), loaded when the run
     /// starts — a mistyped path is then an error at startup rather than a surprise forty
     /// generations into a stalled run, which is the terminal's rule too.
@@ -154,6 +172,7 @@ impl Default for LabOptions {
     fn default() -> Self {
         LabOptions {
             play: false,
+            think: false,
             evolve: false,
             replay: false,
             ghosts: true,
@@ -162,6 +181,7 @@ impl Default for LabOptions {
             generations: None,
             champions: PathBuf::from("champions"),
             resume: None,
+            from_champion: None,
             curriculum: None,
             curriculum_generations: lab::DEFAULT_CURRICULUM_GENERATIONS,
         }
@@ -270,6 +290,12 @@ struct EvoApp {
     editor: Editor,
     mode: Mode,
     session: Option<play::Session>,
+    /// The deliberate controller driving the playtest, when `T` (or `--think`) turned it
+    /// on. Kept beside the session rather than inside it: the session is the world, and
+    /// the controller is a policy about it — the same separation the evolved genome has.
+    driver: Option<evo::Driver>,
+    /// Whether the deliberate controller is at the keys right now.
+    thinking: bool,
     levels_dir: PathBuf,
     /// Pending grid size, applied by the Resize button.
     pending_size: (i32, i32),
@@ -334,6 +360,16 @@ struct EvoApp {
     /// Seconds left on the genius note (§10 Tier 1.3). The panel's own genius flag lasts
     /// as long as its generation does; a splash has to outlive the packet to be seen.
     genius_left: f32,
+    /// **The newest find and its remaining seconds (WP16).** The card is the moment; the packet's
+    /// own field only lasts one generation, and a discovery deserves long enough to be read.
+    discovery: Option<(evo::Discovery, f32)>,
+    /// The speed to return to after a discovery's slow-motion moment, when the viewer has not
+    /// chosen a different one in the meantime.
+    speed_before_discovery: Option<u32>,
+    /// The codex page, loaded when `K` opens it rather than read per frame.
+    codex_view: Option<evo::Codex>,
+    /// Whether the trick codex is up.
+    codex_open: bool,
     /// A transient status note and its remaining seconds.
     note: Option<(String, f32)>,
     /// The mutation rate the run has actually been told about, so the worker is not
@@ -498,6 +534,8 @@ impl EvoApp {
             editor,
             mode: Mode::Edit,
             session: None,
+            driver: None,
+            thinking: false,
             levels_dir,
             pending_size,
             grid: true,
@@ -522,6 +560,10 @@ impl EvoApp {
             single_step: false,
             saved_end: false,
             genius_left: 0.0,
+            discovery: None,
+            speed_before_discovery: None,
+            codex_view: None,
+            codex_open: false,
             note: None,
             applied_rate: None,
             primed: false,
@@ -594,8 +636,44 @@ impl EvoApp {
         // behind the one being played. Going back rebuilds it from the same packet.
         self.replay = None;
         self.session = Some(play::Session::new(&self.editor.level, 1));
+        self.driver = None;
+        self.thinking = self.options.think;
+        if self.thinking {
+            self.start_thinking();
+        }
         self.attach_champion_ghost();
         self.mode = Mode::Play;
+    }
+
+    /// Put the deliberate controller at the keys.
+    ///
+    /// The whole-route planner first: it is the one that can wait out a deck's cycle, and
+    /// it costs a few seconds once rather than a search per tick. If the level has no
+    /// route it falls back to the local model-based controller, which is worse at long
+    /// waits but needs no global plan and reacts to the body's actual state.
+    fn start_thinking(&mut self) {
+        if self.driver.is_some() {
+            self.thinking = true;
+            return;
+        }
+        let planned = evo::Driver::planned(
+            &self.editor.level,
+            1,
+            sim::plan::PlanConfig::default(),
+        );
+        let whole = planned.is_some();
+        self.driver = Some(
+            planned.unwrap_or_else(|| evo::Driver::local(evo::ThinkConfig::default())),
+        );
+        self.thinking = true;
+        self.note = Some((
+            if whole {
+                "the AI planned the level — T gives the keys back".to_string()
+            } else {
+                "the AI is thinking a few moves ahead — T gives the keys back".to_string()
+            },
+            4.0,
+        ));
     }
 
     /// Attach the record-holder as the playtest's ghost, when there is one to race.
@@ -783,6 +861,12 @@ impl EvoApp {
             let cfg = GaConfig {
                 pop_size: self.options.pop_size,
                 master_seed: self.seed,
+                // **The window is a mastery league by default** (WP11). A watched run's whole
+                // promise is that it keeps getting better after it solves the level, and before
+                // this the window had no way to ask for that: a run that found the flag once
+                // went on optimising the crowned fitness, which barely notices the clock. The
+                // league arms only after the record wins, so learning the level is unchanged.
+                mastery: true,
                 ..GaConfig::default()
             };
             let plan = match self.run_plan() {
@@ -850,10 +934,13 @@ impl EvoApp {
         Ok(lab::RunPlan {
             cap: self.options.generations,
             resume: self.options.resume.clone(),
+            seed_from_champion: self.options.from_champion.clone(),
             curriculum,
-            // A fresh run on a level somebody has just drawn starts from a walk of it; a resumed
-            // run already has the population it was handed. See `lab::RunPlan::warm_from_route`.
-            warm_from_route: self.options.resume.is_none(),
+            // A fresh run on a level somebody has just drawn starts from a walk of it; a run
+            // handed a population or a champion already has the better starting point. See
+            // `lab::RunPlan::warm_from_route`.
+            warm_from_route: self.options.resume.is_none()
+                && self.options.from_champion.is_none(),
         })
     }
 
@@ -883,6 +970,68 @@ impl EvoApp {
         };
         lab.restart(&self.editor.level, self.seed, stem);
         lab.set_mutation_rate(self.view.mutation_rate);
+        self.reset_run_view();
+        self.note = Some((format!("{why} (seed {})", self.seed), 6.0));
+    }
+
+    /// Start a new population from the champion **saved for this level**.
+    ///
+    /// The window's half of `train-cli train --from-champion`, and the answer to the one hole
+    /// a saved champion left: the file on disk was readable only by the terminal, so restarting
+    /// the game meant restarting the search from nothing. The champion is loaded before the old
+    /// run is touched — a file this build cannot train on leaves the run where it was and says
+    /// why — and the new run starts at generation 0 with the champion's own episode as its
+    /// record, exactly as the terminal's seeded run does.
+    ///
+    /// The file is the one [`Lab::champion_path`] names, which is where [`Self::save_champion`]
+    /// writes: a level's champion and the control that continues it cannot name two files.
+    fn continue_from_champion(&mut self) {
+        let Some(lab) = &self.lab else {
+            self.note = Some(("start a run first: there is no champion saved yet".into(), 6.0));
+            return;
+        };
+        let path = lab.champion_path();
+        let seed = match lab::champion_seed(&path, &self.editor.level) {
+            Ok(seed) => seed,
+            Err(err) => {
+                self.note = Some((
+                    format!(
+                        "no champion to continue at {} ({err}) — S saves this run's best first",
+                        path.display()
+                    ),
+                    10.0,
+                ));
+                return;
+            }
+        };
+        // A new seed, like Restart: a continued run has to be reproducible from the number on
+        // screen, and reusing the old one would make the new shell the old one's duplicate.
+        // It is only adopted once the restart is accepted, so a champion this run cannot
+        // train on leaves the seed showing the run that is actually running.
+        let next_seed = self.seed.wrapping_add(1);
+        let stem = self.run_stem();
+        let Some(lab) = &mut self.lab else {
+            return;
+        };
+        if let Err(err) = lab.restart_from_champion(&self.editor.level, next_seed, stem, seed) {
+            self.note = Some((format!("cannot continue from the champion: {err}"), 10.0));
+            return;
+        }
+        self.seed = next_seed;
+        lab.set_mutation_rate(self.view.mutation_rate);
+        let origin = lab
+            .origin()
+            .unwrap_or("seeded from a saved champion")
+            .to_string();
+        self.reset_run_view();
+        self.note = Some((format!("{origin} (seed {})", self.seed), 10.0));
+    }
+
+    /// Drop everything the screen holds about the run it was watching.
+    ///
+    /// Shared by the two ways a run starts again — a fresh population and one continued from a
+    /// champion — so a new run cannot leave the old chart, record or scrub position on screen.
+    fn reset_run_view(&mut self) {
         self.lanes = None;
         self.packet = None;
         self.summary = None;
@@ -890,7 +1039,6 @@ impl EvoApp {
         self.view.scrub = None;
         self.saved_end = false;
         self.applied_rate = Some(self.view.mutation_rate);
-        self.note = Some((format!("{why} (seed {})", self.seed), 6.0));
     }
 
     /// One frame of the evolution view: ask for the next generation when the viewer has
@@ -906,6 +1054,7 @@ impl EvoApp {
         if self.genius_left > 0.0 {
             self.genius_left -= dt;
         }
+        self.tick_discovery(dt);
 
         // The run's rate limit, and the reason a paused window costs nothing: while a
         // generation is on screen — or while the viewer is paused or scrubbing — nothing
@@ -930,6 +1079,9 @@ impl EvoApp {
             let packet = lanes.packet().clone();
             if packet.genius {
                 self.genius_left = 6.0;
+            }
+            if let Some(found) = packet.discovery.clone() {
+                self.show_discovery(found);
             }
             // A scrubbed route the record has since dropped is no longer somewhere the
             // viewer can be: the log keeps the most recent improvements and forgets the
@@ -1097,7 +1249,18 @@ impl EvoApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1)) {
             self.help_open = !self.help_open;
         }
-        let (undo, redo, grid, play, evolve, fit, save, restart, watch) = ctx.input(|i| {
+        // **The codex (WP16).** Loaded when the page is opened rather than every frame: it is a
+        // file, and a window that re-read it at 60 Hz would be a disk read per frame to show the
+        // same journal. It belongs to the document's artifacts, which is where a run writes it.
+        if matches!(self.mode, Mode::Evolve | Mode::Replay)
+            && ctx.input(|i| i.key_pressed(egui::Key::K))
+        {
+            self.codex_open = !self.codex_open;
+            if self.codex_open {
+                self.load_codex_view();
+            }
+        }
+        let (undo, redo, grid, play, evolve, fit, save, restart, watch, think) = ctx.input(|i| {
             (
                 // Undo excludes shift so it does not also fire on ctrl+shift+Z: that chord
                 // is the standard redo, and leaving undo on it made the pair cancel out —
@@ -1112,6 +1275,7 @@ impl EvoApp {
                 i.key_pressed(egui::Key::S) && i.modifiers.command,
                 i.key_pressed(egui::Key::R),
                 i.key_pressed(egui::Key::V),
+                i.key_pressed(egui::Key::T),
             )
         });
         if undo && self.editor.undo() {
@@ -1156,9 +1320,33 @@ impl EvoApp {
                 if play || escape {
                     self.leave_play();
                 }
+                // `T` hands the level to the deliberate controller, or gives the keys
+                // back. It is a toggle rather than a one-way takeover because watching
+                // the AI and racing it are the two things this view is for.
+                if think {
+                    self.thinking = !self.thinking;
+                    if self.thinking {
+                        // A plan is a route from the spawn, so handing over mid-run
+                        // has to start the run again: block 80 of the plan is not the
+                        // block this body is on. Restarting is what makes the
+                        // takeover exact rather than approximate.
+                        if let Some(session) = &mut self.session {
+                            session.restart(&self.editor.level);
+                        }
+                        if let Some(driver) = &mut self.driver {
+                            driver.reset();
+                        }
+                        self.start_thinking();
+                    } else {
+                        self.note = Some(("the keys are yours".to_string(), 2.0));
+                    }
+                }
                 if restart {
                     if let Some(session) = &mut self.session {
                         session.restart(&self.editor.level);
+                    }
+                    if let Some(driver) = &mut self.driver {
+                        driver.reset();
                     }
                 }
                 // `grid` is the G key, which the editor claims for its grid: here it is
@@ -1220,6 +1408,7 @@ impl EvoApp {
             follow: i.key_pressed(egui::Key::F),
             ghosts: i.key_pressed(egui::Key::G),
             save: i.key_pressed(egui::Key::S) && !i.modifiers.command,
+            continue_champion: i.key_pressed(egui::Key::C) && !i.modifiers.command,
             older: i.key_pressed(egui::Key::ArrowLeft),
             newer: i.key_pressed(egui::Key::ArrowRight),
         });
@@ -1367,6 +1556,14 @@ impl EvoApp {
             .lab
             .as_ref()
             .is_some_and(|lab| !lab.trained_on(&self.editor.level));
+        // Whether *Continue champion* has a file, asked now rather than read off the generation:
+        // Save and Continue are two presses in one generation, and the second must see what the
+        // first wrote.
+        let mut summary = summary;
+        summary.champion_saved = self
+            .lab
+            .as_ref()
+            .is_some_and(|lab| lab.champion_path().is_file());
         let actions = panel::lab_panel(ui, Some(&self.atlas), &summary, &mut self.view, changed);
         self.summary = Some(summary);
         self.apply_actions(actions);
@@ -1404,6 +1601,9 @@ impl EvoApp {
         }
         if actions.save {
             self.apply(Command::Save);
+        }
+        if actions.continue_champion {
+            self.apply(Command::ContinueChampion);
         }
         if actions.resume {
             self.apply(Command::Live);
@@ -1470,6 +1670,7 @@ impl EvoApp {
                 }
             }
             Command::Save => self.save_champion(),
+            Command::ContinueChampion => self.continue_from_champion(),
             Command::Live => self.view.scrub = None,
             Command::ToggleFollow => {
                 self.view.follow = !self.view.follow;
@@ -2589,6 +2790,167 @@ impl EvoApp {
         }
     }
 
+    /// Put a find on screen and slow the animation down so it can be seen.
+    ///
+    /// The slow-motion half is the plan's "the moment": the record was made by the generation
+    /// about to animate, and a 50x pass over it is over before a person looks up. The previous
+    /// speed is restored when the card expires, unless the viewer chose another one meanwhile.
+    fn show_discovery(&mut self, found: evo::Discovery) {
+        if self.speed_before_discovery.is_none() {
+            self.speed_before_discovery = Some(self.view.speed);
+        }
+        self.view.speed = crate::lab::SPEEDS[0];
+        // The codex page is a snapshot; a new find makes it stale. Reload it at once when it is
+        // on screen, so the card and the page never disagree about what the level has produced.
+        if self.codex_open {
+            self.load_codex_view();
+        } else {
+            self.codex_view = None;
+        }
+        self.discovery = Some((found, DISCOVERY_SECONDS));
+    }
+
+    /// Read the document's codex from disk. The document's, not the run's: they share a stem
+    /// unless the level was edited after the run started, and the page is about the level on
+    /// screen. Missing or stale files are reported and shown as an empty journal rather than
+    /// taken as an error — a codex is a record, not a precondition for drawing a window.
+    fn load_codex_view(&mut self) {
+        let stem = crate::lab::artifact_stem(&self.editor.level, self.editor.path.as_deref());
+        let path = evo::Codex::path_for(&self.options.champions, &stem);
+        self.codex_view = Some(
+            evo::Codex::load(&self.editor.level, &path).unwrap_or_else(|err| {
+                eprintln!("codex: {err}");
+                evo::Codex::empty(&self.editor.level)
+            }),
+        );
+    }
+
+    /// Age the discovery card, and put the speed back when it expires.
+    ///
+    /// The speed is restored only if it is still the slow one, so a viewer who chooses a speed
+    /// during the moment keeps their choice. Split out of [`Self::evolve_step`] so the expiry —
+    /// the half a fast test cannot reach by animating — is a plain function of `dt`.
+    fn tick_discovery(&mut self, dt: f32) {
+        if let Some((_, left)) = &mut self.discovery {
+            *left -= dt;
+            if *left > 0.0 {
+                return;
+            }
+            self.discovery = None;
+            if let Some(speed) = self.speed_before_discovery.take() {
+                if self.view.speed == crate::lab::SPEEDS[0] {
+                    self.view.speed = speed;
+                }
+            }
+        }
+    }
+
+    /// The discovery card: a name, one line and the evidence, over the run, for a few seconds.
+    fn discovery_card(&mut self, ctx: &Context) {
+        let Some((found, _)) = &self.discovery else {
+            return;
+        };
+        egui::Window::new("discovery")
+            .id(egui::Id::new("discovery-card"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-18.0, -54.0])
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.5_f32, theme::GOLD_EDGE)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(320.0);
+                ui.label(
+                    egui::RichText::new("A FIND")
+                        .small()
+                        .strong()
+                        .color(theme::ACCENT_INK),
+                );
+                ui.label(
+                    egui::RichText::new(&found.name)
+                        .heading()
+                        .color(theme::RUN_INK),
+                );
+                ui.label(egui::RichText::new(&found.line).color(theme::TEXT));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "gen {} · genome {} · {} frames · K for the codex",
+                        found.generation, found.genome_id, found.frames
+                    ))
+                    .small()
+                    .color(theme::TEXT_DIM),
+                );
+            });
+    }
+
+    /// The trick codex: what this level has produced, newest last.
+    fn codex_window(&mut self, ctx: &Context) {
+        if !self.codex_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Trick codex")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                let Some(codex) = &self.codex_view else {
+                    ui.label(
+                        egui::RichText::new("no codex for this level")
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                    return;
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} — {} find{}",
+                        codex.level_name,
+                        codex.len(),
+                        if codex.len() == 1 { "" } else { "s" }
+                    ))
+                    .small()
+                    .color(theme::TEXT_DIM),
+                );
+                ui.separator();
+                if codex.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "nothing found yet — a run writes here when it moves the record \
+                             and does something this build can name",
+                        )
+                        .color(theme::TEXT_DIM),
+                    );
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for entry in codex.entries() {
+                            ui.label(
+                                egui::RichText::new(&entry.name)
+                                    .strong()
+                                    .color(theme::RUN_INK),
+                            );
+                            ui.label(egui::RichText::new(&entry.line).color(theme::TEXT));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "gen {} · genome {} · {} frames · seed {}",
+                                    entry.generation, entry.genome_id, entry.frames, entry.seed
+                                ))
+                                .small()
+                                .color(theme::TEXT_DIM),
+                            );
+                            ui.separator();
+                        }
+                    });
+            });
+        self.codex_open = open;
+    }
+
     /// The level's numbers, in a window of their own, closed until they are asked for.
     ///
     /// What stood here was a *column*: a verdict at the top and six labelled sections of readings
@@ -2660,7 +3022,11 @@ impl EvoApp {
             5.0,
             Stroke::new(1.0_f32, colour.gamma_multiply(0.6)),
         );
-        ui.colored_label(colour, self.editor.verdict());
+        let verdict = self.editor.verdict();
+        let label = ui.colored_label(colour, verdict);
+        if let Some(plan) = self.editor.plan_verdict() {
+            label.on_hover_text(format!("{}\n{}", plan.label(), plan.detail()));
+        }
     }
 
     /// What the details window holds, which depends on what the window is showing.
@@ -2761,8 +3127,8 @@ impl EvoApp {
         });
         ui.small(
             egui::RichText::new(
-                "--curriculum <PATH>, --resume <PATH> and --champions <DIR> are the command \
-                 line's: paths are set where the window is opened",
+                "--curriculum <PATH>, --resume <PATH>, --from-champion <PATH> and --champions \
+                 <DIR> are the command line's: paths are set where the window is opened",
             )
             .color(theme::TEXT_DIM),
         );
@@ -3852,22 +4218,59 @@ impl EvoApp {
             } else {
                 play::Keys::read(ctx)
             };
+            let thinking = self.thinking;
             if let Some(session) = &mut self.session {
-                session.advance(dt, keys);
+                if thinking {
+                    if let Some(driver) = &mut self.driver {
+                        // The controller decides on the session's own tick grid, so the
+                        // episode on screen is the one it reasoned about — not a replay
+                        // against the frame rate.
+                        session.advance_actions(dt, |sim| driver.next(sim));
+                    } else {
+                        session.advance(dt, keys);
+                    }
+                } else {
+                    session.advance(dt, keys);
+                }
                 // A death restarts itself after a beat ([`play::AUTO_RESTART_DELAY`]):
                 // the window does for the player what the session's signal asks for, and
                 // `R` still restarts at once — this is the pause doing it instead.
                 if session.restart_due() {
                     session.restart(&self.editor.level);
+                    if let Some(driver) = &mut self.driver {
+                        driver.reset();
+                    }
                 }
             }
             ctx.request_repaint();
         }
         if self.mode == Mode::Evolve {
             self.evolve_step(dt);
-            // A run is always moving, so the window redraws whether or not egui thinks
-            // anything changed.
-            ctx.request_repaint();
+            // A **paused** run is not moving, so it should not cost a frame sixty times a
+            // second. Redraw while the run is live, while the first generation is still being
+            // scored, and while something is counting down (a note, the genius splash, a
+            // discovery card); input repaints the window by itself, so the controls still
+            // respond while it sits still.
+            //
+            // This is the second half of the long-run lag: the fitness chart used to redraw
+            // every generation's points on every one of those frames. The chart is bounded
+            // now (see `panel::chart_geometry`), but a paused run has no reason to ask for
+            // the frame at all.
+            let live = self.lab.is_some()
+                && !self.view.paused
+                && !self.packet.as_ref().is_some_and(|packet| packet.finished);
+            let animating = !self.view.paused
+                && self
+                    .lanes
+                    .as_ref()
+                    .is_some_and(|lanes| !lanes.is_finished());
+            let loading = self.lab.is_some() && self.packet.is_none();
+            let counting = self.note.as_ref().is_some_and(|(_, left)| *left > 0.0)
+                || self.genius_left > 0.0
+                || self.discovery.is_some();
+            if live || animating || loading || counting {
+                ctx.request_repaint();
+            }
         }
         if self.mode == Mode::Replay {
             self.replay_step(dt);
@@ -3959,6 +4362,10 @@ impl EvoApp {
         // The level's numbers float over the canvas rather than holding a column of their own, so
         // they are drawn after it and end up in front of it — which is where a window belongs.
         self.details_window(ctx);
+        // A find is a moment, not a reading: the card is drawn over everything and fades on its
+        // own timer, and the codex is the page it is recorded on.
+        self.discovery_card(ctx);
+        self.codex_window(ctx);
         // ...and so does the one question the window asks about the document itself.
         self.discard_notice(ctx);
 
@@ -4068,6 +4475,54 @@ mod tests {
             Some(false),
         )
         .expect("the window builds")
+    }
+
+    #[test]
+    fn think_mode_puts_the_deliberate_controller_at_the_keys() {
+        let ctx = Context::default();
+        let root = scratch("think");
+        let mut app = app_on(&ctx, &root.join("levels/l2-first-gap.json"));
+        app.options.think = true;
+        app.enter_play();
+        assert!(app.thinking, "--think opens with the AI at the keys");
+        let mut driver = app.driver.take().expect("a driver was built");
+        let mut session = app.session.take().expect("a playtest session");
+        for _ in 0..1200 {
+            if session.sim().outcome().is_finished() {
+                break;
+            }
+            session.advance_actions(1.0 / 60.0, |sim| driver.next(sim));
+        }
+        assert_eq!(
+            session.sim().outcome(),
+            sim::Outcome::Won,
+            "the deliberate controller reached the gap level's flag"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "plans the whole l11 route; run with --ignored for the headline check"]
+    fn think_mode_solves_the_elements() {
+        let ctx = Context::default();
+        let level = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../levels/l11-the-elements.json");
+        let mut app = app_on(&ctx, &level);
+        app.options.think = true;
+        app.enter_play();
+        let mut driver = app.driver.take().expect("a deliberate driver");
+        let mut session = app.session.take().expect("a playtest session");
+        for _ in 0..2000 {
+            if session.sim().outcome().is_finished() {
+                break;
+            }
+            session.advance_actions(1.0 / 60.0, |sim| driver.next(sim));
+        }
+        assert_eq!(
+            session.sim().outcome(),
+            sim::Outcome::Won,
+            "the deliberate controller reached l11's flag"
+        );
     }
 
     /// Run one real frame of the window, with `events` delivered to it.
@@ -4364,6 +4819,131 @@ mod tests {
         // And a document that was saved (so no longer dirty) is never guarded, whatever was armed
         // before it: the guard cannot outlive the work it was protecting.
         assert_eq!(discard_guard(false, Some(8), 8), (false, None));
+    }
+
+    fn a_find_named(name: &str) -> evo::Discovery {
+        evo::Discovery {
+            name: name.to_string(),
+            line: "a line about the find".to_string(),
+            kind: evo::DiscoveryKind::Technique,
+            signature: format!("technique:{name}"),
+            level_name: "L1-flat-run".to_string(),
+            level_hash: "test".to_string(),
+            generation: 3,
+            genome_id: 7,
+            frames: 200,
+            seed: 1,
+            skip_percent: None,
+            replay: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_find_puts_a_card_up_slows_the_run_and_gives_the_speed_back() {
+        let ctx = egui::Context::default();
+        let root = scratch("discovery-card");
+        let mut app = app_on(&ctx, &root.join("levels/l1-flat-run.json"));
+        app.view.speed = 16;
+        app.show_discovery(a_find_named("Corpse Bridge"));
+        assert_eq!(
+            app.discovery.as_ref().map(|(d, _)| d.name.as_str()),
+            Some("Corpse Bridge")
+        );
+        assert_eq!(
+            app.view.speed,
+            crate::lab::SPEEDS[0],
+            "the moment is slow motion"
+        );
+        // Drawing the card is part of a real frame, so this is also the check that it does not
+        // borrow or panic on the way to the screen.
+        frame(&ctx, &mut app, Vec::new());
+        app.tick_discovery(DISCOVERY_SECONDS + 0.1);
+        assert!(app.discovery.is_none(), "the card expires on its own");
+        assert_eq!(app.view.speed, 16, "and the previous speed comes back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Continue from a saved champion, through the window's own key.**
+    ///
+    /// The gap this closes: a saved champion outlived the process, but only the terminal could
+    /// read it back into a population, so restarting the game meant restarting the search from
+    /// nothing. This writes a champion for the level, opens the window on it, presses `C`, and
+    /// checks the run that comes back is seeded from the file — the origin line, the seed, and
+    /// the path the panel offers are its visible facts.
+    #[test]
+    fn c_continues_the_run_from_the_champion_saved_for_the_level() {
+        let ctx = Context::default();
+        let root = scratch("continue-champion");
+        let mut app = app_on(&ctx, &root.join("levels/l1-flat-run.json"));
+        app.options.pop_size = 8;
+
+        // A champion for this level, written the way `train-cli train` writes one.
+        let level = app.editor.level.clone();
+        let genome = evo::Genome::zeros(12_345, evo::default_shape());
+        let config = GaConfig {
+            pop_size: 8,
+            ..GaConfig::default()
+        };
+        let result = evo::run_episode(&level, &genome, &config.eval_config(), 7);
+        let champion = evo::ChampionFile::new(&genome, &result, &level, 4, &config);
+        let path = app.options.champions.join("l1-flat-run.json");
+        champion.save(&path).expect("the champion writes");
+
+        app.enter_evolve();
+        assert!(app.lab.is_some(), "the evolution view starts a run");
+        assert!(
+            app.lab.as_ref().unwrap().champion_path().is_file(),
+            "the panel offers the champion this level saved"
+        );
+
+        let key = egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame(&ctx, &mut app, vec![key]);
+
+        let lab = app.lab.as_ref().expect("the run is still there");
+        let origin = lab
+            .origin()
+            .expect("the continued run says where it started");
+        assert!(origin.contains("seeded from gen 4"), "{origin}");
+        assert!(origin.contains("id 12345"), "{origin}");
+        let note = app.note.as_ref().expect("the status bar says it too");
+        assert!(note.0.contains("seeded from"), "{}", note.0);
+        assert!(note.0.contains("(seed "), "{}", note.0);
+        assert_eq!(lab.stem(), "l1-flat-run");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_codex_page_reads_the_documents_journal() {
+        let ctx = egui::Context::default();
+        let root = scratch("codex-page");
+        let mut app = app_on(&ctx, &root.join("levels/l1-flat-run.json"));
+        let mut journal = evo::Codex::empty(&app.editor.level);
+        journal.record(a_find_named("Corpse Bridge"));
+        let path = evo::Codex::path_for(&app.options.champions, "l1-flat-run");
+        journal.save(&path).expect("the codex writes");
+        app.mode = Mode::Evolve;
+        let key = egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame(&ctx, &mut app, vec![key]);
+        assert!(app.codex_open, "K opens the page");
+        assert_eq!(
+            app.codex_view.as_ref().map(|codex| codex.len()),
+            Some(1),
+            "the journal on disk is what the page shows"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The title bar names the document first, then the mode, then the game.

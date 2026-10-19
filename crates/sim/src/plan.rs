@@ -111,7 +111,144 @@ pub struct TimedRoute {
     pub note: String,
 }
 
+/// **What a trick hunt is looking for (WP14).**
+///
+/// The planner's objective is the flag; these are the objectives that live *outside* the route
+/// oracle's envelope. A discovery is a trajectory that does more of one of them than the intended
+/// route does — a higher stand, a longer flight, a faster body, more distance covered without
+/// touching ground. The hunt returns the best trajectory it found and never claims the level was
+/// solved: a trick artifact is a route fragment, not a champion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HuntObjective {
+    /// Highest point reached (smaller world `y` is higher).
+    Height,
+    /// Longest airborne run, in ticks.
+    Airtime,
+    /// Fastest body speed, tiles/tick.
+    Speed,
+    /// Furthest horizontal distance covered while never grounded.
+    GroundFreeDistance,
+}
+
+impl HuntObjective {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HuntObjective::Height => "height",
+            HuntObjective::Airtime => "airtime",
+            HuntObjective::Speed => "speed",
+            HuntObjective::GroundFreeDistance => "ground-free-distance",
+        }
+    }
+
+    fn value(self, sim: &Sim) -> f32 {
+        match self {
+            HuntObjective::Height => -sim.player().y,
+            HuntObjective::Airtime => sim.stats().max_air_ticks as f32,
+            HuntObjective::Speed => sim.stats().peak_speed,
+            HuntObjective::GroundFreeDistance => sim.stats().max_air_distance,
+        }
+    }
+}
+
+/// What a hunt found, and the trajectory that proves it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HuntOutcome {
+    pub objective: HuntObjective,
+    /// The best reading of the objective, in the objective's own units.
+    pub best: f32,
+    /// The trajectory that set it: block actions from the hunt's start state.
+    pub route: Option<TimedRoute>,
+    pub best_x: f32,
+    pub best_y: f32,
+    pub frames: u32,
+    pub expanded: u32,
+    /// One line in the hunt's voice, for a terminal or an artifact.
+    pub note: String,
+}
+
+/// Search for a trajectory that maximises `objective` instead of reaching the flag.
+///
+/// The beam is the planner's own (`macros_for`/`apply`/snapshot clones), which is deliberate: a
+/// discovery is only interesting if the same physics the ordinary planner uses can produce it, and
+/// reusing the expansion is what keeps the two searches from disagreeing about what a move is. A
+/// node that wins is kept as the best reading and the search continues from its siblings rather
+/// than stopping, because a win is not what was asked for.
+pub fn hunt(level: &Level, seed: u64, cfg: PlanConfig, objective: HuntObjective) -> HuntOutcome {
+    let cfg = cfg.sanitized();
+    let mut frontier = vec![Node {
+        sim: Sim::new(level, seed),
+        actions: Vec::new(),
+        won: false,
+    }];
+    let mut best: Option<Node> = None;
+    let mut best_value = f32::NEG_INFINITY;
+    let mut expanded = 0u32;
+    while expanded < cfg.depth && !frontier.is_empty() {
+        expanded += 1;
+        let children = expand(&frontier, cfg.max_flight_blocks);
+        if children.is_empty() {
+            break;
+        }
+        let mut kept: Vec<Node> = Vec::with_capacity(cfg.beam.min(children.len()));
+        for child in children {
+            let value = objective.value(&child.sim);
+            // Ties are settled by the earlier frame count, so a shorter trajectory that reaches
+            // the same height is the one recorded.
+            let better = best.as_ref().is_none_or(|held| {
+                value > best_value
+                    || (value == best_value && child.sim.stats().frames < held.sim.stats().frames)
+            });
+            if better {
+                best_value = value;
+                best = Some(child.clone());
+            }
+            kept.push(child);
+        }
+        kept.sort_by(|a, b| {
+            objective
+                .value(&b.sim)
+                .total_cmp(&objective.value(&a.sim))
+                .then(b.sim.stats().frames.cmp(&a.sim.stats().frames))
+        });
+        kept.truncate(cfg.beam);
+        frontier = kept;
+    }
+    let route = best.as_ref().map(|node| TimedRoute {
+        actions: node.actions.clone(),
+        frames: node.sim.stats().frames,
+        hops: stand_hops(&node.sim).unwrap_or(0),
+        seed,
+        note: format!(
+            "hunted {} for {} expansions; best {:.3} at x {:.2}, y {:.2}, {} frames",
+            objective.as_str(),
+            expanded,
+            best_value,
+            node.sim.player().x,
+            node.sim.player().y,
+            node.sim.stats().frames
+        ),
+    });
+    let note = match &route {
+        Some(route) => route.note.clone(),
+        None => format!(
+            "hunted {} for {expanded} expansions; no trajectory survived the first move",
+            objective.as_str()
+        ),
+    };
+    HuntOutcome {
+        objective,
+        best: if best_value.is_finite() { best_value } else { 0.0 },
+        route,
+        best_x: best.as_ref().map(|n| n.sim.player().x).unwrap_or(0.0),
+        best_y: best.as_ref().map(|n| n.sim.player().y).unwrap_or(0.0),
+        frames: best.as_ref().map(|n| n.sim.stats().frames).unwrap_or(0),
+        expanded,
+        note,
+    }
+}
+
 /// One node of the search: a whole sim, and the block actions that produced it.
+#[derive(Clone)]
 struct Node {
     sim: Sim,
     actions: Vec<AgentAction>,
@@ -133,6 +270,142 @@ pub struct PlanOutcome {
 /// Solve `level` from the episode's spawn, against `seed`.
 pub fn solve(level: &Level, seed: u64, cfg: PlanConfig) -> Option<TimedRoute> {
     plan_level(level, seed, cfg).route
+}
+
+/// **Anytime planning:** deepen the same search until a route appears or the cap is reached.
+///
+/// The planner's cost is a beam and a depth, and a level that needs one long crossing can be
+/// solved at depth 64 after depth 32 has run out of frontier. Restarting with a larger depth is
+/// deliberate rather than wasteful: the frontier at depth 32 is already the best 32 blocks the
+/// beam kept, and the deterministic tie-breaks make a second pass extend that answer rather than
+/// search a different one. Each pass is a complete `plan_from`, so every returned route is a
+/// route a single fixed configuration would have returned at that depth — the "anytime" part is
+/// the budget, not the semantics.
+///
+/// `step` is the depth increment and `max_depth` the cap; both are clamped to the planner's own
+/// limits. The loop is deterministic for a given `(level, seed, cfg, step, max_depth)`, which is
+/// what makes an artifact built by it replayable.
+pub fn solve_anytime(
+    level: &Level,
+    seed: u64,
+    cfg: PlanConfig,
+    step: u32,
+    max_depth: u32,
+) -> PlanOutcome {
+    let cfg = cfg.sanitized();
+    let step = step.max(1);
+    let max_depth = max_depth.clamp(step, 512);
+    let mut deepest = PlanOutcome {
+        route: None,
+        note: "the planner ran no expansion".into(),
+        best_x: 0.0,
+        best_y: 0.0,
+        frames: 0,
+        expanded: 0,
+    };
+    let mut depth = step.min(max_depth);
+    loop {
+        let outcome = plan_level(
+            level,
+            seed,
+            PlanConfig {
+                depth,
+                ..cfg
+            },
+        );
+        if outcome.route.is_some() {
+            return outcome;
+        }
+        if outcome.expanded > deepest.expanded
+            || (outcome.expanded == deepest.expanded && outcome.best_x > deepest.best_x)
+        {
+            deepest = outcome;
+        }
+        if depth >= max_depth {
+            let mut note = deepest.note.clone();
+            note.push_str(&format!(
+                " (anytime search stopped at depth {max_depth}; raise --plan-max-depth to widen it)"
+            ));
+            deepest.note = note;
+            return deepest;
+        }
+        depth = (depth + step).min(max_depth);
+    }
+}
+
+/// **The editor's verdict (WP6).** Three answers, in the order a designer needs them:
+///
+/// 1. [`PlanVerdict::Planned`] — the timed planner found a route, with its length and the number
+///    of route rungs it closed. This is the only answer that may be shown as "solvable";
+/// 2. [`PlanVerdict::RoutedOnly`] — the reachability oracle can get there but the timed planner
+///    ran out of budget. Honest and useful: the level is beatable in principle, this search just
+///    did not find the line;
+/// 3. [`PlanVerdict::Unbeatable`] — the oracle itself says no, with its diagnosis.
+///
+/// The dangerous direction is calling a level solvable when it is not, so `Planned` is only ever
+/// returned for a route that actually won a replayed search.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanVerdict {
+    Planned {
+        frames: u32,
+        blocks: usize,
+        hops: u32,
+    },
+    RoutedOnly {
+        note: String,
+    },
+    Unbeatable {
+        why: String,
+    },
+}
+
+impl PlanVerdict {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PlanVerdict::Planned { .. } => "solvable by timed plan",
+            PlanVerdict::RoutedOnly { .. } => "solvable by route; timed plan ran out of budget",
+            PlanVerdict::Unbeatable { .. } => "not beatable",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            PlanVerdict::Planned {
+                frames,
+                blocks,
+                hops,
+            } => format!("{blocks} blocks, {frames} frames, {hops} route rungs"),
+            PlanVerdict::RoutedOnly { note } => note.clone(),
+            PlanVerdict::Unbeatable { why } => why.clone(),
+        }
+    }
+}
+
+/// Answer the editor's question: can this level be beaten, and by what kind of search?
+///
+/// The reachability oracle runs first because it is cheap and it is the authority on
+/// *impossibility*; the timed planner then answers the stronger question a designer actually asks
+/// (a line the AI can run), and a budget miss is reported as such rather than downgraded to
+/// "unbeatable". Deterministic for a given `(level, seed, cfg)`.
+pub fn verdict(level: &Level, seed: u64, cfg: PlanConfig) -> PlanVerdict {
+    let report = crate::reach::report(level);
+    if !report.goal_reached {
+        return PlanVerdict::Unbeatable {
+            why: report
+                .diagnosis
+                .unwrap_or_else(|| "the flag cannot be reached".into()),
+        };
+    }
+    match plan_level(level, seed, cfg.sanitized()) {
+        PlanOutcome {
+            route: Some(route), ..
+        } => PlanVerdict::Planned {
+            frames: route.frames,
+            blocks: route.actions.len(),
+            hops: route.hops,
+        },
+        outcome => PlanVerdict::RoutedOnly { note: outcome.note },
+    }
 }
 
 /// The full planning result: the route when there is one, the frontier when there is not.
@@ -208,41 +481,26 @@ pub fn plan_from(level: &Level, mut start: Sim, seed: u64, cfg: PlanConfig) -> P
 
     while expanded < cfg.depth && !frontier.is_empty() {
         expanded += 1;
-        let mut children: Vec<Node> = Vec::new();
-        for node in frontier.drain(..) {
-            if node.won {
+        let children = expand(&frontier, cfg.max_flight_blocks);
+        let mut kept: Vec<Node> = Vec::with_capacity(children.len());
+        for child in children {
+            if child.won {
                 return PlanOutcome {
-                    route: Some(route_of(&node, start_hops, seed, expanded)),
-                    note: node_note(&node, start_hops, expanded),
-                    best_x: node.sim.player().x,
-                    best_y: node.sim.player().y,
-                    frames: node.sim.stats().frames,
+                    route: Some(route_of(&child, start_hops, seed, expanded)),
+                    note: node_note(&child, start_hops, expanded),
+                    best_x: child.sim.player().x,
+                    best_y: child.sim.player().y,
+                    frames: child.sim.stats().frames,
                     expanded,
                 };
             }
-            let macros = macros_for(&node.sim);
-            for m in macros {
-                if let Some(mut child) = apply(node.sim.clone(), m, cfg.max_flight_blocks) {
-                    child.actions.splice(0..0, node.actions.iter().copied());
-                    if child.won {
-                        return PlanOutcome {
-                            route: Some(route_of(&child, start_hops, seed, expanded)),
-                            note: node_note(&child, start_hops, expanded),
-                            best_x: child.sim.player().x,
-                            best_y: child.sim.player().y,
-                            frames: child.sim.stats().frames,
-                            expanded,
-                        };
-                    }
-                    if score(&child) < score_node(&best_sim, &best_actions) {
-                        best_sim = child.sim.clone();
-                        best_actions = Some(child.actions.clone());
-                    }
-                    children.push(child);
-                }
+            if score(&child) < score_node(&best_sim, &best_actions) {
+                best_sim = child.sim.clone();
+                best_actions = Some(child.actions.clone());
             }
+            kept.push(child);
         }
-        frontier = select(children, cfg);
+        frontier = select(kept, cfg);
     }
 
     let note = if best_actions.is_some() {
@@ -329,6 +587,26 @@ fn score(node: &Node) -> (u32, i64, u32) {
     let hops = stand_hops(&node.sim).unwrap_or(u32::MAX);
     let progress = -node.sim.stats().progress_pixels as i64;
     (hops, progress, node.sim.stats().frames)
+}
+
+/// Expand every frontier node into its children, in frontier order.
+///
+/// The order is the determinism contract: a node's children are contiguous and in the same order
+/// `macros_for` produced them, so `select`'s stable sort sees the same input every run. Expansion
+/// is deliberately single-threaded here — the `sim` crate's boundary rule keeps threads out of the
+/// world model; a caller that wants parallel planning runs independent plans in parallel and folds
+/// their deterministic results (see `train-cli plan --parallel`).
+fn expand(frontier: &[Node], max_flight_blocks: u32) -> Vec<Node> {
+    let mut out = Vec::new();
+    for node in frontier {
+        for m in macros_for(&node.sim) {
+            if let Some(mut child) = apply(node.sim.clone(), m, max_flight_blocks) {
+                child.actions.splice(0..0, node.actions.iter().copied());
+                out.push(child);
+            }
+        }
+    }
+    out
 }
 
 /// Keep the best few per `(rung, phase)` bucket, then the best `beam` overall.
@@ -563,5 +841,70 @@ mod tests {
         ]);
         let route = solve(&l, 7, PlanConfig::default()).expect("the gap is jumpable");
         assert!(route.actions.iter().any(|a| a.wants_jump()));
+    }
+
+    #[test]
+    fn a_verdict_names_the_kind_of_answer_the_editor_gets() {
+        let planned = level(&[
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "####################",
+        ]);
+        assert!(matches!(
+            verdict(&planned, 7, PlanConfig::default()),
+            PlanVerdict::Planned { .. }
+        ));
+
+        // No floor at all: the reach oracle is the authority on impossibility, and the verdict
+        // must repeat its answer rather than spend a planner budget pretending to search.
+        let nowhere = level(&[
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+        ]);
+        assert!(matches!(
+            verdict(&nowhere, 7, PlanConfig::default()),
+            PlanVerdict::Unbeatable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_hunt_is_deterministic_and_its_best_trajectory_replays() {
+        let l = level(&[
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "#####....###########",
+        ]);
+        let cfg = PlanConfig {
+            depth: 3,
+            beam: 6,
+            ..PlanConfig::default()
+        };
+        let a = hunt(&l, 7, cfg, HuntObjective::Airtime);
+        let b = hunt(&l, 7, cfg, HuntObjective::Airtime);
+        assert_eq!(a, b, "the hunt is a pure function of its inputs");
+        let route = a.route.expect("some trajectory survived");
+        let mut sim = Sim::new(&l, route.seed);
+        for action in &route.actions {
+            for _ in 0..DECISION_TICKS {
+                if sim.outcome().is_finished() {
+                    break;
+                }
+                sim.step(*action);
+            }
+        }
+        assert_eq!(sim.stats().frames, route.frames);
     }
 }

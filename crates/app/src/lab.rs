@@ -170,6 +170,17 @@ pub struct RunPlan {
     /// terminal's `--resume` does. The checkpoint's generation and genome ids continue,
     /// because the ids are part of every episode seed.
     pub resume: Option<PathBuf>,
+    /// Seed a **new** population from one saved champion, as the terminal's
+    /// `--from-champion` does: the champion in slot 0 and a shell of reheated copies of it
+    /// behind, starting at generation 0 with its recorded episode standing as the run's
+    /// record.
+    ///
+    /// The alternative to [`RunPlan::resume`], not a second step after it: a checkpoint is
+    /// a population and this is one genome, and a run that was stopped without a checkpoint
+    /// leaves only the champion. The level hash is deliberately not checked — the interesting
+    /// seed is exactly a champion from a level that has changed since — and the run says
+    /// which level it came from instead ([`ChampionFile::level_note`]).
+    pub seed_from_champion: Option<PathBuf>,
     /// The easier level to fall back to when the run stalls, and for how long.
     pub curriculum: Option<Curriculum>,
     /// Warm a **fresh** population from the level's own route: walk it with the reachability
@@ -401,6 +412,14 @@ pub struct Packet {
     pub curriculum: Option<String>,
     /// The run reached its cap and the worker has stopped.
     pub finished: bool,
+    /// **A find this generation produced (WP16).** Present only when the record moved *and*
+    /// detection named something the level's codex had not held before: a rediscovery is not
+    /// news, and a generation that did not move the record cannot have found anything new.
+    /// The window shows the newest one and the panel prints the line.
+    pub discovery: Option<evo::Discovery>,
+    /// How many finds the level's codex holds after this generation, so the panel can say
+    /// "2 of 7" without reading a file per frame.
+    pub codex_len: usize,
 }
 
 /// A generation being animated: the packet, and one live episode per lane.
@@ -636,6 +655,15 @@ pub struct Generator {
     deaths: Vec<(f32, f32, u32)>,
     best_k: usize,
     random_k: usize,
+    /// The level's trick codex (WP16). A missing file is an empty codex; a file that belongs to
+    /// another level is reported and set aside, because a stale journal must not stop a run.
+    codex: evo::Codex,
+    /// Where that codex is written. Resolved when the run starts, and again on a restart, so a
+    /// run moved onto another level cannot append to the previous level's journal.
+    codex_path: PathBuf,
+    /// The `(generation, genome)` detection last ran on. A record is detected once rather than
+    /// every generation, because finding its shortcut re-runs the episode.
+    last_record: Option<(u32, u32)>,
 }
 
 /// One practice detour, running on a thread of its own.
@@ -667,6 +695,55 @@ struct DetourDone {
     note: String,
 }
 
+/// A saved champion, loaded and validated as a **starting point** rather than as a claim
+/// about the level.
+///
+/// Loaded on the window's thread before anything is dropped, so a file this build cannot
+/// train on is a message in the status bar instead of a restart that silently became a fresh
+/// population. The origin sentence travels with it: the worker cannot invent the "trained on
+/// <other level>" note, and the window shows it once.
+#[derive(Clone, Debug)]
+pub struct ChampionSeed {
+    genome: Genome,
+    episode_seed: u64,
+    origin: String,
+}
+
+/// Load `path` as a champion to seed a run on `level`.
+///
+/// [`ChampionFile::load_seed`] is the trainable half of the loader — format, versions,
+/// sensors, activations and gene counts are all still refusals, the level hash alone is not.
+/// That is the point: a champion saved before the level was edited is exactly the thing a
+/// designer wants to continue from.
+pub fn champion_seed(path: &Path, level: &Level) -> Result<ChampionSeed, String> {
+    let champion = ChampionFile::load_seed(path)?;
+    let genome = champion.to_genome()?;
+    let origin = match champion.level_note(level) {
+        Some(note) => format!("seeded from {}; {note}", champion.summary()),
+        None => format!("seeded from {}", champion.summary()),
+    };
+    Ok(ChampionSeed {
+        genome,
+        episode_seed: champion.metadata.episode_seed,
+        origin,
+    })
+}
+
+/// Turn one loaded champion into the population a run starts from.
+///
+/// The champion file's own episode seed is replayed rather than a new one invented, so the
+/// record this run starts with is the episode the file claims — which is what lets a seeded
+/// run keep its winner and arm the mastery league from generation 0.
+fn train_from_champion(
+    cfg: &GaConfig,
+    level: &Level,
+    seed: &ChampionSeed,
+) -> Result<Trainer, String> {
+    let mut trainer = Trainer::from_champion(cfg.clone(), seed.genome.clone())?;
+    trainer.seed_record(level, seed.genome.clone(), seed.episode_seed)?;
+    Ok(trainer)
+}
+
 impl Generator {
     /// A fresh population, or — when the plan names a checkpoint — the population that
     /// checkpoint holds.
@@ -687,9 +764,11 @@ impl Generator {
         stem: impl Into<String>,
     ) -> Result<Generator, String> {
         let mut cfg = cfg.sanitized(None);
-        if cfg.trials <= 1 && !level.walkers.is_empty() {
-            cfg.trials = 3;
+        let recommended = evo::GaConfig::recommended_trials_for(&level);
+        if cfg.trials <= 1 && recommended > 1 {
+            cfg.trials = recommended;
         }
+        let stem = stem.into();
         let (trainer, origin) = match plan.resume.as_deref() {
             Some(path) => {
                 let checkpoint = PopulationFile::load(path)?;
@@ -697,26 +776,61 @@ impl Generator {
                 if let Some(note) = checkpoint.level_note(&level) {
                     origin.push_str(&format!("; {note}"));
                 }
-                let trainer =
+                let mut trainer =
                     Trainer::resume(cfg.clone(), checkpoint.to_genomes()?, checkpoint.generation)?;
+                // The cohort may not contain the genome that solved the level; the checkpoint's
+                // record is what turns a resumed stall back into a run that can breed its winner.
+                // Older checkpoints predate the field, and the likely survivor is the champion
+                // beside the level: seed from that rather than resume a solved run with no winner.
+                let record = match checkpoint.best_genome()? {
+                    Some(record) => Some(record),
+                    None => ChampionFile::load_for_level(
+                        out_dir.join(format!("{stem}.json")),
+                        &level,
+                    )
+                    .ok()
+                    .and_then(|champion| champion.to_genome().ok()),
+                };
+                if let Some(record) = record {
+                    trainer.seed_record_from_checkpoint(&level, record)?;
+                }
                 (trainer, Some(origin))
             }
-            // A fresh run warms itself from the level's own route when it has one. See
-            // [`warm_seed_from_route`] and [`RunPlan::warm_from_route`].
-            None => match plan
-                .warm_from_route
-                .then(|| warm_seed_from_route(&level, &cfg))
-                .flatten()
-            {
-                Some((pop, note)) => (Trainer::resume(cfg.clone(), pop, 0)?, Some(note)),
-                None => (Trainer::new(cfg.clone()), None),
+            // A champion is the other artifact a run leaves behind. It is one genome rather
+            // than a cohort, so [`Trainer::from_champion`] reheats a population around it —
+            // and the window resolves the file before the first generation, not on this
+            // thread, so a bad file is a startup message.
+            None => match plan.seed_from_champion.as_deref() {
+                Some(path) => {
+                    let seed = champion_seed(path, &level)?;
+                    let trainer = train_from_champion(&cfg, &level, &seed)?;
+                    (trainer, Some(seed.origin))
+                }
+                // A fresh run warms itself from the level's own route when it has one. See
+                // [`warm_seed_from_route`] and [`RunPlan::warm_from_route`].
+                None => match plan
+                    .warm_from_route
+                    .then(|| warm_seed_from_route(&level, &cfg))
+                    .flatten()
+                {
+                    Some((pop, note)) => (Trainer::resume(cfg.clone(), pop, 0)?, Some(note)),
+                    None => (Trainer::new(cfg.clone()), None),
+                },
             },
+        };
+        let codex_path = evo::Codex::path_for(&out_dir, &stem);
+        let codex = match evo::Codex::load(&level, &codex_path) {
+            Ok(codex) => codex,
+            Err(err) => {
+                eprintln!("codex: {err}; starting a fresh one");
+                evo::Codex::empty(&level)
+            }
         };
         Ok(Generator {
             eval: cfg.eval_config(),
             trainer,
             level,
-            stem: stem.into(),
+            stem,
             cfg,
             plan,
             out_dir,
@@ -729,6 +843,9 @@ impl Generator {
             deaths: Vec::new(),
             best_k,
             random_k,
+            codex,
+            codex_path,
+            last_record: None,
         })
     }
 
@@ -753,6 +870,12 @@ impl Generator {
         &self.level
     }
 
+    /// The run's best-ever record, for the tests that check where a population started.
+    #[cfg(test)]
+    pub fn best(&self) -> Option<&BestEver> {
+        self.trainer.best_ever()
+    }
+
     /// Is a practice detour running on its own thread right now?
     #[cfg(test)]
     pub fn detour_in_flight(&self) -> bool {
@@ -762,7 +885,11 @@ impl Generator {
     /// Start over — on the same level after an edit, or on a different one entirely —
     /// with a fresh population, a fresh chart and an empty record.
     ///
-    /// Everything the run accumulated is dropped on purpose: the chart is a claim about
+    /// "Fresh" is either random (with the level's route as a warm start) or, when the viewer
+    /// asked to continue a saved champion, a reheated shell around that genome — which is
+    /// still a new run, whose record is the champion's own recorded episode.
+    ///
+    /// Everything else the run accumulated is dropped on purpose: the chart is a claim about
     /// *this* population on *this* level, and continuing it across a level change would
     /// draw a cliff that no agent ever experienced.
     pub fn start_over(
@@ -771,6 +898,7 @@ impl Generator {
         seed: u64,
         mutation_rate: f32,
         stem: impl Into<String>,
+        champion: Option<ChampionSeed>,
     ) {
         self.stem = stem.into();
         let mut cfg = self.cfg.clone();
@@ -781,26 +909,39 @@ impl Generator {
         // memoryless shape of the run it replaced. The scan only raises memory and never clears an
         // operator's choice, so this is safe to re-run on the same level.
         let _ = evo::apply_auto_shape(&mut cfg, std::slice::from_ref(&level), false, false);
-        cfg.trials = if level.walkers.is_empty() { 1 } else { 3 };
+        cfg.trials = evo::GaConfig::recommended_trials_for(&level);
         self.eval = cfg.eval_config();
         // A restart is a fresh population on the level as it stands *now*, which is exactly the
         // case the route warm start is for: the edit may have moved the flag, the pit or the whole
         // level, and a walk of the current one is the best thing a new population can be handed.
-        self.trainer = match self
-            .plan
-            .warm_from_route
-            .then(|| warm_seed_from_route(&level, &cfg))
-            .flatten()
-        {
-            Some((pop, note)) => {
-                self.origin = Some(note);
-                Trainer::resume(cfg.clone(), pop, 0).unwrap_or_else(|_| Trainer::new(cfg.clone()))
-            }
-            None => {
-                self.origin = None;
-                Trainer::new(cfg.clone())
-            }
+        // A champion is the third answer and the more specific one: when the viewer asked to
+        // continue one, its reheated shell *is* the fresh population and the route walk would be
+        // a second, weaker idea layered on top.
+        let (trainer, origin) = match champion {
+            Some(champion) => match train_from_champion(&cfg, &level, &champion) {
+                Ok(trainer) => (trainer, Some(champion.origin)),
+                Err(err) => (
+                    Trainer::new(cfg.clone()),
+                    Some(format!(
+                        "could not seed from the champion ({err}); a fresh population"
+                    )),
+                ),
+            },
+            None => match self
+                .plan
+                .warm_from_route
+                .then(|| warm_seed_from_route(&level, &cfg))
+                .flatten()
+            {
+                Some((pop, note)) => (
+                    Trainer::resume(cfg.clone(), pop, 0)
+                        .unwrap_or_else(|_| Trainer::new(cfg.clone())),
+                    Some(note),
+                ),
+                None => (Trainer::new(cfg.clone()), None),
+            },
         };
+        self.trainer = trainer;
         self.cfg = cfg;
         self.traces = TraceLog::new();
         self.history.clear();
@@ -811,8 +952,23 @@ impl Generator {
         // level stays, because it is a setting of the run rather than of its population,
         // and a run restarted onto a hard level still wants somewhere to step back to.
         self.plan.resume = None;
-        self.origin = None;
+        // A champion is a way *into* a run, not a setting of it: once the population exists,
+        // Restart's own meaning — a fresh population — takes over again.
+        self.plan.seed_from_champion = None;
         self.curriculum = None;
+        self.origin = origin;
+        // The codex follows the *level*, not the population: a restart keeps what the level has
+        // already produced (it is a journal of the geometry), and a restart onto another level
+        // opens that level's own journal instead of appending to the old one.
+        self.codex_path = evo::Codex::path_for(&self.out_dir, &self.stem);
+        self.codex = match evo::Codex::load(&self.level, &self.codex_path) {
+            Ok(codex) => codex,
+            Err(err) => {
+                eprintln!("codex: {err}; starting a fresh one");
+                evo::Codex::empty(&self.level)
+            }
+        };
+        self.last_record = None;
         // A detour belongs to the run that was stuck, not to the fresh population. It is
         // detached rather than waited for on purpose: a restart that blocked a second and a
         // half on a thread nobody will read would be the freeze this thread exists to remove.
@@ -995,6 +1151,59 @@ impl Generator {
             eprintln!("lab showcase {:?}", t.elapsed());
         }
 
+        // **Discovery detection (WP16).** A record that moved is asked what it found, once:
+        // finding its shortcut re-runs the episode, and a generation that did not move the record
+        // cannot have found anything the previous one did not have. A new find is written to the
+        // codex here, on the worker, so a watched run never waits on the journal.
+        let record = self
+            .trainer
+            .best_ever()
+            .map(|best| (best.generation, best.genome.id));
+        let mut discovery = None;
+        if record != self.last_record {
+            self.last_record = record;
+            if let Some(best) = self.trainer.best_ever() {
+                // Two phases: detect without evidence first, because capturing a replay re-runs the
+                // episode. Only a find the journal has never seen pays that cost, and it pays it for
+                // the evidence the codex is meant to keep.
+                let found = evo::detect_discoveries(
+                    &self.level,
+                    &best.genome,
+                    &best.result,
+                    &self.eval,
+                    best.generation,
+                    false,
+                );
+                let fresh: Vec<String> = found
+                    .iter()
+                    .filter(|d| !self.codex.contains(&d.signature))
+                    .map(|d| d.signature.clone())
+                    .collect();
+                let found = if fresh.is_empty() {
+                    Vec::new()
+                } else {
+                    evo::detect_discoveries(
+                        &self.level,
+                        &best.genome,
+                        &best.result,
+                        &self.eval,
+                        best.generation,
+                        true,
+                    )
+                    .into_iter()
+                    .filter(|d| fresh.contains(&d.signature))
+                    .collect()
+                };
+                let new = self.codex.record_all(found);
+                if !new.is_empty() {
+                    if let Err(err) = self.codex.save(&self.codex_path) {
+                        eprintln!("codex: {err}");
+                    }
+                    discovery = self.codex.entries().last().cloned();
+                }
+            }
+        }
+
         // Labels count within each group rather than using `lane.rank`: the trainer
         // numbers random lanes `best_k + n`, so a rank would name the first outsider
         // "best 5" whenever four best lanes precede it.
@@ -1150,6 +1359,8 @@ impl Generator {
             level_hash: self.level.scene_hash_string(),
             curriculum: self.curriculum.clone(),
             finished,
+            discovery,
+            codex_len: self.codex.len(),
         }
     }
 }
@@ -1235,6 +1446,19 @@ struct Hub {
     cv: Condvar,
 }
 
+/// A restart the window asked for, handed to the worker.
+///
+/// One struct rather than a tuple because the champion is the third kind of starting point
+/// besides "fresh" and "the checkpoint in the plan", and a tuple of four positional fields
+/// at three call sites is how two of them come to disagree about which is which.
+struct Restart {
+    level: Level,
+    seed: u64,
+    stem: String,
+    /// A champion to seed the new population from, already loaded and validated.
+    champion: Option<ChampionSeed>,
+}
+
 #[derive(Default)]
 struct State {
     /// A finished generation the window has not taken yet.
@@ -1243,8 +1467,10 @@ struct State {
     /// the whole reason the run cannot train ahead of the viewer.
     want_next: bool,
     quit: bool,
-    /// A restart request: the level as it stands, the seed, and the stem its artifacts wear.
-    restart: Option<(Level, u64, String)>,
+    /// A restart request: the level as it stands, the seed, the stem its artifacts wear, and
+    /// the saved champion to seed the new population from when the viewer asked to continue
+    /// one rather than start from nothing.
+    restart: Option<Restart>,
     mutation_rate: Option<f32>,
     /// Generations the worker computes per request (see [`THINKING`]). Live, like the mutation
     /// rate: the dial is meant to be turned *while* watching, and it takes effect on the next
@@ -1329,8 +1555,14 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon:
             )
         };
 
-        if let Some((level, seed, stem)) = restart {
-            generator.start_over(level, seed, rate.unwrap_or(initial_rate), stem);
+        if let Some(restart) = restart {
+            generator.start_over(
+                restart.level,
+                restart.seed,
+                rate.unwrap_or(initial_rate),
+                restart.stem,
+                restart.champion,
+            );
         } else if let Some(rate) = rate {
             generator.set_mutation_rate(rate);
         }
@@ -1469,8 +1701,9 @@ impl Lab {
         // setting does not exist in this front-end; if one is added, it is the `locked` half of
         // `apply_auto_shape` that keeps it.
         let _auto = evo::apply_auto_shape(&mut cfg, std::slice::from_ref(level), false, false);
-        if cfg.trials <= 1 && !level.walkers.is_empty() {
-            cfg.trials = 3;
+        let recommended = evo::GaConfig::recommended_trials_for(level);
+        if cfg.trials <= 1 && recommended > 1 {
+            cfg.trials = recommended;
         }
         // A checkpoint that cannot be loaded is a startup error, not a run that quietly
         // trains something else: it is the same refusal the terminal's `--resume` makes.
@@ -1484,8 +1717,8 @@ impl Lab {
             out_dir.clone(),
             stem.clone(),
         )?;
-        let origin = generator.origin().map(str::to_string);
-        let rate = cfg.mutation_rate;
+    let origin = generator.origin().map(str::to_string);
+    let rate = cfg.mutation_rate;
         let hub = Arc::new(Hub {
             state: Mutex::new(State {
                 // A fresh run should produce its first generation immediately: waiting
@@ -1674,13 +1907,65 @@ impl Lab {
 
     /// Start a fresh run — a new population — on `level`.
     pub fn restart(&mut self, level: &Level, seed: u64, stem: impl Into<String>) {
+        self.restart_with(level, seed, stem, None);
+    }
+
+    /// Start a new run whose population is seeded from a saved champion.
+    ///
+    /// The app's half of `train-cli train --from-champion`. The champion is loaded by
+    /// [`champion_seed`] before this is called; the shape is checked here, on the window's
+    /// thread, because the alternative is a worker that cannot build the population and
+    /// falls back to a fresh one — a run that silently is not the one the viewer asked for,
+    /// under an origin line claiming it is. On `Err` nothing about the current run has moved.
+    pub fn restart_from_champion(
+        &mut self,
+        level: &Level,
+        seed: u64,
+        stem: impl Into<String>,
+        champion: ChampionSeed,
+    ) -> Result<(), String> {
+        // The same shape rule `start_over` will apply on the worker: auto-detected memory is
+        // part of the run's network, so a champion built without it is not this run's shape.
+        let mut cfg = self.config.clone();
+        evo::apply_auto_shape(&mut cfg, std::slice::from_ref(level), false, false);
+        Trainer::from_champion(cfg, champion.genome.clone())?;
+        self.origin = Some(champion.origin.clone());
+        self.restart_with(level, seed, stem, Some(champion));
+        Ok(())
+    }
+
+    /// The file `Save champion` writes for this run, and the file `Continue champion` reads.
+    ///
+    /// One path for both, so the control that offers to continue a champion can only ever
+    /// offer the champion this level's runs actually save — the same argument as
+    /// [`lab::save_champion`]'s naming rule.
+    pub fn champion_path(&self) -> PathBuf {
+        self.out_dir.join(format!("{}.json", self.stem))
+    }
+
+    /// Replace the population with a new run's on `level`, from `champion` when one was named.
+    fn restart_with(
+        &mut self,
+        level: &Level,
+        seed: u64,
+        stem: impl Into<String>,
+        champion: Option<ChampionSeed>,
+    ) {
         self.level = level.clone();
         self.level_hash = level.scene_hash_string();
         self.level_name = level.name.clone();
         self.stem = stem.into();
         self.config.master_seed = seed;
+        if champion.is_none() {
+            self.origin = None;
+        }
         let mut state = self.hub.state.lock().unwrap();
-        state.restart = Some((level.clone(), seed, self.stem.clone()));
+        state.restart = Some(Restart {
+            level: level.clone(),
+            seed,
+            stem: self.stem.clone(),
+            champion,
+        });
         // A restart is also a request: the window wants to see the new run's first
         // generation without having to press something else.
         state.want_next = true;
@@ -2133,7 +2418,7 @@ mod tests {
         assert_eq!(generator.history.len(), 2);
 
         let other = shipped("l3-gauntlet");
-        generator.start_over(other.clone(), 99, 0.10, "other");
+        generator.start_over(other.clone(), 99, 0.10, "other", None);
         assert_eq!(generator.level().name, other.name);
         let fresh = generator.next_packet();
         assert_eq!(
@@ -2452,6 +2737,129 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A real run's best-ever genome, written to a scratch champion file.
+    ///
+    /// The two seeds these tests need are "where the champion came from" and "where the
+    /// continued run's artifacts go", so they are two scratch directories rather than one:
+    /// `scratch` starts by deleting its directory, and a source file deleted by the second
+    /// call would make the test pass on nothing.
+    fn saved_champion(tag: &str) -> (Level, PathBuf) {
+        let level = shipped("l1-flat-run");
+        let mut source = Generator::new(
+            level.clone(),
+            tiny_config(),
+            DEFAULT_BEST_LANES,
+            DEFAULT_RANDOM_LANES,
+            RunPlan::default(),
+            scratch(&format!("{tag}-source")),
+            "l1-flat-run",
+        )
+        .expect("the source run starts");
+        let best = source
+            .next_packet()
+            .best
+            .clone()
+            .expect("a scored generation has a best-ever genome");
+        let dir = scratch(&format!("{tag}-file"));
+        let path = save_champion(&best, &level, &tiny_config(), &dir, "l1-flat-run")
+            .expect("the champion writes");
+        (level, path)
+    }
+
+    /// **Continue from a saved champion**: the window's half of `--from-champion`.
+    ///
+    /// The artifact a run leaves behind when it was stopped without a checkpoint is the
+    /// champion file, and this is the path back from it into a population: slot 0 is the saved
+    /// genome, the run starts at generation 0, and the champion's own recorded episode is its
+    /// record — so the first generation ranks against a winner instead of from nothing, and a
+    /// mastery league can arm at once.
+    #[test]
+    fn a_run_can_start_from_a_saved_champion() {
+        let (level, path) = saved_champion("champion-seed");
+        let champion = ChampionFile::load_for_level(&path, &level).expect("the file loads");
+
+        let seeded = Generator::new(
+            level.clone(),
+            tiny_config(),
+            DEFAULT_BEST_LANES,
+            DEFAULT_RANDOM_LANES,
+            RunPlan {
+                seed_from_champion: Some(path.clone()),
+                ..RunPlan::default()
+            },
+            scratch("champion-seed-run"),
+            "l1-flat-run",
+        )
+        .expect("a champion seeds a run");
+
+        let origin = seeded.origin().expect("the run says where it started");
+        assert!(origin.contains("seeded from"), "{origin}");
+        let held = seeded
+            .best()
+            .expect("the champion's episode is the new run's record");
+        assert_eq!(held.genome.id, champion.metadata.genome_id);
+        assert_eq!(held.result.fitness, champion.fitness);
+        assert_eq!(held.result.frames, champion.metadata.frames);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// A restart can continue a champion, and a plain restart forgets it.
+    ///
+    /// The distinction is the whole meaning of the two controls: *Continue champion* starts a
+    /// new run from the saved genome, while *Restart run* is a fresh population — replaying
+    /// the champion on every restart would make the word mean the opposite of what the button
+    /// says.
+    #[test]
+    fn a_restart_can_continue_a_saved_champion_and_a_plain_restart_forgets_it() {
+        let (level, path) = saved_champion("champion-restart");
+        let champion = ChampionFile::load_for_level(&path, &level).expect("the file loads");
+        let seed = champion_seed(&path, &level).expect("the saved champion is trainable");
+
+        let mut generator = Generator::new(
+            level.clone(),
+            tiny_config(),
+            DEFAULT_BEST_LANES,
+            DEFAULT_RANDOM_LANES,
+            RunPlan {
+                seed_from_champion: Some(path.clone()),
+                ..RunPlan::default()
+            },
+            scratch("champion-restart-run"),
+            "l1-flat-run",
+        )
+        .expect("the run starts");
+        generator.start_over(level.clone(), 7, 0.05, "l1-flat-run", Some(seed));
+        let origin = generator.origin().expect("the restart says where it started");
+        assert!(origin.contains("seeded from"), "{origin}");
+        let held = generator.best().expect("the record came with the champion");
+        assert_eq!(held.genome.id, champion.metadata.genome_id);
+
+        generator.start_over(level, 8, 0.05, "l1-flat-run", None);
+        assert!(generator.origin().is_none(), "a plain restart starts from nothing");
+        assert!(
+            generator.plan().seed_from_champion.is_none(),
+            "a champion is a way into a run, not a setting of every restart"
+        );
+        assert!(generator.best().is_none(), "a fresh population has no record yet");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// A champion that cannot seed this run is a refusal at the window, not a silent reset.
+    #[test]
+    fn a_champion_this_build_cannot_train_on_is_refused_before_the_population_is_dropped() {
+        let (level, path) = saved_champion("champion-bad-seed");
+        std::fs::write(&path, "{\"format\": \"not-a-champion\"}").expect("the file writes");
+        let err = champion_seed(&path, &level).expect_err("a malformed file is refused");
+        assert!(err.contains("champion"), "{err}");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
     }
 
     /// The window's `--curriculum`, driven end to end: a run that stops moving writes
@@ -2863,7 +3271,7 @@ mod tests {
         )
         .expect("the checkpoint loads");
 
-        generator.start_over(shipped("l3-gauntlet"), 5, 0.05, "l3-gauntlet");
+        generator.start_over(shipped("l3-gauntlet"), 5, 0.05, "l3-gauntlet", None);
         assert!(
             generator.plan().resume.is_none(),
             "a restart reproduces nothing: it starts a fresh population"

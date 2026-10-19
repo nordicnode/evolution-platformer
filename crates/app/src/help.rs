@@ -121,6 +121,10 @@ const PLAY: &[Key] = &[
         what: "brake",
     },
     Key {
+        keys: "T",
+        what: "hand the level to the AI — it plans the route and plays it, or gives the keys back",
+    },
+    Key {
         keys: "R",
         what: "start the run again",
     },
@@ -182,8 +186,16 @@ const EVOLVE: &[Key] = &[
         what: "save the champion",
     },
     Key {
+        keys: "C",
+        what: "continue from the champion saved for this level",
+    },
+    Key {
         keys: "V",
         what: "watch the best agent run it",
+    },
+    Key {
+        keys: "K",
+        what: "the trick codex — what this level has produced",
     },
     Key {
         keys: "P  /  E  /  Esc",
@@ -216,6 +228,10 @@ const REPLAY: &[Key] = &[
     Key {
         keys: "S",
         what: "save the champion",
+    },
+    Key {
+        keys: "K",
+        what: "the trick codex — what this level has produced",
     },
     Key {
         keys: "V  /  P  /  E  /  Esc",

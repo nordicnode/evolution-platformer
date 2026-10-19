@@ -427,6 +427,20 @@ pub struct EpisodeResult {
     pub progress_pixels: f32,
     pub best_x: f32,
     pub stomps: u32,
+    /// Longest stomp chain without touching ground (WP13, reporting only).
+    pub max_stomp_chain: u32,
+    /// Wall jumps taken (WP13, reporting only).
+    pub wall_jumps: u32,
+    /// Spring-pad launches taken (WP13, reporting only).
+    pub springs: u32,
+    /// Brittle tiles that burned underfoot (WP13, reporting only).
+    pub crumble_burned: u32,
+    /// Longest airborne run in ticks (WP13, reporting only).
+    pub max_air_ticks: u32,
+    /// Furthest horizontal distance covered in one airborne run, in pixels (WP14 reporting).
+    pub max_air_distance: f32,
+    /// Fastest body speed reached, tiles/tick (WP13, reporting only).
+    pub peak_speed: f32,
     /// Jumps taken, so a watcher can tell "solved it" from "bounced all the way there".
     pub jumps: u32,
     /// Safe landing zones reached past a hazard, so a watcher can tell how far a genome
@@ -533,9 +547,33 @@ impl EpisodeRunner {
         }
     }
 
+    /// Build a runner from a **snapshot** instead of spawn (WP8). The caller has already called
+    /// [`Sim::restart_from_snapshot`], so the world clock and the episode accounting are the
+    /// snapshot's start state.
+    pub fn from_snapshot(genome: Genome, cfg: &EvalConfig, seed: u64, sim: Sim) -> Self {
+        let repeat = cfg.action_repeat.max(1);
+        let guard = sim.max_frames() + repeat + 8;
+        EpisodeRunner {
+            genome,
+            sim,
+            scratch: ActScratch::new(),
+            action: AgentAction::Walk,
+            repeat,
+            seed,
+            trace: StateHasher::new(),
+            iterations: 0,
+            guard,
+        }
+    }
+
     /// Live view of the episode. Read-only, so a renderer cannot disturb it.
     pub fn sim(&self) -> &Sim {
         &self.sim
+    }
+
+    /// Attach a plan guide before the episode runs (WP5). It changes no physics and no hash.
+    pub fn set_plan_guide(&mut self, guide: sim::PlanGuide) {
+        self.sim.set_plan_guide(guide);
     }
 
     pub fn seed(&self) -> u64 {
@@ -590,6 +628,13 @@ impl EpisodeRunner {
             progress_pixels: stats.progress_pixels,
             best_x: stats.best_x,
             stomps: stats.stomps,
+            max_stomp_chain: stats.max_stomp_chain,
+            wall_jumps: stats.wall_jumps,
+            springs: stats.springs,
+            crumble_burned: stats.crumble_burned,
+            max_air_ticks: stats.max_air_ticks,
+            max_air_distance: stats.max_air_distance,
+            peak_speed: stats.peak_speed,
             jumps: stats.jumps,
             checkpoints: stats.checkpoints,
             route_hops_closed: stats.route_hops_closed,
@@ -627,6 +672,67 @@ pub fn run_episode(
     runner.result()
 }
 
+/// Run one episode from an archived snapshot (WP8). The result's frames and seed continue the
+/// snapshot's world clock; its progress is measured from the snapshot, not from spawn.
+pub fn run_episode_from_snapshot(
+    genome: &Genome,
+    cfg: &EvalConfig,
+    seed: u64,
+    snapshot: &Sim,
+) -> EpisodeResult {
+    run_episode_from_snapshot_sim(genome, cfg, seed, snapshot).0
+}
+
+/// As [`run_episode_from_snapshot`], but also returns the final sim. The archive needs that state:
+/// a probe that got further than its start is the next frontier, whether or not it reached the
+/// flag.
+pub fn run_episode_from_snapshot_sim(
+    genome: &Genome,
+    cfg: &EvalConfig,
+    seed: u64,
+    snapshot: &Sim,
+) -> (EpisodeResult, Sim) {
+    let mut runner = EpisodeRunner::from_snapshot(
+        genome.clone(),
+        cfg,
+        seed,
+        snapshot.restart_from_snapshot(),
+    );
+    while !runner.is_finished() {
+        runner.step();
+    }
+    let final_sim = runner.sim().clone();
+    (runner.result(), final_sim)
+}
+
+/// Run one episode under a **plan guide** (WP5), returning the ordinary result and the fraction
+/// of the plan's waypoints the body reached.
+///
+/// The fraction is measured by the sim's own guide cursor, not by a second implementation here:
+/// a caller that wants plan proximity and a replay that wants to explain it must be reading the
+/// same traversal. The result is the v9 reading — the plan never enters [`score`] — which is what
+/// keeps a champion recordable and replayable while the selection bonus decays around it.
+pub fn run_episode_guided(
+    level: &Level,
+    genome: &Genome,
+    cfg: &EvalConfig,
+    seed: u64,
+    guide: sim::PlanGuide,
+) -> (EpisodeResult, f32) {
+    let mut runner = EpisodeRunner::new(level, genome.clone(), cfg, seed);
+    runner.set_plan_guide(guide);
+    while !runner.is_finished() {
+        runner.step();
+    }
+    let (reached, total) = runner.sim().plan_progress();
+    let fraction = if total == 0 {
+        0.0
+    } else {
+        reached as f32 / total as f32
+    };
+    (runner.result(), fraction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +761,13 @@ mod tests {
             best_x: 0.0,
             no_progress_frames: 0,
             stomps: 0,
+            max_stomp_chain: 0,
+            wall_jumps: 0,
+            springs: 0,
+            crumble_burned: 0,
+            max_air_ticks: 0,
+            max_air_distance: 0.0,
+            peak_speed: 0.0,
             jumps: 0,
             checkpoints: 0,
             route_hops_closed: 0,

@@ -1472,6 +1472,19 @@ impl Level {
 ///    pins the inversion against the real pack rather than against a rearrangement
 ///    of the same formulas.
 impl Level {
+    /// Does this level draw a **patrol phase** per episode?
+    ///
+    /// Walkers, chasers and flyers are placed from the episode seed, so the same genome meets a
+    /// different world on every seed. This is the one answer the trainer's auto-trial rule and
+    /// the auto-shape scan share; they used to disagree — the scan counted chasers and flyers as
+    /// stochastic, the trial rule counted only walkers — and a chaser level like
+    /// `l11-the-elements` was therefore trained and saved on a single phase (`l11` logs `trials 1`
+    /// despite `auto` naming `patrols`). The difference is how a champion is found that wins once
+    /// and not again: the record was a maximum over one phase, not a policy that handles phases.
+    pub fn has_patrols(&self) -> bool {
+        !self.walkers.is_empty() || !self.chasers.is_empty() || !self.flyers.is_empty()
+    }
+
     /// A playable starting document: solid floor, spawn top-left, goal far right.
     ///
     /// Already valid rather than an empty grid, because every rule above is easier

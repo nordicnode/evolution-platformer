@@ -198,10 +198,23 @@ pub struct RunSummary {
     pub trend: Trend,
     pub stall: Option<Stall>,
     pub genius: bool,
+    /// **The newest find (WP16)**, when this generation produced one that the level's codex had
+    /// not held before. `None` for a rediscovery, which is not news, and for a generation that did
+    /// not move the record.
+    pub discovery: Option<evo::Discovery>,
+    /// How many finds the level's codex holds, after this generation.
+    pub codex_len: usize,
     /// The note from the run's one curriculum step, if it fell back to an easier level
     /// when it stalled (§12 M5). A fact about the run rather than a reading of its
     /// history, so it is carried through from the packet and not derived here.
     pub curriculum: Option<String>,
+    /// Whether a champion file exists for this level, and so whether *Continue champion*
+    /// has anything to continue.
+    ///
+    /// Set by the window when the menu is drawn rather than when the generation was scored:
+    /// pressing Save and then Continue in the same generation has to work, and a reading
+    /// taken one generation earlier would leave the second control disabled for no reason.
+    pub champion_saved: bool,
     pub finished: bool,
     /// Tile the population is dying in, when a stall makes that the interesting
     /// question. `None` before a stall, and `None` until a level width is supplied.
@@ -258,7 +271,10 @@ impl RunSummary {
             trend: fitness_trend(history),
             stall: fitness_stall(history),
             genius: packet.genius,
+            discovery: packet.discovery.clone(),
+            codex_len: packet.codex_len,
             curriculum: packet.curriculum.clone(),
+            champion_saved: false,
             finished: packet.finished,
             deaths_at: None,
             deaths_count: 0,
@@ -362,6 +378,8 @@ pub enum Command {
     Restart,
     /// Write the best-ever genome out as a champion file.
     Save,
+    /// Start a new population from the champion saved for this level, when there is one.
+    ContinueChampion,
     /// Leave the scrubbed view and follow the live run again.
     Live,
     /// Follow the leading agent's camera, or go back to the whole level.
@@ -386,6 +404,8 @@ pub struct Actions {
     pub step: bool,
     pub restart: bool,
     pub save: bool,
+    /// Start a new population from the champion saved for this level.
+    pub continue_champion: bool,
     /// Leave the scrubbed view and follow the live run again.
     pub resume: bool,
     /// The follow checkbox was clicked. The window owns the state, as it does for pause:
@@ -463,6 +483,8 @@ pub struct Keys {
     pub ghosts: bool,
     /// `s`
     pub save: bool,
+    /// `c`
+    pub continue_champion: bool,
     /// `left`
     pub older: bool,
     /// `right`
@@ -578,6 +600,9 @@ pub fn commands_for(keys: Keys, view: &ViewState) -> Vec<Command> {
     }
     if keys.save {
         out.push(Command::Save);
+    }
+    if keys.continue_champion {
+        out.push(Command::ContinueChampion);
     }
     if keys.older {
         out.push(Command::Scrub(-1));
@@ -1004,6 +1029,27 @@ pub fn lab_panel(
     {
         actions.save = true;
     }
+    // **Continue from a champion.** Disabled rather than hidden when this level has no
+    // champion yet: a control that appears only after the file exists is a control a viewer
+    // never learns about, and the disabled row says what would make it usable.
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_PLAY),
+        "Continue champion",
+        width,
+        false,
+        summary.champion_saved,
+    )
+    .on_hover_text(if summary.champion_saved {
+        "start a new population from the champion saved for this level — C"
+    } else {
+        "no champion saved for this level yet — S saves the run's best ever"
+    })
+    .clicked()
+    {
+        actions.continue_champion = true;
+    }
     if ui::menu_row(
         ui,
         atlas,
@@ -1079,6 +1125,19 @@ pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState
     }
     if summary.genius {
         ui.colored_label(WIN_TICK, "genius agent: max jumped by more than half");
+    }
+    // **A named find, on the panel as well as in the card (WP16).** The card is the moment; this
+    // line is the record of it, and it stays for as long as the generation it belongs to does, so
+    // a viewer who looks away during the card can still read what was found.
+    if let Some(discovery) = &summary.discovery {
+        ui.colored_label(WIN_TICK, format!("discovery: {}", discovery.name));
+        small_dim(ui, discovery.line.clone());
+        if summary.codex_len > 1 {
+            small_dim(
+                ui,
+                format!("{} finds in this level's codex", summary.codex_len),
+            );
+        }
     }
     // The two grids, as rows rather than as another clause on the sentence above: they are readings
     // about how *spread out* the population is, which is a different question from how hard the
@@ -1940,17 +1999,18 @@ pub struct ChartGeometry {
 }
 
 pub fn chart_geometry(history: &[HistoryPoint], plot: Rect) -> ChartGeometry {
-    let usable: Vec<&HistoryPoint> = history
-        .iter()
-        .filter(|p| p.max_fitness.is_finite() || p.avg_fitness.is_finite())
-        .collect();
-    if usable.is_empty() {
-        return ChartGeometry::default();
-    }
-
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
-    for point in &usable {
+    let mut first: Option<u32> = None;
+    let mut last: Option<u32> = None;
+    let mut usable = 0usize;
+    for point in history {
+        if !(point.max_fitness.is_finite() || point.avg_fitness.is_finite()) {
+            continue;
+        }
+        usable += 1;
+        first.get_or_insert(point.generation);
+        last = Some(point.generation);
         for value in [point.max_fitness, point.avg_fitness] {
             if value.is_finite() {
                 lo = lo.min(value);
@@ -1958,6 +2018,9 @@ pub fn chart_geometry(history: &[HistoryPoint], plot: Rect) -> ChartGeometry {
             }
         }
     }
+    let (Some(first), Some(last)) = (first, last) else {
+        return ChartGeometry::default();
+    };
     if !lo.is_finite() || !hi.is_finite() {
         return ChartGeometry::default();
     }
@@ -1968,16 +2031,6 @@ pub fn chart_geometry(history: &[HistoryPoint], plot: Rect) -> ChartGeometry {
     let span = (hi - lo).max(1.0);
     let lo = lo - span * 0.08;
     let hi = hi + span * 0.08;
-
-    let first = usable[0].generation;
-    let last = usable[usable.len() - 1].generation;
-    let x = |generation: u32| {
-        if last > first {
-            plot.left() + plot.width() * (generation - first) as f32 / (last - first) as f32
-        } else {
-            plot.center().x
-        }
-    };
     let y = |value: f32| plot.bottom() - plot.height() * (value - lo) / (hi - lo);
 
     let mut geometry = ChartGeometry {
@@ -1987,29 +2040,110 @@ pub fn chart_geometry(history: &[HistoryPoint], plot: Rect) -> ChartGeometry {
         last_generation: last,
         ..ChartGeometry::default()
     };
-    for point in &usable {
-        let at = |value: f32| {
-            Pos2::new(
-                x(point.generation).clamp(plot.left(), plot.right()),
-                y(value).clamp(plot.top(), plot.bottom()),
-            )
+
+    // **The chart is at most one point per pixel column.** A run of twelve thousand
+    // generations has more points than the plot has pixels, so drawing them all costs
+    // tessellation for points that land on the same column — and the chart is redrawn
+    // every frame, which is how a long run came to make even a paused window lag. A
+    // history that fits in the plot's width is drawn exactly as before; a longer one is
+    // bucketed by column, keeping the **maximum** of each column for the max series (a
+    // spike must survive the reduction) and the mean for the average.
+    let columns = plot.width().floor().max(1.0) as usize;
+    if usable <= columns {
+        let x = |generation: u32| {
+            if last > first {
+                plot.left() + plot.width() * (generation - first) as f32 / (last - first) as f32
+            } else {
+                plot.center().x
+            }
         };
-        if point.max_fitness.is_finite() {
-            geometry.max.push(at(point.max_fitness));
+        for point in history {
+            if !(point.max_fitness.is_finite() || point.avg_fitness.is_finite()) {
+                continue;
+            }
+            let at = |value: f32| {
+                Pos2::new(
+                    x(point.generation).clamp(plot.left(), plot.right()),
+                    y(value).clamp(plot.top(), plot.bottom()),
+                )
+            };
+            if point.max_fitness.is_finite() {
+                geometry.max.push(at(point.max_fitness));
+            }
+            if point.avg_fitness.is_finite() {
+                geometry.avg.push(at(point.avg_fitness));
+            }
+            if point.wins > 0 {
+                // A win is a tick on the **top rule**, not a point at its own value: the chart
+                // exists to show the learning arc, and a flag reached is an event to count
+                // rather than a number to read off the axis. This is also where
+                // `chart_panel` draws them, so the geometry and the drawing agree instead of
+                // leaving the marker's y to mean nothing in particular.
+                geometry.wins.push(Pos2::new(
+                    x(point.generation).clamp(plot.left(), plot.right()),
+                    plot.top(),
+                ));
+            }
+        }
+        return geometry;
+    }
+
+    #[derive(Clone, Default)]
+    struct Column {
+        max: f32,
+        max_seen: bool,
+        avg_sum: f64,
+        avg_count: u32,
+        won: bool,
+    }
+    let mut buckets = vec![Column::default(); columns];
+    // Integer arithmetic, so a generation lands in one bucket and the buckets stay in
+    // order: `(last - first) * columns` overflows u32 long before this does.
+    let span_generations = last.saturating_sub(first) as u64;
+    let width = columns as u64;
+    for point in history {
+        if !(point.max_fitness.is_finite() || point.avg_fitness.is_finite()) {
+            continue;
+        }
+        let along = point.generation.saturating_sub(first) as u64;
+        let column = if span_generations == 0 {
+            0
+        } else {
+            ((along * width) / (span_generations + 1)).min(width - 1) as usize
+        };
+        let bucket = &mut buckets[column];
+        if point.max_fitness.is_finite() && (!bucket.max_seen || point.max_fitness > bucket.max) {
+            bucket.max = point.max_fitness;
+            bucket.max_seen = true;
         }
         if point.avg_fitness.is_finite() {
-            geometry.avg.push(at(point.avg_fitness));
+            bucket.avg_sum += point.avg_fitness as f64;
+            bucket.avg_count += 1;
         }
-        if point.wins > 0 {
-            // A win is a tick on the **top rule**, not a point at its own value: the chart
-            // exists to show the learning arc, and a flag reached is an event to count
-            // rather than a number to read off the axis. This is also where
-            // `chart_panel` draws them, so the geometry and the drawing agree instead of
-            // leaving the marker's y to mean nothing in particular.
-            geometry.wins.push(Pos2::new(
-                x(point.generation).clamp(plot.left(), plot.right()),
-                plot.top(),
-            ));
+        bucket.won |= point.wins > 0;
+    }
+    for (column, bucket) in buckets.iter().enumerate() {
+        if !bucket.max_seen && bucket.avg_count == 0 {
+            continue;
+        }
+        let x = if columns > 1 {
+            plot.left() + plot.width() * column as f32 / (columns - 1) as f32
+        } else {
+            plot.center().x
+        };
+        if bucket.max_seen {
+            geometry
+                .max
+                .push(Pos2::new(x, y(bucket.max).clamp(plot.top(), plot.bottom())));
+        }
+        if bucket.avg_count > 0 {
+            let avg = (bucket.avg_sum / bucket.avg_count as f64) as f32;
+            geometry
+                .avg
+                .push(Pos2::new(x, y(avg).clamp(plot.top(), plot.bottom())));
+        }
+        if bucket.won {
+            geometry.wins.push(Pos2::new(x, plot.top()));
         }
     }
     geometry
@@ -2122,6 +2256,10 @@ mod tests {
             best: None,
             curriculum: None,
             finished: false,
+            // The fixture is a run with no find in this generation and an empty codex; the
+            // discovery line's own tests build their packet with both set.
+            discovery: None,
+            codex_len: 0,
         }
     }
 
@@ -2234,6 +2372,57 @@ mod tests {
         assert!(geometry.lo.is_finite() && geometry.hi.is_finite());
     }
 
+    /// **A long run costs the chart its width, not its generation count.**
+    ///
+    /// The bug this pins: at ~12,000 generations the window was laggy even when paused,
+    /// because every frame tessellated one point per generation plus a win tick for every
+    /// winning generation. Measured in a fresh headless context in the release build, this
+    /// fixture drew **177,308 vertices in 7.0 ms** before the reduction and **17,348 in
+    /// 2.6 ms** after it. The chart cannot resolve more than one point per pixel column, so
+    /// the rest was geometry the screen could not show. The reduced chart is bounded by
+    /// [`plot`]'s width, keeps the maximum of each column (a spike is not smoothed away), and
+    /// still reaches both ends.
+    #[test]
+    fn a_long_run_does_not_make_the_chart_expensive() {
+        let mut points: Vec<HistoryPoint> = (0..12_000u32)
+            .map(|g| HistoryPoint {
+                generation: g,
+                max_fitness: 100.0 + (g % 500) as f32,
+                avg_fitness: 50.0 + (g % 200) as f32,
+                wins: usize::from(g % 3 == 0),
+            })
+            .collect();
+        // One spike, far into the run: the reduction must keep it.
+        points[6_000].max_fitness = 10_000.0;
+
+        let columns = plot().width().floor() as usize;
+        let geometry = chart_geometry(&points, plot());
+        assert!(geometry.max.len() <= columns, "max: {}", geometry.max.len());
+        assert!(geometry.avg.len() <= columns, "avg: {}", geometry.avg.len());
+        assert!(geometry.wins.len() <= columns, "wins: {}", geometry.wins.len());
+        assert_eq!(geometry.first_generation, 0);
+        assert_eq!(geometry.last_generation, 11_999);
+        assert_eq!(
+            geometry.max.last().map(|p| p.x),
+            Some(plot().right()),
+            "the latest generation is still the right-hand edge"
+        );
+        let spike = plot().bottom()
+            - plot().height() * (10_000.0 - geometry.lo) / (geometry.hi - geometry.lo);
+        assert!(
+            geometry.max.iter().any(|p| (p.y - spike).abs() < 0.1),
+            "the spike was averaged away"
+        );
+
+        let started = std::time::Instant::now();
+        let vertices = draw_in_headless_context(&points, 120.0, None);
+        let elapsed = started.elapsed();
+        assert!(
+            vertices < 30_000,
+            "12k generations drew {vertices} vertices for a ~900 px chart ({elapsed:?})"
+        );
+    }
+
     #[test]
     fn only_a_generation_that_reached_the_flag_gets_a_win_tick() {
         let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1), (2, 411.0, 70.0, 2)]);
@@ -2244,6 +2433,36 @@ mod tests {
         for tick in &geometry.wins {
             assert_eq!(tick.y, plot().top(), "a win is marked on the top rule");
         }
+    }
+
+    #[test]
+    fn a_generation_that_found_something_carries_it_onto_the_panel() {
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
+        let mut found = packet(points.clone(), Vec::new(), true);
+        found.discovery = Some(evo::Discovery {
+            name: "Corpse Bridge".to_string(),
+            line: "chained three stomps without touching the ground".to_string(),
+            kind: evo::DiscoveryKind::Technique,
+            signature: "technique:Corpse Bridge".to_string(),
+            level_name: "l1-flat-run".to_string(),
+            level_hash: "test".to_string(),
+            generation: 1,
+            genome_id: 7,
+            frames: 200,
+            seed: 3,
+            skip_percent: None,
+            replay: Vec::new(),
+        });
+        found.codex_len = 4;
+        let summary = RunSummary::new(&found, &points);
+        assert_eq!(
+            summary.discovery.as_ref().map(|d| d.name.as_str()),
+            Some("Corpse Bridge")
+        );
+        assert_eq!(summary.codex_len, 4);
+        // A rediscovery is not news: a packet with none leaves the panel's line absent.
+        let quiet = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        assert!(quiet.discovery.is_none());
     }
 
     #[test]
@@ -2450,6 +2669,13 @@ mod tests {
                 ..Default::default()
             }),
             vec![Command::Save]
+        );
+        assert_eq!(
+            one(Keys {
+                continue_champion: true,
+                ..Default::default()
+            }),
+            vec![Command::ContinueChampion]
         );
         assert_eq!(
             one(Keys {
@@ -2698,15 +2924,22 @@ mod tests {
 
     /// An idle frame of the menu asks for nothing.
     ///
-    /// The four things the menu can ask for are all destructive in the same way — pause a run,
-    /// restart it, write a champion, run a generation — so a panel that fired one without a pointer
-    /// on it would be a control nobody pressed, acting. Drawn with no atlas, too: a machine with a
-    /// tileset older than the `ui_*` glyphs gets captioned plates and no pictures, and it still has
-    /// to be a panel rather than a crash.
+    /// The five things the menu can ask for are all destructive in the same way — pause a run,
+    /// restart it, write a champion, continue one, run a generation — so a panel that fired one
+    /// without a pointer on it would be a control nobody pressed, acting. Drawn with no atlas, too:
+    /// a machine with a tileset older than the `ui_*` glyphs gets captioned plates and no pictures,
+    /// and it still has to be a panel rather than a crash.
     #[test]
     fn an_idle_frame_of_the_menu_asks_for_nothing() {
         let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
-        let summary = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        let mut summary = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        // With and without a champion on disk: the row exists in both states (disabled until
+        // there is a file), and neither state may press itself.
+        assert_eq!(
+            draw_panel(&summary, &mut ViewState::default()),
+            Actions::default()
+        );
+        summary.champion_saved = true;
         assert_eq!(
             draw_panel(&summary, &mut ViewState::default()),
             Actions::default()

@@ -18,10 +18,11 @@ blocked and 2.5× faster bit-identically, sensors v13 gave the policy a clock, a
 `sim::plan` is a model-based teacher. This plan does not repeat that roadmap. It
 starts from what those changes exposed and aims at the owner's goal above.
 
-**Status of this document:** plan plus a first implementation pass (2026-10-18).
-Six packages have code and tests; none of their gates have been measured yet, and
-no measurement below is claimed. §0.1 lists exactly what landed and what is still
-parked. Every work package keeps the measurement that would justify — or kill — it.
+**Status of this document:** plan plus a second implementation pass (2026-10-18).
+Most packages now have code and tests; the behavioural gates are still mostly unrun, and
+no measurement below is claimed unless §0.1 names it. §0.1 lists exactly what landed,
+what was tried and reverted, and what is still parked. Every work package keeps the
+measurement that would justify — or kill — it.
 
 ### 0.1 What has landed (2026-10-18), and what has not
 
@@ -37,6 +38,9 @@ Landed, with unit/integration tests and no version moves:
   turrets, movers, vents, flyers or cracked ground, and sets rank pessimism 0.5 on
   patrol levels; it never overrides an explicit flag, only raises memory, and prints
   its reasons in the run header. Wired into `train`, `watch` and the window's `Lab`.
+  A **patrol** is a walker, a chaser or a flyer (`Level::has_patrols`); the auto-trial
+  rule now uses the same predicate, which is the fix for `l11-the-elements` being judged
+  on one phase while its scan named `patrols`.
 - **WP3 — the thinking dial.** `THINKING = [1, 4, 16, 64]` on the run panel: one request
   computes that many generations and queues the last, so the worker still never runs
   more than one request past the screen. **Best-of-N restarts are not implemented**;
@@ -45,21 +49,166 @@ Landed, with unit/integration tests and no version moves:
   `--from-champion`): mirrored CEM over the last layer's weights and biases, hidden
   genes frozen, judged on fixed seeds, certified only on a separate held-out set, and
   written as `<level>-polished.json` rather than over its input.
-- **WP11 — the mastery league.** `--mastery`: once the record solves, selection ranks
-  winners by the clock (`ga::league_score`, jump penalty removed for unsolved
-  episodes); the crowned fitness still selects, validates and writes the champion.
-- **WP14 — the shortcut hunter (second half only).** `evo::shortcut` + `train-cli
-  shortcut`: replay the champion's own episode, record the route stands it actually
-  used, diff against the graph's intended route, and print the skipped percentage and
-  first skipped stand. The non-goal *trick hunt* search is not implemented.
+- **WP11 — the mastery league.** Once the record solves, selection ranks winners by
+  the clock (`ga::league_score`, jump penalty removed for unsolved episodes); the
+  crowned fitness still selects, validates and writes the champion. **On by default**
+  in the window, `train` and `watch` (`--no-mastery` for the old run). A population
+  checkpoint now carries the run's best-ever genome, and a resumed or champion-seeded
+  run seeds its record from it, so the league arms from generation 0 instead of waiting
+  for a lost lineage to be rediscovered.
+- **WP13 — technique counters, archive and firsts.** `EpisodeStats`/`EpisodeResult`
+  carry wall jumps, spring launches, longest stomp chain, crumble tiles burned underfoot,
+  longest flight and peak speed (reporting only — no fitness change). `evo::technique`
+  keeps a coarse archive keyed by `(stomps, wall jumps, springs, airtime)`, filled with
+  the genome that did *most* of the technique rather than the one with the best progress,
+  and reports named firsts (`Corpse Bridge`, `Shaft Requiem`, `Springboard Skip`,
+  `Fusesurf`, `Long Haul`). `Trainer::technique()` exposes it; `train` prints the totals
+  and the first six firsts at the end of a run.
+- **WP4 — segment distillation.** `plan_segments` replays a timed route and splits it at
+  the ground stands it actually lands on (decks are skipped, because a spawn needs a tile);
+  `practice_level_between` builds a level for any entry/exit pair; `segment_campaign`
+  observes the planner's own blocks on the full level, fits that leg's demonstration, injects
+  the clone as one warm parent, then trains the leg with `[segment, main]` ranked worst-of-two,
+  so earlier legs are not bred away. `train-cli segments` writes the split for inspection and `train-cli campaign`
+  runs the campaign end to end. Measured only structurally so far (l11 splits into 11 legs;
+  a small l2 campaign completes), **not** on the plan's 500-generation headline gate.
+- **WP6 — anytime planner and editor verdict.** `plan::solve_anytime` deepens the same
+  deterministic beam until a route appears or the cap is hit; `plan::verdict` answers
+  planned / routed-but-over-budget / unreachable, with the unreachable diagnosis taken
+  from the reach oracle. The editor re-answers on **save** (not per frame) and shows the
+  plan verdict beside the reachability one.
+- **WP7 — islands.** `evo::islands` runs 1–12 independent `Trainer`s with a deterministic
+  spread (sigma ×1.5/×0.7, novelty, pessimism, archive children), a ring of migrants every
+  25 generations via `Trainer::inject` (weakest slot, never an elite, ids kept unique), and
+  `train-cli islands` writes the best record any island found. All islands share the net
+  shape, because weights cannot migrate across shapes; the plan's 0/16 feedback split is
+  therefore not implemented. Single-population training remains the default until the
+  equal-episode gate runs.
+- **WP12 — TAS polish CLI.** `evo::tas` records a champion's episode at one action per
+  tick and hill-climbs substitutions and press shifts, with frames-to-win as the only
+  score. `train-cli tas` writes a machine-polished route artifact and refuses to write one
+  that does not replay to the recorded state hash.
+- **WP14 — trick hunt and shortcut hunter.** `plan::hunt` reuses the planner's macros with
+  a non-goal objective (height, airtime, speed, ground-free distance); `train-cli hunt`
+  writes the best trajectory as a `Discovered` route artifact after replaying it. The
+  existing `shortcut` command reports the skip percentage against the intended route.
+- **WP15 — style titles.** `evo::style` verifies Fastest, Fewest jumps, No sprint, No wall
+  jump and Minimalist from a tick route plus its episode reading, awards a title only to a
+  won route, and `train-cli styles` prints what a champion holds. **Stomp-only crossings is
+  retired**: a `TasRoute` does not segment itself into crossings, so the constraint cannot
+  be verified without inventing a definition the rest of the codebase does not share.
 
-Parked, in the plan's own order: **WP4** (segment distillation), **WP5** (planner-guided
-fitness v10), **WP6** (anytime planner, solver ghost, editor verdict), **WP7** (islands),
-**WP8** (snapshot archive), **WP10** (sensors v14), **WP12** (TAS polish), **WP13**
-(technique stats/archive), **WP15** (style championships), **WP16** (presentation), and
-the §9 battery levels. They are not stubs: each needs either a retrain window (WP5,
-WP10), a trainer restructure (WP7, WP8), or authored-and-verified levels (the battery),
-and shipping a shallow version would make the plan's gates unreadable rather than met.
+### 0.2 Post-test repair (2026-10-18, after the l11 run)
+
+A saved `l11-the-elements` champion (818 frames) was reported as winning once and then never
+again, with 30 000 further generations failing to beat its time. Three defects explained parts
+of that, and all three are fixed:
+
+1. **The record was not retained.** The stall checkpoint at generation 20 614 named a best of
+   11.7k set at 17 212, but its population's best was 1 392: the winner had fallen out of the
+   cohort. Checkpoints now carry the best-ever genome (`PopulationFile::best`), a resumed run
+   re-evaluates and seeds it (`Trainer::seed_record_from_checkpoint`), `adopt` re-inserts it
+   after a practice detour, and `breed` reserves one slot for it. `--from-champion` also seeds
+   the record from the champion's own episode (`Trainer::seed_record`), so a seeded run keeps
+   its winner and arms the league from generation 0. A window resume of an **older** checkpoint
+   (one written before the field existed) falls back to the champion beside the level, which is
+   how the run that produced this report is recovered without starting over.
+2. **A chaser level was judged on one phase.** `recommended_trials_for` counted only walkers,
+   so l11 (one chaser, no walker) logged `trials 1` while the auto-shape scan named `patrols`.
+   `Level::has_patrols` is now the shared predicate (walker, chaser or flyer), the header prints
+   the *effective* count, and l11 runs three phases. This is what makes a saved champion a
+   policy that handles a patrol rather than a maximum over one draw.
+3. **Mastery was opt-in in the terminal.** The window turned it on by default but `train` and
+   `watch` did not, so a terminal run that solved kept ranking on the crowned fitness. All
+   three front-ends now default it on; `--no-mastery` restores the old run.
+
+**Measured, and not yet solved:** with the fixes in place, resuming from the saved l11 champion
+(release build, pop 200, three trials, mastery on) for 2 000 generations left the clock at 818
+frames. The league was armed from generation 0 and the record stayed in the population — the
+generation maximum was 11 658 in every one of the 2 000 generations, where the old stall
+checkpoint's population topped out at 1 392 — so the "never wins again" half is fixed. The clock
+half is a search plateau rather than the retention failure above: no mutation found a shorter
+route.
+Shortening it is the job of the parked route work (WP4 segment distillation, WP6 planner,
+WP12 TAS polish), not of retention, and no claim that the clock now improves is made.
+
+**The third pass (2026-10-18, later the same day) landed WP5, WP8, WP16 and the §9 battery.**
+All four are described below with what was measured and what was not; the only package still
+parked is **WP10** (sensors v14), whose implementation and revert are recorded further down.
+
+- **WP5 — planner-guided selection, not fitness v10.** The plan proposed a plan-proximity term
+  *inside* fitness v10, batched with a pack retrain. What shipped is deliberately the same
+  mechanism one layer out: `Trainer::seed_plan` replays the planner's own route and attaches it
+  as a `sim::PlanGuide`; every generation's ranking gets `plan_bonus × fraction-of-waypoints`,
+  decaying linearly to zero over `plan_bonus_generations`, while `score` and every recorded
+  number stay v9. That is why there is **no version move and no retrain**: the arm cannot
+  invalidate a champion, and a planless run is bit-identical to before. The recorded-fitness
+  half is tested directly (same genome, same seed, with and without the guide: identical score
+  and trajectory hash), and the decay property is structural — at generation ≥ the window the
+  loop is skipped entirely. The CLI arms are `--plan-bonus` and `--plan-bonus-generations`, and
+  `train` attaches the guide by solving the level first, refusing honestly when there is no
+  route. **Not run:** the plan's 24-seed paired arms on l11 and a battery switchback, so no
+  claim that the bonus speeds learning is made. The window does not expose the knob; it is a
+  terminal experimental arm until that measurement exists.
+- **WP8 — snapshot archive and probes.** `evo::snapshots` keeps a `Sim` per
+  `(route stand, clock bucket, mover phase)` cell, admitting the state with the most remaining
+  budget; `Trainer::seed_snapshots` fills it from a spawn-started episode and
+  `Trainer::snapshot_probe` starts mutated probes from the least-visited cell every
+  `--snapshot-every` generations, then archives the probe's own final state. A probe that wins is
+  injected as a child; **no probe can enter the record**, because its episode did not start at
+  spawn. The gate is structural (tests cover admission, sampling spread, the restart's fresh
+  progress and kept world clock, and that a probe batch extends the archive without crowning),
+  and `train` prints cells / probes / wins when the arm is on. **Not run:** the plan's 24-seed
+  episodes-matched comparison against the detour chain on pit-bait and backtrack.
+- **WP16 — discovery detector, trick codex and presentation.** `evo::discovery` turns the
+  technique table and the shortcut trace into named finds: the names come from the one fixed
+  table `technique::TECHNIQUE_RULES` (so the trainer's firsts and the window's presentation
+  cannot disagree) plus a three-rung shortcut ladder (Detour / Shortcut / Grand Theft Flag).
+  **Only a winning route is a find**: the trainer's firsts still fire on losses (that is what
+  the technique archive is for), but a codex entry is a claim about a route to the flag, and
+  without the rule a body that fell off the level edge for seven seconds would be presented as
+  *Long Haul*.`evo::Codex` is a per-level JSON journal at `champions/codex/<stem>.json` (the CLI's `--codex-dir`
+  defaults to the same directory the window writes it in), one entry per signature, with a tick-resolution replay and the first-run provenance; it refuses a file that
+  belongs to another level rather than merging it. Presentation: a watched run detects a find once per new
+  record (finding a shortcut re-runs the episode), records it, and shows a card for ten seconds
+  with **slow motion on the generation that produced it**; `K` opens the level's codex page, and
+  the run panel keeps the name and line for as long as the generation does. CLI: `codex` names
+  and records what a champion found, and `break` is the "break my level" report — intended
+  route, the champion's diff, its finds, and a non-goal hunt beyond the flag. **Not done:**
+  the plan's "can you do THAT?" playtest challenge beside an AI ghost, an automatic
+  break-my-level run after a solve (it is on request), and the fun gate itself (a person has to
+  watch it). The slow-motion card replays the *generation*, not a cropped segment of the
+  trajectory as the plan describes; that crop needs the replay machinery to take a start/end
+  frame, which is a separate piece of work.
+- **§9 — the adversarial battery.** Seven levels in `levels/bat-*.json`, one per skill in the
+  plan's table: crumble bridge, double threat, patrol wait, backtrack, pit bait, spring chain,
+  and deck phase. Each carries the v13 failure it was written against in its `_notes`. Every
+  one is verified **reachable by the oracle and routable by the timed planner**, both in
+  `cargo test` (a `sim` levels test, ~6 s in a debug build) and as a permanent CLI gate:
+  `train-cli battery` prints both answers with the planner's expansion count and wall time and
+  exits non-zero if any level fails. Measured at the default planner budget (depth 32, beam 64):
+  six levels need 3–7 expansions; `bat-pit-bait`, which is deceptive by construction, needs 31
+  expansions (about 1 s in the release build, 5 s in a debug build), so it is the battery's own
+  worst case and the one to watch if the planner's defaults move. **Not run:** the training half of the gate — that a default run
+  *fails* each level and that the package it isolates makes it pass — which is a 24-seed
+  measurement, not a unit test.
+
+**Sensors v14 was implemented and reverted, with the gate as the reason.** The trial added
+the crumble fuse, the second mover's velocity/phase, enemies in the patch and two more
+threat objects with velocities (108 → 120 inputs). The sensor tests passed, but the
+project's own warm-start regression fired: on `l2-first-gap` the warm arm needed 23
+generations against random's 18, i.e. a pack level regressed, which is exactly the WP10 gate's
+first condition. Rather than weaken that measured claim or keep an unmeasured default, the
+sensor tree was restored to v13 and the v14 design stays here as the parked plan it is. The
+attempt also confirmed the gate's cost: v14 cannot land without a full 24-seed difficulty
+table and a retrain, not just unit tests.
+
+**What the new packages do not yet have.** WP4 has structural tests (a real l11 split into
+11 legs, a small l2 campaign that finishes) but not the plan's 500-generation headline gate;
+WP7 has unit tests and a smoke run but not the equal-episode 24-seed comparison; WP6's
+planner budget test, WP12's league-route comparison, WP14's envelope audit and WP15's
+two-level three-title gate are all unrun. Every one is recorded here as unrun rather than
+implied by the code existing.
 
 ---
 
@@ -254,6 +403,10 @@ make planning a recurring part of training, in segments small enough to learn.
 
 ### WP5. Planner-guided fitness (dense credit where the geodesic lies)
 
+> **Shipped differently, and deliberately (2026-10-18).** The term landed as a *selection*
+> bonus outside `score` rather than as fitness v10, so there is no version move and no retrain;
+> see §0.1 for the mechanism and for the 24-seed gate that has not been run.
+
 - **Problem.** Fitness v9's progress is geodesic: route hops closed, monotone.
   Where the route graph is degenerate — switchbacks, go-left-first, wait-for-
   the-deck — shaping falls back toward straight-line distance, which the v5
@@ -344,6 +497,9 @@ make planning a recurring part of training, in segments small enough to learn.
   four levels → keep single-pop, record the negative, retire.
 
 ### WP8. Snapshot archive: generalise the practice detour (Go-Explore shape)
+
+> **Shipped (2026-10-18).** `evo::snapshots` + `Trainer::snapshot_probe`, behind
+> `--snapshot-every` / `--snapshot-probes`; structural tests only, gate unrun (§0.1).
 
 - **Problem.** The stall → practice-level detour is a one-cell version of a
   known, stronger idea: return to a promising *state*, explore from there.
@@ -613,6 +769,10 @@ bounds), and each patch is a physics version bump with the cost stated.
 
 ### WP16. Show the discovery (presentation — owner decisions)
 
+> **Shipped (2026-10-18) as the detector, codex, run card and `codex`/`break` commands.**
+> The playtest challenge and an automatic post-solve run are still open, and the fun gate is
+> the owner's to run (§0.1).
+
 Half the wow is noticing. Packages:
 
 1. **Discovery detector + naming.** A classifier over champion/league
@@ -678,7 +838,12 @@ If WP5's gate fails, its window disappears and Phase D's is the only one.
 Phase E adds no window: league scoring, technique stats, constraints and
 polish all live outside the crowning fitness and the sensor vector.
 
-## 9. The adversarial battery (build before Phase B's gate can run)
+## 9. The adversarial battery (built 2026-10-18)
+
+> **The seven levels exist as `levels/bat-*.json`**, and `train-cli battery` plus a `sim`
+> integration test are the permanent gate described at the end of this section (§0.1 has the
+> measured planner budgets). The training half — that the default run fails each one — is
+> still unrun.
 
 The pack (l1–l11) does not contain levels that isolate the skills this plan
 claims to add. Author one small level per skill, each verified solvable by

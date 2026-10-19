@@ -1,0 +1,37 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 3,
+  "name": "bat-backtrack",
+  "width": 46,
+  "height": 16,
+  "spawn": {
+    "x": 2,
+    "y": 13
+  },
+  "tiles": [
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................################",
+    "..............................................",
+    "..............................................",
+    ".............................v................",
+    "############...###############........########",
+    "############...###############........########"
+  ],
+  "entities": [
+    {
+      "type": "goal",
+      "x": 32,
+      "y": 9
+    }
+  ],
+  "_notes": "battery: cross, return. The flag hangs over the second pit; the only way onto its shelf is a spring pad on the lip before the pit, which throws the body past the flag, so the route must go right and then come back left to touch it. Expected failure of a v13 run: the route graph is forward-monotone and its waypoint never points back. Verified solvable by the reach oracle and the timed planner."
+}

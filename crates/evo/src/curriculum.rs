@@ -250,16 +250,36 @@ fn seed_jump_timing(
         return;
     }
     // The weakest slots make room: they are the least of what got stuck, and the practice
-    // level is about to re-judge every slot anyway.
-    let mut weakest: Vec<usize> = (0..population.len()).collect();
+    // level is about to re-judge every slot anyway. The anchor itself is **not** a candidate:
+    // it is the run's proven genome, and the one thing a lesson must not spend is the take that
+    // can already win. It is put back exactly if it is absent, which is what carries the record
+    // through a detour rather than only through the checkpoint.
+    let anchor_at = population
+        .iter()
+        .position(|g| crate::ga::same_genes(g, anchor));
+    let mut weakest: Vec<usize> = (0..population.len())
+        .filter(|&i| Some(i) != anchor_at)
+        .collect();
     weakest.sort_by(|&a, &b| population[a].fitness.total_cmp(&population[b].fitness));
     let mut rng = sim::rng_from_seed(master_seed ^ 0x7A11_7A11_71A1_5EED);
     let first_id = population.iter().map(|g| g.id).max().unwrap_or(0) + 1;
-    for (id, &slot) in (first_id..).zip(weakest.iter().take(seed_count)) {
+    let seed_slots: Vec<usize> = weakest.iter().take(seed_count).copied().collect();
+    for (offset, &slot) in seed_slots.iter().enumerate() {
         let genes = 1 + (sim::rng::next_f32(&mut rng) * crate::ga::FINE_GENE_MAX as f32) as usize;
         let mut child = crate::genome::mutate_jump_timing(anchor, genes, sigma, &mut rng);
-        child.id = id;
+        child.id = first_id + offset as u32;
         population[slot] = child;
+    }
+    if anchor_at.is_none() {
+        if let Some(&slot) = weakest.get(seed_slots.len()) {
+            let mut copy = anchor.clone();
+            copy.fitness = 0.0;
+            copy.id = first_id + seed_slots.len() as u32;
+            while population.iter().any(|g| g.id == copy.id) {
+                copy.id += 1;
+            }
+            population[slot] = copy;
+        }
     }
 }
 
@@ -309,7 +329,10 @@ fn detour(trainer: &mut Trainer, orders: Orders<'_>) -> Result<CurriculumStep, S
         main_level,
         &trainer.config,
         format!("stalled: {stall_note}"),
-    );
+    )
+    // The record travels with the cohort: a checkpoint without it can resume a solved run that
+    // can no longer breed its own champion.
+    .with_best(trainer.best_ever().map(|b| &b.genome));
     // A bare file name has an empty parent, and creating "" is an error rather than a
     // no-op, so the directory is only made when there is one.
     if let Some(dir) = checkpoint_path
@@ -838,6 +861,362 @@ pub fn practice_level_for_stall(trainer: &Trainer, main: &Level) -> Result<Level
     practice_level_from(main, spot, stand)
 }
 
+/// **One leg of a planned route, as a level that can be practised (WP4).**
+///
+/// The unit is the one the stall detour already proved: a single crossing with both its entry and
+/// its exit in place, not the whole level. Errors in a whole-route clone compound at the first
+/// imperfect block; a segment is short enough that the student's own states stay near the
+/// demonstration it was fitted on.
+///
+/// The segment carries the planner's block actions for its own span, so a caller can fit a
+/// demonstration (or seed a population) without re-running the search. `level` is the same world
+/// with its spawn moved to `entry` and its flag moved to `exit`; nothing else about the geometry
+/// changes.
+#[derive(Clone, Debug)]
+pub struct PlanSegment {
+    pub index: usize,
+    pub entry: (i32, i32),
+    pub exit: (i32, i32),
+    /// First decision block of the route this segment covers (inclusive).
+    pub start_block: usize,
+    /// One past the last block (exclusive).
+    pub end_block: usize,
+    /// Frames the planned route had used when the segment ended.
+    pub frames: u32,
+    /// The block actions to hold through the segment.
+    pub actions: Vec<sim::physics::AgentAction>,
+    pub level: Level,
+}
+
+impl PlanSegment {
+    pub fn blocks(&self) -> usize {
+        self.end_block.saturating_sub(self.start_block)
+    }
+}
+
+/// Build a practice level from an arbitrary entry tile to an arbitrary exit tile.
+///
+/// [`practice_level_from`] always ends at the *next* route rung, which is right for a stall and
+/// wrong for a planned segment that may span several. This is the same construction with the
+/// destination named: the spawn is validated as ground, the old flag is removed through the same
+/// mutator the editor uses, and the new one is placed with `set_goal_tile` so a level the rules
+/// would refuse can never be produced here.
+pub fn practice_level_between(
+    main: &Level,
+    spawn_tile: (i32, i32),
+    goal_tile: (i32, i32),
+) -> Result<Level, String> {
+    let (tx, ty) = spawn_tile;
+    if !main.spawn_stands_on_ground(tx, ty) {
+        return Err(format!(
+            "segment spawn at tile ({tx}, {ty}) does not stand on ground in {}",
+            main.name
+        ));
+    }
+    let mut practice = main.clone();
+    practice.set_spawn_tile(tx, ty);
+    if practice.goal_tiles().first().copied() != Some(goal_tile) {
+        for (ox, oy) in practice.goal_tiles() {
+            practice.remove_goal_at(ox, oy);
+        }
+        if !practice.set_goal_tile(goal_tile.0, goal_tile.1) {
+            return Err(format!(
+                "the segment flag will not stand at tile ({}, {}) in {}",
+                goal_tile.0, goal_tile.1, main.name
+            ));
+        }
+    }
+    practice.name = format!(
+        "{} segment ({tx}, {ty}) to ({}, {})",
+        main.name, goal_tile.0, goal_tile.1
+    );
+    Ok(practice)
+}
+
+/// Split a planned route at the **route stands it actually lands on**, and derive one practice
+/// level per leg (WP4).
+///
+/// Boundaries are only ground stands: a deck has no tile a spawn can be placed on, so a hand-off
+/// on a moving platform would produce a level the engine refuses. A route whose only intermediate
+/// stands are decks therefore yields one segment (spawn to flag), which is the honest answer —
+/// there is nowhere ground-based to hand over.
+///
+/// The split is deterministic: it reads the planner's own block actions, replays them at the
+/// policy cadence, and records the first block that lands on each new ground stand. No path is
+/// invented and no stand is assumed; a level the search could not route returns `Err` rather than
+/// an empty campaign.
+pub fn plan_segments(
+    main: &Level,
+    route: &sim::plan::TimedRoute,
+) -> Result<Vec<PlanSegment>, String> {
+    let goal = main
+        .goal_tiles()
+        .first()
+        .copied()
+        .ok_or_else(|| format!("{} has no goal flag to route to", main.name))?;
+    let spawn_col = Level::tile_x(main.spawn.x + main.spawn.w * 0.5);
+    // The body's own cell, not the floor under it: `spawn_stands_on_ground` asks about the empty
+    // cell the player occupies, while the route stands are described by their *surface* row.
+    let spawn_row = Level::tile_y(main.spawn.y + main.spawn.h - 0.05);
+    let entry = (spawn_col, spawn_row);
+    if !main.spawn_stands_on_ground(entry.0, entry.1) {
+        return Err(format!(
+            "{}'s spawn does not stand on ground, so no segment can start there",
+            main.name
+        ));
+    }
+
+    let routes = sim::reach::goal_routes(main);
+    // `(block, body tile, goal tile, frames)`: the hand-off points in route order. The two tiles
+    // differ by one row — a spawn occupies the empty cell above the surface a flag's pole stands
+    // on — and keeping them apart is what stops a segment flag being placed in mid-air.
+    type Mark = (usize, (i32, i32), (i32, i32), u32);
+    let mut marks: Vec<Mark> = vec![(0, entry, (entry.0, entry.1 + 1), 0)];
+    let mut last_stand = routes.zone_at(entry.0, entry.1 + 1);
+    let repeat = crate::ACTION_REPEAT.max(1);
+    let mut sim = sim::Sim::new(main, route.seed);
+    for (block, action) in route.actions.iter().enumerate() {
+        for _ in 0..repeat {
+            if sim.outcome().is_finished() {
+                break;
+            }
+            sim.step(*action);
+        }
+        if let Some(stand) = sim.route_stand() {
+            if Some(stand) != last_stand {
+                if let Some((body, goal)) = ground_tile_for_stand(main, &routes, stand) {
+                    // A hand-off that lands back where the previous one did is not a boundary.
+                    if marks.last().is_none_or(|(_, _, held, _)| *held != goal) {
+                        marks.push((block + 1, body, goal, sim.stats().frames));
+                    }
+                    last_stand = Some(stand);
+                }
+            }
+        }
+        if sim.outcome().is_finished() {
+            break;
+        }
+    }
+    // The flag is the last exit even when the route's final stand is a deck: the goal tile is
+    // always a legal place to put a practice flag.
+    if marks.last().is_none_or(|(_, _, held, _)| *held != goal) {
+        marks.push((
+            route.actions.len(),
+            (goal.0, goal.1 - 1),
+            goal,
+            route.frames,
+        ));
+    }
+    if marks.len() < 2 {
+        return Err(format!(
+            "the planned route in {} has only one ground stand; there is no segment boundary",
+            main.name
+        ));
+    }
+
+    let mut out = Vec::with_capacity(marks.len() - 1);
+    for (i, pair) in marks.windows(2).enumerate() {
+        let (start_block, entry, _, _) = pair[0];
+        let (end_block, _, exit, frames) = pair[1];
+        if exit == entry {
+            continue;
+        }
+        let level = practice_level_between(main, entry, exit)?;
+        out.push(PlanSegment {
+            index: i,
+            entry,
+            exit,
+            start_block,
+            end_block,
+            frames,
+            actions: route
+                .actions
+                .get(start_block..end_block)
+                .unwrap_or(&[])
+                .to_vec(),
+            level,
+        });
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "the planned route in {} has no non-empty ground segment",
+            main.name
+        ));
+    }
+    for (i, segment) in out.iter_mut().enumerate() {
+        segment.index = i;
+    }
+    Ok(out)
+}
+
+/// The ground tile inside a route stand, or `None` for a deck.
+///
+/// `zone_bounds` names a surface row and a column span; a deck's span has nothing solid at that
+/// row, and that is exactly the predicate [`Level::spawn_stands_on_ground`] answers.
+fn ground_tile_for_stand(
+    main: &Level,
+    routes: &sim::reach::GoalRoutes,
+    stand: usize,
+) -> Option<((i32, i32), (i32, i32))> {
+    // A stand's row is the *surface* row (the floor the body stands on); a spawn tile is the
+    // empty cell above it. Asking `spawn_stands_on_ground` about the surface row itself would
+    // always answer no, because that cell is solid.
+    let (surface, x0, x1) = routes.zone_bounds(stand);
+    let body_row = surface - 1;
+    (x0..=x1).find_map(|col| {
+        main.spawn_stands_on_ground(col, body_row)
+            .then_some(((col, body_row), (col, surface)))
+    })
+}
+
+/// The decisions a planned segment demonstrates, observed from the state the route reaches at
+/// the segment's first block.
+///
+/// This is the whole-route clone cut to the leg without cutting the *observations*: the prefix is
+/// replayed on the full level so the body is at the right state, then the segment's own block
+/// actions are recorded at the policy cadence. A caller that fitted this against the practice
+/// level instead would be labelling states by a world that starts at the segment, which is not
+/// where the student will meet them.
+fn segment_demonstration(
+    main: &Level,
+    route: &sim::plan::TimedRoute,
+    segment: &PlanSegment,
+) -> crate::route_play::RoutePlay {
+    let repeat = crate::ACTION_REPEAT.max(1);
+    let mut sim = sim::Sim::new(main, route.seed);
+    for action in route.actions.iter().take(segment.start_block) {
+        for _ in 0..repeat {
+            if sim.outcome().is_finished() {
+                break;
+            }
+            sim.step(*action);
+        }
+    }
+    let mut decisions = Vec::new();
+    for action in &segment.actions {
+        if sim.outcome().is_finished() {
+            break;
+        }
+        decisions.push(crate::route_play::Decision {
+            observation: sim.observation(),
+            action: *action,
+        });
+        for _ in 0..repeat {
+            if sim.outcome().is_finished() {
+                break;
+            }
+            sim.step(*action);
+        }
+    }
+    crate::route_play::RoutePlay {
+        decisions,
+        outcome: sim.outcome(),
+        frames: sim.stats().frames,
+        seed: route.seed,
+        hops_closed: sim.stats().route_hops_closed,
+        best_block: segment.blocks(),
+        best_stand: sim.route_stand(),
+        route_hops: Some(sim.stats().route_hops_closed),
+        note: format!(
+            "segment {} demonstration: {} blocks on {} from block {}",
+            segment.index + 1,
+            segment.blocks(),
+            main.name,
+            segment.start_block
+        ),
+        trace: Vec::new(),
+    }
+}
+
+/// What a segment campaign did.
+#[derive(Clone, Debug)]
+pub struct SegmentCampaign {
+    pub segments: usize,
+    pub steps: Vec<CurriculumStep>,
+    /// The main level's record after the campaign, when the caller trains on it afterwards.
+    pub solved: bool,
+}
+
+/// **Segment chaining (WP4):** train each leg as a practice level with the main level in the
+/// suite, in route order.
+///
+/// This is [`practice_step`] repeated over [`plan_segments`], and the repetition is the design:
+/// every leg is judged on `[segment, main]` ranked worst-of-two, so a policy that graduates from
+/// segment *k* has not been allowed to forget segment *k-1* or the original level. A fresh
+/// population is not created between legs; the same run carries its record and elite slots, and
+/// [`Trainer::adopt`] re-inserts the record if an excursion's survivors dropped it.
+///
+/// `checkpoint` is the base path for the per-segment population files; each leg writes one beside
+/// it (`<stem>.segment-01.population.json`), so a campaign that is stopped mid-way is inspectable
+/// leg by leg.
+pub fn segment_campaign(
+    trainer: &mut Trainer,
+    main: &Level,
+    route: &sim::plan::TimedRoute,
+    segments: &[PlanSegment],
+    generations_per_segment: u32,
+    checkpoint: &Path,
+    mutation_rate: f32,
+) -> Result<SegmentCampaign, String> {
+    if segments.is_empty() {
+        return Err("a segment campaign needs at least one segment".into());
+    }
+    let mut steps = Vec::with_capacity(segments.len());
+    for segment in segments {
+        // **The demonstration for this leg only.** The plan's step 2 is explicit that a segment is
+        // seeded from the planner's own actions over that span, not from a whole-route clone: the
+        // whole-route clone's failures are what this package exists to avoid. The clone is fitted
+        // from observations the full level actually had at those blocks, then injected into the
+        // population as one warm parent; the run's record and its other genomes are untouched.
+        let play = segment_demonstration(main, route, segment);
+        if !play.decisions.is_empty() {
+            let fit = crate::imitate::ImitateConfig {
+                epochs: 200,
+                prefer_agreement: true,
+                ..crate::imitate::ImitateConfig::default()
+            };
+            if let Ok(report) =
+                crate::imitate::clone_from_play(&play, trainer.config.shape.clone(), &fit)
+            {
+                let _ = trainer.inject(report.genome);
+            }
+        }
+        let stem = checkpoint
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "campaign".into());
+        let path = checkpoint.with_file_name(format!(
+            "{stem}.segment-{:02}.population.json",
+            segment.index + 1
+        ));
+        let note = format!(
+            "segment {}/{}: ({}, {}) to ({}, {}) over {} blocks",
+            segment.index + 1,
+            segments.len(),
+            segment.entry.0,
+            segment.entry.1,
+            segment.exit.0,
+            segment.exit.1,
+            segment.blocks()
+        );
+        let step = practice_step(
+            trainer,
+            main,
+            &segment.level,
+            generations_per_segment,
+            &path,
+            mutation_rate,
+            &note,
+        )?;
+        steps.push(step);
+    }
+    Ok(SegmentCampaign {
+        segments: segments.len(),
+        steps,
+        solved: trainer.best_ever().is_some_and(|b| b.result.solved()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1383,10 @@ mod tests {
             checkpoint.note.contains("no new best in a long time"),
             "the stall's own words are kept: {:?}",
             checkpoint.note
+        );
+        assert!(
+            checkpoint.best.is_some(),
+            "a checkpoint carries the run's best-ever genome, so the excursion can hand it back"
         );
         // The level it was taken on is the *main* level, not the one it was just
         // trained on: a resumed run has to be told which level the numbers mean.
@@ -1589,5 +1972,39 @@ mod tests {
             main.content_hash_string(),
             "a different spawn is a different level"
         );
+    }
+
+    #[test]
+    fn a_planned_route_splits_into_ground_segments_that_are_all_playable_starts() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../levels/l2-first-gap.json");
+        let level = Level::from_json_file(&path).expect("the shipped level loads");
+        let route = sim::plan::solve(
+            &level,
+            1,
+            sim::plan::PlanConfig {
+                depth: 24,
+                beam: 32,
+                ..sim::plan::PlanConfig::default()
+            },
+        )
+        .expect("l2 is planned");
+        let segments = plan_segments(&level, &route).expect("the route has segments");
+        assert!(!segments.is_empty());
+        assert_eq!(segments[0].start_block, 0);
+        assert_eq!(
+            segments.last().expect("non-empty").end_block,
+            route.actions.len(),
+            "the legs cover the whole route and leave no tail"
+        );
+        for segment in &segments {
+            assert!(
+                segment.level.spawn_stands_on_ground(segment.entry.0, segment.entry.1),
+                "segment {} starts on ground",
+                segment.index
+            );
+            assert_eq!(segment.level.goal_tiles().first().copied(), Some(segment.exit));
+            assert!(segment.blocks() > 0);
+        }
     }
 }

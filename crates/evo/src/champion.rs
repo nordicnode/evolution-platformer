@@ -209,9 +209,10 @@ pub struct TrainingSummary {
     /// describe a search it did not run.
     #[serde(default)]
     pub jump_timing_share: f32,
-    /// Whether the run entered the **mastery league** after its record solved the level (WP11).
-    /// Defaulted to `false` for a file written before the mode existed: that run ranked on the
-    /// crowned fitness throughout, which is what "no league" means.
+    /// Whether the run was **configured for the mastery league** (WP11). The league itself arms
+    /// only once the record solves, so `true` here means the second phase was available, not that
+    /// it necessarily ran. Defaulted to `false` for a file written before the mode existed: that
+    /// run ranked on the crowned fitness throughout, which is what "no league" means.
     #[serde(default)]
     pub mastery: bool,
     /// Whether the run tuned its own mutation size. Defaulted to `false`, which is the

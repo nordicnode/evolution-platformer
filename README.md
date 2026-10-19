@@ -48,7 +48,7 @@ thing at stake is whether the artifact on disk still counts.
 ## Quick start
 
 ```bash
-cargo test --workspace                 # 692 tests
+cargo test --workspace                 # 750 passing tests
 cargo build --release
 
 # The game: draw a level, drag tiles out of a palette, play it yourself.
@@ -76,7 +76,8 @@ cargo run --release -p app -- --level levels/l6-marathon.json
 cargo run --release -p app -- --evolve --level levels/l2-first-gap.json
 #   space pause   n one generation   -/+ speed   m/M mutation rate
 #   left/right scrub the recorded champions   h back to live
-#   s save the best-ever champion   f follow the leader / whole level   v the run's replay
+#   s save the best-ever champion   c continue from that champion   v the run's replay
+#   f follow the leader / whole level
 
 # Try to beat the AI. The playtest runs a stopwatch against the run's quickest win, in
 # the line at the top of the window: "7.10s at the flag — the AI's best time is 7.90s,
@@ -85,6 +86,15 @@ cargo run --release -p app -- --evolve --level levels/l2-first-gap.json
 # Train first (or pass --evolve) if the run has no win to race yet.
 cargo run --release -p app -- --play --level levels/l2-first-gap.json
 cargo run --release -p app -- --play --screenshot out/play-race.png
+
+# Hand the level to the AI's **deliberate** controller. It plans the whole route with
+# the real simulator — movers, patrols, turret cooldowns and all — and then plays it, so
+# a level whose answer is a wait is answered by thinking rather than by another mutation.
+# The plan is computed once when the view opens (a few seconds); T toggles it in any
+# playtest. If the planner cannot route the level, the same key falls back to a short
+# lookahead controller that picks each move by simulating it first.
+cargo run --release -p app -- --play --think --level levels/l11-the-elements.json
+#   T the AI thinks / the keys are yours   R restart (the plan starts over)
 
 # Watch the run's answer rather than its search: the best agent it found, playing at
 # the speed the game runs at, with the population it last scored ghosted beside it.
@@ -104,6 +114,13 @@ cargo run --release -p app -- --evolve --level levels/l5-tightrope.json \
     --curriculum levels/l3-gauntlet.json
 cargo run --release -p app -- --evolve --level levels/l5-tightrope.json \
     --resume champions/l5-tightrope.population.json
+
+# A saved champion is a second way back into a run, without a checkpoint: the window's
+# Continue champion (or C) seeds a new population from champions/<level>.json, and
+# --from-champion does the same from the command line. The champion is slot 0, the rest
+# are reheated copies of it, and its own recorded episode is the new run's first record.
+cargo run --release -p app -- --evolve --level levels/l5-tightrope.json \
+    --from-champion champions/l5-tightrope.json
 
 # With no authored fallback the run derives its own (findings 50–51): the same level
 # from the furthest spot its best genome has actually stood, with the flag moved to
@@ -130,6 +147,7 @@ be started in one front-end and resumed in the other:
     --generations 200 --pop 200 --stop-on-win --csv out/l3.csv         # headless
 ./target/release/train-cli replay --champion champions/l3-gauntlet.json
 ./target/release/train-cli play --level levels/l1-flat-run.json        # play it yourself
+./target/release/train-cli think --level levels/l11-the-elements.json --plan  # the AI thinks
 ./target/release/train-cli render --level levels/l3-gauntlet.json --steps 400 --stride 40
 ./target/release/train-cli sensors      # the observation layout and the physics bible
 
@@ -156,9 +174,10 @@ be started in one front-end and resumed in the other:
 ./target/release/train-cli score --champion champions/l2-first-gap-suite.json \
     --suite levels/l2-first-gap.json,levels/l5-tightrope.json,levels/l9-wait-and-climb.json
 
-# The mastery league: once the record solves, keep evolving with the objective flipped to the
-# clock. The crowned fitness still selects and validates the champion; the league only changes
-# what the next generation is bred toward, and the jump penalty is gone for unsolved lines.
+# The mastery league: **on by default** once the record solves (the window, `train` and `watch`
+# all agree). It keeps evolving with the objective flipped to the clock; the crowned fitness
+# still selects and validates the champion, and the jump penalty is gone for unsolved lines.
+# `--no-mastery` restores the crowned-fitness-only run.
 ./target/release/train-cli train --level levels/l3-gauntlet.json --mastery --generations 500
 
 # Post-solve polish: a small CEM over the champion's output layer alone (187 genes), every
@@ -170,6 +189,34 @@ be started in one front-end and resumed in the other:
 # What did a champion skip? Replays its own recorded episode, records the route stands it
 # actually stood on, and diffs that against the graph's intended route.
 ./target/release/train-cli shortcut --champion champions/l3-gauntlet.json
+
+# WP4: split a planned route at the ground stands it lands on, then train the legs in order
+# with the main level always in the suite, and finish on the whole level. `segments` writes the
+# practice levels without training, which is how a human checks the split.
+./target/release/train-cli segments --level levels/l11-the-elements.json --depth 64 --beam 64
+./target/release/train-cli campaign --level levels/l11-the-elements.json --depth 64 --beam 64 \
+    --segment-generations 40 --generations 200 --pop 200
+
+# WP7: several populations with different settings, a ring of migrants every 25 generations,
+# and the best record any island found. Single-population training stays the default.
+./target/release/train-cli islands --level levels/l9-wait-and-climb.json --islands 4 \
+    --generations 300 --pop 200
+
+# WP12/WP14: polish a win to tick precision, or hunt a non-goal objective and keep the
+# trajectory as a replayable discovery artifact. Neither writes a champion.
+./target/release/train-cli tas --champion champions/l3-gauntlet.json
+./target/release/train-cli hunt --level levels/l3-gauntlet.json --objective airtime --depth 8
+
+# WP15: which constrained titles does a champion's own winning route hold?
+./target/release/train-cli styles --champion champions/l3-gauntlet.json
+
+# WP16: the discoveries. `codex` names what a champion's own episode found and records it,
+# with a replay, in champions/codex/<stem>.json; `break` is the level-design QA report — intended route,
+# the champion's diff, its discoveries, and what a non-goal hunt finds beyond the flag.
+./target/release/train-cli codex --champion champions/l3-gauntlet.json
+./target/release/train-cli break --champion champions/l3-gauntlet.json --objective height
+# and the adversarial battery's gate (see 'the adversarial battery' under Levels):
+./target/release/train-cli battery
 
 # Where a run starts. `--resume` continues a **population** checkpoint (the artifact a stall
 # writes); `--from-champion` starts a new population around one saved **genome** — the champion
@@ -228,8 +275,10 @@ than a knob to reach for. Every genome of a generation is played on the **same**
 (`common_episodes`), so a tournament compares policies instead of two draws of the patrol phase —
 and because the episodes are paired, the extra trials can be spent only where they still matter
 (`race_episodes`): trial 0 for everyone, trial 1 for the better half, trial 2 for the better quarter.
-That is 1.75 episodes per genome on a walker level instead of 3.00, and 29 % off the wall clock at
-pop 200 on `l3-gauntlet` for the same first-win counts. `--no-common-episodes` restores the
+That is 1.75 episodes per genome on a patrol level instead of 3.00, and 29 % off the wall clock at
+pop 200 on `l3-gauntlet` for the same first-win counts. **A patrol is a walker, a chaser or a
+flyer**: the auto-trial rule used to count only walkers, so `l11-the-elements` (one chaser, no
+walker) was trained and saved on a single phase even though its header named `patrols`. `--no-common-episodes` restores the
 per-genome policy every earlier table was taken under (and
 turns racing off, since a race cannot be sounded on unpaired episodes); `--no-race-episodes` keeps
 pairing and judges every genome on every trial. The arms are recorded in [FINDINGS.md](FINDINGS.md).
@@ -271,6 +320,36 @@ a frame count.
 The generation each level falls at, per seed, is measured in
 [FINDINGS.md](FINDINGS.md#difficulty-the-generation-the-population-first-wins) — nine
 levels, twelve seeds, pop 200 — along with what a solve costs to *watch*.
+
+### The adversarial battery
+
+`levels/bat-*.json` is a second, smaller set: one level per skill the improvement plan
+claims to add, built to isolate that skill rather than to be another rung. They are probes,
+not a ladder — a battery level the default run already solves would test nothing — and each
+one's `_notes` names the v13 failure it was written against.
+
+| Level | The skill, and the reading it is built to test |
+|---|---|
+| `bat-crumble-bridge` | leave before the fuse ends — an eight-tile brittle span over a pit; the fuse is 32 ticks, so stopping on the bridge is fatal |
+| `bat-double-threat` | two patrols converging over a spike patch; the second threat is outside a memoryless patch |
+| `bat-patrol-wait` | wait a full patrol round trip — the only way up is a spring pad at a lip behind a long patrol |
+| `bat-backtrack` | cross, return: the flag hangs over a pit and the pad that reaches its shelf throws the body *past* it |
+| `bat-pit-bait` | a deceptive near route: the ground line runs at the flag's column and dead-ends below it, while the real route climbs shelves that start left of the spawn |
+| `bat-spring-chain` | two spring launches in sequence, the second from the first shelf's lip |
+| `bat-deck-phase` | board the second of two movers on its returning phase, then a two-tile hop to the ground |
+
+```bash
+./target/release/train-cli battery                 # the gate: reach + timed planner, per level
+./target/release/train-cli battery --verbose       # ...and why a failure failed
+```
+
+Before a training run on a battery level can mean anything, the level has to be beatable in
+principle and routable by the timed planner. `battery` answers both for every `bat-*` level
+and prints the planner's expansion count and wall time; `sim`'s `levels` integration test asks
+the same two questions so the gate runs in `cargo test`. The plan's *training* half — that the
+default run fails these levels and that the package changes make it pass — is a measurement,
+not a unit test, and is recorded in [AI_IMPROVEMENT_PLAN.md](AI_IMPROVEMENT_PLAN.md) as not
+yet run.
 
 `levels/scratch-*.json` are working levels rather than part of the ladder;
 `scratch-tower.json` is a 10×22 climb whose flag is at the **top**, an example of a

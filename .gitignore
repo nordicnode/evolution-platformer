@@ -8,6 +8,8 @@
 # Champion + export artifacts are generated, but the curated starter pack is not.
 /champions/*.json
 !/champions/README.md
+# Trick codex files are written by a run, not authored.
+/champions/codex/
 /export/
 
 # Fitness-chart CSV exports from `train-cli train --csv`

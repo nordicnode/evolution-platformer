@@ -111,7 +111,7 @@ pub fn scan(level: &Level) -> AutoShape {
 
     // **Stochastic episodes.** Walkers, chasers and flyers all draw a patrol phase per
     // generation; a level with any of them is the level the pessimistic ranking is for.
-    if !level.walkers.is_empty() || !level.chasers.is_empty() || !level.flyers.is_empty() {
+    if level.has_patrols() {
         note("patrols");
         out.pessimism = true;
     }

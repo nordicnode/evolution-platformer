@@ -221,6 +221,21 @@ pub struct EpisodeStats {
     pub no_progress_frames: u32,
     /// Walkers stomped.
     pub stomps: u32,
+    /// Longest run of stomps without touching the ground (WP13, reporting only).
+    pub max_stomp_chain: u32,
+    /// Wall jumps taken (WP13, reporting only).
+    pub wall_jumps: u32,
+    /// Spring-pad launches taken (WP13, reporting only).
+    pub springs: u32,
+    /// Brittle tiles that burned while the body was standing on them (WP13, reporting only).
+    pub crumble_burned: u32,
+    /// Longest airborne run, in ticks (WP13, reporting only).
+    pub max_air_ticks: u32,
+    /// Furthest horizontal distance from the take-off point reached in one airborne run, in
+    /// pixels (WP14 reporting). A ground-free crossing is the technique this measures.
+    pub max_air_distance: f32,
+    /// Fastest body speed reached, tiles/tick (WP13, reporting only).
+    pub peak_speed: f32,
     /// Jumps taken: ground jumps, buffered ones and wall jumps alike.
     ///
     /// Reported because it is the statistic that makes "the agent jumps endlessly"
@@ -267,6 +282,13 @@ impl EpisodeStats {
             best_x: player.x,
             no_progress_frames: 0,
             stomps: 0,
+            max_stomp_chain: 0,
+            wall_jumps: 0,
+            springs: 0,
+            crumble_burned: 0,
+            max_air_ticks: 0,
+            max_air_distance: 0.0,
+            peak_speed: 0.0,
             jumps: 0,
             checkpoints: 0,
             route_hops_closed: 0,
@@ -274,6 +296,31 @@ impl EpisodeStats {
             decks: 0,
             death_pos: None,
         }
+    }
+}
+
+/// **A plan as a sequence of positions (WP5).**
+///
+/// The planner's output is a list of block actions; this is the same route replayed into the
+/// body positions it visits at each decision, plus the flag at the end. A guide is attached to a
+/// training episode and never to a physics state: it changes no collision, no timing and no hash,
+/// and a sim without one behaves exactly as it did before the structure existed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlanGuide {
+    /// Body centres along the planned route, in visit order, ending at the flag. The first point
+    /// is the spawn, so a body that has moved nowhere reads one waypoint reached.
+    pub points: Vec<(f32, f32)>,
+    /// How close the body must be, in world units, to count the next waypoint as reached.
+    pub radius: f32,
+}
+
+impl PlanGuide {
+    /// The fraction of the plan's waypoints an episode reached, in `0..=1`.
+    pub fn fraction(&self, reached: usize) -> f32 {
+        if self.points.is_empty() {
+            return 0.0;
+        }
+        reached.min(self.points.len()) as f32 / self.points.len() as f32
     }
 }
 
@@ -353,6 +400,10 @@ pub struct Sim {
     /// Consecutive ticks on each side of a press: what a jump's timing is actually a function of.
     air_ticks: u32,
     ground_ticks: u32,
+    /// Current stomp chain. Reset by a grounded frame that did not stomp (WP13 reporting).
+    stomp_chain: u32,
+    /// Where the current airborne run started, for [`EpisodeStats::max_air_distance`].
+    air_start_x: f32,
     /// What ended a dying episode, for the `why` read. Not part of the score and not hashed:
     /// two trajectories that reach the same state are the same episode whatever killed them.
     death_cause: Option<DeathCause>,
@@ -370,6 +421,10 @@ pub struct Sim {
     /// The route stand index the body is currently standing on (or last stood on), used by
     /// the waypoint sensor (`sensors::observe_from_stand`) and geodesic progress tracking.
     current_route_stand: Option<usize>,
+    /// Optional plan-proximity guide (WP5). Never part of the physics or the state hash.
+    plan_guide: Option<PlanGuide>,
+    /// Waypoints of [`Sim::plan_guide`] reached so far, monotone.
+    plan_reached: usize,
     /// Route hops from the spawn stand to the flag, if the spawn is on a route to the flag.
     spawn_hops: Option<u32>,
     /// Minimum `hops_to_flag` reached on a grounded stand so far in this episode.
@@ -462,6 +517,8 @@ impl Sim {
             decks_stood: Vec::new(),
             air_ticks: 0,
             ground_ticks: 0,
+            stomp_chain: 0,
+            air_start_x: spawn_player.x,
             death_cause: None,
             stats: EpisodeStats::new(&spawn_player, level),
             level: level.clone(),
@@ -472,6 +529,8 @@ impl Sim {
             // and the first grounded frame always takes the slow path once.
             last_stand: (i32::MIN, i32::MIN),
             current_route_stand,
+            plan_guide: None,
+            plan_reached: 0,
             spawn_hops,
             min_hops_reached: spawn_hops,
             crumbles: Vec::new(),
@@ -541,6 +600,87 @@ impl Sim {
     /// planner's `which rung is this` question.
     pub fn route_stand(&self) -> Option<usize> {
         self.current_route_stand
+    }
+
+    /// Attach a plan-proximity guide (WP5). The guide is reporting/selection data only: it does
+    /// not touch the body, the world or [`Sim::state_hash`].
+    pub fn set_plan_guide(&mut self, guide: PlanGuide) {
+        self.plan_reached = 0;
+        self.plan_guide = Some(guide);
+        self.advance_plan_guide();
+    }
+
+    /// `(waypoints reached, waypoints in the guide)`, the numerator and denominator of the plan
+    /// fraction. `(0, 0)` exactly when no guide is attached, which is what lets a caller tell
+    /// "no plan" from "a plan it has not moved on".
+    pub fn plan_progress(&self) -> (usize, usize) {
+        match &self.plan_guide {
+            Some(guide) => (self.plan_reached, guide.points.len()),
+            None => (0, 0),
+        }
+    }
+
+    /// **A snapshot restarted as a fresh episode (WP8).**
+    ///
+    /// The world — body, enemies, movers, world clock — is exactly the snapshot, so a policy
+    /// started here meets the phase it was archived in. What resets is the *episode accounting*:
+    /// progress and closest approach are measured from this state, route/deck/checkpoint credit
+    /// starts again, and the outcome is running. `stats.frames` is deliberately **kept**, because
+    /// movers and turrets are functions of the world clock; a snapshot that reset it to zero would
+    /// be a different world wearing the same geometry.
+    ///
+    /// The returned sim is a normal episode from here on, and a result produced from it is
+    /// replayable only from the snapshot — which is why this state never crowns a record without a
+    /// spawn-started validation.
+    pub fn restart_from_snapshot(&self) -> Sim {
+        let mut sim = self.clone();
+        let mut stats = EpisodeStats::new(&sim.player, &sim.level);
+        stats.frames = sim.stats.frames;
+        stats.budget_frames = frame_budget(&sim.level);
+        stats.best_stand = sim.current_route_stand;
+        stats.best_x = sim.player.x;
+        sim.stats = stats;
+        sim.outcome = Outcome::Running;
+        sim.death_cause = None;
+        sim.stomp_chain = 0;
+        sim.decks_stood.clear();
+        sim.credited.clear();
+        sim.spawn_hops = sim
+            .current_route_stand
+            .and_then(|s| sim.level.routes().hops_to_flag(s));
+        sim.min_hops_reached = sim.spawn_hops;
+        sim.no_progress_frames_reset();
+        let surface = Level::tile_y(sim.player.y + sim.player.h + 0.05);
+        let col = Level::tile_x(sim.player.x + sim.player.w * 0.5);
+        sim.last_stand = (surface, col);
+        sim.plan_guide = None;
+        sim.plan_reached = 0;
+        sim
+    }
+
+    /// Reset the anti-camper timer after a snapshot restart. Kept as a method rather than a
+    /// direct field write because `no_progress_frames` is the one stat the termination rule reads
+    /// on the very next tick, and a reset that forgot it would end a snapshot episode as `Stuck`
+    /// before it moved.
+    fn no_progress_frames_reset(&mut self) {
+        self.stats.no_progress_frames = 0;
+    }
+
+    /// Move the guide's cursor past every point the body has now reached. Called once per tick;
+    /// the cursor is monotone, so a body that backtracks cannot lose plan credit it earned.
+    fn advance_plan_guide(&mut self) {
+        let Some(guide) = &self.plan_guide else {
+            return;
+        };
+        let (cx, cy) = self.player.aabb().center();
+        let radius2 = guide.radius.max(0.0).powi(2);
+        while let Some(&(px, py)) = guide.points.get(self.plan_reached) {
+            let d2 = (px - cx).powi(2) + (py - cy).powi(2);
+            if d2 > radius2 {
+                break;
+            }
+            self.plan_reached += 1;
+        }
     }
 
     /// A copy of the whole episode state, for planning and frontier restarts. The sim is
@@ -636,13 +776,26 @@ impl Sim {
         if touched.jumped {
             self.stats.jumps += 1;
         }
+        if touched.wall_jumped {
+            self.stats.wall_jumps += 1;
+        }
         if self.player.grounded {
             self.ground_ticks = self.ground_ticks.saturating_add(1);
             self.air_ticks = 0;
         } else {
+            if self.air_ticks == 0 {
+                self.air_start_x = self.player.x;
+            }
             self.air_ticks = self.air_ticks.saturating_add(1);
             self.ground_ticks = 0;
+            self.stats.max_air_ticks = self.stats.max_air_ticks.max(self.air_ticks);
+            self.stats.max_air_distance = self
+                .stats
+                .max_air_distance
+                .max((self.player.x - self.air_start_x).abs());
         }
+        let speed = (self.player.vx * self.player.vx + self.player.vy * self.player.vy).sqrt();
+        self.stats.peak_speed = self.stats.peak_speed.max(speed);
 
         // ---- springs: a pad throws a falling body back up -----------------
         // The rule itself — and the reasoning for every half of it — is `physics::spring_launch`,
@@ -650,7 +803,9 @@ impl Sim {
         // reachability oracle rather than written here because the two must not disagree about how
         // far a move goes: the oracle runs the same call inside its canonical trajectories, which
         // is what makes a pad-only crossing something it can find (`REVIEW.md` §1.12).
-        crate::physics::spring_launch(&self.level, &mut self.player, ph);
+        if crate::physics::spring_launch(&self.level, &mut self.player, ph) {
+            self.stats.springs += 1;
+        }
 
         // ---- landing on a mover: a crossing, not a position -----------------
         //
@@ -726,6 +881,12 @@ impl Sim {
         }
         if stomped {
             self.stats.stomps += 1;
+            self.stomp_chain = self.stomp_chain.saturating_add(1);
+            self.stats.max_stomp_chain = self.stats.max_stomp_chain.max(self.stomp_chain);
+        } else if self.player.grounded {
+            // A stomp chain is consecutive, so touching ordinary ground ends it. A bounce from a
+            // stomp leaves the body ungrounded, which is what keeps the chain alive.
+            self.stomp_chain = 0;
         }
 
         // ---- flyers: the same stomp rule as a walker, one row up ------------
@@ -740,6 +901,8 @@ impl Sim {
                 self.player.vy = -ph.jump_v0 * ph.stomp_bounce;
                 self.player.grounded = false;
                 self.stats.stomps += 1;
+                self.stomp_chain = self.stomp_chain.saturating_add(1);
+                self.stats.max_stomp_chain = self.stats.max_stomp_chain.max(self.stomp_chain);
             } else {
                 self.die(DeathCause::Flyer);
                 return;
@@ -779,6 +942,14 @@ impl Sim {
             .any(|g| self.player.aabb().overlaps(g))
         {
             self.outcome = Outcome::Won;
+            // **Winning is reaching the plan's last waypoint.** The guide's final point is the
+            // flag's centre, and the flag is a trigger box, so a body can win while its centre is
+            // still further than the guide's radius from that centre. This branch returns before
+            // the guide cursor is advanced, so without this the planner's own route would read
+            // 34 of 35 waypoints on a level it solved.
+            if let Some(guide) = &self.plan_guide {
+                self.plan_reached = guide.points.len();
+            }
             self.finish();
             return;
         }
@@ -820,6 +991,16 @@ impl Sim {
                     self.crumbles.swap_remove(i);
                     self.level.burn_tile(tile.0, tile.1);
                     self.broken.push(tile);
+                    // WP13: did the body ride this tile until it burned? A fuse that expired
+                    // underfoot is the technique a crumble-surf is made of; a fuse the body
+                    // outran is not credited.
+                    if self.player.grounded {
+                        let feet = Level::tile_y(self.player.y + self.player.h + 0.05);
+                        let (c0, c1) = tile_span(self.player.x, self.player.w);
+                        if tile.1 == feet && tile.0 >= c0 && tile.0 <= c1 {
+                            self.stats.crumble_burned += 1;
+                        }
+                    }
                 } else {
                     self.crumbles[i].1 = left - 1;
                     i += 1;
@@ -892,6 +1073,8 @@ impl Sim {
                 }
             }
         }
+
+        self.advance_plan_guide();
 
         // ---- progress / termination --------------------------------------
         // Progress is *how much closer to the flag than the spawn the body has ever been*,
@@ -1227,6 +1410,39 @@ mod tests {
                 format_time(frames)
             );
         }
+    }
+
+    #[test]
+    fn a_plan_guide_counts_waypoints_once_and_never_backwards() {
+        let level = Level::from_json_str(include_str!("../../../levels/l1-flat-run.json"))
+            .expect("the shipped level parses");
+        let mut sim = Sim::new(&level, 1);
+        let start = sim.player().aabb().center();
+        let goal = level.goals.first().expect("the level has a flag").center();
+        // A straight line from the spawn to the flag, sampled densely enough that a body running
+        // the floor can meet each point in turn.
+        let points = (0..=20)
+            .map(|i| {
+                let t = i as f32 / 20.0;
+                (start.0 + (goal.0 - start.0) * t, start.1 + (goal.1 - start.1) * t)
+            })
+            .collect();
+        sim.set_plan_guide(PlanGuide {
+            points,
+            radius: 0.75,
+        });
+        let mut last = sim.plan_progress().0;
+        for _ in 0..120 {
+            sim.step(crate::physics::AgentAction::Run);
+            let reached = sim.plan_progress().0;
+            assert!(reached >= last, "the plan cursor must be monotone");
+            last = reached;
+        }
+        assert!(last > 1, "a body that ran along the plan reached nothing: {last}");
+        assert!(
+            sim.plan_progress().0 <= sim.plan_progress().1,
+            "the cursor cannot pass the guide's end"
+        );
     }
 
     /// Frames a written time stands for, to the nearest frame. The inverse of [`format_time`] for

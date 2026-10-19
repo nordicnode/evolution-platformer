@@ -81,6 +81,119 @@ fn all_shipped_levels_load_with_the_documented_shape() {
     }
 }
 
+/// **The §9 adversarial battery.** One small level per skill the improvement plan claims to
+/// add, each built to isolate that skill rather than to be another rung on the pack's ladder.
+///
+/// `(slug, width, height, patrols)` — the patrol count is the number of `walker` entities the
+/// file lists, which is what this table can check without starting an episode.
+///
+/// A battery level that the current default run already solves would test nothing, so each one
+/// is written against a v13 failure (recorded in its own `_notes`). What is asserted *here* is
+/// the other half: the level is beatable in principle, the planner can route it, and the tiles
+/// it is made of are the mechanic it names. That is the precondition for a training run to
+/// measure anything at all; the training measurement itself is not a unit test.
+const BATTERY: [(&str, i32, i32, usize); 7] = [
+    ("bat-crumble-bridge", 44, 15, 0),
+    ("bat-double-threat", 46, 15, 2),
+    ("bat-patrol-wait", 46, 15, 1),
+    ("bat-backtrack", 46, 16, 0),
+    ("bat-pit-bait", 36, 16, 0),
+    ("bat-spring-chain", 56, 15, 0),
+    ("bat-deck-phase", 46, 15, 0),
+];
+
+#[test]
+fn every_battery_level_loads_with_its_documented_shape() {
+    for (slug, width, height, walkers) in BATTERY {
+        let level = common::level(slug);
+        assert_eq!(level.width, width, "{slug} width");
+        assert_eq!(level.height, height, "{slug} height");
+        assert_eq!(level.walkers.len(), walkers, "{slug} walker count");
+        assert_eq!(level.goals.len(), 1, "{slug} must have exactly one flag");
+        assert!(
+            level.spawn.w > 0.0 && level.spawn.h > 0.0,
+            "{slug} should give the player a body"
+        );
+    }
+}
+
+#[test]
+fn every_battery_level_is_reachable_and_plannable() {
+    // The plan's battery gate, at the smallest form that can run in the suite: the reach oracle
+    // answers "beatable in principle", and the timed planner answers "routable by the search a
+    // champion can actually be distilled from". Both are deterministic, so a failure here is a
+    // statement about the level rather than about a seed.
+    use sim::plan::{solve, PlanConfig};
+    for (slug, ..) in BATTERY {
+        let level = common::level(slug);
+        let report = sim::reach::report(&level);
+        assert!(
+            report.goal_reached,
+            "{slug} must be beatable in principle, but: {:?}",
+            report.diagnosis
+        );
+        let route = solve(&level, 1, PlanConfig::default());
+        assert!(
+            route.is_some(),
+            "{slug} must be routable by the planner at its default budget; a battery level \
+             nobody can plan is a level nobody can be shown a solution to"
+        );
+    }
+}
+
+/// Each battery level has to contain the mechanic it is named for, or it is a test of the
+/// wrong thing that happens to load.
+#[test]
+fn every_battery_level_contains_the_mechanic_it_names() {
+    use sim::Tile;
+    let count = |slug: &str, f: fn(Tile) -> bool| {
+        let level = common::level(slug);
+        let mut n = 0;
+        for y in 0..level.height {
+            for x in 0..level.width {
+                if level.tile(x, y).is_some_and(f) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+
+    assert!(
+        count("bat-crumble-bridge", Tile::is_cracked) >= 8,
+        "the bridge level needs a brittle span long enough to outlast a fuse"
+    );
+    assert_eq!(
+        common::level("bat-double-threat").walkers.len(),
+        2,
+        "the double-threat level needs two patrols"
+    );
+    assert!(
+        !common::level("bat-patrol-wait").walkers.is_empty(),
+        "the wait level needs a patrol to wait for"
+    );
+    assert!(
+        count("bat-backtrack", Tile::is_spring) >= 1,
+        "the backtrack level climbs its shelf on a spring pad"
+    );
+    assert!(
+        count("bat-spring-chain", Tile::is_spring) >= 2,
+        "the spring chain needs two pads, not one"
+    );
+    assert_eq!(
+        common::level("bat-deck-phase").platforms.len(),
+        2,
+        "the deck level needs two movers to phase between"
+    );
+    // Pit-bait is about a *shape* rather than a tile: a shelf above the ground line and a flag
+    // the direct line cannot touch. The reach test is what proves the shape; this is the cheap
+    // check that the level still has a raised route at all.
+    let bait = common::level("bat-pit-bait");
+    let raised = (0..bait.height)
+        .any(|y| (0..bait.width).any(|x| bait.is_solid(x, y) && y < bait.height - 4));
+    assert!(raised, "the pit-bait level needs a route above the ground line");
+}
+
 /// Every level in the pack must be beatable in principle.
 ///
 /// This used to be the interesting test: with a five-entry take-off sweep the

@@ -1,0 +1,54 @@
+{
+  "format": "evo-platformer-level",
+  "level_format_version": 3,
+  "name": "bat-deck-phase",
+  "width": 46,
+  "height": 15,
+  "spawn": {
+    "x": 2,
+    "y": 12
+  },
+  "tiles": [
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "..............................................",
+    "###########.................##################",
+    "###########.................##################"
+  ],
+  "entities": [
+    {
+      "type": "platform",
+      "x": 12,
+      "y": 11,
+      "tiles": 2,
+      "span": 6,
+      "dir": 1,
+      "axis": "x"
+    },
+    {
+      "type": "platform",
+      "x": 24,
+      "y": 10,
+      "tiles": 2,
+      "span": 6,
+      "dir": -1,
+      "axis": "x"
+    },
+    {
+      "type": "goal",
+      "x": 43,
+      "y": 12
+    }
+  ],
+  "_notes": "battery: board the second of two movers on the right phase. The first deck only reaches the second's track when it is coming back, and the second's far deck is a two-tile hop from the ground. Expected failure of a v13 run: the second mover is unphased in the observation. Verified solvable by the reach oracle and the timed planner."
+}

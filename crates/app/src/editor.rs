@@ -491,6 +491,10 @@ pub struct Editor {
     /// The level hash the current report describes, so the oracle is re-run when the
     /// document changes and not otherwise.
     report_hash: u64,
+    /// The timed planner's answer for the level as it was last saved (WP6). `None` until a save:
+    /// planning costs seconds, so it belongs to an explicit act rather than to every keystroke,
+    /// and a stale verdict is worse than no verdict. Paired with the hash it describes.
+    plan_verdict: Option<sim::plan::PlanVerdict>,
     /// Last tile painted, so a fast drag fills the gap it jumped over.
     last_paint: Option<(i32, i32)>,
 }
@@ -520,6 +524,7 @@ impl Editor {
             redo: Vec::new(),
             stroke_open: false,
             report_hash,
+            plan_verdict: None,
             last_paint: None,
         }
     }
@@ -1146,6 +1151,8 @@ impl Editor {
         if hash != self.report_hash {
             self.report = sim::reach::report(&self.level);
             self.report_hash = hash;
+            // A saved plan verdict describes a document that no longer exists.
+            self.plan_verdict = None;
         }
     }
 
@@ -1155,18 +1162,32 @@ impl Editor {
     }
 
     /// A one-line summary of what the oracle thinks.
+    ///
+    /// Before a save this is the reachability answer; after one it is the **timed planner's**
+    /// answer too (WP6), because "a route exists" and "a line can be run" are different claims and
+    /// a designer needs the second one. The plan half is deliberately not computed here: this is
+    /// called from the status bar every frame, and a plan is seconds of search.
     pub fn verdict(&self) -> String {
         if self.report.goal_reached {
-            format!(
+            let base = format!(
                 "beatable: flag reachable over {} platform(s)",
                 self.report.reachable_platforms()
-            )
+            );
+            match &self.plan_verdict {
+                Some(verdict) => format!("{base}; {}", verdict.label()),
+                None => base,
+            }
         } else {
             match &self.report.diagnosis {
                 Some(why) => format!("NOT beatable: {why}"),
                 None => "NOT beatable: the flag cannot be reached".to_string(),
             }
         }
+    }
+
+    /// The planner's answer for the level as last saved, when there is one (WP6).
+    pub fn plan_verdict(&self) -> Option<&sim::plan::PlanVerdict> {
+        self.plan_verdict.as_ref()
     }
 
     /// Save to the current path, or to `path` and remember it.
@@ -1188,6 +1209,14 @@ impl Editor {
         // The document refuses to write a level the loader would reject, and its
         // error text is the message the user sees.
         self.level.to_json_file(&target)?;
+        // The editor's verdict is part of the level's quality, so it is re-answered on the act
+        // that publishes the document. A planner budget miss is recorded as such; it is never
+        // reported as solvable.
+        let plan_cfg = sim::plan::PlanConfig {
+            depth: 48,
+            ..sim::plan::PlanConfig::default()
+        };
+        self.plan_verdict = Some(sim::plan::verdict(&self.level, 1, plan_cfg));
         let name = self.level.name.clone();
         self.path = Some(target.clone());
         self.dirty = false;
@@ -1199,6 +1228,10 @@ impl Editor {
         } else {
             format!("saved {name} to {}", target.display())
         };
+        if let Some(verdict) = &self.plan_verdict {
+            self.message
+                .push_str(&format!(" ({})", verdict.label()));
+        }
         Ok(target)
     }
 

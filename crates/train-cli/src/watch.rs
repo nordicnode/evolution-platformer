@@ -74,6 +74,7 @@ const WATCH_OPTS: &[&str] = &[
     "fine-children",
     "jump-timing-share",
     "mastery",
+    "no-mastery",
     "stagnation",
     "immigrants",
     "reheat-factor",
@@ -219,7 +220,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
             "jump-timing-share",
             GaConfig::default().jump_timing_share,
         ))?,
-        mastery: a.has_flag("mastery"),
+        // The same default as `train` and the window: after the record solves, the second phase
+        // ranks winners by the clock. `--no-mastery` is the plain run.
+        mastery: !a.has_flag("no-mastery"),
         adaptive_sigma: if a.has_flag("adaptive-sigma") {
             true
         } else {
@@ -246,7 +249,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
             feedback: usage(a.usize_opt("feedback", GaConfig::default().shape.feedback))?,
             ..GaConfig::default().shape
         },
-        // As in `train`: the walker rule lives in the trainer (`GaConfig::effective_trials`), so
+        // As in `train`: the patrol rule lives in the trainer (`GaConfig::effective_trials`), so
         // watching a run judges it the way training it does — which the window, this mode and the
         // API all get from the same place.
         trials: usage(a.usize_opt("trials", GaConfig::default().trials as usize))? as u32,
@@ -314,11 +317,15 @@ pub fn watch(a: &Args) -> Result<(), String> {
             if let Some(note) = checkpoint.level_note(&level) {
                 println!("note    {note}");
             }
-            Trainer::resume(
+            let mut trainer = Trainer::resume(
                 cfg.clone(),
                 checkpoint.to_genomes()?,
                 checkpoint.generation,
-            )?
+            )?;
+            if let Some(record) = checkpoint.best_genome()? {
+                trainer.seed_record_from_checkpoint(&level, record)?;
+            }
+            trainer
         }
         None => Trainer::new(cfg),
     };

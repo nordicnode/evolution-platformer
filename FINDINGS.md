@@ -4940,6 +4940,49 @@ What this does **not** say: the end-to-end generation speedup. The forward pass 
 generation (review §2.5), so the expected saving is in that range, but it was not re-measured here
 and the number to quote is the microbenchmark above.
 
+## Deliberate play: the agent that looks at the world before it moves
+
+The GA is a search with no model: every genome is judged by an episode that has already
+finished, so a deck that is not under the body *now* is indistinguishable from a deck that
+never arrives. That is the shape of the l11 failure above, and it is not repaired by more
+generations. The deliberate controller is the other half of the agent. It is not a policy
+over observations; it is a search over **the real simulator's next few decision blocks**.
+
+`evo::navigate::play` holds the real `Sim`, asks the route graph where the next landing is,
+and expands every action for a horizon of decision blocks. Each node is a cloned sim, so a
+jump into a pit is a death the search has already seen rather than a score it has to infer.
+The score is the sim's own progress toward the flag, the rungs left, and survival; the
+keep-one-node-per-first-action rule is what lets a jump survive pruning while its first
+blocks score worse than waiting. `Driver` holds one action for the four-tick block, so what
+a window plays is the episode the search reasoned about. The whole-route timed planner is
+the other mode (`--plan`): it searches the deck cycles and cooldowns that a six-block
+horizon cannot see, then replays the route before accepting it.
+
+Measured on the shipped pack (release binary, seed 1, local `--horizon 12 --beam 24`):
+
+| level | local controller | timed plan |
+|---|---|---|
+| `l1-flat-run` | won | won, 93 decisions / 371 frames, 0.0 s |
+| `l2-first-gap` | won | won, 93 / 369, 0.1 s |
+| `l3-gauntlet` | **won**, 1733 frames, 1.7 s | won, 112 / 446, 0.2 s |
+| `l5-tightrope` | died at x 54.3 (spike) | won, 197 / 788, 0.2 s |
+| `l9-wait-and-climb` | **won**, 693 frames, 0.9 s | **no route** after 128 expansions (frontier x 37.4) |
+| `l11-the-elements` | died at x 52.7 (lava, on the second deck) | **won**, 240 / 957 frames, 2.9 s |
+
+The two modes are complementary rather than redundant: the local horizon untangles a patrol
+that the whole-route beam prunes (`l9`), and the whole-route planner waits out the deck
+cycle that is outside the local horizon (`l11`). The window uses the plan when there is one
+and falls back to the local controller when there is not, so `--think` / `T` answers both.
+Against that, the same l11 at 300 generations, pop 200, three seeds: **0 wins**, best `x`
+46.2 / 48.1 / 50.6 — the controller is the difference between a policy that has to
+discover a wait by mutation and one that can simulate it.
+
+What this is **not**: a learned policy, a replacement for the GA, or a claim about the
+evolved champion. It is the deliberate layer the plan's WP6 asked for; the evolved agent
+remains the fast reflex. The window exposes it on `T` in any playtest and on
+`evo-app --play --think`, and the terminal on `train-cli think` (`--plan` for the
+whole-route mode).
+
 # Deliberately deferred
 
 **A hop in the canonical move set.** A policy clears a one-tile pad by releasing its direction

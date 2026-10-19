@@ -51,6 +51,18 @@ pub struct PopulationFile {
     /// Genome id per network, index-aligned with `networks`.
     pub genome_ids: Vec<u32>,
     pub networks: Vec<NetworkSpec>,
+    /// The run's **best-ever genome**, when the file was written by a run that had one.
+    ///
+    /// The population alone is not enough to resume a solved run: the record can be a mutation
+    /// that won once and was then lost from the cohort, and a checkpoint written without it makes
+    /// the resumed run unable to breed the only lineage that ever reached the flag. The genome is
+    /// re-evaluated on load ([`crate::ga::Trainer::seed_record_from_checkpoint`]), so this is a candidate rather
+    /// than a recorded win. Defaulted so every checkpoint written before this field existed still
+    /// loads.
+    #[serde(default)]
+    pub best_id: Option<u32>,
+    #[serde(default)]
+    pub best: Option<NetworkSpec>,
 }
 
 impl PopulationFile {
@@ -77,7 +89,39 @@ impl PopulationFile {
             training_config: TrainingSummary::from(config),
             genome_ids: genomes.iter().map(|g| g.id).collect(),
             networks: genomes.iter().map(NetworkSpec::from_genome).collect(),
+            best_id: None,
+            best: None,
         }
+    }
+
+    /// Attach the run's best-ever genome to the checkpoint.
+    ///
+    /// Builder-shaped rather than a fifth argument to [`PopulationFile::new`]: a checkpoint of a
+    /// population is a complete artifact on its own, and the record is extra provenance the caller
+    /// has or does not.
+    pub fn with_best(mut self, best: Option<&Genome>) -> PopulationFile {
+        self.best_id = best.map(|g| g.id);
+        self.best = best.map(NetworkSpec::from_genome);
+        self
+    }
+
+    /// Rebuild the recorded best-ever genome, if the checkpoint carried one.
+    pub fn best_genome(&self) -> Result<Option<Genome>, String> {
+        let Some(net) = &self.best else {
+            return Ok(None);
+        };
+        let id = self
+            .best_id
+            .ok_or_else(|| "checkpoint has a best network but no genome id".to_string())?;
+        let genome = Genome {
+            id,
+            shape: net.shape(),
+            weights: net.weights.clone(),
+            biases: net.biases.clone(),
+            fitness: 0.0,
+        };
+        genome.validate()?;
+        Ok(Some(genome))
     }
 
     /// Rebuild the population, in the order it was saved.
@@ -240,6 +284,38 @@ mod tests {
             &GaConfig::default(),
             "stalled for 25 generations",
         )
+    }
+
+    /// The record travels with the cohort, and an older file without it still loads.
+    #[test]
+    fn a_checkpoint_can_carry_the_runs_best_ever_genome() {
+        let mut original = population(4);
+        let best = original.remove(2);
+        let file = checkpoint().with_best(Some(&best));
+        assert_eq!(file.best_id, Some(best.id));
+        let rebuilt = file
+            .best_genome()
+            .expect("the record parses")
+            .expect("the record is present");
+        assert_eq!(rebuilt.id, best.id);
+        assert_eq!(rebuilt.weights, best.weights);
+        assert_eq!(rebuilt.biases, best.biases);
+
+        // Through the text form too, which is what a checkpoint file actually is.
+        let json = file.to_json_pretty().expect("serializes");
+        let back = PopulationFile::from_json_str(&json).expect("parses");
+        assert_eq!(back.best_id, Some(best.id));
+
+        // A file written before this field existed has no record and must still load. Removed
+        // through `serde_json` rather than by stripping lines: the last key of an object cannot
+        // be taken out textually without leaving a trailing comma behind.
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let object = value.as_object_mut().expect("a checkpoint is an object");
+        assert!(object.remove("best").is_some(), "best is written");
+        assert!(object.remove("best_id").is_some(), "best_id is written");
+        let old = PopulationFile::from_json_str(&value.to_string())
+            .expect("an older checkpoint parses");
+        assert_eq!(old.best_genome().expect("no record is not an error"), None);
     }
 
     #[test]
