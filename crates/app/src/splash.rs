@@ -155,9 +155,10 @@ const SLATE: Color32 = Color32::from_rgb(86, 100, 124);
 /// cream: a pale line over a pale-blue sky was the one piece of type on this screen that had
 /// to be read twice. Dark navy on sky is 8.7:1 and belongs to the same palette.
 const SUBTITLE_INK: Color32 = Color32::from_rgb(24, 34, 46);
-/// Small print on the stage: the *screen* ink, because the band under the level is dark.
-/// The old footer used the chrome's dim ink and was 1.3:1 on it — a caption nobody could read.
-const FOOT_INK: Color32 = theme::SCREEN_INK_DIM;
+/// The footer's quiet ink: the warm cream the prompt's key line is printed in, because the
+/// band under the level is dark and the footer's small print has to be read on it. The old
+/// footer used the chrome's dim ink and was 1.3:1 on it — a caption nobody could read.
+const FOOT_INK: Color32 = Color32::from_rgb(222, 204, 172);
 /// The stage: near-black, blue-shifted, so the gold on it reads warm.
 const STAGE_INK: Color32 = Color32::from_rgb(54, 38, 24);
 /// The menu's face: the window's warm white, because the box is a piece of the game's own menu
@@ -180,14 +181,15 @@ const DOORS_LAG: f32 = 0.25;
 /// on one line, and narrow enough to read as a box.
 const MENU_W: f32 = 520.0;
 /// One option line's height. A line of a console menu is a line of type with a cursor beside
-/// it, not a card: 40 points is a name, its key and the air a blinking cursor needs.
-const LINE_H: f32 = 40.0;
-/// The panel's padding, and the description strip under the options.
+/// it, not a card: 42 points is a name, its colour chip, its key cap and the air a blinking
+/// cursor needs.
+const LINE_H: f32 = 42.0;
+/// The panel's padding, and the description plaque under the options.
 ///
-/// The strip is what a console menu does instead of a sentence on every line: one hint about
-/// the thing the cursor is on, in the bottom of the box.
+/// The plaque is what a console menu does instead of a sentence on every line: one hint
+/// about the thing the cursor is on, in a little plate of its own in the bottom of the box.
 const PANEL_PAD: f32 = 14.0;
-const DESC_H: f32 = 34.0;
+const DESC_H: f32 = 36.0;
 /// Padding from the window's bottom edge, for the box, the prompt and the key line.
 const MENU_BOTTOM_PAD: f32 = 96.0;
 
@@ -1138,15 +1140,56 @@ fn menu(
     action
 }
 
+/// A colour mixed toward a background: `t` of `colour`, the rest of `bg`.
+///
+/// The one bit of paint arithmetic the menu needs twice: an unchosen row is tinted with
+/// its door's colour rather than filled with it, and the description plaque is tinted
+/// with the chosen door's. Mixing in plain RGB is right here — these are flat paints
+/// being blended on a plate, not light being simulated.
+fn blend(colour: Color32, bg: Color32, t: f32) -> Color32 {
+    let mix = |a: u8, b: u8| (a as f32 * t + b as f32 * (1.0 - t)).round() as u8;
+    Color32::from_rgb(
+        mix(colour.r(), bg.r()),
+        mix(colour.g(), bg.g()),
+        mix(colour.b(), bg.b()),
+    )
+}
+
+/// A colour taken down toward black: the shaded foot of a filled row, the way the logo's
+/// letters are darker at the bottom of their gradient than at the top.
+fn shade(colour: Color32, by: f32) -> Color32 {
+    let cut = |a: u8| (a as f32 * by).round() as u8;
+    Color32::from_rgb(cut(colour.r()), cut(colour.g()), cut(colour.b()))
+}
+
+/// Text with the logo's hard shadow under it: the same words twice, plum first, offset by
+/// a couple of points, never blurred — the way the wordmark's shadow is printed.
+fn shadow_text(
+    painter: &Painter,
+    at: Pos2,
+    align: Align2,
+    text: &str,
+    font: FontId,
+    ink: Color32,
+) {
+    // The shadow fades with its word: a shadow at full strength under a word still
+    // arriving would be a second, darker word arriving early.
+    let shadow = PLUM.gamma_multiply(ink.a() as f32 / 255.0);
+    painter.text(at + Vec2::new(2.0, 2.0), align, text, font.clone(), shadow);
+    painter.text(at, align, text, font, ink);
+}
+
 /// The menu panel and everything in it.
 ///
 /// The plate is dressed the way the logo is: a warm white face in a thick plum outline
 /// with a hard slate shadow under it, square-ish corners, and a grass tab on its top edge
-/// naming what it is. The rows are set in the logo's pixel face, and the chosen row is
-/// *filled* with its door's colour out of the logo's cycle and rimmed in white at the top,
-/// the way a letter of the wordmark is filled and rimmed — so the cursor's position is the
-/// brightest thing on the plate, and it is bright in the game's colours rather than in the
-/// editor's gold.
+/// naming what it is. Every row is a piece of the same furniture, chosen or not: a band
+/// tinted with its door's colour out of the logo's cycle, a square colour chip with the
+/// letter's white top rim, the name in the pixel face, and the key it answers to carried
+/// on a little key cap with its own plum outline and slate shadow. The chosen row is the
+/// same band at full strength — *filled* with its door's colour, shaded at its foot and
+/// rimmed in white at the top, the way a letter of the wordmark is — so moving the cursor
+/// raises a row rather than swapping it for a different object.
 fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clock: f32) {
     let ink = |colour: Color32| colour.gamma_multiply(arrived);
     let shift = Vec2::new(0.0, (1.0 - arrived) * 12.0);
@@ -1156,7 +1199,8 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clo
     // The tab: a tab of the lawn's own green stuck on the box's top edge, the way a menu
     // screen labels itself. It is drawn first so the box's outline closes over its bottom
     // and the tab reads as stuck *onto* the plate rather than as a second panel floating
-    // above it. Its shadow is the logo's slate, hard and offset.
+    // above it. Its shadow is the logo's slate, hard and offset, its face is rimmed with
+    // white along the top like a letter, and its word carries the plum shadow.
     let tab_w = 196.0;
     let tab = Rect::from_min_size(
         Pos2::new(panel.center().x - tab_w * 0.5, panel.top() - 26.0),
@@ -1164,13 +1208,22 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clo
     );
     painter.rect_filled(tab.translate(Vec2::new(4.0, 4.0)), radius, ink(SLATE));
     painter.rect_filled(tab, radius, ink(Color32::from_rgb(104, 186, 68)));
+    painter.rect_filled(
+        Rect::from_min_size(
+            Pos2::new(tab.left() + 8.0, tab.top() + 2.0),
+            Vec2::new((tab.width() - 16.0).max(0.0), 2.0),
+        ),
+        CornerRadius::ZERO,
+        ink(Color32::from_white_alpha(140)),
+    );
     painter.rect_stroke(
         tab,
         radius,
         Stroke::new(3.0_f32, ink(PLUM)),
         egui::StrokeKind::Inside,
     );
-    painter.text(
+    shadow_text(
+        painter,
         tab.center(),
         Align2::CENTER_CENTER,
         "SELECT",
@@ -1197,32 +1250,49 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clo
     for (index, door) in DOORS.iter().enumerate() {
         let line = line_rect(panel, index);
         let chosen = index == selected;
+        let band = line.shrink2(Vec2::new(6.0, 3.0));
+        // Every row casts the slate shadow, chosen or not: a row is a tile lying on the
+        // plate, and a tile that only casts a shadow while the cursor is on it is two
+        // different objects taking turns.
+        painter.rect_filled(band.translate(Vec2::new(3.0, 3.0)), radius, ink(SLATE));
         if chosen {
-            // The chosen line is a filled band in the door's own colour, outlined in the
-            // logo's plum and rimmed with white along the top: a letter of the wordmark,
-            // laid on its side as a row.
-            let band = line.shrink2(Vec2::new(6.0, 3.0));
+            // The chosen line at full strength: filled with the door's colour, shaded at
+            // its foot, rimmed with white along the top and outlined in the logo's plum —
+            // a letter of the wordmark, laid on its side as a row.
             painter.rect_filled(band, radius, ink(door.colour));
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(band.left() + 3.0, band.bottom() - 8.0),
+                    Pos2::new(band.right() - 3.0, band.bottom() - 3.0),
+                ),
+                CornerRadius::ZERO,
+                ink(shade(door.colour, 0.82)),
+            );
             painter.rect_filled(
                 Rect::from_min_size(
                     Pos2::new(band.left() + 8.0, band.top() + 2.0),
                     Vec2::new((band.width() - 16.0).max(0.0), 2.0),
                 ),
                 CornerRadius::ZERO,
-                ink(Color32::from_white_alpha(140)),
+                ink(Color32::from_white_alpha(160)),
             );
             painter.rect_stroke(
                 band,
                 radius,
-                Stroke::new(2.0_f32, ink(PLUM)),
+                Stroke::new(3.0_f32, ink(PLUM)),
+                egui::StrokeKind::Inside,
+            );
+        } else {
+            // The unchosen line at rest: the same band, tinted with the door's colour
+            // rather than filled with it, under a quieter plum outline.
+            painter.rect_filled(band, radius, ink(blend(door.colour, PANEL_FACE, 0.30)));
+            painter.rect_stroke(
+                band,
+                radius,
+                Stroke::new(2.0_f32, ink(blend(PLUM, PANEL_FACE, 0.55))),
                 egui::StrokeKind::Inside,
             );
         }
-        let name_ink = if chosen {
-            PLUM
-        } else {
-            PLUM.gamma_multiply(0.78)
-        };
         // The cursor: a solid plum triangle pointing at the line, blinking.
         if chosen && blink {
             let cursor = cursor_points(Pos2::new(panel.left() + 27.0, line.center().y));
@@ -1232,42 +1302,121 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clo
                 Stroke::NONE,
             ));
         }
+        // The door's colour chip: a square of its colour with a plum outline and the
+        // letter's white top rim. On the chosen row the fill is already the band's own
+        // colour, so the chip is the plate's white with the colour at its heart instead —
+        // the same chip, read against a louder ground.
+        let chip = Rect::from_min_size(
+            Pos2::new(panel.left() + 44.0, line.center().y - 11.0),
+            Vec2::new(22.0, 22.0),
+        );
+        if chosen {
+            painter.rect_filled(chip, CornerRadius::same(2), ink(PANEL_FACE));
+            painter.rect_filled(
+                chip.shrink(6.0),
+                CornerRadius::ZERO,
+                ink(door.colour),
+            );
+        } else {
+            painter.rect_filled(chip, CornerRadius::same(2), ink(door.colour));
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(chip.left() + 3.0, chip.top() + 2.0),
+                    Vec2::new((chip.width() - 6.0).max(0.0), 2.0),
+                ),
+                CornerRadius::ZERO,
+                ink(Color32::from_white_alpha(160)),
+            );
+        }
+        painter.rect_stroke(
+            chip,
+            CornerRadius::same(2),
+            Stroke::new(2.0_f32, ink(PLUM)),
+            egui::StrokeKind::Inside,
+        );
         painter.text(
-            Pos2::new(panel.left() + 52.0, line.center().y),
+            Pos2::new(panel.left() + 78.0, line.center().y),
             Align2::LEFT_CENTER,
             door.name,
             theme::pixel_font(15.0),
-            ink(name_ink),
+            ink(PLUM),
         );
+        // The key, on a cap: a little plate of the panel's own white with the slate
+        // shadow and the plum outline every other object on this screen wears, so the
+        // hint reads as a *key* rather than as a footnote that wandered onto the row.
         let key_font = theme::pixel_font(8.0);
-        let galley = painter.layout_no_wrap(door.key.to_string(), key_font, ink(theme::TEXT_DIM));
+        let galley = painter.layout_no_wrap(door.key.to_string(), key_font.clone(), ink(PLUM));
+        let cap = Rect::from_min_size(
+            Pos2::new(
+                panel.right() - 16.0 - (galley.size().x + 18.0),
+                line.center().y - 11.0,
+            ),
+            Vec2::new(galley.size().x + 18.0, 22.0),
+        );
+        painter.rect_filled(
+            cap.translate(Vec2::new(2.0, 2.0)),
+            CornerRadius::same(2),
+            ink(SLATE),
+        );
+        painter.rect_filled(cap, CornerRadius::same(2), ink(PANEL_FACE));
+        painter.rect_stroke(
+            cap,
+            CornerRadius::same(2),
+            Stroke::new(2.0_f32, ink(PLUM)),
+            egui::StrokeKind::Inside,
+        );
         painter.galley(
             Pos2::new(
-                panel.right() - 20.0 - galley.size().x,
-                line.center().y - galley.size().y * 0.5,
+                cap.center().x - galley.size().x * 0.5,
+                cap.center().y - galley.size().y * 0.5,
             ),
             galley,
-            ink(theme::TEXT_DIM),
+            ink(PLUM),
         );
     }
 
-    // The description strip: one sentence about the highlighted door, the way a console menu
-    // explains the file under the cursor rather than putting a sentence on every line.
+    // The description plaque: one sentence about the highlighted door, the way a console
+    // menu explains the file under the cursor rather than putting a sentence on every
+    // line — carried on a plate of its own, tinted with the chosen door's colour, with a
+    // square of that colour standing in for a bullet.
     let top = panel.top() + PANEL_PAD + LINE_H * DOORS.len() as f32;
+    let plaque = Rect::from_min_max(
+        Pos2::new(panel.left() + 14.0, top + 5.0),
+        Pos2::new(panel.right() - 14.0, top + DESC_H - 3.0),
+    );
     painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(panel.left() + 14.0, top + 6.0),
-            Vec2::new(panel.width() - 28.0, 1.0),
-        ),
+        plaque.translate(Vec2::new(3.0, 3.0)),
+        radius,
+        ink(SLATE),
+    );
+    painter.rect_filled(
+        plaque,
+        radius,
+        ink(blend(DOORS[selected].colour, PANEL_FACE, 0.30)),
+    );
+    painter.rect_stroke(
+        plaque,
+        radius,
+        Stroke::new(2.0_f32, ink(blend(PLUM, PANEL_FACE, 0.55))),
+        egui::StrokeKind::Inside,
+    );
+    let bullet = Rect::from_min_size(
+        Pos2::new(plaque.left() + 12.0, plaque.center().y - 5.0),
+        Vec2::new(10.0, 10.0),
+    );
+    painter.rect_filled(bullet, CornerRadius::ZERO, ink(DOORS[selected].colour));
+    painter.rect_stroke(
+        bullet,
         CornerRadius::ZERO,
-        ink(theme::EDGE),
+        Stroke::new(2.0_f32, ink(PLUM)),
+        egui::StrokeKind::Inside,
     );
     painter.text(
-        Pos2::new(panel.left() + 24.0, top + 6.0 + DESC_H * 0.5),
+        Pos2::new(plaque.left() + 34.0, plaque.center().y),
         Align2::LEFT_CENTER,
         DOORS[selected].blurb,
         theme::pixel_font(9.0),
-        ink(theme::TEXT_DIM),
+        ink(PLUM),
     );
 }
 
@@ -1311,43 +1460,94 @@ fn prompt(painter: &Painter, rect: Rect, clock: f32) {
             theme::ACCENT.gamma_multiply(arrived),
         );
     }
-    painter.text(
+    shadow_text(
+        painter,
         Pos2::new(rect.center().x, rect.bottom() - 42.0),
         Align2::CENTER_CENTER,
         MENU_HINT,
         theme::pixel_font(9.0),
-        Color32::from_rgb(222, 204, 172).gamma_multiply(arrived),
+        FOOT_INK.gamma_multiply(arrived),
     );
 }
 
 /// The bottom band: what this is, whose run it is, and what it is not.
+///
+/// Lettered like everything else on this screen, because a footer in the window's
+/// monospace was a line of the *tool* showing through the game's front door: the game's
+/// name in the pixel face in gold on the plum shadow, its version after it in the quiet
+/// cream, and the four activities at the right each in the light tone of its own colour
+/// family from the logo's cycle (Replay takes the grass family — it is the one activity
+/// with no door of its own up above), separated by little squares of cream rather than by
+/// a middot the pixel face does not carry.
 fn footer(painter: &Painter, rect: Rect, credit: Option<&str>) {
-    let font = FontId::monospace(11.0);
-    painter.text(
-        Pos2::new(rect.left() + 14.0, rect.bottom() - 11.0),
+    let base = rect.bottom() - 11.0;
+    // The brand, at the left: the name in gold, then the version in the quiet ink, both on
+    // the plum shadow the rest of the screen's stage type wears.
+    let name_font = theme::pixel_font(9.0);
+    let name_at = Pos2::new(rect.left() + 14.0, base);
+    shadow_text(
+        painter,
+        name_at,
         Align2::LEFT_BOTTOM,
-        format!("evo-app {}", env!("CARGO_PKG_VERSION")),
-        font.clone(),
+        "ONE TWO HUNDRED",
+        name_font.clone(),
+        theme::ACCENT,
+    );
+    let name_w = painter
+        .layout_no_wrap("ONE TWO HUNDRED".to_string(), name_font, theme::ACCENT)
+        .size()
+        .x;
+    painter.text(
+        Pos2::new(name_at.x + name_w + 12.0, base),
+        Align2::LEFT_BOTTOM,
+        format!("V{}", env!("CARGO_PKG_VERSION")),
+        theme::pixel_font(8.0),
         FOOT_INK,
     );
     // The credit is the one line down here worth reading, so it is the one line down here
-    // that is not grey: the title's gold, held back far enough to stay a caption.
+    // in gold: the title's gold, held back far enough to stay a caption. Set in the pixel
+    // face like the rest of the band, uppercased to match it, with the middots the face
+    // does not carry traded for hyphens it does.
     if let Some(credit) = credit {
-        painter.text(
-            Pos2::new(rect.center().x, rect.bottom() - 11.0),
+        shadow_text(
+            painter,
+            Pos2::new(rect.center().x, base),
             Align2::CENTER_BOTTOM,
-            credit,
-            font.clone(),
-            theme::ACCENT.gamma_multiply(0.85),
+            &credit.replace('·', "-").to_uppercase(),
+            theme::pixel_font(8.0),
+            theme::ACCENT.gamma_multiply(0.9),
         );
     }
-    painter.text(
-        Pos2::new(rect.right() - 14.0, rect.bottom() - 11.0),
-        Align2::RIGHT_BOTTOM,
-        "edit · play · evolve · replay",
-        font,
-        FOOT_INK,
-    );
+    // The activities, at the right, laid out right to left so the row ends flush with the
+    // window's edge: each word in its family's light tone, with a three-point square of
+    // the quiet cream between one word and the next.
+    let modes: [(&str, Color32); 4] = [
+        ("EDIT", Color32::from_rgb(255, 214, 102)),
+        ("PLAY", Color32::from_rgb(255, 186, 116)),
+        ("EVOLVE", Color32::from_rgb(112, 200, 224)),
+        ("REPLAY", Color32::from_rgb(150, 220, 96)),
+    ];
+    let mode_font = theme::pixel_font(8.0);
+    let mut right = rect.right() - 14.0;
+    for (word, colour) in modes.iter().rev() {
+        let galley = painter.layout_no_wrap(word.to_string(), mode_font.clone(), *colour);
+        let at = Pos2::new(right - galley.size().x, base);
+        painter.text(at + Vec2::new(2.0, 2.0), Align2::LEFT_BOTTOM, word, mode_font.clone(), PLUM);
+        painter.galley(
+            Pos2::new(at.x, at.y - galley.size().y),
+            galley.clone(),
+            *colour,
+        );
+        right = at.x - 10.0;
+        if word != &"EDIT" {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(right + 2.0, base - 7.0), Vec2::new(3.0, 3.0)),
+                CornerRadius::ZERO,
+                FOOT_INK,
+            );
+            right -= 10.0;
+        }
+    }
 }
 
 #[cfg(test)]
