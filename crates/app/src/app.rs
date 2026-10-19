@@ -718,6 +718,8 @@ impl EvoApp {
     fn leave_play(&mut self) {
         self.mode = Mode::Edit;
         self.session = None;
+        // The body is gone, so the pool it was standing beside is silent.
+        crate::sound::set_ambience(0.0, 0.0);
     }
 
     // -----------------------------------------------------------------------
@@ -775,6 +777,7 @@ impl EvoApp {
     fn leave_replay(&mut self, to: Mode) {
         self.replay = None;
         self.mode = to;
+        crate::sound::set_ambience(0.0, 0.0);
         // Following was the replay's opening view, and the camera is left wherever the
         // star stood: going back to a view that is not following gets the whole level
         // back, which is the same rule the follow toggle keeps.
@@ -851,6 +854,9 @@ impl EvoApp {
     /// record are worth preserving across a look at the editor, and this is the only way
     /// to look at the run and the level it is training on side by side.
     fn enter_evolve(&mut self) {
+        // A run has no single body to stand beside a pool: the beds belong to
+        // a playtest or a replay, so the last one is faded out here.
+        crate::sound::set_ambience(0.0, 0.0);
         // Training needs something to reach. A document whose flag has been erased has no
         // progress to score and no bonus to win, so a run on it is a room of agents walking
         // into the wall under a "0 tiles to go" readout — say why instead of starting one.
@@ -2109,6 +2115,8 @@ impl EvoApp {
                 ui.add_space(2.0);
                 self.dock_modes(ui);
                 ui.add_space(2.0);
+                self.dock_sound(ui);
+                ui.add_space(2.0);
                 self.dock_readout(ui);
             });
         });
@@ -2378,6 +2386,33 @@ impl EvoApp {
         }
         if let Some(cell) = chosen {
             self.set_mode(Mode::ALL[cell]);
+        }
+    }
+
+    /// The sound switch: on every screen, because a mute you can only reach
+    /// from one view is a mute someone cannot find from the view making the
+    /// noise. The plate is gold while sound is on and plain once it is off, so
+    /// the state is the face rather than a word to decode.
+    ///
+    /// `M` stays the shortcut in Edit, Play and Replay; Evolve already gives
+    /// that key to the mutation rate, which is why the plate exists at all.
+    fn dock_sound(&mut self, ui: &mut egui::Ui) {
+        let muted = crate::sound::muted();
+        let label = if muted { "Muted" } else { "Sound" };
+        let response = ui::icon_button(
+            ui,
+            Some(&self.atlas),
+            None,
+            label,
+            ui::TOOL_SIZE,
+            !muted,
+            true,
+        )
+        .on_hover_text(
+            "sound on or off — this plate is on every screen; M toggles it outside Evolve",
+        );
+        if response.clicked() {
+            crate::sound::toggle_mute();
         }
     }
 

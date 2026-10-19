@@ -210,6 +210,27 @@ impl Session {
     /// caller that wants silence is the title screen's demo.
     pub fn set_audible(&mut self, audible: bool) {
         self.audible = audible;
+        if !audible {
+            crate::sound::set_ambience(0.0, 0.0);
+        }
+    }
+
+    /// Tell the sound thread how close this body is to water and lava. Called
+    /// every frame rather than on a timer: the beds are continuous, and the
+    /// whole point of them is that walking towards a pool brings its sound up
+    /// before the body is in it.
+    fn room(&self) {
+        if !self.audible {
+            return;
+        }
+        let p = self.sim.player();
+        let (water, lava) = crate::sound::proximity(
+            self.sim.level(),
+            p.x + p.w * 0.5,
+            p.y + p.h * 0.5,
+            p.in_water,
+        );
+        crate::sound::set_ambience(water, lava);
     }
 
     /// Where to **draw** the body this frame: between the last two physics ticks, by however
@@ -495,6 +516,9 @@ impl Session {
         // How far this frame sits between the last tick and the next. Always updated, including
         // on a frame that ran no tick — that is the frame the interpolation exists for.
         self.render_alpha = (self.accumulator / TICK).clamp(0.0, 1.0);
+        // The element beds follow the body every frame, tick or no tick: they
+        // are about where it is, not about what this frame simulated.
+        self.room();
         // The animation is advanced by the *simulated* time, not by the ticks this frame happened to
         // run: the drawn body moves a third of a tick on a frame that ran none, and a run cycle that
         // only moved on the tick frames would take its steps at 60 Hz under a body gliding at the
@@ -532,6 +556,9 @@ impl Session {
     /// is unaffected — it is a recording, not a race.
     pub fn advance(&mut self, dt: f32, keys: Keys) {
         if !self.started && keys.is_idle() {
+            // The clock has not started, but the body is standing somewhere,
+            // and a pool beside it should still be audible.
+            self.room();
             return;
         }
         self.started = true;

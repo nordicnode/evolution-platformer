@@ -4,11 +4,11 @@
 //! thing for a person who already knows what the four tabs are and a cold start for everyone
 //! else. So the first frame is this: the game's own picture — the same sky gradient, the same
 //! parallax hills and drifting clouds, the same grass, trees and butterflies, drawn by the
-//! same functions — with a title over it, and the whole thing is **running**. An agent on a
-//! small level built for the occasion runs to the flag, jumps one gap and climbs one step on
-//! the way, and the scene holds on the waving flag for a moment before starting again, so
-//! what a person watches while deciding to press a key is the game being played rather than
-//! a picture of it.
+//! same functions — and the whole thing is **running**. The wordmark stands in the level as a
+//! terraced hill; an agent on a small level built for the occasion runs at it from the left,
+//! climbs its face, crosses its top edge and drops down to the flag on the right. The scene
+//! holds on the waving flag for a moment before starting again, so what a person watches while
+//! deciding to press a key is the game being played rather than a picture of it.
 //!
 //! What this module owns is the *screen*: the level, the little episode, the camera pull-back
 //! and the words. The world is drawn by [`crate::view`], and the episode is a
@@ -46,6 +46,7 @@ use sim::{AgentAction, Level, Sim, Tile};
 use crate::atlas::Atlas;
 use crate::play::{self, Keys};
 use crate::theme;
+use crate::ui;
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 
 /// The lockup is the game's logo itself: the approved wordmark, drawn as art rather than
@@ -111,7 +112,7 @@ const ARMED: f32 = 0.35;
 /// menu needs a band of its own under the ground rather than the lawn's brown. Pushing
 /// the world up is one number and it is what turns the layer under the ground from a state
 /// the fit happened to land on into a *floor for the text*.
-const RAISED: f32 = 0.17;
+const RAISED: f32 = 0.13;
 /// Where the ground sits in the window when a champion is playing, as a fraction of the
 /// window's height.
 ///
@@ -121,6 +122,11 @@ const RAISED: f32 = 0.17;
 const GROUND_LINE: f32 = 0.60;
 /// The seed of the splash's episode, so the splash is the same splash every launch.
 const SEED: u64 = 4;
+/// The smallest visible gap between the runner's head and the top of the window.
+///
+/// The climb is tall enough that a full jump from the summit would otherwise carry the agent
+/// out of frame. The camera eases down only when the body gets this close to the top edge.
+const TOP_MARGIN: f32 = 40.0;
 
 /// The prompt's ink: warm cream, because the band under the level is dark.
 const FOOT_INK: Color32 = Color32::from_rgb(222, 204, 172);
@@ -143,7 +149,7 @@ const LINE_H: f32 = 44.0;
 /// The panel's padding.
 const PANEL_PAD: f32 = 14.0;
 /// Padding from the window's bottom edge, for the box and the prompt under it.
-const MENU_BOTTOM_PAD: f32 = 76.0;
+const MENU_BOTTOM_PAD: f32 = 56.0;
 /// The prompt's baseline above the window's bottom edge.
 const PROMPT_BOTTOM: f32 = 40.0;
 /// The champion credit's baseline above the window's bottom edge.
@@ -320,14 +326,15 @@ impl Splash {
 
     /// Skip the reveal and the pull-back, for a still frame.
     ///
-    /// A screenshot cannot show a reveal — the capture is of one frame, taken within a frame
-    /// or two of the window opening, when the title is a fifth of the way in and the camera
-    /// is still on the runner. `--splash --screenshot` therefore asks for the splash at the
-    /// end of its opening move instead of the beginning, which is the frame a person would
-    /// photograph if they were showing somebody the screen. The episode is advanced as well,
-    /// so the runner in that frame is running rather than standing on the spawn tile.
+    /// A screenshot cannot show a reveal, and the opening frame has the runner still on the
+    /// left. `--splash --screenshot` therefore asks for the splash at the moment the demo run
+    /// is climbing the wordmark, which is the frame a person would photograph if they were
+    /// showing somebody the screen. The episode is advanced as well, so the runner in that
+    /// frame is running rather than standing on the spawn tile.
     pub fn skip_opening(&mut self) {
-        let skip = HINT_AT + 0.9;
+        // Two and a half seconds puts the runner on the upper face of the mark on the demo
+        // level; a champion's level lands wherever its own episode is at that instant.
+        let skip = 2.6;
         let steps = (skip / sim::DT).ceil() as u32;
         for _ in 0..steps {
             self.advance(sim::DT);
@@ -413,8 +420,8 @@ impl Splash {
     /// Draw the screen, and say which way the viewer asked to go — or `None` if they have not
     /// asked yet.
     ///
-    /// The picture first, then the stage, then the logo and the menu: the level is the screen's
-    /// *subject*, and everything drawn over it is furniture arranged around it.
+    /// The picture first, then the stage, then the menu: the level is the screen's *subject*,
+    /// and everything drawn over it is furniture arranged around it.
     ///
     /// Any key press or any click counts, once the screen has been up for [`ARMED`] seconds: a
     /// splash is a doorway, and a doorway that argues is a wall. Two keys open the activity they
@@ -435,21 +442,38 @@ impl Splash {
         let camera = self.camera(rect);
         let sheet = Sheet::new(&painter, atlas, sprites, &camera, rect);
         // The world, exactly as the play view draws it: the sky and its parallax, then the
-        // level and the agent in it with its dust. The level's own bounds box is the one
-        // thing the play view draws that belongs to a document rather than to a picture, so
-        // it is off.
+        // level, then the logo, then the agent with its dust. The level's own bounds box is
+        // the one thing the play view draws that belongs to a document rather than to a
+        // picture, so it is off.
         view::draw_background(sheet, &self.level, view::Backdrop::Sky, self.clock);
         let opts = RenderOpts {
             bounds: false,
             ..RenderOpts::playing()
         };
-        view::draw_sim(
-            sheet,
-            self.session.sim(),
-            opts,
-            self.clock,
-            self.session.anim(),
-        );
+        let scripted = matches!(self.policy, Policy::Script);
+        let logo = self.logo_texture(ctx);
+        if scripted {
+            // The demo logo is part of the level: terrain first, then the mark, then the
+            // runner so the climb happens *on* the logo rather than behind it.
+            view::draw_level(sheet, &self.level, opts, None, self.clock);
+            paint_logo(&painter, logo_world_rect(camera, rect), self.clock, &logo);
+            view::draw_agents(
+                sheet,
+                self.session.sim(),
+                self.clock,
+                Color32::WHITE,
+                self.session.anim(),
+                true,
+            );
+        } else {
+            view::draw_sim(
+                sheet,
+                self.session.sim(),
+                opts,
+                self.clock,
+                self.session.anim(),
+            );
+        }
 
         // The band under the level's own floor is the stage. Measured from the floor rather
         // than from a fraction of the window, because a champion is played on whatever level
@@ -459,12 +483,17 @@ impl Splash {
             .to_screen(0.0, (self.level.height - 1) as f32, rect)
             .y;
         stage(&painter, rect, floor);
-        let logo = self.logo_texture(ctx);
-        lockup(&painter, rect, self.clock, &logo);
+        if !scripted {
+            lockup(&painter, rect, self.clock, &logo);
+        }
 
         let panel = menu_panel(rect);
         let from_menu = menu(ctx, &painter, rect, panel, &mut self.selected, self.clock);
         champion_credit(&painter, rect, self.credit());
+        // The sound switch belongs on the front door too: the music is already
+        // playing here, and the alternative is asking a person to start the
+        // game to turn it down.
+        let sound_rect = sound_button(ctx, rect, atlas);
 
         if self.clock < ARMED {
             return None;
@@ -495,6 +524,13 @@ impl Splash {
                             }
                             egui::Key::P => Pressed::Go(Action::Play),
                             egui::Key::E => Pressed::Go(Action::Evolve),
+                            // One key that does not start the game: the music
+                            // is already playing, and muting it should not
+                            // cost the viewer the title screen.
+                            egui::Key::M => {
+                                crate::sound::toggle_mute();
+                                Pressed::None
+                            }
                             _ => Pressed::Go(Action::Edit),
                         };
                     }
@@ -505,6 +541,14 @@ impl Splash {
                     egui::Event::PointerButton {
                         pressed: true, pos, ..
                     } if menu_is_up(self.clock) && panel.expand(10.0).contains(*pos) => {
+                        continue;
+                    }
+                    // The sound plate is a control, not a start button: its
+                    // own press toggles on release, and this press must not
+                    // also dismiss the screen.
+                    egui::Event::PointerButton {
+                        pressed: true, pos, ..
+                    } if sound_rect.contains(*pos) => {
                         continue;
                     }
                     egui::Event::PointerButton { pressed: true, .. } => {
@@ -569,7 +613,15 @@ impl Splash {
     /// level whole: a level that already fits inside the follow zoom is not worth tracking.
     fn target(&self, rect: Rect) -> Camera {
         match &self.policy {
-            Policy::Script => framed(&self.level, rect),
+            Policy::Script => {
+                let mut camera = framed(&self.level, rect);
+                let p = self.session.sim().player();
+                let head = camera.to_screen(p.x, p.y, rect).y;
+                if head < TOP_MARGIN {
+                    camera.centre.y -= (TOP_MARGIN - head) / camera.zoom;
+                }
+                camera
+            }
             Policy::Champion(_) => {
                 let p = self.session.sim().player();
                 let zoom = framed(&self.level, rect).zoom.max(crate::app::FOLLOW_ZOOM);
@@ -616,28 +668,55 @@ fn level() -> Level {
     // moves need and no taller than a level ever is. The shape is a framing decision — the
     // fit is width-limited on a window this wide, so a longer level would draw every tile
     // smaller and put the runner's head at eight pixels.
-    let mut level = Level::starter("splash", 34, 13);
-    // The floor is two rows deep, the way a shipped level's is — the lawn, and the dirt under
-    // it — which is what lets a gap read as a pit rather than as a stripe of sky.
+    let mut level = Level::starter("splash", 34, 15);
+    // A deeper frame than the old demo: the extra sky above the wordmark and the extra ground
+    // below it are what put the mark near the top and the land low in the window.
     for tx in 0..level.width {
-        level.set_tile(tx, 11, Tile::Solid);
+        level.set_tile(tx, 13, Tile::Solid);
+        level.set_tile(tx, 14, Tile::Solid);
     }
     // `starter` placed the spawn and the flag on the single row it knows about; with the
-    // floor a row higher they move up with it. A goal tile is the *pole* — the lower of the
-    // flag's two cells, and the one that has to have ground under it — so it is row 10, the
-    // tile standing on the lawn. A level has one flag, so both calls are *moves*: the spawn's
-    // and the goal's place in the row are what changes, not how many of them there are.
-    level.set_spawn_tile(1, 10);
-    level.set_goal_tile(31, 10);
-    // A gap three tiles wide and a step one tile high: both the widest and the tallest thing
-    // the physics comfortably clears from a full run, so the runner is not relying on luck
-    // and a person is not watching a near miss.
-    for tx in 12..15 {
-        level.set_tile(tx, 11, Tile::Empty);
-        level.set_tile(tx, 12, Tile::Empty);
-    }
-    for tx in 20..26 {
-        level.set_tile(tx, 10, Tile::Solid);
+    // floor two rows lower they move down with it. A goal tile is the *pole* — the lower of
+    // the flag's two cells, and the one that has to have ground under it — so it is row 12,
+    // the tile standing on the lawn. A level has one flag, so both calls are *moves*: the
+    // spawn's and the goal's place in the row are what changes, not how many of them there
+    // are.
+    level.set_spawn_tile(1, 12);
+    level.set_goal_tile(31, 12);
+
+    // A terraced hill in the middle, ten tiles from the ground to the summit. The summit sits
+    // one row below the top of the mark, so the runner crosses the wordmark's face and top
+    // edge without its jump carrying it out of the window. The lower terraces stay visible as
+    // the mountain the mark stands on. One tile per terrace is the shape the script can read;
+    // the jump can carry several treads at once, which is why the steps are here at all rather
+    // than a wall.
+    const TERRACES: [(i32, i32, i32); 19] = [
+        (5, 6, 12),
+        (6, 7, 11),
+        (7, 8, 10),
+        (8, 9, 9),
+        (9, 10, 8),
+        (10, 11, 7),
+        (11, 12, 6),
+        (12, 13, 5),
+        (13, 14, 4),
+        (14, 20, 3),
+        (20, 21, 4),
+        (21, 22, 5),
+        (22, 23, 6),
+        (23, 24, 7),
+        (24, 25, 8),
+        (25, 26, 9),
+        (26, 27, 10),
+        (27, 28, 11),
+        (28, 29, 12),
+    ];
+    for (left, right, top) in TERRACES {
+        for tx in left..right {
+            for ty in top..13 {
+                level.set_tile(tx, ty, Tile::Solid);
+            }
+        }
     }
     level
 }
@@ -677,7 +756,7 @@ fn scripted(level: &Level, sim: &Sim) -> Keys {
 
 /// The run's champion for this level, if there is one worth playing.
 ///
-/// Three things are checked, and each of them is there because the alternative is a title
+/// Four things are checked, and each of them is there because the alternative is a title
 /// screen quietly showing the wrong thing:
 ///
 /// * **The file is where the front-ends leave it.** Two names are tried: the level *file's*
@@ -694,6 +773,8 @@ fn scripted(level: &Level, sim: &Sim) -> Keys {
 ///   costs the trainer — and a champion that does not reach the flag is not played. A title
 ///   screen looping a run's best agent dying is worse than the demo run it replaced, and
 ///   "best" is best of a population that may never have beaten the level at all.
+/// * **It was learned.** A generation-zero winner is the seed population's best, not a run
+///   that learned anything; the demo is the better introduction.
 ///
 /// Every refusal is silent, on purpose. The file is a build artifact in a directory the
 /// window was told to look in, and a title screen that refused to open over a stale one would
@@ -702,7 +783,10 @@ fn scripted(level: &Level, sim: &Sim) -> Keys {
 fn champion_run(level: &Level, champions: &Path, level_path: Option<&Path>) -> Option<ChampionRun> {
     let champion = champion_file(level, champions, level_path)?;
     let (genome, result) = evo::champion::replay(level, &champion).ok()?;
-    if !result.won() {
+    // A generation-zero winner is the seed population's best agent, not a learned run. It
+    // belongs on the level it happened to solve, not on the front door; the demo is a better
+    // introduction and is what a fresh checkout gets.
+    if !result.won() || champion.metadata.generation == 0 {
         return None;
     }
     Some(ChampionRun {
@@ -749,7 +833,7 @@ fn logo_in(clock: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The size the logo is drawn at: the screen's subject, sized from the window.
+/// The size the overhead logo is drawn at on a champion's level.
 ///
 /// Wide enough to be the thing the screen is *about* — a logo a third of the window wide
 /// is a caption — and capped, because past a size the picture is just nearer, not bigger
@@ -761,24 +845,42 @@ fn logo_size(rect: Rect) -> Vec2 {
 
 /// Where the logo's top edge sits at rest, as a fraction of the window's height.
 ///
-/// High enough that the sky above it is a margin rather than a second subject, low enough
-/// that the mark and the level's floor stack without touching.
+/// Only the champion path uses this overhead placement; the scripted demo puts the mark in
+/// the level so the runner can climb it.
 const LOGO_TOP: f32 = 0.105;
 
-/// The logo: one picture, fading up into place.
+/// The demo level's logo: five tiles tall, high over the terraced hill.
 ///
-/// The mark is the screen's subject and the only thing above the level. It does not fall,
-/// bounce, bloom or sway; the world behind it already moves, and adding motion to the sign
-/// only competes with the action it is introducing.
-fn lockup(painter: &Painter, rect: Rect, clock: f32, logo: &egui::TextureHandle) {
+/// The width follows the picture's own aspect. The logo spans the upper face of the hill, so
+/// the runner climbs it and crosses its top edge, while the land stays low below.
+const LOGO_WORLD_TOP: f32 = 2.0;
+const LOGO_WORLD_BOTTOM: f32 = 7.0;
+const LOGO_WORLD_CENTRE: f32 = 17.0;
+
+/// The logo's rectangle in the demo level, in screen space.
+///
+/// The height is five tiles; its bottom sits above the ground, leaving the lower terraces of
+/// the hill visible underneath. The width comes from the picture so the mark keeps its shape
+/// at whatever zoom the camera is at.
+fn logo_world_rect(camera: Camera, rect: Rect) -> Rect {
+    let height = LOGO_WORLD_BOTTOM - LOGO_WORLD_TOP;
+    let width = height * LOGO_ASPECT;
+    let min = camera.to_screen(LOGO_WORLD_CENTRE - width * 0.5, LOGO_WORLD_TOP, rect);
+    let max = camera.to_screen(LOGO_WORLD_CENTRE + width * 0.5, LOGO_WORLD_BOTTOM, rect);
+    Rect::from_min_max(min, max)
+}
+
+/// Draw the logo at `dest`, fading up into place.
+///
+/// One paint for both placements: the overhead mark on a champion's level, and the mark in
+/// the demo level the runner climbs.
+fn paint_logo(painter: &Painter, dest: Rect, clock: f32, logo: &egui::TextureHandle) {
     let arrived = logo_in(clock);
     if arrived <= 0.0 {
         return;
     }
-    let size = logo_size(rect);
     let rise = (1.0 - arrived) * 10.0;
-    let top = rect.top() + rect.height() * LOGO_TOP + rise;
-    let dest = Rect::from_min_size(Pos2::new(rect.center().x - size.x * 0.5, top), size);
+    let dest = dest.translate(Vec2::new(0.0, rise));
     painter.image(
         logo.id(),
         dest,
@@ -788,6 +890,14 @@ fn lockup(painter: &Painter, rect: Rect, clock: f32, logo: &egui::TextureHandle)
         // the picture arriving.
         Color32::from_rgba_unmultiplied(255, 255, 255, (arrived * 255.0) as u8),
     );
+}
+
+/// The overhead logo, for a champion playing a level the screen did not build.
+fn lockup(painter: &Painter, rect: Rect, clock: f32, logo: &egui::TextureHandle) {
+    let size = logo_size(rect);
+    let top = rect.top() + rect.height() * LOGO_TOP;
+    let dest = Rect::from_min_size(Pos2::new(rect.center().x - size.x * 0.5, top), size);
+    paint_logo(painter, dest, clock, logo);
 }
 
 /// The stage: the band under the level's floor, darkened to a near-black gradient.
@@ -817,6 +927,37 @@ fn stage(painter: &Painter, rect: Rect, floor: f32) {
 /// and the rule that any press starts the editor has to step aside for it. Two copies of
 /// "when is it up" is how the band ends up swallowing a click on a frame the rows are not
 /// drawn on.
+/// The sound plate in the splash's top-right corner, and the rectangle it
+/// occupied.
+///
+/// The rectangle is returned because this screen dismisses on *any* pointer
+/// press, and a control that dismisses the screen on its way to being clicked
+/// is not a control. The caller lets a press inside it through to the widget.
+fn sound_button(ctx: &Context, rect: Rect, atlas: &Atlas) -> Rect {
+    let muted = crate::sound::muted();
+    let label = if muted { "Muted" } else { "Sound" };
+    egui::Area::new(egui::Id::new("splash-sound"))
+        .fixed_pos(Pos2::new(rect.max.x - 126.0, 16.0))
+        .movable(false)
+        .show(ctx, |ui| {
+            let response = ui::icon_button(
+                ui,
+                Some(atlas),
+                None,
+                label,
+                Vec2::new(84.0, 36.0),
+                !muted,
+                true,
+            )
+            .on_hover_text("sound on or off — M also works here");
+            if response.clicked() {
+                crate::sound::toggle_mute();
+            }
+        })
+        .response
+        .rect
+}
+
 fn menu_is_up(clock: f32) -> bool {
     clock >= HINT_AT + DOORS_LAG
 }
@@ -1142,13 +1283,14 @@ mod tests {
             panel.top() > world_bottom,
             "the menu is drawn over the level: box {panel:?} against world bottom {world_bottom}"
         );
-        // The prompt and the key line live under the box, and the box leaves them their band.
+        // The prompt lives under the box, and the box leaves it its band.
+        let prompt = rect.bottom() - PROMPT_BOTTOM;
         assert!(
-            panel.bottom() <= rect.bottom() - 70.0,
-            "the box is standing on the prompt under it: {panel:?}"
+            panel.bottom() + 8.0 < prompt,
+            "the box is standing on the prompt under it: {panel:?} vs {prompt:.0}"
         );
         assert!(
-            panel.bottom() <= rect.bottom(),
+            panel.bottom() <= rect.bottom() - CREDIT_BOTTOM,
             "the box falls off the window"
         );
 
@@ -1221,8 +1363,10 @@ mod tests {
     fn the_splash_runner_reaches_the_flag() {
         let mut splash = Splash::scripted();
         let mut seconds = 0.0;
+        let mut highest = splash.session.sim().player().y;
         while !splash.session.sim().outcome().is_finished() && seconds < 30.0 {
             splash.advance(sim::DT);
+            highest = highest.min(splash.session.sim().player().y);
             seconds += sim::DT;
         }
         assert_eq!(
@@ -1232,8 +1376,33 @@ mod tests {
             splash.session.summary()
         );
         assert!(
+            highest < LOGO_WORLD_TOP + 1.0,
+            "the runner only reached y {highest:.1}; it never climbed over the logo"
+        );
+        assert!(
             seconds < 12.0,
             "the little run takes {seconds:.1}s, which is longer than a splash has"
+        );
+    }
+
+    /// The camera keeps the runner inside the window even on the tall summit jump.
+    ///
+    /// The mark now sits high and the hill is long; a full jump from the top terrace would
+    /// otherwise put the agent's head above the frame. The target camera eases down by the
+    /// missing margin, and this drives the whole run to prove it never loses the runner.
+    #[test]
+    fn the_camera_keeps_the_runner_in_frame() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
+        let mut splash = Splash::scripted();
+        let mut highest = f32::MAX;
+        while !splash.session.sim().outcome().is_finished() {
+            splash.advance(sim::DT);
+            let p = splash.session.sim().player();
+            highest = highest.min(splash.camera(rect).to_screen(p.x, p.y, rect).y);
+        }
+        assert!(
+            highest >= 0.0,
+            "the runner's head reached y {highest:.1}, above the window"
         );
     }
 
@@ -1515,11 +1684,11 @@ mod tests {
 
     /// Nothing that is not this level's champion, for this build, is played.
     ///
-    /// Four refusals, each of which would otherwise be a title screen quietly showing the
+    /// Five refusals, each of which would otherwise be a title screen quietly showing the
     /// wrong thing: no file at all; a champion for a different level, whose terrain is not the
-    /// one on screen; a file from another build, whose physics are not this one's; and a
-    /// best-ever agent that dies — the commonest of the four, because a champion is the best a
-    /// run *got*, and a run on a hard level may never have beaten it.
+    /// one on screen; a file from another build, whose physics are not this one's; a best-ever
+    /// agent that dies; and a generation-zero winner, which is the seed population's best
+    /// rather than a learned run.
     #[test]
     fn nothing_but_this_levels_champion_for_this_build_is_played() {
         let flat = shipped("l1-flat-run");
@@ -1542,6 +1711,18 @@ mod tests {
         save_champion(&elsewhere, "l1-flat-run", &pit, 7);
         assert!(matches!(
             Splash::open(&flat, &elsewhere, Some(&flat_path)).policy,
+            Policy::Script
+        ));
+
+        // A generation-zero winner: the seed population, not a learned run.
+        let seed = scratch("generation-zero");
+        let mut early = save_champion(&seed, "l1-flat-run", &flat, 7);
+        early.metadata.generation = 0;
+        early
+            .save(seed.join("l1-flat-run.json"))
+            .expect("the seed champion writes");
+        assert!(matches!(
+            Splash::open(&flat, &seed, Some(&flat_path)).policy,
             Policy::Script
         ));
 
@@ -1707,14 +1888,7 @@ mod tests {
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let size = Vec2::new(1360.0, 800.0);
         let rect = Rect::from_min_size(Pos2::ZERO, size);
-        // The lockup's own band: the logo, and nothing the menu or the prompt contributes.
-        // Counting here is what makes this a test of the reveal rather than a count of
-        // everything drawn on the screen.
-        let line = Rect::from_min_size(
-            Pos2::new(rect.left(), rect.height() * 0.08),
-            Vec2::new(rect.width(), rect.height() * 0.32),
-        );
-        let counts = |clock: f32| -> (usize, usize, usize, usize) {
+        let counts = |clock: f32| -> (usize, usize, usize, u32) {
             let mut splash = {
                 let mut splash = Splash::scripted();
                 while splash.clock() < clock {
@@ -1734,7 +1908,7 @@ mod tests {
             // The frame just drawn uploaded the logo; its id is how its quad is known from
             // every other quad on the screen.
             let logo_id = splash.logo.as_ref().map(|handle| handle.id());
-            let (mut world, mut words, mut title, mut logo) = (0, 0, 0, 0);
+            let (mut world, mut words, mut logo) = (0, 0, 0);
             for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
                 let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
                     continue;
@@ -1744,15 +1918,9 @@ mod tests {
                     continue;
                 }
                 if Some(mesh.texture_id) == logo_id {
-                    for quad in mesh.vertices.chunks(4) {
-                        if quad.len() < 4 {
-                            continue;
-                        }
-                        let centre = quad.iter().fold(Pos2::ZERO, |a, v| a + v.pos.to_vec2()) / 4.0;
-                        if line.contains(centre) {
-                            logo += 1;
-                        }
-                    }
+                    // The demo logo is in the level, so count every quad that samples its
+                    // texture rather than only those in a screen band.
+                    logo += mesh.vertices.len() / 4;
                     continue;
                 }
                 if mesh.texture_id != egui::TextureId::default() {
@@ -1763,23 +1931,23 @@ mod tests {
                         continue;
                     }
                     // A *word* is a quad that samples a glyph. A quad that samples the font
-                    // atlas's white pixel is a filled shape — the sunbeams and the vignette
-                    // the sky is drawn with are meshes too, and they land on the lockup's own
-                    // band, so counting them would count scenery as type.
+                    // atlas's white pixel is a filled shape; counting those would count
+                    // scenery as type.
                     if quad[0].uv == egui::epaint::WHITE_UV {
                         continue;
                     }
-                    let centre = quad.iter().fold(Pos2::ZERO, |a, v| a + v.pos.to_vec2()) / 4.0;
-                    words += 1;
-                    if line.contains(centre) {
-                        title += 1;
+                    // The sound plate is the one word this screen shows before
+                    // the menu: it is a control, not part of the reveal.
+                    if quad[0].pos.x > rect.max.x - 140.0 && quad[0].pos.y < 80.0 {
+                        continue;
                     }
+                    words += 1;
                 }
             }
-            (world, words, title, logo)
+            (world, words, logo, splash.session.sim().stats().frames)
         };
 
-        let (world, words, title, logo) = counts(2.4);
+        let (world, words, logo, frames) = counts(2.4);
         assert!(
             world > 40,
             "the splash drew {world} sprite quads: the world is not on the screen"
@@ -1790,19 +1958,15 @@ mod tests {
         );
         assert!(
             logo >= 1,
-            "the splash drew {logo} logo quads on the lockup's band: the logo is not on the screen"
+            "the splash drew {logo} logo quads: the logo is not on the screen"
         );
-        assert_eq!(
-            title, 0,
-            "{title} glyphs were drawn around the logo: the lockup has copy on it again"
-        );
-        let (_, _, early_words, early_logo) = counts(0.0);
+        let (_, early_words, early_logo, _) = counts(0.0);
         assert_eq!(early_words, 0, "the menu is already up at the first frame");
         assert_eq!(early_logo, 0, "the logo is already up at the first frame");
-        let (later_world, _, _, _) = counts(6.0);
+        let (_, _, _, later_frames) = counts(6.0);
         assert!(
-            later_world != world,
-            "the world is the same picture at 2.4s and 6.0s: nothing in it is running"
+            later_frames != frames,
+            "the episode is on the same tick at 2.4s and 6.0s: nothing in it is running"
         );
     }
 }

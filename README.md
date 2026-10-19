@@ -16,7 +16,7 @@ the terminal.
 
 ![Title screen](docs/images/title-screen.png)
 
-*The title screen, over a live demo run.*
+*The title screen: the demo runner climbs the wordmark.*
 
 ![The blocks and the cast](docs/images/blocks-gallery.png)
 
@@ -78,6 +78,12 @@ ghosted beside it.
 - **Headless training** with `train-cli`: train, watch, replay champions,
   check levels, and run seed benchmarks, all from the terminal. A run started
   in the window can be resumed in the terminal and the other way round.
+- **Synthesised sound**, with no audio assets: an effect for every jump,
+  stomp, spring and death; water and lava beds that fade in as you approach
+  them, with splashes and swim strokes, and lava vents that announce a volley;
+  an original minute-and-a-quarter theme that runs through intro, four
+  sections, a bridge and a final chorus before it loops; and a sound switch on
+  every screen.
 
 ## The levels
 

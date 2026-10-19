@@ -389,6 +389,19 @@ impl Replay {
             }
         }
         self.ticks += ticks;
+        // The beds follow the star, so a replay on a level with a pool and a
+        // vent sounds like that level even when the star is not splashing
+        // this second.
+        if let Some(runner) = self.runners.first() {
+            let p = runner.sim().player();
+            let (water, lava) = crate::sound::proximity(
+                &self.level,
+                p.x + p.w * 0.5,
+                p.y + p.h * 0.5,
+                p.in_water,
+            );
+            crate::sound::set_ambience(water, lava);
+        }
     }
 
     /// The episode being replayed.
