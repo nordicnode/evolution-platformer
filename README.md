@@ -1,4 +1,8 @@
-# Evolution Platformer
+<p align="center">
+  <img src="docs/images/logo.png" alt="One Two Hundred" width="720">
+</p>
+
+# One Two Hundred
 
 Build a 2D platformer level, then watch a population of neural networks evolve to
 beat it. The entertainment product is the **visible learning arc** — stands still,
@@ -19,6 +23,37 @@ numbered findings, the verification detail and the deferred work are in
 [AI_IMPROVEMENT_PLAN.md](AI_IMPROVEMENT_PLAN.md). (The original design document
 and the dated review/audit snapshots this repo accumulated were retired on
 2026-10-18; they live in git history.)
+
+## In pictures
+
+![The title screen: the logo over a living run of the game](docs/images/title-screen.png)
+
+*The front door. The scene behind the name is the game itself, running: a little
+level, played by a script or by the saved champion of the level you opened on.*
+
+![The blocks and the cast, drawn from the game's own tileset](docs/images/blocks-gallery.png)
+
+*What a level is made of. Four materials (grass, sand, brick, timber) that are all
+solid in exactly the same way, the behaviour tiles (one-way shelf, mover, cracked
+ground, spikes, spring pad), the three elements (water, lava, vine), and the cast
+that lives on them.*
+
+![The editor, on a showcase level that uses everything at once](docs/images/editor-showcase.png)
+
+*The editor, on `levels/scratch-showcase.json`: one diorama that puts every material,
+both trap tiles, both pools, a vine, a mover and the whole cast on one screen, with
+the palette of parts down the left. The line at the bottom is the reachability
+oracle's verdict on what you have drawn.*
+
+![A run in the window: twenty generations in, the chart climbing, a champion saved](docs/images/evolve.png)
+
+*The run, watched in the window: twenty generations on `l3-gauntlet`, nine of the two
+hundred home, the fitness chart below doing the thing the whole game is about.*
+
+![The replay: the run's quickest win, with the population it came from ghosted beside it](docs/images/replay.png)
+
+*The replay: the champion's own episode played back at game speed, with the
+population it last scored against ghosted beside it.*
 
 ## Status
 
