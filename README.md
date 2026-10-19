@@ -16,7 +16,7 @@ the terminal.
 
 ![Title screen](docs/images/title-screen.png)
 
-*Title screen.*
+*The title screen, over a live demo run.*
 
 ![The blocks and the cast](docs/images/blocks-gallery.png)
 

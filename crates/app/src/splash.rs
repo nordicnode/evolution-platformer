@@ -20,9 +20,9 @@
 //!
 //! **It gets out of the way, and it leads where its sign says.** Any key or any click after
 //! the first [`ARMED`] seconds dismisses it ([`Action`]): `P` opens the playtest and `E`
-//! starts a run, and every other key — or a click — opens the editor. The keys printed on the
-//! front door therefore *do* what they say, rather than being hints for a screen that would
-//! consume the press and drop the viewer into the editor anyway. The window is playable from
+//! starts a run, and every other key — or a click — opens the editor. Those shortcuts *do*
+//! what they say, rather than being hints for a screen that would consume the press and drop
+//! the viewer into the editor anyway. The window is playable from
 //! the frame after that, and nothing about the splash is reachable again except by restarting
 //! the app. A stray event from the window manager — a focus click, a key repeat — must not eat
 //! the title before a person has seen it, which is what [`ARMED`] is for.
@@ -39,9 +39,7 @@
 
 use std::path::Path;
 
-use egui::{
-    Align2, Color32, Context, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, Vec2,
-};
+use egui::{Align2, Color32, Context, CornerRadius, Painter, Pos2, Rect, Stroke, Vec2};
 use evo::{ActScratch, ChampionFile, Genome};
 use sim::{AgentAction, Level, Sim, Tile};
 
@@ -61,18 +59,14 @@ use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 /// (`crates/app/assets/logo.png`), not redrawn in a font that happens to be nearby. A
 /// redrawn logo is a second logo, and the two would drift.
 ///
-/// The eyebrow is the genre line a box would carry above its name; the subtitle is the hook.
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
 /// The logo's own aspect, width over height, so its rectangle on screen is the picture's
 /// shape rather than a guess at it.
 const LOGO_ASPECT: f32 = 1515.0 / 420.0;
-const EYEBROW: &str = "AN ARTIFICIAL-LIFE PLATFORMER";
-const SUBTITLE: &str = "a population learns to beat the level you draw";
-/// The menu's own help line: how to move between the doors, and how to take one.
+/// The only instruction the screen needs: move the selection, then take it.
 ///
-/// "Up / down" rather than arrow glyphs, which the window's font does not have: a hint that
-/// renders as two empty boxes is worse than one that spells the key out.
-const MENU_HINT: &str = "UP / DOWN   SELECT";
+/// Arrow glyphs are not in the pixel face, so the keys are spelled out.
+const MENU_HINT: &str = "UP / DOWN    ENTER";
 
 /// What a person asked for by dismissing the screen.
 ///
@@ -98,24 +92,13 @@ pub enum Action {
 const PULLBACK: f32 = 1.8;
 /// When the logo starts arriving, and how long its whole entrance takes.
 ///
-/// The logo arrives as one gesture rather than letter by letter: it is a picture, and a
-/// picture that assembles itself piece by piece reads as a loading screen. The entrance is
-/// the game's own motion rather than a user interface's (see [`logo_pose`]): the mark
-/// falls the last stretch under gravity, lands on its ground strip with a squash and a
-/// puff of dust, and then sways almost imperceptibly for as long as the screen is up — a
-/// sign standing in the world, subject to the same weather as everything else in it.
-const LOGO_AT: f32 = 0.30;
-const LOGO_FADE: f32 = 0.95;
-/// The fraction of the entrance that is the fall; the rest is the landing's settle.
-const LOGO_FALL: f32 = 0.62;
-/// How far above its resting place the logo starts its fall.
-const LOGO_DROP: f32 = 46.0;
-/// The deepest the landing squash takes the mark, as a fraction of its height.
-const LOGO_SQUASH: f32 = 0.075;
-/// When the menu arrives. After the title has finished assembling: a screen that is still
-/// revealing its name while it offers its doors is still assembling itself at the moment it
-/// invites the viewer to choose.
-const HINT_AT: f32 = 1.9;
+/// The mark fades up and drifts a few points into place. Nothing assembles letter by letter
+/// and nothing bounces: the picture is already the game's name, and the screen's motion is
+/// the episode running behind it.
+const LOGO_AT: f32 = 0.15;
+const LOGO_FADE: f32 = 0.70;
+/// When the menu arrives. The mark has settled by then.
+const HINT_AT: f32 = 1.15;
 /// How long the finished episode is held before the little run starts over.
 const HOLD: f32 = 1.15;
 /// How long a dismissing event is ignored at the very start.
@@ -125,7 +108,7 @@ const ARMED: f32 = 0.35;
 ///
 /// A level fitted to the middle of a window this wide leaves two even bands of sky, and the
 /// screen it is behind needs them unequal: the title wants sky above and below it, and the
-/// invitation needs a band of its own under the ground rather than the lawn's brown. Pushing
+/// menu needs a band of its own under the ground rather than the lawn's brown. Pushing
 /// the world up is one number and it is what turns the layer under the ground from a state
 /// the fit happened to land on into a *floor for the text*.
 const RAISED: f32 = 0.17;
@@ -134,107 +117,60 @@ const RAISED: f32 = 0.17;
 ///
 /// Low enough that the lawn, the props and the agent are in the lower third of a window the
 /// sky and its parallax fill above them, high enough to leave a band of its own under the
-/// ground for the invitation. See [`Splash::target`].
+/// ground for the menu. See [`Splash::target`].
 const GROUND_LINE: f32 = 0.60;
 /// The seed of the splash's episode, so the splash is the same splash every launch.
 const SEED: u64 = 4;
 
-/// The screen's share of the game's palette, taken from the logo's own paint box.
-///
-/// The logo's letters are outlined in one dark plum and shadowed in one flat slate, and the
-/// menu below it wears the same two, so the plate on the stage reads as furniture from the
-/// same object rather than as a dialog that wandered in from the editor. The bright fills
-/// live on the doors themselves (see [`Door::colour`]): each door carries one of the
-/// palette families the logo cycles — gold, vermilion, water — and the selected row is
-/// *filled* with it, the way a letter of the wordmark is.
-/// The outline every letter of the logo wears, and the menu plate with it.
-const PLUM: Color32 = Color32::from_rgb(44, 24, 36);
-/// The logo's hard shadow: flat slate, offset, never blurred.
-const SLATE: Color32 = Color32::from_rgb(86, 100, 124);
-/// The tagline is read on the *sky*, so it is the window's dark screen ink rather than its
-/// cream: a pale line over a pale-blue sky was the one piece of type on this screen that had
-/// to be read twice. Dark navy on sky is 8.7:1 and belongs to the same palette.
-const SUBTITLE_INK: Color32 = Color32::from_rgb(24, 34, 46);
-/// The footer's quiet ink: the warm cream the prompt's key line is printed in, because the
-/// band under the level is dark and the footer's small print has to be read on it. The old
-/// footer used the chrome's dim ink and was 1.3:1 on it — a caption nobody could read.
+/// The prompt's ink: warm cream, because the band under the level is dark.
 const FOOT_INK: Color32 = Color32::from_rgb(222, 204, 172);
 /// The stage: near-black, blue-shifted, so the gold on it reads warm.
 const STAGE_INK: Color32 = Color32::from_rgb(54, 38, 24);
-/// The menu's face: the window's warm white, because the box is a piece of the game's own menu
-/// set on top of the picture rather than a hole cut into it.
-const PANEL_FACE: Color32 = theme::CARD;
 
-/// When the menu is up: a beat after the invitation starts breathing.
+/// When the menu is clickable: a beat after it starts appearing.
 ///
-/// It arrives with the caption rather than at the first frame, because a doorway offered
-/// before the screen has said what it is a doorway *to* is a button nobody reads. A beat
-/// and not a crossfade: a row is a hit target as well as a pixel, and a target that is
-/// half transparent on the frame it becomes clickable is a target somebody clicks twice.
-const DOORS_LAG: f32 = 0.25;
+/// A row is a hit target as well as a pixel, and a target that is half transparent on the
+/// frame it becomes clickable is a target somebody clicks twice.
+const DOORS_LAG: f32 = 0.20;
 
 /// The panel the menu is drawn in: a framed box in the band under the level.
 ///
-/// A fixed width rather than a fraction of the window, because a menu is an *object*: three
-/// lines six hundred points wide on a cinema screen are a toolbar, and the same lines on a
-/// small window are a wall. 520 is wide enough for a cursor, a name, a description and a key
-/// on one line, and narrow enough to read as a box.
-const MENU_W: f32 = 520.0;
-/// One option line's height. A line of a console menu is a line of type with a cursor beside
-/// it, not a card: 42 points is a name, its colour chip, its key cap and the air a blinking
-/// cursor needs.
-const LINE_H: f32 = 42.0;
-/// The panel's padding, and the description plaque under the options.
-///
-/// The plaque is what a console menu does instead of a sentence on every line: one hint
-/// about the thing the cursor is on, in a little plate of its own in the bottom of the box.
+/// Wide enough for the longest option at the size it is set, and no wider. A menu is an
+/// object, not a toolbar stretched across the window.
+const MENU_W: f32 = 360.0;
+/// One option line's height.
+const LINE_H: f32 = 44.0;
+/// The panel's padding.
 const PANEL_PAD: f32 = 14.0;
-const DESC_H: f32 = 36.0;
-/// Padding from the window's bottom edge, for the box, the prompt and the key line.
-const MENU_BOTTOM_PAD: f32 = 96.0;
+/// Padding from the window's bottom edge, for the box and the prompt under it.
+const MENU_BOTTOM_PAD: f32 = 76.0;
+/// The prompt's baseline above the window's bottom edge.
+const PROMPT_BOTTOM: f32 = 40.0;
+/// The champion credit's baseline above the window's bottom edge.
+const CREDIT_BOTTOM: f32 = 14.0;
 
-/// One door: what it is called, what it does, the sentence the box shows while the cursor is
-/// on it, and the key that also takes it.
+/// One door: what it is called and where it leads.
 ///
-/// Edit first because it is what most launches want — a splash is usually opened on the way
-/// to drawing something — and then the two activities the plan lists: play it yourself, then
-/// teach the population. The key chips are the same keys [`show`] reads, so a person who
-/// would rather use the keyboard can read the key off the row instead of guessing at it, and
-/// the pictures are the mode switch's own sprites, so the front door and the dock agree
-/// about what the four activities look like.
+/// Edit first because it is what most launches want, then play it yourself, then teach the
+/// population. The descriptions, colour chips and key caps the screen used to carry are gone:
+/// three verbs are enough to say what the three activities are.
 struct Door {
     name: &'static str,
     action: Action,
-    blurb: &'static str,
-    key: &'static str,
-    /// The door's own colour out of the logo's cycle: the mid tone of one palette family,
-    /// bright enough to fill a row and dark enough to hold dark type. The selected row is
-    /// filled with it, so the cursor's position is said in the logo's language — a bright
-    /// letter among plain ones — rather than in the editor's.
-    colour: Color32,
 }
 
 const DOORS: [Door; 3] = [
     Door {
         name: "EDIT",
         action: Action::Edit,
-        blurb: "draw a level, tile by tile",
-        key: "ANY KEY",
-        colour: Color32::from_rgb(255, 214, 102),
     },
     Door {
         name: "PLAY",
         action: Action::Play,
-        blurb: "take the keyboard and play it",
-        key: "P",
-        colour: Color32::from_rgb(244, 128, 52),
     },
     Door {
         name: "EVOLVE",
         action: Action::Evolve,
-        blurb: "train a population to beat it",
-        key: "E",
-        colour: Color32::from_rgb(66, 154, 192),
     },
 ];
 
@@ -249,15 +185,14 @@ pub struct Splash {
     /// Who is playing it.
     policy: Policy,
     /// Seconds since the splash opened. The only clock: the reveal, the pull-back and the
-    /// breathing invitation are all functions of it, so two frames at the same instant are
-    /// the same frame.
+    /// menu are all functions of it, so two frames at the same instant are the same frame.
     clock: f32,
     /// Seconds left of the hold after the episode ends, and then it starts again.
     hold: f32,
     /// Which door the keyboard is on: an index into [`DOORS`].
     ///
-    /// One selection with two ways to move it. The pointer sets it on hover, so the gold bar
-    /// is under the cursor, and <up>/<down> set it, so the bar is where the next Enter will
+    /// One selection with two ways to move it. The pointer sets it on hover, so the filled
+    /// row is under the cursor, and up/down set it, so the fill is where the next Enter will
     /// go. Two cursors that could disagree would be a menu that shows one thing and does
     /// another.
     selected: usize,
@@ -307,7 +242,7 @@ struct ChampionRun {
     /// The episode's seed out of the file: half of the episode, and the half a champion
     /// cannot be re-run without.
     seed: u64,
-    /// Whose run this is, for the line under the words.
+    /// Whose run this is, for the caption under the menu.
     credit: String,
 }
 
@@ -466,11 +401,7 @@ impl Splash {
             [width as usize, height as usize],
             rgba.as_raw(),
         );
-        let handle = ctx.load_texture(
-            "one-two-hundred-logo",
-            image,
-            egui::TextureOptions::NEAREST,
-        );
+        let handle = ctx.load_texture("one-two-hundred-logo", image, egui::TextureOptions::NEAREST);
         self.logo = Some(handle.clone());
         handle
     }
@@ -478,7 +409,7 @@ impl Splash {
     /// Draw the screen, and say which way the viewer asked to go — or `None` if they have not
     /// asked yet.
     ///
-    /// The picture first, then the stage, then the words and the menu: the level is the screen's
+    /// The picture first, then the stage, then the logo and the menu: the level is the screen's
     /// *subject*, and everything drawn over it is furniture arranged around it.
     ///
     /// Any key press or any click counts, once the screen has been up for [`ARMED`] seconds: a
@@ -528,15 +459,8 @@ impl Splash {
         lockup(&painter, rect, self.clock, &logo);
 
         let panel = menu_panel(rect);
-        let from_menu = menu(
-            ctx,
-            &painter,
-            rect,
-            panel,
-            &mut self.selected,
-            self.clock,
-        );
-        footer(&painter, rect, self.credit());
+        let from_menu = menu(ctx, &painter, rect, panel, &mut self.selected, self.clock);
+        champion_credit(&painter, rect, self.credit());
 
         if self.clock < ARMED {
             return None;
@@ -553,9 +477,7 @@ impl Splash {
                 match event {
                     // A press, not a release: letting go of a key is not a decision.
                     egui::Event::Key {
-                        key,
-                        pressed: true,
-                        ..
+                        key, pressed: true, ..
                     } => {
                         return match key {
                             egui::Key::ArrowDown | egui::Key::ArrowRight | egui::Key::Tab => {
@@ -577,14 +499,13 @@ impl Splash {
                     // taking the press here would start the editor out from under the pointer
                     // and the click would arrive somewhere it was not aimed.
                     egui::Event::PointerButton {
-                        pressed: true,
-                        pos, ..
+                        pressed: true, pos, ..
                     } if menu_is_up(self.clock) && panel.expand(10.0).contains(*pos) => {
                         continue;
                     }
-                    egui::Event::PointerButton {
-                        pressed: true, ..
-                    } => return Pressed::Go(Action::Edit),
+                    egui::Event::PointerButton { pressed: true, .. } => {
+                        return Pressed::Go(Action::Edit)
+                    }
                     _ => {}
                 }
             }
@@ -635,7 +556,7 @@ impl Splash {
     /// with its jumps. The floor is what the picture is composed around — the level is fifteen
     /// rows tall and the window is eight hundred points, so where the ground sits is what
     /// decides whether the screen reads as a platformer or as a stripe of lawn with a lot of
-    /// nothing under it — and pinning it leaves the band under the ground for the words.
+    /// nothing under it — and pinning it leaves the band under the ground for the menu.
     ///
     /// `max` with the fit rather than the follow zoom alone, so the same code shows a *small*
     /// level whole: a level that already fits inside the follow zoom is not worth tracking.
@@ -660,7 +581,7 @@ impl Splash {
     }
 }
 
-/// The whole level, as the splash frames it: fitted, then raised for the words.
+/// The whole level, as the splash frames it: fitted, then raised for the menu.
 ///
 /// The pull-back ends here and the tests read it as the end of the move, which is why it is a
 /// function rather than three lines inside [`Splash::camera`]: a camera that eased to *roughly*
@@ -784,7 +705,7 @@ fn champion_run(level: &Level, champions: &Path, level_path: Option<&Path>) -> O
         repeat: champion.metadata.action_repeat.max(1),
         seed: champion.metadata.episode_seed,
         credit: format!(
-            "the run's champion · generation {} · fitness {:.0}",
+            "champion · gen {} · fitness {:.0}",
             champion.metadata.generation, champion.fitness
         ),
     })
@@ -811,13 +732,14 @@ fn champion_file(
     })
 }
 
-/// How far the logo's entrance has run: 0 not yet, 1 fully landed and settled.
+/// How far the logo's entrance has run: 0 not yet, 1 settled.
 ///
 /// A pure function of the clock, so the reveal can be tested without a screen, and so the
-/// logo being settled before the invitation arrives is a fact about the timing constants
-/// rather than something to eyeball.
+/// logo being settled before the menu arrives is a fact about the timing constants rather
+/// than something to eyeball.
 fn logo_in(clock: f32) -> f32 {
-    ((clock - LOGO_AT) / LOGO_FADE).clamp(0.0, 1.0)
+    let t = ((clock - LOGO_AT) / LOGO_FADE).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// The size the logo is drawn at: the screen's subject, sized from the window.
@@ -826,190 +748,38 @@ fn logo_in(clock: f32) -> f32 {
 /// is a caption — and capped, because past a size the picture is just nearer, not bigger
 /// in any way that matters. The height follows from the picture's own aspect.
 fn logo_size(rect: Rect) -> Vec2 {
-    let width = (rect.width() * 0.54).clamp(400.0, 740.0);
+    let width = (rect.width() * 0.56).clamp(400.0, 760.0);
     Vec2::new(width, width / LOGO_ASPECT)
 }
 
 /// Where the logo's top edge sits at rest, as a fraction of the window's height.
 ///
 /// High enough that the sky above it is a margin rather than a second subject, low enough
-/// that the mark, its tagline and the level's floor stack without touching.
-const LOGO_TOP: f32 = 0.098;
+/// that the mark and the level's floor stack without touching.
+const LOGO_TOP: f32 = 0.105;
 
-/// Where the logo is and how it is shaped at `clock`: its vertical offset from rest
-/// (negative is above it) and its height as a fraction of itself.
+/// The logo: one picture, fading up into place.
 ///
-/// The entrance is the game's own motion, not an easing curve off a user interface shelf.
-/// The mark *falls* the last stretch under gravity — the distance closes with the square
-/// of the time, so it arrives faster than it left, which is the whole difference between
-/// falling and sliding — lands with the squash every landing in this game has, and then
-/// breathes: a two-point sway on a slow period, the smallest motion that keeps a sign
-/// standing in a living scene from reading as pasted onto it. Both halves are timed off
-/// the one ramp ([`logo_in`]), so the reveal stays one number a test can reason about.
-fn logo_pose(clock: f32) -> (f32, f32) {
-    let p = logo_in(clock);
-    if p <= 0.0 {
-        return (-LOGO_DROP, 1.0);
-    }
-    if p >= 1.0 {
-        // Settled: the sway. Slow and small, there to be felt rather than watched.
-        let sway = ((clock - LOGO_AT - LOGO_FADE) * std::f32::consts::TAU / 3.4).sin();
-        return (sway * 1.6, 1.0);
-    }
-    if p < LOGO_FALL {
-        let t = p / LOGO_FALL;
-        return (-LOGO_DROP * (1.0 - t * t), 1.0);
-    }
-    // The landing squash: a fast dip to the deepest point, then a slower recovery with a
-    // breath of overshoot above full height before it rests — the shape of every landing
-    // the physics in this game draws.
-    let s = (p - LOGO_FALL) / (1.0 - LOGO_FALL);
-    let squash = if s < 0.28 {
-        let u = s / 0.28;
-        LOGO_SQUASH * (1.0 - (1.0 - u) * (1.0 - u))
-    } else {
-        let u = (s - 0.28) / 0.72;
-        LOGO_SQUASH * (1.0 - u) - 0.018 * (u * std::f32::consts::PI).sin() * (1.0 - u)
-    };
-    (0.0, 1.0 - squash)
-}
-
-/// The lockup: the eyebrow, the logo and the tagline, arriving in that order.
-///
-/// The picture does the talking. Around it, two lines of the pixel face the logo is set in
-/// (see [`crate::theme::pixel_font`]): the genre line above, in the sky's dark ink, and the
-/// hook below it. Nothing else is drawn up here — the old lockup's rule and diamond went
-/// away with the set type, because jewellery around a picture is a frame competing with
-/// its subject.
+/// The mark is the screen's subject and the only thing above the level. It does not fall,
+/// bounce, bloom or sway; the world behind it already moves, and adding motion to the sign
+/// only competes with the action it is introducing.
 fn lockup(painter: &Painter, rect: Rect, clock: f32, logo: &egui::TextureHandle) {
-    let centre = rect.center().x;
-
-    eyebrow(painter, rect, clock);
-
     let arrived = logo_in(clock);
-    if arrived > 0.0 {
-        // Solid almost at once: a thing that is falling should not look like a ghost, so
-        // the fade is only there to keep the first frame from being a pop.
-        let ink = (arrived / 0.18).clamp(0.0, 1.0);
-        let size = logo_size(rect);
-        let (offset, squash_y) = logo_pose(clock);
-        let squash_x = 1.0 + (1.0 - squash_y) * 0.6;
-        let drawn = Vec2::new(size.x * squash_x, size.y * squash_y);
-        // Bottom-anchored through the whole entrance: the mark falls *onto* its ground
-        // strip and squashes *into* it, so the strip stays planted where it lands and
-        // only the top of the picture moves.
-        let bottom = rect.top() + rect.height() * LOGO_TOP + size.y + offset;
-        let dest = Rect::from_min_max(
-            Pos2::new(centre - drawn.x * 0.5, bottom - drawn.y),
-            Pos2::new(centre + drawn.x * 0.5, bottom),
-        );
-        // A warm bloom behind the mark, so the colours have light behind them rather than
-        // flat sky. Fourteen concentric discs at a few percent each: cheap, and it is the
-        // difference between a picture on a background and a picture *in* a scene.
-        for step in 0..14 {
-            let t = step as f32 / 13.0;
-            let radius = size.x * (0.52 - 0.36 * t);
-            let alpha = ((3.0 + 2.0 * t) * ink) as u8;
-            painter.circle_filled(
-                dest.center(),
-                radius,
-                Color32::from_rgba_unmultiplied(255, 240, 196, alpha),
-            );
-        }
-        painter.image(
-            logo.id(),
-            dest,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            // A pure alpha fade rather than a gamma multiply: the multiply darkens as it
-            // thins, so the mark's first frames would read as a grey watermark instead of
-            // as the picture arriving.
-            Color32::from_rgba_unmultiplied(255, 255, 255, (ink * 255.0) as u8),
-        );
-        landing_dust(painter, dest, clock);
-
-        // And the sentence under it, in the sky's own dark ink rather than the window's
-        // cream: a pale line over a pale-blue sky has to be read twice, and dark-on-sky is
-        // 8.7:1. It follows the logo in, timed off the landing rather than off the clock's
-        // start, so the two never arrive half over each other.
-        let tagline = ((clock - LOGO_AT - LOGO_FADE * 0.55) / 0.6).clamp(0.0, 1.0);
-        if tagline > 0.0 {
-            painter.text(
-                Pos2::new(centre, dest.bottom() + 30.0),
-                Align2::CENTER_CENTER,
-                SUBTITLE,
-                theme::pixel_font(13.0),
-                SUBTITLE_INK.gamma_multiply(tagline),
-            );
-        }
-    }
-}
-
-/// The puff of dust the landing kicks up, along the logo's base.
-///
-/// Alive for half a second from the moment the fall ends, and a pure function of the
-/// clock like everything else on this screen: three pixel squares a side, thrown outward
-/// and a little upward, growing and thinning as they go. It is the dust the runner kicks
-/// up, said at the size this picture needs — the punctuation that makes the landing a
-/// landing in the game's world rather than an animation over it.
-fn landing_dust(painter: &Painter, dest: Rect, clock: f32) {
-    let impact = LOGO_AT + LOGO_FADE * LOGO_FALL;
-    let age = clock - impact;
-    if !(0.0..=0.5).contains(&age) {
-        return;
-    }
-    let fade = 1.0 - age / 0.5;
-    let ink = Color32::from_rgba_unmultiplied(246, 242, 230, (150.0 * fade) as u8);
-    for side in [-1.0_f32, 1.0] {
-        for i in 0..3 {
-            let f = i as f32;
-            let out = 4.0 + age * (46.0 + f * 12.0);
-            let x = if side < 0.0 {
-                dest.left() + 10.0 - out
-            } else {
-                dest.right() - 10.0 + out
-            };
-            let y = dest.bottom() - 3.0 - age * (12.0 + f * 5.0) - f * 2.0;
-            let size = 3.0 + age * 12.0 + f * 1.5;
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x - size * 0.5, y - size * 0.5), Vec2::splat(size)),
-                CornerRadius::ZERO,
-                ink,
-            );
-        }
-    }
-}
-
-/// The genre line above the logo, between two short rules.
-///
-/// Small and in the pixel face, because it is part of the same sign: the line a box carries
-/// over its name to say what the game *is*. Dark on the sky for the subtitle's reason — it
-/// has to be read, not just be present.
-fn eyebrow(painter: &Painter, rect: Rect, clock: f32) {
-    let arrived = ((clock - 0.10) / 0.55).clamp(0.0, 1.0);
     if arrived <= 0.0 {
         return;
     }
-    let ink = SUBTITLE_INK.gamma_multiply(arrived * 0.9);
-    let font = theme::pixel_font(11.0);
-    let y = rect.top() + rect.height() * 0.066;
-    let centre = rect.center().x;
-    let galley = painter.layout_no_wrap(EYEBROW.to_string(), font.clone(), ink);
-    painter.text(Pos2::new(centre, y), Align2::CENTER_CENTER, EYEBROW, font, ink);
-    let half = galley.size().x * 0.5;
-    let rule = Stroke::new(2.0_f32, SUBTITLE_INK.gamma_multiply(arrived * 0.5));
-    painter.line_segment(
-        [
-            Pos2::new(centre - half - 84.0, y),
-            Pos2::new(centre - half - 14.0, y),
-        ],
-        rule,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(centre + half + 14.0, y),
-            Pos2::new(centre + half + 84.0, y),
-        ],
-        rule,
+    let size = logo_size(rect);
+    let rise = (1.0 - arrived) * 10.0;
+    let top = rect.top() + rect.height() * LOGO_TOP + rise;
+    let dest = Rect::from_min_size(Pos2::new(rect.center().x - size.x * 0.5, top), size);
+    painter.image(
+        logo.id(),
+        dest,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        // A pure alpha fade rather than a gamma multiply: the multiply darkens as it
+        // thins, so the mark's first frames would read as a grey watermark instead of as
+        // the picture arriving.
+        Color32::from_rgba_unmultiplied(255, 255, 255, (arrived * 255.0) as u8),
     );
 }
 
@@ -1031,16 +801,6 @@ fn stage(painter: &Painter, rect: Rect, floor: f32) {
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(mesh);
-    // A hairline of gold along the bottom of the window, the same lip the dock wears: the
-    // stage is furniture, and the window's furniture has a gold edge.
-    painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(rect.left(), rect.bottom() - 3.0),
-            Vec2::new(rect.width(), 3.0),
-        ),
-        CornerRadius::ZERO,
-        theme::GOLD_EDGE.gamma_multiply(0.55),
-    );
 }
 
 /// Whether the menu is on screen at `clock`.
@@ -1068,7 +828,7 @@ fn menu_in(clock: f32) -> f32 {
 /// whatever document was opened, and a level tall enough to reach the panel must not push the
 /// doorway off the screen. The stage behind it is what keeps it readable when it overlaps.
 fn menu_panel(rect: Rect) -> Rect {
-    let height = PANEL_PAD * 2.0 + LINE_H * DOORS.len() as f32 + DESC_H;
+    let height = PANEL_PAD * 2.0 + LINE_H * DOORS.len() as f32;
     let top = (rect.bottom() - MENU_BOTTOM_PAD - height).max(rect.top() + 12.0);
     Rect::from_min_size(
         Pos2::new(rect.center().x - MENU_W * 0.5, top),
@@ -1083,18 +843,19 @@ fn menu_panel(rect: Rect) -> Rect {
 /// own highlight.
 fn line_rect(panel: Rect, index: usize) -> Rect {
     Rect::from_min_size(
-        Pos2::new(panel.left(), panel.top() + PANEL_PAD + index as f32 * LINE_H),
+        Pos2::new(
+            panel.left(),
+            panel.top() + PANEL_PAD + index as f32 * LINE_H,
+        ),
         Vec2::new(panel.width(), LINE_H),
     )
 }
 
 /// Draw the menu, and report the door that was clicked, if any.
 ///
-/// Real widgets (`Ui::interact`) for the hit test, hand-painted for the look: the panel is a
-/// dialog box, the options are lines of type with a cursor beside them, and the row under the
-/// pointer is the row the keyboard's arrow keys are on. That is the whole of a console menu —
-/// a frame, a list, one cursor and one blinking prompt — and it is what this screen is: a
-/// game's front door, not an application's launcher.
+/// Real widgets (`Ui::interact`) for the hit test, hand-painted for the look: a framed list,
+/// one filled row for the chosen option, and the row under the pointer is the row the arrow
+/// keys are on. That is enough for a front door.
 fn menu(
     ctx: &Context,
     painter: &Painter,
@@ -1134,420 +895,79 @@ fn menu(
             }
         });
     if arrived > 0.0 {
-        paint_menu(painter, panel, *selected, arrived, clock);
+        paint_menu(painter, panel, *selected, arrived);
         prompt(painter, rect, clock);
     }
     action
 }
 
-/// A colour mixed toward a background: `t` of `colour`, the rest of `bg`.
+/// The menu panel and its three rows.
 ///
-/// The one bit of paint arithmetic the menu needs twice: an unchosen row is tinted with
-/// its door's colour rather than filled with it, and the description plaque is tinted
-/// with the chosen door's. Mixing in plain RGB is right here — these are flat paints
-/// being blended on a plate, not light being simulated.
-fn blend(colour: Color32, bg: Color32, t: f32) -> Color32 {
-    let mix = |a: u8, b: u8| (a as f32 * t + b as f32 * (1.0 - t)).round() as u8;
-    Color32::from_rgb(
-        mix(colour.r(), bg.r()),
-        mix(colour.g(), bg.g()),
-        mix(colour.b(), bg.b()),
-    )
-}
-
-/// A colour taken down toward black: the shaded foot of a filled row, the way the logo's
-/// letters are darker at the bottom of their gradient than at the top.
-fn shade(colour: Color32, by: f32) -> Color32 {
-    let cut = |a: u8| (a as f32 * by).round() as u8;
-    Color32::from_rgb(cut(colour.r()), cut(colour.g()), cut(colour.b()))
-}
-
-/// Text with the logo's hard shadow under it: the same words twice, plum first, offset by
-/// a couple of points, never blurred — the way the wordmark's shadow is printed.
-fn shadow_text(
-    painter: &Painter,
-    at: Pos2,
-    align: Align2,
-    text: &str,
-    font: FontId,
-    ink: Color32,
-) {
-    // The shadow fades with its word: a shadow at full strength under a word still
-    // arriving would be a second, darker word arriving early.
-    let shadow = PLUM.gamma_multiply(ink.a() as f32 / 255.0);
-    painter.text(at + Vec2::new(2.0, 2.0), align, text, font.clone(), shadow);
-    painter.text(at, align, text, font, ink);
-}
-
-/// The menu panel and everything in it.
-///
-/// The plate is dressed the way the logo is: a warm white face in a thick plum outline
-/// with a hard slate shadow under it, square-ish corners, and a grass tab on its top edge
-/// naming what it is. Every row is a piece of the same furniture, chosen or not: a band
-/// tinted with its door's colour out of the logo's cycle, a square colour chip with the
-/// letter's white top rim, the name in the pixel face, and the key it answers to carried
-/// on a little key cap with its own plum outline and slate shadow. The chosen row is the
-/// same band at full strength — *filled* with its door's colour, shaded at its foot and
-/// rimmed in white at the top, the way a letter of the wordmark is — so moving the cursor
-/// raises a row rather than swapping it for a different object.
-fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, clock: f32) {
+/// One surface, one accent, no decoration: a warm plate with a dark outline, the chosen row
+/// filled in the window's gold, and the verbs themselves as the only labels.
+fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32) {
     let ink = |colour: Color32| colour.gamma_multiply(arrived);
-    let shift = Vec2::new(0.0, (1.0 - arrived) * 12.0);
-    let panel = panel.translate(shift);
-    let radius = CornerRadius::same(4);
-
-    // The tab: a tab of the lawn's own green stuck on the box's top edge, the way a menu
-    // screen labels itself. It is drawn first so the box's outline closes over its bottom
-    // and the tab reads as stuck *onto* the plate rather than as a second panel floating
-    // above it. Its shadow is the logo's slate, hard and offset, its face is rimmed with
-    // white along the top like a letter, and its word carries the plum shadow.
-    let tab_w = 196.0;
-    let tab = Rect::from_min_size(
-        Pos2::new(panel.center().x - tab_w * 0.5, panel.top() - 26.0),
-        Vec2::new(tab_w, 36.0),
-    );
-    painter.rect_filled(tab.translate(Vec2::new(4.0, 4.0)), radius, ink(SLATE));
-    painter.rect_filled(tab, radius, ink(Color32::from_rgb(104, 186, 68)));
-    painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(tab.left() + 8.0, tab.top() + 2.0),
-            Vec2::new((tab.width() - 16.0).max(0.0), 2.0),
-        ),
-        CornerRadius::ZERO,
-        ink(Color32::from_white_alpha(140)),
-    );
-    painter.rect_stroke(
-        tab,
-        radius,
-        Stroke::new(3.0_f32, ink(PLUM)),
-        egui::StrokeKind::Inside,
-    );
-    shadow_text(
-        painter,
-        tab.center(),
-        Align2::CENTER_CENTER,
-        "SELECT",
-        theme::pixel_font(10.0),
-        ink(Color32::WHITE),
-    );
-
-    // The box: a warm white plate with the logo's hard slate shadow and thick plum
-    // outline. Two rings rather than the chrome's three — the logo has no gold hairline,
-    // and the plate is dressed as the logo's furniture, not the editor's.
-    painter.rect_filled(panel.translate(Vec2::new(6.0, 7.0)), radius, ink(SLATE));
-    painter.rect_filled(panel, radius, ink(PANEL_FACE));
+    let radius = CornerRadius::same(theme::RADIUS_LG);
+    painter.rect_filled(panel, radius, ink(theme::CARD));
     painter.rect_stroke(
         panel,
         radius,
-        Stroke::new(4.0_f32, ink(PLUM)),
+        Stroke::new(2.0_f32, ink(theme::OUTLINE)),
         egui::StrokeKind::Inside,
     );
-
-    // The options. The cursor blinks on the *frame's* clock, a hard on-and-off rather than a
-    // fade: every game that ever had a menu blinked its cursor, and a breath reads as a glow
-    // rather than as an invitation to press something.
-    let blink = (clock * 2.2).fract() < 0.62;
     for (index, door) in DOORS.iter().enumerate() {
         let line = line_rect(panel, index);
         let chosen = index == selected;
-        let band = line.shrink2(Vec2::new(6.0, 3.0));
-        // Every row casts the slate shadow, chosen or not: a row is a tile lying on the
-        // plate, and a tile that only casts a shadow while the cursor is on it is two
-        // different objects taking turns.
-        painter.rect_filled(band.translate(Vec2::new(3.0, 3.0)), radius, ink(SLATE));
         if chosen {
-            // The chosen line at full strength: filled with the door's colour, shaded at
-            // its foot, rimmed with white along the top and outlined in the logo's plum —
-            // a letter of the wordmark, laid on its side as a row.
-            painter.rect_filled(band, radius, ink(door.colour));
             painter.rect_filled(
-                Rect::from_min_max(
-                    Pos2::new(band.left() + 3.0, band.bottom() - 8.0),
-                    Pos2::new(band.right() - 3.0, band.bottom() - 3.0),
-                ),
-                CornerRadius::ZERO,
-                ink(shade(door.colour, 0.82)),
-            );
-            painter.rect_filled(
-                Rect::from_min_size(
-                    Pos2::new(band.left() + 8.0, band.top() + 2.0),
-                    Vec2::new((band.width() - 16.0).max(0.0), 2.0),
-                ),
-                CornerRadius::ZERO,
-                ink(Color32::from_white_alpha(160)),
-            );
-            painter.rect_stroke(
-                band,
-                radius,
-                Stroke::new(3.0_f32, ink(PLUM)),
-                egui::StrokeKind::Inside,
-            );
-        } else {
-            // The unchosen line at rest: the same band, tinted with the door's colour
-            // rather than filled with it, under a quieter plum outline.
-            painter.rect_filled(band, radius, ink(blend(door.colour, PANEL_FACE, 0.30)));
-            painter.rect_stroke(
-                band,
-                radius,
-                Stroke::new(2.0_f32, ink(blend(PLUM, PANEL_FACE, 0.55))),
-                egui::StrokeKind::Inside,
+                line.shrink2(Vec2::new(8.0, 4.0)),
+                CornerRadius::same(theme::RADIUS),
+                ink(theme::ACCENT),
             );
         }
-        // The cursor: a solid plum triangle pointing at the line, blinking.
-        if chosen && blink {
-            let cursor = cursor_points(Pos2::new(panel.left() + 27.0, line.center().y));
-            painter.add(egui::Shape::convex_polygon(
-                cursor.to_vec(),
-                ink(PLUM),
-                Stroke::NONE,
-            ));
-        }
-        // The door's colour chip: a square of its colour with a plum outline and the
-        // letter's white top rim. On the chosen row the fill is already the band's own
-        // colour, so the chip is the plate's white with the colour at its heart instead —
-        // the same chip, read against a louder ground.
-        let chip = Rect::from_min_size(
-            Pos2::new(panel.left() + 44.0, line.center().y - 11.0),
-            Vec2::new(22.0, 22.0),
-        );
-        if chosen {
-            painter.rect_filled(chip, CornerRadius::same(2), ink(PANEL_FACE));
-            painter.rect_filled(
-                chip.shrink(6.0),
-                CornerRadius::ZERO,
-                ink(door.colour),
-            );
-        } else {
-            painter.rect_filled(chip, CornerRadius::same(2), ink(door.colour));
-            painter.rect_filled(
-                Rect::from_min_size(
-                    Pos2::new(chip.left() + 3.0, chip.top() + 2.0),
-                    Vec2::new((chip.width() - 6.0).max(0.0), 2.0),
-                ),
-                CornerRadius::ZERO,
-                ink(Color32::from_white_alpha(160)),
-            );
-        }
-        painter.rect_stroke(
-            chip,
-            CornerRadius::same(2),
-            Stroke::new(2.0_f32, ink(PLUM)),
-            egui::StrokeKind::Inside,
-        );
         painter.text(
-            Pos2::new(panel.left() + 78.0, line.center().y),
-            Align2::LEFT_CENTER,
+            line.center(),
+            Align2::CENTER_CENTER,
             door.name,
-            theme::pixel_font(15.0),
-            ink(PLUM),
-        );
-        // The key, on a cap: a little plate of the panel's own white with the slate
-        // shadow and the plum outline every other object on this screen wears, so the
-        // hint reads as a *key* rather than as a footnote that wandered onto the row.
-        let key_font = theme::pixel_font(8.0);
-        let galley = painter.layout_no_wrap(door.key.to_string(), key_font.clone(), ink(PLUM));
-        let cap = Rect::from_min_size(
-            Pos2::new(
-                panel.right() - 16.0 - (galley.size().x + 18.0),
-                line.center().y - 11.0,
-            ),
-            Vec2::new(galley.size().x + 18.0, 22.0),
-        );
-        painter.rect_filled(
-            cap.translate(Vec2::new(2.0, 2.0)),
-            CornerRadius::same(2),
-            ink(SLATE),
-        );
-        painter.rect_filled(cap, CornerRadius::same(2), ink(PANEL_FACE));
-        painter.rect_stroke(
-            cap,
-            CornerRadius::same(2),
-            Stroke::new(2.0_f32, ink(PLUM)),
-            egui::StrokeKind::Inside,
-        );
-        painter.galley(
-            Pos2::new(
-                cap.center().x - galley.size().x * 0.5,
-                cap.center().y - galley.size().y * 0.5,
-            ),
-            galley,
-            ink(PLUM),
+            theme::pixel_font(17.0),
+            ink(if chosen {
+                theme::INK_ON_ACCENT
+            } else {
+                theme::TEXT
+            }),
         );
     }
-
-    // The description plaque: one sentence about the highlighted door, the way a console
-    // menu explains the file under the cursor rather than putting a sentence on every
-    // line — carried on a plate of its own, tinted with the chosen door's colour, with a
-    // square of that colour standing in for a bullet.
-    let top = panel.top() + PANEL_PAD + LINE_H * DOORS.len() as f32;
-    let plaque = Rect::from_min_max(
-        Pos2::new(panel.left() + 14.0, top + 5.0),
-        Pos2::new(panel.right() - 14.0, top + DESC_H - 3.0),
-    );
-    painter.rect_filled(
-        plaque.translate(Vec2::new(3.0, 3.0)),
-        radius,
-        ink(SLATE),
-    );
-    painter.rect_filled(
-        plaque,
-        radius,
-        ink(blend(DOORS[selected].colour, PANEL_FACE, 0.30)),
-    );
-    painter.rect_stroke(
-        plaque,
-        radius,
-        Stroke::new(2.0_f32, ink(blend(PLUM, PANEL_FACE, 0.55))),
-        egui::StrokeKind::Inside,
-    );
-    let bullet = Rect::from_min_size(
-        Pos2::new(plaque.left() + 12.0, plaque.center().y - 5.0),
-        Vec2::new(10.0, 10.0),
-    );
-    painter.rect_filled(bullet, CornerRadius::ZERO, ink(DOORS[selected].colour));
-    painter.rect_stroke(
-        bullet,
-        CornerRadius::ZERO,
-        Stroke::new(2.0_f32, ink(PLUM)),
-        egui::StrokeKind::Inside,
-    );
-    painter.text(
-        Pos2::new(plaque.left() + 34.0, plaque.center().y),
-        Align2::LEFT_CENTER,
-        DOORS[selected].blurb,
-        theme::pixel_font(9.0),
-        ink(PLUM),
-    );
 }
 
-/// The cursor: a solid pixel triangle pointing at the chosen line.
-fn cursor_points(at: Pos2) -> [Pos2; 3] {
-    [
-        Pos2::new(at.x - 6.0, at.y - 7.0),
-        Pos2::new(at.x + 6.0, at.y),
-        Pos2::new(at.x - 6.0, at.y + 7.0),
-    ]
-}
-
-/// The blinking invitation under the box, and the keys that move the cursor.
-///
-/// "PRESS ENTER" rather than "press any key": the screen has a cursor now, so the honest
-/// invitation is the key that takes it. Any *other* key still leaves for the editor, which is
-/// what the Edit line's own `ANY KEY` chip says. Gold on a plum shadow, in the pixel face:
-/// the way a game's score line is printed over the picture, and in the type its logo is set
-/// in, so the invitation belongs to the same sign as the box above it.
+/// The one instruction under the box: move the selection, then take it.
 fn prompt(painter: &Painter, rect: Rect, clock: f32) {
     let arrived = ((clock - HINT_AT - DOORS_LAG - 0.15) / 0.45).clamp(0.0, 1.0);
     if arrived <= 0.0 {
         return;
     }
-    let blink = (clock * 1.5).fract() < 0.66;
-    if blink {
-        let font = theme::pixel_font(13.0);
-        let at = Pos2::new(rect.center().x, rect.bottom() - 62.0);
-        painter.text(
-            at + Vec2::new(2.0, 2.0),
-            Align2::CENTER_CENTER,
-            "PRESS ENTER TO START",
-            font.clone(),
-            PLUM.gamma_multiply(arrived),
-        );
-        painter.text(
-            at,
-            Align2::CENTER_CENTER,
-            "PRESS ENTER TO START",
-            font,
-            theme::ACCENT.gamma_multiply(arrived),
-        );
-    }
-    shadow_text(
-        painter,
-        Pos2::new(rect.center().x, rect.bottom() - 42.0),
+    painter.text(
+        Pos2::new(rect.center().x, rect.bottom() - PROMPT_BOTTOM),
         Align2::CENTER_CENTER,
         MENU_HINT,
-        theme::pixel_font(9.0),
+        theme::pixel_font(10.0),
         FOOT_INK.gamma_multiply(arrived),
     );
 }
 
-/// The bottom band: what this is, whose run it is, and what it is not.
+/// Whose run is playing, when it is a saved champion's rather than the demo.
 ///
-/// Lettered like everything else on this screen, because a footer in the window's
-/// monospace was a line of the *tool* showing through the game's front door: the game's
-/// name in the pixel face in gold on the plum shadow, its version after it in the quiet
-/// cream, and the four activities at the right each in the light tone of its own colour
-/// family from the logo's cycle (Replay takes the grass family — it is the one activity
-/// with no door of its own up above), separated by little squares of cream rather than by
-/// a middot the pixel face does not carry.
-fn footer(painter: &Painter, rect: Rect, credit: Option<&str>) {
-    let base = rect.bottom() - 11.0;
-    // The brand, at the left: the name in gold, then the version in the quiet ink, both on
-    // the plum shadow the rest of the screen's stage type wears.
-    let name_font = theme::pixel_font(9.0);
-    let name_at = Pos2::new(rect.left() + 14.0, base);
-    shadow_text(
-        painter,
-        name_at,
-        Align2::LEFT_BOTTOM,
-        "ONE TWO HUNDRED",
-        name_font.clone(),
-        theme::ACCENT,
-    );
-    let name_w = painter
-        .layout_no_wrap("ONE TWO HUNDRED".to_string(), name_font, theme::ACCENT)
-        .size()
-        .x;
+/// A caption, not a footer: one short line, and only when there is something to credit.
+fn champion_credit(painter: &Painter, rect: Rect, credit: Option<&str>) {
+    let Some(credit) = credit else {
+        return;
+    };
     painter.text(
-        Pos2::new(name_at.x + name_w + 12.0, base),
-        Align2::LEFT_BOTTOM,
-        format!("V{}", env!("CARGO_PKG_VERSION")),
+        Pos2::new(rect.center().x, rect.bottom() - CREDIT_BOTTOM),
+        Align2::CENTER_CENTER,
+        credit.replace('·', "-").to_uppercase(),
         theme::pixel_font(8.0),
-        FOOT_INK,
+        theme::ACCENT.gamma_multiply(0.85),
     );
-    // The credit is the one line down here worth reading, so it is the one line down here
-    // in gold: the title's gold, held back far enough to stay a caption. Set in the pixel
-    // face like the rest of the band, uppercased to match it, with the middots the face
-    // does not carry traded for hyphens it does.
-    if let Some(credit) = credit {
-        shadow_text(
-            painter,
-            Pos2::new(rect.center().x, base),
-            Align2::CENTER_BOTTOM,
-            &credit.replace('·', "-").to_uppercase(),
-            theme::pixel_font(8.0),
-            theme::ACCENT.gamma_multiply(0.9),
-        );
-    }
-    // The activities, at the right, laid out right to left so the row ends flush with the
-    // window's edge: each word in its family's light tone, with a three-point square of
-    // the quiet cream between one word and the next.
-    let modes: [(&str, Color32); 4] = [
-        ("EDIT", Color32::from_rgb(255, 214, 102)),
-        ("PLAY", Color32::from_rgb(255, 186, 116)),
-        ("EVOLVE", Color32::from_rgb(112, 200, 224)),
-        ("REPLAY", Color32::from_rgb(150, 220, 96)),
-    ];
-    let mode_font = theme::pixel_font(8.0);
-    let mut right = rect.right() - 14.0;
-    for (word, colour) in modes.iter().rev() {
-        let galley = painter.layout_no_wrap(word.to_string(), mode_font.clone(), *colour);
-        let at = Pos2::new(right - galley.size().x, base);
-        painter.text(at + Vec2::new(2.0, 2.0), Align2::LEFT_BOTTOM, word, mode_font.clone(), PLUM);
-        painter.galley(
-            Pos2::new(at.x, at.y - galley.size().y),
-            galley.clone(),
-            *colour,
-        );
-        right = at.x - 10.0;
-        if word != &"EDIT" {
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(right + 2.0, base - 7.0), Vec2::new(3.0, 3.0)),
-                CornerRadius::ZERO,
-                FOOT_INK,
-            );
-            right -= 10.0;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1612,7 +1032,7 @@ mod tests {
         (ctx, atlas, sprites, rect)
     }
 
-    /// A splash driven far enough that the doors and the invitation are both up.
+    /// A splash driven far enough that the menu and its prompt are both up.
     fn armed() -> Splash {
         let mut splash = Splash::scripted();
         while splash.clock() < HINT_AT + 0.6 {
@@ -1652,7 +1072,7 @@ mod tests {
         // the window and the *window* takes it — this test failed exactly that way, with the
         // button's rectangle printed around the pointer and `hovered()` false. Two frames is
         // a window that has drawn the screen twice, which is every frame a person can click
-        // on: the doors are up for a quarter second before the invitation is drawn, and the
+        // on: the rows are up a beat before the prompt is drawn, and the
         // first of those is the only one an area cannot be clicked on.
         assert_eq!(
             frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
@@ -1691,10 +1111,10 @@ mod tests {
         );
     }
 
-    /// The box arrives only once the invitation has been, and it sits under the world.
+    /// The box arrives with its prompt and sits under the world.
     ///
     /// Both halves are geometry, and both are the kind a screenshot catches late: a menu drawn
-    /// over the level's lawn, or a box that appears before the caption that explains it. The
+    /// over the level's lawn, or a box that appears before the line that explains it. The
     /// box is anchored to the window's bottom edge — a menu is a thing you *open into*, not a
     /// caption that follows the terrain — so a level tall enough to reach it must not push the
     /// doorways off the screen.
@@ -1720,7 +1140,10 @@ mod tests {
             panel.bottom() <= rect.bottom() - 70.0,
             "the box is standing on the prompt under it: {panel:?}"
         );
-        assert!(panel.bottom() <= rect.bottom(), "the box falls off the window");
+        assert!(
+            panel.bottom() <= rect.bottom(),
+            "the box falls off the window"
+        );
 
         // A short window still holds the whole box: the top is clamped into the frame.
         let small = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 240.0));
@@ -1870,24 +1293,24 @@ mod tests {
             (settled.zoom - fit.zoom).abs() < 0.01 && (settled.centre - fit.centre).length() < 0.01,
             "after the pull-back the camera is at {settled:?} and the fit is at {fit:?}"
         );
-        // And the words have the band this framing is for: the invitation and the keys are
-        // below the level's own bottom edge, not printed over the lawn.
+        // And the menu has the band this framing is for: its prompt is below the level's own
+        // bottom edge, not printed over the lawn.
         let ground = splash.level.height as f32;
         let bottom = settled.to_screen(0.0, ground, rect).y;
-        let invitation = rect.bottom() - rect.height() * 0.125;
+        let prompt = rect.bottom() - PROMPT_BOTTOM;
         assert!(
-            invitation > bottom + 20.0,
-            "the invitation at {invitation:.0} is on the world, which ends at {bottom:.0}"
+            prompt > bottom + 20.0,
+            "the prompt at {prompt:.0} is on the world, which ends at {bottom:.0}"
         );
     }
 
-    /// The logo is fully revealed before the invitation arrives to be read.
+    /// The logo is fully revealed before the menu arrives to be read.
     ///
-    /// Both halves matter: a mark that is still arriving when the "press enter" line is
-    /// solid is a screen that is still assembling itself while it tells you to leave, and a
-    /// reveal that takes longer than a person waits is a logo nobody reads.
+    /// Both halves matter: a mark that is still arriving while the menu is already solid is a
+    /// screen that is still assembling itself while it asks the viewer to choose, and a reveal
+    /// that takes longer than a person waits is a logo nobody reads.
     #[test]
-    fn the_logo_arrives_before_the_invitation() {
+    fn the_logo_arrives_before_the_menu() {
         assert_eq!(logo_in(0.0), 0.0, "the logo is up before the clock is");
         assert_eq!(
             logo_in(LOGO_AT - 0.01),
@@ -1898,7 +1321,7 @@ mod tests {
         assert_eq!(logo_in(done + 0.01), 1.0, "the logo never settles");
         assert!(
             done < HINT_AT,
-            "the logo is still arriving at {done:.2}s, after the invitation at {HINT_AT}s"
+            "the logo is still arriving at {done:.2}s, after the menu at {HINT_AT}s"
         );
         // Halfway through the fade it is halfway there: the reveal is a ramp, not a cut,
         // because a picture that snaps in at full strength reads as a pop rather than as a
@@ -2077,7 +1500,7 @@ mod tests {
         assert!(stats.best_x > level.spawn.x, "the agent never moved");
         let credit = splash.credit().expect("a champion run says whose it is");
         assert!(
-            credit.contains("generation 7")
+            credit.contains("gen 7")
                 && credit.contains(&format!("fitness {:.0}", champion.fitness)),
             "the credit line reads {credit:?}, which is not this file's run"
         );
@@ -2209,7 +1632,7 @@ mod tests {
         assert_eq!(target.zoom, crate::app::FOLLOW_ZOOM);
         // The opening frame is closer still, on the runner: the pull-back is a move, not a cut.
         assert!(splash.camera(rect).zoom > target.zoom);
-        // The floor is pinned low, with the words' band under it.
+        // The floor is pinned low, with the menu's band under it.
         let floor = target.to_screen(0.0, level.height as f32, rect).y;
         assert!(
             (floor - rect.height() * GROUND_LINE).abs() < 1.0,
@@ -2233,11 +1656,12 @@ mod tests {
         );
     }
 
-    /// The prompt and the key line have their own band under the box, whatever the window.
+    /// The prompt and the champion credit have their own band under the box, whatever the
+    /// window.
     ///
     /// The screen plays whatever level the window opened on when that level has a champion, so
-    /// the words cannot be placed as a fraction of the world and trusted: a level tall enough to
-    /// reach the band would have the prompt printed on its own lawn. The box is anchored to the
+    /// the prompt cannot be placed as a fraction of the world and trusted: a level tall enough to
+    /// reach the band would have it printed on its own lawn. The box is anchored to the
     /// window's bottom edge and the prompt to the box, which is what keeps the two readable on
     /// every level the screen can be opened on.
     #[test]
@@ -2245,12 +1669,11 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
         let panel = menu_panel(rect);
         assert!(panel.top() >= rect.top(), "the box starts above the window");
-        // The blinking prompt is at `rect.bottom() - 62`, the key line at `- 42`.
         assert!(
-            panel.bottom() < rect.bottom() - 62.0,
+            panel.bottom() < rect.bottom() - PROMPT_BOTTOM,
             "the prompt is drawn on the box"
         );
-        assert!(panel.bottom() < rect.bottom() - 42.0);
+        assert!(panel.bottom() < rect.bottom() - CREDIT_BOTTOM);
         // And the box is bottom-anchored: a taller window moves it, it does not stretch it.
         let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 1100.0));
         assert_eq!(
@@ -2277,10 +1700,9 @@ mod tests {
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let size = Vec2::new(1360.0, 800.0);
         let rect = Rect::from_min_size(Pos2::ZERO, size);
-        // The lockup's own band: the logo and the tagline under it, and nothing the footer
-        // or the menu contributes. Counting *here* rather than counting everything is what
-        // makes this a test of the reveal: the footer is on the screen from the first frame,
-        // and a count of every glyph in the window would be a count of that.
+        // The lockup's own band: the logo, and nothing the menu or the prompt contributes.
+        // Counting here is what makes this a test of the reveal rather than a count of
+        // everything drawn on the screen.
         let line = Rect::from_min_size(
             Pos2::new(rect.left(), rect.height() * 0.08),
             Vec2::new(rect.width(), rect.height() * 0.32),
@@ -2319,8 +1741,7 @@ mod tests {
                         if quad.len() < 4 {
                             continue;
                         }
-                        let centre =
-                            quad.iter().fold(Pos2::ZERO, |a, v| a + v.pos.to_vec2()) / 4.0;
+                        let centre = quad.iter().fold(Pos2::ZERO, |a, v| a + v.pos.to_vec2()) / 4.0;
                         if line.contains(centre) {
                             logo += 1;
                         }
@@ -2357,19 +1778,19 @@ mod tests {
             "the splash drew {world} sprite quads: the world is not on the screen"
         );
         assert!(
-            words > 60,
-            "the splash drew {words} glyph quads: the words are not on the screen"
+            words > 20,
+            "the splash drew {words} glyph quads: the menu and prompt are not on the screen"
         );
         assert!(
             logo >= 1,
             "the splash drew {logo} logo quads on the lockup's band: the logo is not on the screen"
         );
-        assert!(
-            title >= 30,
-            "{title} glyphs on the lockup's band: the tagline alone is more than that"
+        assert_eq!(
+            title, 0,
+            "{title} glyphs were drawn around the logo: the lockup has copy on it again"
         );
         let (_, _, early_words, early_logo) = counts(0.0);
-        assert_eq!(early_words, 0, "the tagline is already up at the first frame");
+        assert_eq!(early_words, 0, "the menu is already up at the first frame");
         assert_eq!(early_logo, 0, "the logo is already up at the first frame");
         let (later_world, _, _, _) = counts(6.0);
         assert!(
