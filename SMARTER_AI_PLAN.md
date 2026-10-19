@@ -240,6 +240,283 @@ a special case has to earn its keep.
 
 **Effort.** S to M.
 
+## Item 6: A standing generalist population
+
+**Problem.** Every level starts evolution from near scratch, with at best a
+clone of that level's own route. Nothing the AI learns on one level carries
+to the next, so a level a player draws this minute is approached by a
+population that has never seen a spike, a deck or a patrol, however many
+hundreds of levels it has solved before.
+
+**Implementation.**
+
+1. Keep one population permanently trained across the level pack, using
+   the suite training that already exists (the `ga_suite` test path and
+   the suite seeding in the library), rotating levels so no single level
+   dominates.
+2. When a run starts on any level, seed a fixed share of generation zero
+   from the generalist population's current elites, alongside the existing
+   route clone and from-plan children. The share is a flag, default off
+   until gated, like every other seeding source.
+3. Refresh the generalist population between pack runs from the champions
+   the pack produced, so the transfer runs both ways.
+
+**Performance impact.** None at runtime: it is a seeding source, and the
+generalist's own training happens offline between runs, not inside a run.
+
+**Gate.** On three pack levels and one battery level, generations to
+validated win against the current seeding mix, 24 seeds paired. The
+generalist share must help or at worst be neutral everywhere; a level it
+hurts loses it.
+
+**Kill criterion.** If generation zero from the generalist is not better
+than generation zero from the level's own history anywhere, transfer is a
+story, not a mechanism: drop it.
+
+**Effort.** M. Mostly orchestration around suite training that exists.
+
+## Item 7: Learn from the player's own playthroughs
+
+**Problem.** The strongest teaching signal available, a human completing
+the level, is currently thrown away. The playtest already simulates every
+tick of a human run through the same input path the AI uses, but no trace
+is kept.
+
+**Implementation.**
+
+1. Record playtest runs: the per-tick actions of a human play session,
+   stored beside the level like routes and champions are, with the usual
+   header fields (level hash, physics version).
+2. Feed a completed human run to the existing imitation code
+   (`crates/evo/src/imitate.rs`) exactly as a planner route is fed: fit
+   clones to the recorded decisions at the states the human actually
+   visited, inject them as ordinary children.
+3. A human run that used a technique the planner does not know is worth
+   more than a planner route, not less: do not filter demonstrations
+   through planner agreement.
+
+**Performance impact.** None. Demonstrations are data; the fitting cost
+is the imitation fit that already exists.
+
+**Gate.** On one level where the default run stalls (`l11-the-elements`
+or a battery level chosen for the purpose): generations to validated win
+with a demonstration against the same run without one, paired seeds. A
+single demonstration should visibly move the stall; that is the claim
+being tested.
+
+**Kill criterion.** If a fitted demonstration does not beat its control,
+the bottleneck is the fitting, not the idea; record that and stop rather
+than collecting more demos.
+
+**Effort.** S for capture (the trace exists in the play loop), M for the
+fitting path and its tests.
+
+## Item 8: Phase randomisation in training
+
+**Problem.** A policy can memorise a patrol's timetable instead of
+learning to read the patrol. Training draws phases already, but narrowly
+enough that a champion can be a phase specialist: brilliant on the phases
+it trained against, helpless on held-out ones, which is exactly what
+validation then catches, late and expensively.
+
+**Implementation.**
+
+1. Widen the phase draw for training episodes across patrol, mover and
+   turret phases, up to the full phase space the validators sample from.
+2. Keep the validation phase set (`VALIDATION_PHASES`) fixed and untouched:
+   the honest exam does not move, the practice gets harder.
+3. Report, per champion, the gap between training-phase and
+   held-out-phase performance as a first-class number in the difficulty
+   table, so memorisation is visible rather than anecdotal.
+
+**Performance impact.** None: same episodes, wider draw.
+
+**Gate.** The train/validation gap on the pack shrinks without
+generations-to-win regressing on any level, 24 seeds paired. Levels with
+phase-independent solutions should be unaffected, and the table will show
+it if they are not.
+
+**Kill criterion.** If the gap does not shrink, the memorisation theory is
+wrong for this game and the wider draw is just noise added to training:
+revert to the narrow draw and record the negative result.
+
+**Effort.** S. The machinery (common episodes, phase draws) exists; this
+is ranges and reporting.
+
+## Item 9: Fuse the leg specialists
+
+**Problem.** The segment campaign (WP4) produces a specialist clone per
+leg of a hard level, then trains legs one at a time. The obvious untried
+step is breeding the specialists into each other: a whole-level genome
+whose opening legs descend from one specialist and whose closing legs
+descend from another. Crossover between two genomes stuck at the same
+wall mixes two failures; crossover between specialists mixes two
+successes.
+
+**Implementation.**
+
+1. After a campaign run has produced its per-leg clones, seed a
+   whole-level population with pairwise crosses of distinct leg
+   specialists as a named seeding share, alongside the best whole-level
+   genomes the campaign already keeps.
+2. Reuse the shipped crossover operator unchanged; the experiment is about
+   who the parents are, not a new operator.
+3. Compare against the campaign's existing continuation (train the best
+   single chain further) at equal total episodes.
+
+**Performance impact.** None per episode; the claim is fewer episodes.
+
+**Gate.** On the two levels the campaign exists for (`l11-the-elements`,
+`l10-the-gauntlet-ii`): episodes to validated win, fused seeding against
+the current campaign continuation.
+
+**Kill criterion.** If fusion does not beat continuation, segment
+specialists do not compose, which is itself worth knowing and recording:
+the campaign keeps its current shape.
+
+**Effort.** S. Parents, seeding and crossover all exist.
+
+## Item 10: A committee champion
+
+**Problem.** The window shows one genome: the replay, the title-screen
+demo and the saved champion are a single point of failure. Its mistakes
+are idiosyncratic; five top genomes rarely make the same mistake on the
+same tick.
+
+**Implementation.**
+
+1. Add an ensemble policy for display and replay contexts: the top k
+   genomes of a finished run (k = 5) each evaluate the observation; the
+   action is the majority vote, ties broken by the leaderboard order, so
+   the committee is deterministic.
+2. Keep the single champion as the recorded artifact and the thing gates
+   measure. The committee is a presentation of the run's result, and it
+   must never be smuggled into a difficulty-table row as if it were a
+   genome.
+3. Validate the committee the same way a champion is validated: it must
+   complete the level on the validation phases before the window may
+   show it as the level's solver.
+
+**Performance impact.** Training: none. Display: k forward passes for one
+agent, negligible next to a frame of rendering.
+
+**Gate.** Committee against its own best member on the validation phases
+across the pack: completion and clock. The committee ships only if it is
+never worse than its best member on completion.
+
+**Kill criterion.** If the committee ties or loses, one genome was already
+carrying the skill and the votes were noise: keep the single champion.
+
+**Effort.** S to M. The forward pass exists; the work is the vote, the
+determinism test and the validation wiring.
+
+## Item 11: Let the technique archive select
+
+**Problem.** The technique archive catalogues what genomes did (stomps,
+wall jumps, springs, airtime) but only for presentation. Scalar fitness
+routinely deletes a weird skill that a later wall needed, because the
+genome carrying it was mediocre everywhere else. Diversity that is only
+described is diversity that evolution cannot use.
+
+**Implementation.**
+
+1. Give the archive cells a breeding role: each cell (a technique band)
+   keeps its best occupant, and a fixed share of each generation's
+   parents is drawn from cells rather than from the leaderboard, in the
+   style of quality-diversity archives (MAP-Elites).
+2. This is a selection mechanism only, like the plan bonus: fitness does
+   not change, no version moves, and every child still earns its record
+   the ordinary way.
+3. The cell share is a flag, default off until gated, and reported per
+   run so its effect is separable from Item 1's arms.
+
+**Performance impact.** None per episode; the claim is better use of the
+same episodes on levels where a rare technique is the key.
+
+**Gate.** On `l11-the-elements` and one technique-gated battery level:
+generations to validated win against the current selection, 24 seeds
+paired, plus a diversity measure (occupied cells over time) to confirm
+the mechanism did what it claims before crediting it with any win.
+
+**Kill criterion.** If occupied-cell diversity rises but solve times do
+not, the archive is a museum: keep it for presentation, out of breeding.
+
+**Effort.** M. The archive exists; the selection wiring and the diversity
+reporting are the work.
+
+## Item 12: Let the policy choose its commitment length
+
+**Problem.** Decisions happen every 4 ticks, always (DECIDE_EVERY). On a
+long straight that wastes three decisions in four; at a timed jump, four
+ticks is coarse. The cadence is a compromise the policy never gets to
+negotiate.
+
+**Implementation.**
+
+1. Add one output head: alongside the action, the net chooses a
+   commitment of 1, 2, 4 or 8 ticks for which the action repeats before
+   the next decision. At 1 the policy has finer control than today; at 8
+   it skips decisions it does not need.
+2. This is a genome shape change like Item 3's: it rides the same
+   migration machinery, with the new head's weights zero-initialised so
+   the initial behaviour reproduces today's fixed cadence as closely as
+   the head's encoding allows, and it ships only inside Item 3's retrain
+   window rather than forcing a second one.
+3. The interpreter and the replay format treat the commitment as part of
+   the action stream, so a saved run replays exactly.
+
+**Performance impact.** Potentially negative cost: fewer decisions on
+easy stretches means fewer forward passes per episode. The head itself is
+one output neuron.
+
+**Gate.** The Item 3 difficulty table, compared arm against arm: v14
+senses with fixed cadence against v14 senses with chosen cadence. Solve
+times must not regress, and decisions per episode should fall measurably
+on open levels.
+
+**Kill criterion.** If the policy collapses to always choosing one
+cadence, the head is dead weight and the shape stays at Item 3's.
+
+**Effort.** M, and deliberately folded into Item 3's window.
+
+## Item 13: Grow the net on a plateau, function-preserving
+
+**Problem.** The standing answer to "make the net bigger" is no, because
+capacity is not the measured constraint on any level so far. But "not
+measured anywhere yet" is not "never": the first plan already allows
+spending Item 2's headroom on width when a level fails specifically on
+capacity. Today there is no mechanism to do that mid-run, only a bigger
+default for everyone forever.
+
+**Implementation.**
+
+1. Add a growth operator using the same trick as Item 3's migration: when
+   a run's record has not improved for the plateau window (shared with
+   Item 4's trigger), insert a small number of hidden units whose
+   outgoing weights are zero. The policy is bit-identical at the moment
+   of growth; evolution gains capacity it did not have and pays for it
+   only from then on.
+2. Growth is per-run and recorded in the run's output: the champion
+   carries the shape it grew to, and autoshape already knows how to read
+   mixed shapes.
+3. Cap growth (two events per run, a fixed unit budget) so a stuck run
+   cannot inflate itself indefinitely instead of solving.
+
+**Performance impact.** Zero until a growth event fires; afterwards the
+run pays for a modestly larger net, which is why this item stands behind
+Item 2 in the sequence.
+
+**Gate.** On a plateau case (the resumed l11 champion clock test from
+Item 4): growth against no-growth at equal episodes. The clock must move
+in the growth arm where it does not in the control.
+
+**Kill criterion.** If grown capacity does not move the plateau it was
+grown for, capacity was never the constraint there either: remove the
+operator and let the "no bigger net" rule stand unqualified.
+
+**Effort.** M. The migration proof pattern from Item 3 is reused; the
+trigger and the caps are new.
+
 ## Sequencing
 
 1. **Item 1** first: it is evidence, not code, and it may change what the
@@ -249,8 +526,15 @@ a special case has to earn its keep.
    cheaper to run.
 4. **Item 3** fourth: the one deliberate retrain, taken only with Item 2's
    headroom banked and the migration proof green.
-5. **Item 4** last: the largest build, aimed at the plateau the other items
-   do not touch.
+5. **Item 4** last of the first tier: the largest build, aimed at the
+   plateau the other items do not touch.
+
+The remaining items need no order against each other and can be picked up
+opportunistically, with two exceptions: Item 12 rides Item 3's retrain
+window, and Item 13 stands behind Item 2's banked headroom and shares
+Item 4's plateau trigger. Items 6 to 11 are independent, mostly cheap,
+and each is gated on its own, so a failure in one says nothing about the
+others.
 
 ## What this plan deliberately does not do
 
@@ -258,8 +542,9 @@ a special case has to earn its keep.
   across genomes on a GPU would trade determinism and latency for nothing.
 - **No bigger default net.** Capacity is not the binding constraint on any
   measured level; perception (Item 3) and credit assignment (Item 4) are.
-  If a battery level ever fails specifically on capacity, the answer is
-  Item 2's headroom spent on width, with that failure as the evidence.
+  The one exception is Item 13: capacity a run grows for itself, on a
+  plateau, with the plateau as the evidence, never a larger default
+  handed to every level in advance.
 - **No fitness version move.** Nothing here needs one: the plan bonus stays
   a selection mechanism, lessons enter through breeding, and early
   termination is defined to be score-identical. The only version that
