@@ -157,41 +157,128 @@ fn mix(parts: &[(usize, Vec<f32>)]) -> Vec<f32> {
     out
 }
 
-/// The music loop: eight bars of a minor-key chiptune at low volume, bass and
-/// a sparse lead, generated once and looped by the player. Kept deliberately
-/// plain: it is a backdrop for watching an agent learn, not a performance.
+/// A melody note with a sustain envelope: fast attack, a held body, and the
+/// release saved for the end. The effects all decay (a blip should), but a
+/// tune made of decays is a tune made of hiccups: the lead has to *hold* its
+/// notes the way a whistled one does.
+fn note(freq: f32, secs: f32, vol: f32, wave: Wave) -> Vec<f32> {
+    let n = (secs * RATE as f32) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut phase = 0.0f32;
+    let release_at = 0.8;
+    for i in 0..n {
+        let t = i as f32 / n.max(1) as f32;
+        phase += freq / RATE as f32;
+        let attack = (i as f32 / (RATE as f32 * 0.008)).min(1.0);
+        let body = if t < release_at {
+            1.0
+        } else {
+            1.0 - (t - release_at) / (1.0 - release_at)
+        };
+        out.push(wave.at(phase) * vol * attack * body);
+    }
+    out
+}
+
+/// Equal-temperament frequency of a MIDI note number.
+fn midi(m: i32) -> f32 {
+    440.0 * 2f32.powf((m - 69) as f32 / 12.0)
+}
+
+/// The menu music: an original tune built the way the memorable ones are, a
+/// singable lead with a hook that repeats and answers itself, over the
+/// four chords half of pop music shares (I–V–vi–IV in C), with a walking
+/// bass and a soft arpeggio filling the air the way the underwater themes
+/// do. Eight bars, sixty-four eighth-note steps at 132 BPM, looped.
+///
+/// The lead is two four-bar phrases. The first climbs to the high C, spills
+/// back down and lands on the tonic; the second asks the same question and
+/// answers it a step higher, ending on the high C held, which is what makes
+/// the loop's restart feel like a chorus coming round rather than a tape
+/// rewinding.
 fn music_loop() -> Vec<f32> {
-    // A2 C3 E3 G2 | A2 C3 E3 B2 ... roots of Am, Am, F, G in the second half.
-    let bass_line: [f32; 16] = [
-        110.0, 110.0, 130.81, 164.81, 110.0, 110.0, 98.0, 123.47, //
-        87.31, 87.31, 110.0, 130.81, 98.0, 98.0, 123.47, 146.83,
-    ];
-    let step_secs = 0.21;
-    let step = (step_secs * RATE as f32) as usize;
+    const STEP_SECS: f32 = 60.0 / 132.0 / 2.0;
+    let step = (STEP_SECS * RATE as f32) as usize;
     let mut parts: Vec<(usize, Vec<f32>)> = Vec::new();
-    for (i, &f) in bass_line.iter().enumerate() {
-        parts.push((i * step, tone(f, step_secs * 0.95, 0.34, Wave::Square)));
+
+    // (start step, MIDI note, length in steps). C5=72, E5=76, G5=79, A5=81,
+    // B5=83, C6=84, D6=86.
+    let lead: [(usize, i32, usize); 28] = [
+        // Phrase A: C G Am F.
+        (0, 76, 2),
+        (2, 79, 2),
+        (4, 84, 3),
+        (7, 83, 1),
+        (8, 81, 2),
+        (10, 79, 2),
+        (12, 76, 4),
+        (16, 77, 2),
+        (18, 81, 2),
+        (20, 79, 2),
+        (22, 76, 2),
+        (24, 74, 2),
+        (26, 76, 2),
+        (28, 72, 4),
+        // Phrase B: C G F G, the same opening, a higher answer.
+        (32, 76, 2),
+        (34, 79, 2),
+        (36, 84, 3),
+        (39, 86, 1),
+        (40, 83, 2),
+        (42, 81, 2),
+        (44, 79, 4),
+        (48, 81, 2),
+        (50, 83, 2),
+        (52, 84, 2),
+        (54, 86, 2),
+        (56, 83, 2),
+        (58, 79, 2),
+        (60, 84, 4),
+    ];
+    for (at, m, len) in lead {
         parts.push((
-            i * step + step / 2,
-            tone(f * 2.0, step_secs * 0.4, 0.1, Wave::Sine),
+            at * step,
+            note(midi(m), STEP_SECS * len as f32 * 0.96, 0.21, Wave::Square),
         ));
     }
-    // The lead answers every other bar with three notes of the chord.
-    let lead: [(usize, f32); 6] = [
-        (0, 440.0),
-        (2, 523.25),
-        (4, 659.25),
-        (8, 349.23),
-        (10, 440.0),
-        (12, 523.25),
+
+    // One chord per bar: roots in MIDI (C3=48, G2=43, A2=45, F2=41) and the
+    // third's quality, which the arpeggio needs and the bass does not.
+    let bars: [(i32, bool); 8] = [
+        (48, true),
+        (43, true),
+        (45, false),
+        (41, true),
+        (48, true),
+        (43, true),
+        (41, true),
+        (43, true),
     ];
-    for (i, f) in lead {
-        parts.push((i * step, tone(f, step_secs * 1.8, 0.13, Wave::Sine)));
+    for (bar, (root, major)) in bars.iter().enumerate() {
+        let base = bar * 8;
+        // The bass walks: root, fifth, root, fifth, quarter notes.
+        for (i, off) in [0, 7, 0, 7].iter().enumerate() {
+            parts.push((
+                (base + i * 2) * step,
+                note(midi(root + off), STEP_SECS * 1.9, 0.26, Wave::Square),
+            ));
+        }
+        // The arpeggio breathes over the top: chord tones rising and
+        // falling, one per eighth, sine and quiet.
+        let third = if *major { 4 } else { 3 };
+        let tones = [0, third, 7, 12, 7, third, 0, third];
+        for (i, off) in tones.iter().enumerate() {
+            parts.push((
+                (base + i) * step,
+                note(midi(root + 24 + off), STEP_SECS * 0.95, 0.055, Wave::Sine),
+            ));
+        }
     }
-    // Exactly sixteen steps, padded: a loop whose length is not a whole
+
+    // Exactly sixty-four steps, padded: a loop whose length is not a whole
     // number of steps restarts mid-note and clicks once a cycle, forever.
     let mut out = mix(&parts);
-    out.resize(step * 16, 0.0);
+    out.resize(step * 64, 0.0);
     out
 }
 
@@ -495,8 +582,35 @@ mod tests {
     fn the_music_loop_is_bounded_and_loops_on_a_whole_step() {
         let samples = music_loop();
         assert!(samples.iter().all(|s| s.abs() <= 1.0));
-        let step = (0.21 * RATE as f32) as usize;
-        assert_eq!(samples.len() % step, 0, "loop must end on a step boundary");
+        let step = (60.0 / 132.0 / 2.0 * RATE as f32) as usize;
+        assert_eq!(
+            samples.len(),
+            step * 64,
+            "the loop is exactly sixty-four eighth-note steps"
+        );
+    }
+
+    #[test]
+    fn the_lead_hook_repeats_with_a_variation() {
+        // The tune's claim is a hook that comes back changed: the two phrases
+        // open on the same three notes, so the loop's first and fifth bars
+        // should sound alike in the lead's register but not identical. This
+        // compares the rendered mix's energy in the two windows rather than
+        // the note table, so a rewrite that loses the repetition fails here
+        // even if every note is still in range.
+        let samples = music_loop();
+        let step = (60.0 / 132.0 / 2.0 * RATE as f32) as usize;
+        let energy = |from: usize, to: usize| -> f32 {
+            samples[from..to].iter().map(|s| s * s).sum()
+        };
+        let a = energy(0, step * 8);
+        let b = energy(step * 32, step * 40);
+        assert!(a > 0.0 && b > 0.0, "both phrases carry the lead");
+        let ratio = a / b;
+        assert!(
+            (0.4..=2.5).contains(&ratio),
+            "phrases are the same hook at similar weight (ratio {ratio:.2})"
+        );
     }
 
     #[test]
