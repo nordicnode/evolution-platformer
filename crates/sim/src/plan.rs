@@ -423,8 +423,43 @@ pub fn solve_from(level: &Level, start: Sim, seed: u64, cfg: PlanConfig) -> Opti
     plan_from(level, start, seed, cfg).route
 }
 
+/// **Plan one leg from a divergent state**: search until the body closes `target_hops` route
+/// crossings, rather than until it reaches the flag.
+///
+/// This is the teacher a leg curriculum needs. `plan_from` answers "how do I finish the level"
+/// from wherever the student is, which on a long level is a full-level search even when the
+/// student has wandered two tiles from the plan; a correction only has to carry the body to the
+/// next crossing, and asking for that makes the search local and affordable. `target_hops` is a
+/// reading of [`crate::EpisodeStats::route_hops_closed`], so it is the same index the telemetry
+/// and [`crate::route_plan::Leg`] use.
+///
+/// A route that reaches the flag counts as success too: a foot that touches it has closed the
+/// level whatever its crossing count says.
+pub fn plan_leg(
+    level: &Level,
+    start: Sim,
+    seed: u64,
+    target_hops: u32,
+    cfg: PlanConfig,
+) -> PlanOutcome {
+    plan_from_until(level, start, seed, cfg, Some(target_hops))
+}
+
 /// [`solve_from`] with the full diagnosis.
-pub fn plan_from(level: &Level, mut start: Sim, seed: u64, cfg: PlanConfig) -> PlanOutcome {
+pub fn plan_from(level: &Level, start: Sim, seed: u64, cfg: PlanConfig) -> PlanOutcome {
+    plan_from_until(level, start, seed, cfg, None)
+}
+
+/// The shared search behind [`plan_from`] and [`plan_leg`]. `target` is `None` for "reach the
+/// flag" and `Some(k)` for "close the k-th route crossing", which is what makes a correction
+/// local.
+fn plan_from_until(
+    level: &Level,
+    mut start: Sim,
+    seed: u64,
+    cfg: PlanConfig,
+    target: Option<u32>,
+) -> PlanOutcome {
     debug_assert_eq!(
         level.width,
         start.level().width,
@@ -484,10 +519,21 @@ pub fn plan_from(level: &Level, mut start: Sim, seed: u64, cfg: PlanConfig) -> P
         let children = expand(&frontier, cfg.max_flight_blocks);
         let mut kept: Vec<Node> = Vec::with_capacity(children.len());
         for child in children {
-            if child.won {
+            let reached_target = target
+                .is_some_and(|hops| child.sim.stats().route_hops_closed >= hops);
+            if child.won || reached_target {
+                let route = route_of(&child, start_hops, seed, expanded);
+                let note = match target {
+                    Some(hops) if !child.won => format!(
+                        "planned a leg to crossing {hops} in {} blocks and {} frames ({expanded} expansions)",
+                        route.actions.len(),
+                        route.frames
+                    ),
+                    _ => node_note(&child, start_hops, expanded),
+                };
                 return PlanOutcome {
-                    route: Some(route_of(&child, start_hops, seed, expanded)),
-                    note: node_note(&child, start_hops, expanded),
+                    route: Some(route),
+                    note,
                     best_x: child.sim.player().x,
                     best_y: child.sim.player().y,
                     frames: child.sim.stats().frames,
@@ -874,6 +920,48 @@ mod tests {
             verdict(&nowhere, 7, PlanConfig::default()),
             PlanVerdict::Unbeatable { .. }
         ));
+    }
+
+    /// **A leg plan stops at the leg, not at the flag.** The correction a curriculum asks for is
+    /// local: from the state the student is in, carry it to the next route crossing. The proof is
+    /// that the returned action list is shorter than the full route and its replay closes the
+    /// requested crossing without winning.
+    #[test]
+    fn a_leg_plan_stops_at_the_next_crossing() {
+        let l = level(&[
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "#####....##....#####",
+        ]);
+        let full = solve(&l, 7, PlanConfig::default()).expect("the level routes");
+        assert_eq!(full.hops, 2, "two gaps, two route crossings");
+        let leg = plan_leg(&l, Sim::new(&l, 7), 7, 1, PlanConfig::default());
+        let leg = leg.route.expect("one crossing is a local plan");
+        assert!(
+            leg.actions.len() < full.actions.len(),
+            "a leg plan ({}) must be shorter than the whole route ({})",
+            leg.actions.len(),
+            full.actions.len()
+        );
+        let mut sim = Sim::new(&l, 7);
+        for action in &leg.actions {
+            for _ in 0..DECISION_TICKS {
+                if sim.outcome().is_finished() {
+                    break;
+                }
+                sim.step(*action);
+            }
+        }
+        assert_eq!(
+            sim.stats().route_hops_closed,
+            1,
+            "the leg route closes the crossing it was asked for"
+        );
+        assert_ne!(sim.outcome(), crate::Outcome::Won, "and stops before the flag");
     }
 
     #[test]

@@ -132,6 +132,12 @@ per-leg margins (`--all --levels-dir levels/practice --out plans` for the whole
 suite). A level the oracle certifies but the planner cannot route is reported
 as such; the window then starts that run's population random rather than warm.
 
+`train-cli train --from-plan` goes further: its DAgger corrections are planned
+from the state the clone actually reaches (one route crossing at a time), and a
+leg curriculum takes the first leg the clone fails and spends the rest of the
+fit budget on it. The `clone` line ends with the per-leg mastery reading — how
+many legs were cleared, and which one stopped it.
+
 ## Quick start
 
 You need a Rust toolchain. From the top of the repo:

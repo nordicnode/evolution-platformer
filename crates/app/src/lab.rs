@@ -158,8 +158,7 @@ fn warm_seed_from_plan_with(
         }
     };
     let eval = cfg.eval_config();
-    let route = plan.timed_route();
-    let fit = match from_certified_plan(level, &route, &eval, cfg.shape.clone(), imit) {
+    let fit = match from_certified_plan(level, &plan, &eval, cfg.shape.clone(), imit) {
         Ok((play, report)) => (play, report),
         Err(why) => {
             return (
@@ -174,11 +173,16 @@ fn warm_seed_from_plan_with(
     let (play, report) = fit;
     if profiling() {
         eprintln!(
-            "lab warm plan+clone {:?} ({} decisions, {} legs, {:.0}% agreement)",
+            "lab warm plan+clone {:?} ({} decisions, {} legs, {:.0}% agreement{})",
             started.elapsed(),
             play.decisions.len(),
             plan.legs.len(),
-            report.agreement * 100.0
+            report.agreement * 100.0,
+            report
+                .mastery
+                .as_ref()
+                .map(|m| format!(", {}/{} legs cleared", m.cleared(), m.legs.len()))
+                .unwrap_or_default()
         );
     }
     let mut rng = sim::rng::rng_from_seed(cfg.master_seed ^ 0x2E5E_ED2E_5EED_2E5E);
@@ -201,12 +205,21 @@ fn warm_seed_from_plan_with(
             plan.hops
         )
     };
+    // **What the clone can actually do**, on the window's own origin line. Agreement is the fit's
+    // number; mastery is the game's, and the weak leg is the one Phase 2's curriculum spent its
+    // budget on. A warm start that says only "84 % agreement" leaves the operator to discover on
+    // generation 0 that the policy cannot make the first spike.
+    let mastery = report
+        .mastery
+        .as_ref()
+        .map(|m| format!("; {}", m.line()))
+        .unwrap_or_default();
     (
         Some(pop),
         format!(
             "warmed from this level's timed plan: {coverage} in {} blocks and {}; a genome was \
              cloned from the plan ({:.0}% of the demonstrated decisions reproduced) and {warm} of \
-             {} genomes start from that clone, the rest are random; {}",
+             {} genomes start from that clone, the rest are random; {}{mastery}",
             plan.actions.len(),
             sim::format_time(plan.frames),
             report.agreement * 100.0,
@@ -3222,8 +3235,9 @@ mod tests {
         assert!(
             note.starts_with("warmed from this level's timed plan")
                 && note.contains("legs /")
-                && note.contains("cloned"),
-            "the note names the plan's legs and the clone: {note}"
+                && note.contains("cloned")
+                && note.contains("mastery"),
+            "the note names the plan's legs, the clone and which leg the clone stops on: {note}"
         );
     }
 

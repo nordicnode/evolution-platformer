@@ -140,6 +140,13 @@ pub struct RoutePlay {
     pub seed: u64,
     /// Route hops closed on the way (`hops_to_flag` falling while the body stood on a stand).
     pub hops_closed: u32,
+    /// Start indices of the demonstration's contiguous runs, ascending, first always `0`.
+    ///
+    /// A replay is one run. A DAgger dataset is not: every lesson rolled out from a snapshot —
+    /// the spawn, or the start of a failing leg — begins a new episode with fresh recurrent state,
+    /// and concatenating it onto the old one without saying so would train a clone's memory across
+    /// a boundary the body never walked. The fit reads these to reset the context it feeds forward.
+    pub segments: Vec<usize>,
     /// The number of decision blocks played before the walk's deepest route stand.
     ///
     /// A prefix of a demonstration is the state a stalled run reached; a planner can start
@@ -587,6 +594,7 @@ pub fn timed_play_from(
     };
     RoutePlay {
         decisions,
+        segments: vec![0],
         outcome,
         frames,
         seed: route.seed,
@@ -907,6 +915,7 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
     trace.push(note.clone());
     RoutePlay {
         decisions,
+        segments: vec![0],
         outcome: sim.outcome(),
         frames: sim.stats().frames,
         seed,

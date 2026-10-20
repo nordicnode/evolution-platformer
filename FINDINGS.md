@@ -5949,3 +5949,99 @@ Files: `crates/sim/src/route_plan.rs` (artifact and compiler), `crates/evo/src/i
 `crates/evo/src/ga.rs` (per-level suite pass and `GenerationReport::per_level`),
 `crates/app/src/lab.rs` (plan warm start, refusal note), `crates/train-cli/src/commands.rs`
 (`routeplan`, per-level JSONL), `tools/phase1_gate.py`.
+
+## Phase 2: leg skill, taught where the clone fails
+
+Phase 1's teacher was a route and a fit. Measured on `l11`, that clone reproduced 84.7 % of the
+plan's decisions and died on the first spike inside leg 1, and the suite's agreement number could
+not say *where* it stopped. Phase 2 makes the teacher answer the student and makes the reading
+per leg.
+
+### The teacher: replanning, one crossing at a time
+
+* **A leg target, not the flag.** `sim::plan::plan_leg` is the shared planner search stopped at the
+  k-th route crossing (`route_hops_closed`) instead of the flag. A correction from a divergent state
+  only has to finish the leg the student is standing on; asking for the whole level from there made
+  the search fail at any realistic depth (measured: every replan returned `None`, so every label
+  fell back to the plan's nearest state, and the first attempt at this pass cost 128 s while
+  changing nothing).
+* **Corrections come from the student's state.** A rollout step asks the planner for an action
+  when the observation is off the demonstration's corridor (`squared sensor distance > 0.5`), and
+  replans from *that* snapshot. On the corridor the demonstrated action is the label — asking the
+  planner at those states was measured to replan on every block while returning the same action.
+* **Refits continue from the student.** `imitate::clone_from_play_init` initialises from the
+  current clone (at a quarter of the from-scratch learning rate) instead of a fresh random net.
+  Refitting from scratch at a few hundred passes was measured to lose a leg every round; the
+  round was rejected and nothing improved.
+* **Dataset segments reset recurrent state.** Every lesson rolled out from a snapshot is a new
+  episode, so `RoutePlay::segments` marks its start and the fit zeroes the feedback context there.
+  Without it the first lesson was trained with the memory left over from the flag.
+* **Two whole-route DAgger rounds, then the curriculum.** Six from-scratch rounds were the Phase 1
+  shape; with corrections planned locally, two rounds reach the same wall, and the budget is
+  better spent on the failing leg.
+
+### The curriculum and the reading
+
+`measure_mastery` rolls the clone out from the spawn on the plan's episode and reports, per leg,
+whether it was reached, whether its crossing was cleared, whether the episode ended in it, and the
+frames spent there. `weakest()` is the first leg without a crossing — the telemetry's `best_end_leg`
+and the plan's `Leg::index` are the same number, so the reading needs no translation. The curriculum
+then rolls out from the leg **before** the weak one (the approach contains the failure; starting on
+the weak leg gave four states on `l11` and taught only the death), from the state the student
+actually reaches, labels the divergent states with `plan_leg`, refits from the student, and adopts
+the round only if it clears more legs. A round that teaches nothing is discarded, not returned.
+
+### The gate, as run
+
+`tools/phase2_gate.py --seeds 8`: `l11`, plan depth 64, clone 300 epochs (the window's budget), pop
+8; three arms differing only in the teacher. Distributions, not one number:
+
+| arm | mean / median / min-max legs cleared | past the first spike | deaths by spike | plan+fit s |
+|---|---|---|---|---|
+| imitate (Phase 1) | 1.12 / 1.0 / 1-2 | 1/8 | 7/8 | 2.88 |
+| replanning DAgger | 1.88 / 2.0 / 1-3 | 6/8 | 2/8 | 3.88 |
+| + leg curriculum | **2.00** / 2.0 / 1-4 | **6/8** | 3/8 | 5.70 |
+
+Per seed, the leg the mastery reading named:
+
+| seed | imitate | DAgger | curriculum |
+|---|---|---|---|
+| 1 | 1, died spike x 16.3 | 2, died turret x 16.2 | 2, died turret x 16.2 |
+| 2 | 1, died spike x 16.3 | 2, died turret x 16.2 | 2, died turret x 16.2 |
+| 3 | 2, died turret x 16.3 | 3, stuck x 25.4 | **4, died spike x 28.1** |
+| 4 | 1, died spike | 2, died turret | 2, died turret |
+| 5 | 1, died spike x 16.6 | 2, died turret | 2, died turret |
+| 6 | 1, died spike x 16.3 | 1, died spike | 1, died spike |
+| 7 | 1, died spike x 16.3 | 1, died spike | 1, died spike |
+| 8 | 1, died spike x 16.4 | 2, died turret x 16.3 | 2, died turret x 16.3 |
+
+**The named failure moved.** The Phase 1 clone died on the first spike in 7 of 8 seeds; with the
+replanning teacher 6 of 8 clear that crossing and now stop at the turret one leg later, and seed 3
+clears four legs. The remaining two seeds (6, 7) still die on the first spike, and the mastery
+reading names leg 1 for both — which is the required answer when the teacher does not get there.
+The curriculum's own contribution is small and honest: +0.12 legs on average, one seed (3) gaining
+a leg over DAgger, every other seed unchanged, and it costs about 2 s of startup.
+
+### What this does not claim
+
+* **The turret is the new wall, and the curriculum does not clear it.** All improved seeds stop at
+  x 16.2 in leg 2 with the same death. A leg lesson there contains the approach and the shot but
+  the 300-epoch fit does not learn the wait; the round that tried was measured and rejected. Phase
+  2's claim is the spike, not the level.
+* **Two seeds show no gain at all.** The gate reports them rather than averaging them away.
+* **Cost is real.** Replanning adds ~0.9 s and the curriculum ~2 s to startup; both are inside the
+  synchronous warm start, which the window still runs on its worker before generation 0.
+* **`l11`'s plan is compiled against the working tree's level file**, which is the user's
+  uncommitted edit; the gate's numbers are about that terrain.
+
+### Gates
+
+`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green except
+the pre-existing `evo --test migration` saved-`l11` fixture, which fails only because that level file
+is edited in this working tree (it passes on HEAD's file, as recorded in Phase 1).
+
+Files: `crates/sim/src/plan.rs` (`plan_leg`, leg-targeted search), `crates/evo/src/imitate.rs`
+(replanning DAgger, `segments`, `clone_from_play_init`, `LegMastery`, curriculum),
+`crates/evo/src/route_play.rs` (segment starts), `crates/train-cli/src/{commands,main}.rs`
+(`--dagger-rounds`, `--leg-rounds`, `--leg-rollouts`, `--replan-depth`, mastery on the `clone` line),
+`crates/app/src/lab.rs` (mastery in the run's origin note), `tools/phase2_gate.py`.

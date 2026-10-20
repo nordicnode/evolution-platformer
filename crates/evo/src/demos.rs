@@ -161,6 +161,7 @@ impl HumanDemo {
         let last_tick = self.decisions.last().map_or(0, |d| d.tick);
         Ok(RoutePlay {
             decisions,
+            segments: vec![0],
             outcome: if self.won {
                 sim::Outcome::Won
             } else {

@@ -66,9 +66,8 @@ pub use ga::{
 };
 pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
 pub use imitate::{
-    clone_from_play, from_certified_plan, from_plan, from_route, warm_population, warm_set,
-    ImitateConfig,
-    ImitationReport,
+    clone_from_play, from_certified_plan, from_plan, from_route, measure_mastery, warm_population,
+    warm_set, ImitateConfig, ImitationReport, LegMastery, LegSkill,
 };
 pub use islands::{IslandConfig, IslandStep, Islands};
 pub use mistakes::{find_mistake, find_mistakes, learn as learn_from_mistake, Mistake};
