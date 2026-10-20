@@ -90,6 +90,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "leg-rollouts",
     "replan-depth",
     "dagger-rounds",
+    "correction-epochs",
     "no-meta",
     "no-jump-labels",
     "route-seed",
@@ -1569,6 +1570,13 @@ fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
         replan_depth: usage(a.usize_opt("replan-depth", ImitateConfig::default().replan_depth as usize))?
             as u32,
         dagger_rounds: usage(a.usize_opt("dagger-rounds", ImitateConfig::default().dagger_rounds))?,
+        // The fit that includes corrections, separate from the demonstration fit: a corrected
+        // state is a few exemplars against the whole route, and the same budget can leave it
+        // unlearned (FINDINGS.md, Phase 3). Zero keeps the demonstration's own budget.
+        correction_epochs: usage(a.usize_opt(
+            "correction-epochs",
+            ImitateConfig::default().correction_epochs,
+        ))?,
         // The meta-controller is on by default; `--no-meta` is the Phase 2 arm, where the plan's
         // blocks and the raw leg routes are the teacher. It exists so a gate can compare the two
         // teachers on the same tree rather than across commits.
