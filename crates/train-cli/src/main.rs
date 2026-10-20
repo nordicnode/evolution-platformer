@@ -258,7 +258,11 @@ TRAIN OPTIONS:
     --growth-events <N>   Cap on growth events per run.                     [default 2]
     --lesson-every <N>    Item 4: every N generations, plan the level, fit a clone to the
                           states the run actually visits, and inject it as an ordinary child.
-                          0 disables; the clone must earn the record like any child. [default 0]
+                          0 disables; the clone must earn the record like any child.
+                          Measured on `l11` at a 20-lesson budget over 24 paired seeds:
+                          2 solves each way, p = 1.0, and the lesson arm's pair arrive
+                          more than a thousand generations later, so it stays off.
+                                                                        [default 0]
     --plateau-window <N>  Item 4: generations without a record improvement before a bounded
                           full-net CEM phase is spent. 0 disables.             [default 0]
     --plateau-cem-generations <N>

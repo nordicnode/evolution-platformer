@@ -2398,6 +2398,23 @@ impl Trainer {
         self.cut_refunds
     }
 
+    /// How many mid-run lessons this run injected (Item 4, step 1).
+    ///
+    /// The companion number to [`GaConfig::lesson_every`]: the cadence says how often a lesson
+    /// was *asked for*, and this says how many were actually fitted and bred. `0` beside a
+    /// positive cadence means the planner produced no clone for this level — the lesson was
+    /// requested and did not happen. A lesson that fails silently is exactly the kind of arm
+    /// that gets quoted as "lessons ran" when nothing ran.
+    pub fn lessons_taught(&self) -> usize {
+        self.lessons
+    }
+
+    /// CEM phases this run spent on the plateau (Item 4, step 2), capped by
+    /// [`GaConfig::plateau_cem_events`]. `0` when the trigger is off.
+    pub fn cem_phases(&self) -> u32 {
+        self.cem_rounds
+    }
+
     /// The plan-proximity guide, when one was attached (WP5).
     pub fn plan_guide(&self) -> Option<&sim::PlanGuide> {
         self.plan_guide.as_ref()

@@ -235,6 +235,15 @@ pub struct SeedRow {
     /// one, at the cap when there was not. The number that separates "never learned" from
     /// "learned everything but the last move".
     pub best_fitness: f32,
+    /// Mid-run lessons this seed actually injected ([`evo::Trainer::lessons_taught`]).
+    ///
+    /// The per-seed companion to [`BenchArm::lesson_every`]: the cadence says how often a
+    /// lesson was asked for, this says how many were fitted. Zero beside a positive cadence
+    /// means the planner returned no clone on this level, which is an arm that *looked* like
+    /// it ran lessons and did not. Defaulted on load so arms recorded before the field
+    /// existed read back with no reading rather than a fabricated one.
+    #[serde(default)]
+    pub lessons: u32,
 }
 
 /// A recorded arm: the sweep, what it measured, and every knob that was in force.
@@ -291,6 +300,23 @@ pub struct BenchArm {
     /// back as the leaderboard-only search it actually ran.
     #[serde(default)]
     pub technique_children: usize,
+    /// Item 4's mid-run lesson cadence ([`evo::GaConfig::lesson_every`]): one clone fitted to
+    /// the states the run reaches, injected through breeding, every this many generations.
+    ///
+    /// Recorded for the same reason every other search-shaping knob is: the level, the budget
+    /// and the seeds all live in this file, so an arm whose file did not name its cadence is
+    /// indistinguishable from the default and could be quoted as one. Defaulted to zero for
+    /// arms taken before the field existed, which ran no lessons.
+    #[serde(default)]
+    pub lesson_every: u32,
+    /// Item 4's plateau trigger, CEM generations per phase, and the cap on phases. All
+    /// defaulted to zero, which is the off trigger every earlier arm ran under.
+    #[serde(default)]
+    pub plateau_window: u32,
+    #[serde(default)]
+    pub plateau_cem_generations: u32,
+    #[serde(default)]
+    pub plateau_cem_events: u32,
     pub archive_on_diversity: bool,
     /// Selection-only plan bonus this arm ran with (`GaConfig::plan_bonus`). Defaulted to zero
     /// for arms recorded before the first plan-bonus arm actually attached a guide.
@@ -531,6 +557,21 @@ pub fn bench(a: &Args) -> Result<(), String> {
             "episodes {:.2} per genome per generation",
             evo::ga::episodes_per_genome(std::slice::from_ref(&level), pop, &cfg)
         );
+        println!(
+            "lesson  every {}  plateau {} ({}x{})",
+            if cfg.lesson_every == 0 {
+                "off".to_string()
+            } else {
+                format!("{} generations", cfg.lesson_every)
+            },
+            if cfg.plateau_window == 0 {
+                "off".to_string()
+            } else {
+                format!("after {} generations without a record", cfg.plateau_window)
+            },
+            cfg.plateau_cem_generations,
+            cfg.plateau_cem_events
+        );
         println!("start   {start}");
         println!(
             "version sim {} / sensors v{} / fitness v{}\n",
@@ -596,6 +637,7 @@ pub fn bench(a: &Args) -> Result<(), String> {
             seed,
             first_win,
             best_fitness,
+            lessons: trainer.lessons_taught() as u32,
         });
     }
 
@@ -622,6 +664,10 @@ pub fn bench(a: &Args) -> Result<(), String> {
         growth_units: cfg.growth_units,
         growth_events: cfg.growth_events,
         technique_children: cfg.technique_children,
+        lesson_every: cfg.lesson_every,
+        plateau_window: cfg.plateau_window,
+        plateau_cem_generations: cfg.plateau_cem_generations,
+        plateau_cem_events: cfg.plateau_cem_events,
         archive_on_diversity: cfg.archive_on_diversity,
         plan_bonus: cfg.plan_bonus,
         plan_waypoints,
@@ -1147,6 +1193,71 @@ mod tests {
         assert!(sign_test_p(8, 2) < sign_test_p(6, 4));
         assert!(sign_test_p(6, 4) <= 1.0);
         assert_eq!(sign_test_p(5, 5), 1.0);
+    }
+
+    /// **Item 4's arm is only quotable if its file names its cadence.** A lesson arm used to
+    /// record exactly what the default records, and a per-seed lesson count of zero beside a
+    /// positive cadence is the failure mode that makes an "no lessons ran" read as "lessons
+    /// ran and did not help". This pins both halves: the cadence reaches the file, the lessons
+    /// actually injected do too, and a file written before the fields existed still loads.
+    #[test]
+    fn an_item_4_arm_records_its_cadence_and_the_lessons_it_injected() {
+        let dir = tmpdir("lesson");
+        let out = dir.to_string_lossy().to_string();
+        bench(&a(&[
+            "bench",
+            "--protocol",
+            "chain",
+            "--level",
+            &wpath("levels/l1-flat-run.json"),
+            "--seeds",
+            "1",
+            "--generations",
+            "3",
+            "--pop",
+            "16",
+            "--lesson-every",
+            "1",
+            "--arm",
+            "lesson",
+            "--out",
+            &out,
+            "--quiet",
+        ]))
+        .expect("a lesson arm runs");
+
+        let path = dir.join("chain-lesson.json");
+        let read_back = read_arm(&path.to_string_lossy()).expect("reads back");
+        assert_eq!(read_back.lesson_every, 1);
+        assert_eq!(read_back.plateau_window, 0);
+        let default = evo::GaConfig::default();
+        assert_eq!(read_back.plateau_cem_generations, default.plateau_cem_generations);
+        assert_eq!(read_back.plateau_cem_events, default.plateau_cem_events);
+        assert!(
+            read_back.rows[0].lessons > 0,
+            "the cadence fired but the file says no lesson was injected: {:?}",
+            read_back.rows[0]
+        );
+
+        // An arm recorded before the Item 4 fields existed is not a corrupt file: it is an
+        // arm that ran no lessons, and it has to read back saying exactly that.
+        let mut old = serde_json::to_value(&read_back).expect("serializes");
+        for key in [
+            "lesson_every",
+            "plateau_window",
+            "plateau_cem_generations",
+            "plateau_cem_events",
+        ] {
+            old.as_object_mut().expect("object").remove(key);
+        }
+        for row in old["rows"].as_array_mut().expect("rows") {
+            row.as_object_mut().expect("row").remove("lessons");
+        }
+        let restored: BenchArm = serde_json::from_value(old).expect("an older arm still loads");
+        assert_eq!(restored.lesson_every, 0);
+        assert_eq!(restored.plateau_window, 0);
+        assert_eq!(restored.rows[0].lessons, 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

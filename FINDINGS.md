@@ -5120,8 +5120,9 @@ Both halves are off by default, and both have now been run on a 12-seed protocol
 **Mid-run lessons**, `--lesson-every 20` against the default on `gauntlet` (pop 200, 300
 generations): **8 seeds won by lessons, 3 by the default, 1 tie** (exact sign test p = 0.23),
 median first win **8 against 16** and mean 11.4 against 19.4. The direction is the one the plan
-predicts and the sample cannot establish it; the plan's own gate is `l11-the-elements`, which is
-still running.
+predicts and the sample cannot establish it; the plan's own gate is `l11-the-elements`, and it was
+run — 24 paired seeds, 2 solves each way, **p = 1.0** — and it does not replicate this direction
+(see "Items 4, 11 and 13 on `l11`" below).
 
 **Plateau CEM**, `--plateau-window 20` against the default on `tower`: **2 wins each, 8 ties,
 p = 1.0**, same solved count (9 of 12) and same median (53). It flipped seed 1 from unsolved to
@@ -5559,7 +5560,7 @@ is ~2 % against a 25 % bar.
 | 1 islands | shipped, off | tower, 4 × 50: 1 win / 9 losses, p = 0.02, median 134 vs 53 — a loss at equal genome budget |
 | 2 batched pass | built, measured, **killed**: `Genome::forward_block` is not routed into evaluation | 1.14× batched on the memoryless shape, **0.96×** on the reference level's feedback shape, against a 10 % kill line; forward pass is 15 % of a generation on this machine |
 | 3 sensors v14 | **not in the tree**, rebuilt once more and reverted; `sensors::VERSION` stays 13 at 108 inputs | **the gate's premise is false**: both levels it names are already solved by the v13 default (`bat-crumble-bridge` 12/12 at generation 0, `bat-double-threat` 12/12, median 3.5), so no sensor can move them; the warm canary also reproduces at the same width (l5 199 vs 168, l2 38 vs 33 at 12 seeds) |
-| 4 lessons + CEM | shipped, both off | gauntlet: lessons 8 wins / 3 losses, p = 0.23 (median 8 vs 16); tower CEM: 2/2, p = 1.0; the l11 arm is not run — 100 planner searches per seed at the elements protocol (measured cost, recorded below) |
+| 4 lessons + CEM | shipped, both off | gauntlet: lessons 8 wins / 3 losses, p = 0.23 (median 8 vs 16); tower CEM: 2/2, p = 1.0; **`l11` gate run at a 20-lesson budget, 24 paired seeds: 2 solves each way, p = 1.0** — the arm's solves land 1 183 and 1 143 generations later than the control's, so the trigger stays off |
 | 5 early cut | shipped, off, with the band and the refund | **12-seed `chain` gate: fails on solves** — default 11/12, band 9/12, win-margin 6/12, refund 9/12; directions are 7–4 and 5–7, p = 0.55 / 0.77 |
 | WP8 snapshot probes | shipped, off | gauntlet: 5 wins / 5 losses, p = 1.0, median 15.5 vs 16; bat-pit-bait (600 gens): 2 solves against 5, 1 win / 4 losses, p = 0.375 — a loss on its own gate level, at 0.1 % more episodes |
 | 6 generalist seeding | shipped, off; `generalist` command keeps one population rotating across the pack and refreshes it from pack champions | **12-seed `tightrope` gate, level held out of the rotation: passes** — 12/12 solved at median 4.0 against the default's median 8.0, 10 wins / 1 loss, p = 0.0117 |
@@ -6431,9 +6432,75 @@ kept behind `growth_units = 0` rather than deleted: its kill criterion is writte
 resumed clock, and two proxies that fail is not that test — but nothing in the tree grows a net
 unless a run asks for it.
 
-**Item 4's `l11` gate was not run, and the reason is measured.** `--lesson-every 20` fires 100
-lessons over the 2 000-generation protocol, and each lesson plans the level (`from_plan` compiles the
-route at depth 64 and then runs the DAgger rounds); on this machine that is roughly four minutes of
-planning per seed before the search itself, so a 12-seed paired arm is over an hour of compute for a
-level whose default solves one seed. The arm stays off by default, its `gauntlet` reading stands (8
-wins, 3 losses, p = 0.23, median 8 against 16), and this paragraph is the record rather than a claim.
+### Item 4's `l11` gate: run at a stated budget, and lost
+
+The gate was recorded as unrun because `--lesson-every 20` costs a planner search per lesson and the
+protocol is 2 000 generations: 100 lessons, each compiling the route at depth 64 and then running
+the DAgger rounds. Measured on this machine a lesson costs **about six seconds** (`elements`, pop
+200: 201 generations with three lessons took 19 s against about 3 s for the same generations
+without), so the arms below are specified as a *budget* rather than a cadence — **20 lessons per
+run, `--lesson-every 100`** — 20 requests, at generations 0, 100, … 1 900, ~2 minutes of
+planning added to ~1.2 minutes of search per seed, and a measured **63 minutes** for the 24-seed arm against
+**29 minutes** for the control on one core. That is affordable enough to run and cheap enough to
+repeat, which is what the previous paragraph's estimate ("over an hour" for 12 seeds) was standing
+in for.
+
+The `elements` protocol (`l11-the-elements`, pop 200, 2 000 generations, **24 seeds**, first-win
+stop, both arms complete), `bench`:
+
+| arm | knob | solved | seeds | median first win | mean best fitness |
+|---|---|---|---|---|---|
+| default | — | **2 of 24** | 2 (658), 20 (845) | 751.5 | 2 006.1 |
+| lessons | `--lesson-every 100` | **2 of 24** | 17 (1 988), 22 (1 841) | 1 914.5 | 2 005.1 |
+
+Paired: **2 wins each way, 20 ties, p = 1.0** over the four discordant seeds. The arms solve the
+*same number* on *disjoint* seeds — the control keeps 2 and 20, the lesson arm takes 17 and 22 —
+and the lesson arm's pair arrive **1 183 and 1 143 generations later than the control's two
+solves**, one of them twelve generations short of the cap. Mean best fitness is flat (2 005.1 against 2 006.1), so the run did
+not even lift the near-miss ceiling the way a lesson stream would if the clones were teaching
+something the population could not stumble into. The arm injected 20 lessons per seed (19 on seed
+22, which stopped at its win before generation 1 900): the mechanism fired every time and bought
+nothing, which is the difference between "lessons did not help" and "lessons did not run".
+
+Reproduce: `train-cli bench --protocol elements --arm default --seeds 24` and
+`train-cli bench --protocol elements --arm lessons100 --seeds 24 --lesson-every 100`, then
+`train-cli bench --compare out/item4/elements-default.json,out/item4/elements-lessons100.json`
+for the paired table (the arm files themselves are under gitignored `out/`).
+
+**Verdict: the plan's kill criterion, applied.** Lessons that do not beat their equal-budget
+control are a distraction dressed as teaching, so the cadence stays unoffered — `--lesson-every`
+defaults to 0 and no run configuration turns it on — with the numbers kept here rather than the
+knob deleted. The `gauntlet` reading (8–3, p = 0.23, median 8 against 16) is the only positive
+direction in the record, it is not significant, and this gate is the one the plan named; the honest
+summary is that lessons help a level a plain search already solves in tens of generations, and do
+not touch a plateau that solves once in twenty-four seeds.
+
+**Which level bytes these numbers came from, stated exactly.** This working tree carries an
+*uncommitted* edit to `levels/l11-the-elements.json` — three flyers and two turrets added, thirty
+lines — and both arms above ran on that file, not on the level as committed. The comparison is
+still a valid paired one (both arms played identical bytes, seed for seed), but two consequences
+have to be recorded rather than glossed:
+
+* **The level hash cannot tell them apart.** `Level::content_hash_string` returns
+  `fnv1a64:6ffbb73687a02bde` for the committed level and for the edited one, so the arm files,
+  champion provenance and committee compatibility checks all treat a level whose hazards were
+  moved or added as the same level. The migration fixture is the proof that the entities matter:
+  its champion replays 1 567 frames on the committed level and **49 frames on the working copy**
+  (a new turret at the spawn side kills it), which is also why
+  `the_saved_l11_champion_survives_growth_and_replays_bit_identically` fails on this working tree
+  and passes on a clean checkout. The hash fix is a provenance change (it moves every level's
+  hash and every file that quotes one), so it is not folded into this gate; it is recorded here
+  as the next thing the numbers need.
+* **The control's own reading reproduces what this tree recorded.** Seed 2's solve at generation
+  658 was the elements protocol's single solve in the twelve-seed arms taken earlier in this same tree, so
+  the two readings are the same level and the same search. What this gate does not establish is
+  how either arm behaves on the committed level, and that is the arm to run once the hash is
+  fixed.
+
+**The arm file now proves which arm it was.** A bench arm used to record every search knob except
+the Item 4 ones, so a lesson sweep wrote a file identical to the control's and could have been
+quoted as one. `BenchArm` now records `lesson_every`, `plateau_window`,
+`plateau_cem_generations` and `plateau_cem_events`, and each `SeedRow` records the lessons that
+seed actually injected (`Trainer::lessons_taught`); all are serde-defaulted to zero, so an arm
+written before they existed still loads as the no-lesson run it was. Pinned by
+`an_item_4_arm_records_its_cadence_and_the_lessons_it_injected`.
