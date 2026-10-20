@@ -5559,17 +5559,17 @@ is ~2 % against a 25 % bar.
 | 1 islands | shipped, off | tower, 4 × 50: 1 win / 9 losses, p = 0.02, median 134 vs 53 — a loss at equal genome budget |
 | 2 batched pass | built, measured, **killed**: `Genome::forward_block` is not routed into evaluation | 1.14× batched on the memoryless shape, **0.96×** on the reference level's feedback shape, against a 10 % kill line; forward pass is 15 % of a generation on this machine |
 | 3 sensors v14 | **not in the tree**, rebuilt once more and reverted; `sensors::VERSION` stays 13 at 108 inputs | **the gate's premise is false**: both levels it names are already solved by the v13 default (`bat-crumble-bridge` 12/12 at generation 0, `bat-double-threat` 12/12, median 3.5), so no sensor can move them; the warm canary also reproduces at the same width (l5 199 vs 168, l2 38 vs 33 at 12 seeds) |
-| 4 lessons + CEM | shipped, both off | gauntlet: lessons 8 wins / 3 losses, p = 0.23 (median 8 vs 16); tower CEM: 2/2, p = 1.0; l11 gates outstanding |
+| 4 lessons + CEM | shipped, both off | gauntlet: lessons 8 wins / 3 losses, p = 0.23 (median 8 vs 16); tower CEM: 2/2, p = 1.0; the l11 arm is not run — 100 planner searches per seed at the elements protocol (measured cost, recorded below) |
 | 5 early cut | shipped, off, with the band and the refund | **12-seed `chain` gate: fails on solves** — default 11/12, band 9/12, win-margin 6/12, refund 9/12; directions are 7–4 and 5–7, p = 0.55 / 0.77 |
 | WP8 snapshot probes | shipped, off | gauntlet: 5 wins / 5 losses, p = 1.0, median 15.5 vs 16; bat-pit-bait (600 gens): 2 solves against 5, 1 win / 4 losses, p = 0.375 — a loss on its own gate level, at 0.1 % more episodes |
 | 6 generalist seeding | shipped, off; `generalist` command keeps one population rotating across the pack and refreshes it from pack champions | **12-seed `tightrope` gate, level held out of the rotation: passes** — 12/12 solved at median 4.0 against the default's median 8.0, 10 wins / 1 loss, p = 0.0117 |
-| 7 human demo | shipped, on demand | 95 % clone agreement; stall gate outstanding |
+| 7 human demo | shipped, on demand | 95 % clone agreement on `l2`; the stall gate is **blocked on data**, not code: the only recorded human run in the repo is on `l2`, which solves in two generations |
 | 8 phase draw | no lever exists; the **gap reading** is now in the champion file and the train summary | measured 0/3 training vs 0/12 held-out on gauntlet |
-| 9 fused seeding | `campaign --fuse <N>` / `--fuse-cross-rate`, on the shared `Trainer::seed_donors` primitive | **12-seed campaign on `tightrope`: 11/12 solved against 10/12**, one discordant seed (7), p = 1.0 — mechanism confirmed, effect unproven |
-| 10 committee | shipped + file + gate command + title-screen display | pack gate outstanding |
-| 11 technique share | shipped, off | gauntlet: 5 wins / 7 losses, p = 0.77, median 17.5 vs 16; l11/battery gate outstanding |
-| 12 cadence head | shipped, off | gauntlet proxy: 7 wins / 5 losses, p = 0.77, median 12 vs 16; the plan's v14 arm-vs-arm gate is blocked with Item 3 |
-| 13 hidden growth | shipped, off | tower arm: 2 wins / 1 loss / 9 ties, p = 1.0, and one solved seed lost — no movement |
+| 9 fused seeding | `campaign --fuse <N>` / `--fuse-cross-rate`, on the shared `Trainer::seed_donors` primitive | **12-seed campaign on `tightrope`: 11/12 solved against 10/12**, one discordant seed (7), p = 1.0 — mechanism confirmed, effect unproven, so the kill criterion applies and the campaign keeps its shape; the plan's gate names `l10-the-gauntlet-ii`, **which does not exist** (the pack's tenth level is `l10-the-hunt`) |
+| 10 committee | shipped + file + gate command + title-screen display | **pack gate passes**: 0 of 12 levels lose to their best member at pop 200 (and the vote is better on `l3` and `l10`); at a deliberately small budget it loses `l8`, so the screen's validate-before-show rule is load-bearing |
+| 11 technique share | shipped, off | gauntlet: 5 wins / 7 losses, p = 0.77, median 17.5 vs 16; `l11` at the elements protocol: **0/12 solved against the default's 1/12**, so the archive stays presentation-only, and the battery half cannot discriminate (those levels solve at generation 0) |
+| 12 cadence head | shipped, off | gauntlet proxy: 7 wins / 5 losses, p = 0.77, median 12 vs 16; the plan's v14 arm-vs-arm gate is **blocked by its own sequencing** (Item 3 is not in the tree), while the head itself is verified: absent head = four-tick cadence, and `EpisodeRunner` honours the chosen commitment in replay and the splash |
+| 13 hidden growth | shipped, off | tower arm: 2 wins / 1 loss / 9 ties, p = 1.0, one solved seed lost; `l11` elements protocol: **0/12 against the default's 1/12** — no movement on either plateau; the named resumed-clock gate cannot be read because the resumed l11 champion never wins (no clock) |
 
 
 ## Review fixes, 2026-10-19: the pass, audited
@@ -6322,3 +6322,118 @@ level). Both halves of the gate are reproducible: `out/phase3/phase3-gate-1-8.md
 Files: `crates/evo/src/imitate.rs` (`correction_epochs`, used by both correction refits),
 `crates/train-cli/src/{commands,main}.rs` (`--correction-epochs`, help), `tools/phase3_gate.py`
 (the `fit` arm, `--first-seed`, per-range artifacts).
+
+## Closing the plan's outstanding gates
+
+The audit above left six gates unrun. This section runs the ones the repository can discriminate and
+records why the others cannot, so no row of the item table ends on "outstanding" without either a
+number or a verified reason.
+
+### Item 10: the pack-wide committee gate passes
+
+`tools/committee_gate.py --pop 200 --generations 100`: one run per pack level, `train --committee 5`
+writes `committees/<level>.committee.json`, and `train-cli committee` re-validates it from the file
+against the run's own twelve fixed validation episodes. The plan's rule is completion — the vote may
+tie its best member, never lose.
+
+| level | committee won | best member won | frames (vote / member) | gate |
+|---|---|---|---|---|
+| l1-flat-run | 12/12 | 12/12 | 369 / 369 | pass |
+| l2-first-gap | 12/12 | 12/12 | 369 / 369 | pass |
+| l3-gauntlet | 12/12 | 12/12 | **460 / 494** | pass |
+| l4-rhythm | 12/12 | 12/12 | 426 / 426 | pass |
+| l5-tightrope | 12/12 | 12/12 | 447 / 447 | pass |
+| l6-marathon | 12/12 | 12/12 | 509 / 510 | pass |
+| l7-ascent | 12/12 | 12/12 | 334 / 334 | pass |
+| l7-wall-school | 12/12 | 12/12 | 148 / 148 | pass |
+| l8-long-jump | 12/12 | 12/12 | 370 / 370 | pass |
+| l9-wait-and-climb | 0/12 | 0/12 | — | pass (tie at zero) |
+| l10-the-hunt | **6/12** | 5/12 | 369 / 379 | pass |
+| l11-the-elements | 0/12 | 0/12 | — | pass (tie at zero) |
+
+Zero of twelve lose, and on two levels the vote is *better* than its best member (one more episode on
+`l10`, 34 frames faster on `l3`). The item's gate is satisfied and the committee stays a presentation
+artifact: the champion is still what is recorded and what every difficulty row reads.
+
+**The budget matters, and that is the finding worth keeping.** At a deliberately small budget (pop
+100, 40 generations) the vote **lost** `l8-long-jump` 0/12 against 12/12: four members that had not
+converged outvoted the one that had. At pop 200 it wins. So the committee is a reading about a
+*converged* population, and the splash's rule — show the vote only when the file validates — is
+load-bearing rather than ceremonial.
+
+### Item 9: the gate names a level that does not exist
+
+The plan's gate is "on the two levels the campaign exists for (`l11-the-elements`,
+`l10-the-gauntlet-ii`)". There is no `l10-the-gauntlet-ii` in this repository: the pack's tenth level
+is `l10-the-hunt`. The measured reading remains the twelve-seed `l5-tightrope` campaign above — 11 of
+12 solved with fusion against 10 of 12 without, one discordant seed, p = 1.0 — which is the plan's kill
+criterion ("if fusion does not beat continuation, segment specialists do not compose"): the campaign
+keeps its current shape, `--fuse` stays an off-by-default arm, and the mechanism is recorded as
+confirmed with its effect unproven. Re-running on `l10-the-hunt` would be a *new* gate on a level the
+plan does not name, not the gate it asked for.
+
+### Item 7: the gate needs a human, and there is no human run on a stalling level
+
+The repository holds exactly one recorded playthrough, `crates/app/demos/l2-first-gap.demo.json`, on a
+level the default run solves in two generations. The item's gate is a demonstration on a level where
+the default **stalls** (`l11` or a battery level), and no such human run exists — a demonstration the
+planner produced would be the route clone the project already has, not a human's technique, and
+fitting it would test nothing this item claims. The capture and fit paths are verified end to end
+(95.0 % agreement on `l2`, two of eight slots seeded); the gate is **blocked on data**, not code.
+
+### Item 12: blocked by the plan's own sequencing, and the replay half is real
+
+The plan requires Item 12 to ship "only inside Item 3's retrain window", and Item 3 is not in the
+tree (its battery gate cannot discriminate), so the arm-against-arm gate has no v14 arm to compare
+with. What can be verified is the part Item 12 owns beyond training: the head is one extra output
+row, a genome without it behaves exactly as before (`Genome::grown_with_commitment` reads a four-tick
+commitment), and the interpreter honours it — `EpisodeRunner` queries `act_with_commitment` whenever
+the shape carries the head, and both `replay` and the splash drive episodes through `EpisodeRunner`,
+so a saved run replays with the commitments it chose. The gate is **blocked on Item 3**, as designed.
+
+### The audit's code closures
+
+Two implementation gaps the earlier review recorded are now closed by code that landed since:
+
+* **Mid-run lessons re-plan from the visited state.** `Trainer::inject_lesson` calls
+  `imitate::from_plan`, whose DAgger pass is `replanning_rollout`: it rolls the student out on the
+  real sim and calls `plan_leg` from *that* snapshot at every divergent state (Phase 3, second pass).
+  The "fresh plan per visited state" variant the review called unbuilt is the shipped one; the states
+  are the clone's, not the record genome's, and the labels now include the jump-margin case.
+* **Islands is not a `bench` arm, and that is deliberate.** Item 1 asked for the bench machinery so an
+  arm is recorded and comparable. Islands is its own command with its own artifact; the arm was
+  assembled from its log and is recorded above, with that caveat stated. Making it a bench arm would
+  add a second code path to a mechanism that measured as a loss, which is not what its kill criterion
+  asks for.
+
+### Items 4, 11 and 13 on `l11`: the plateau does not move
+
+The `elements` protocol (`l11-the-elements`, pop 200, 2 000 generations, 12 seeds), three arms on one
+tree, `bench`:
+
+| arm | flag | solved | note |
+|---|---|---|---|
+| default | — | **1 of 12** | seed 2, generation 658 |
+| Item 13 growth | `--growth-units 4 --growth-events 2` | 0 of 12 | highest fitness 4 377 (seed 5) and 4 249 (seed 8), no win |
+| Item 11 technique | `--technique-children 2` | 0 of 12 | best fitness 1 298 |
+
+Neither arm moves the plateau, and both **lose the one seed the default solves**. That is the plan's
+kill criterion for both: Item 11's archive stays presentation-only (`--technique-children` off, its
+`gauntlet` proxy already 5–7 and its battery half unmeasurable because those levels solve at
+generation 0), and Item 13's operator stays at `growth_units = 0`, now with a second negative reading
+(the tower arm was 2–1–9 and lost a solved seed as well).
+
+**What is still not readable, and why.** Item 13's named gate is the *resumed-champion clock test*,
+and it cannot be read on this level: the saved l11 champion's own episode is a stuck 1 567 frames, so
+there is no win and therefore no clock for the growth arm to move. The arm above is the from-scratch
+proxy for the same plateau, and it is recorded as a proxy. That distinction is why the operator is
+kept behind `growth_units = 0` rather than deleted: its kill criterion is written against the
+resumed clock, and two proxies that fail is not that test — but nothing in the tree grows a net
+unless a run asks for it.
+
+**Item 4's `l11` gate was not run, and the reason is measured.** `--lesson-every 20` fires 100
+lessons over the 2 000-generation protocol, and each lesson plans the level (`from_plan` compiles the
+route at depth 64 and then runs the DAgger rounds); on this machine that is roughly four minutes of
+planning per seed before the search itself, so a 12-seed paired arm is over an hour of compute for a
+level whose default solves one seed. The arm stays off by default, its `gauntlet` reading stands (8
+wins, 3 losses, p = 0.23, median 8 against 16), and this paragraph is the record rather than a claim.
