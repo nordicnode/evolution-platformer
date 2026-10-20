@@ -418,10 +418,15 @@ TRAIN OPTIONS:
                           sim snapshots at the policy's own decision cadence, with the deck phases
                           and turret cooldowns the reachability oracle cannot see. The plan is
                           replayed to prove it wins, cloned at that cadence, and repaired with
-                          DAgger against the states the clone actually visits. Unlike --from-route,
-                          the demonstration is already written in block actions, so a missed press
-                          is a fit failure rather than an unrepresentable one. It is still a seed,
-                          not a solver: on l11 a 97%-agreement clone dies before the first deck.
+                          DAgger against the states the clone actually visits, with corrections
+                          **replanned from the divergent state** rather than looked up by frame
+                          index. A leg curriculum then measures which plan leg the clone fails and
+                          spends its remaining rounds rolling out from that leg's start. Unlike
+                          --from-route, the demonstration is already written in block actions, so
+                          a missed press is a fit failure rather than an unrepresentable one. The
+                          `clone` line ends with the per-leg mastery reading — which legs the
+                          clone cleared and which one stopped it — because agreement alone cannot
+                          say where the policy stops playing the level.
     --plan-depth <N>      Expansions the timed planner may make.                    [default 32]
     --plan-beam <N>       Nodes carried into each expansion.                        [default 64]
     --plan-bonus <S>      Selection-only fitness paid for the fraction of the planned route a
@@ -454,6 +459,14 @@ TRAIN OPTIONS:
                           clone's basin is a plateau with no win on it.   [default pop/4]
     --clone-epochs <N>    Gradient passes over the replay's demonstration when cloning it.
                           [default 300; 3 000 with --from-plan, where one press is the plan]
+    --leg-rounds <N>      Leg-curriculum rounds: after each fit, find the first plan leg the clone
+                          did not clear, roll out from that leg's start with the planner
+                          correcting, and refit. 0 keeps the whole-route DAgger only. [default 2]
+    --leg-rollouts <N>    Rollouts per leg-curriculum round, each starting on the failing leg.
+                                                                                  [default 2]
+    --replan-depth <N>    Planner expansions for a correction planned from a divergent state.
+                                                                                 [default 16]
+    --dagger-rounds <N>   Whole-route DAgger rounds before the leg curriculum.    [default 2]
     --route-seed <N>      Episode seed of the replay that produces the demonstration: the walk is
                           deterministic, so this is what makes a warm start reproducible.
                                                                     [default --seed]

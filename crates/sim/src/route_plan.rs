@@ -236,6 +236,17 @@ pub fn compile(level: &Level, seed: u64, cfg: PlanConfig) -> Result<RoutePlan, C
                 .unwrap_or_else(|| "the flag cannot be reached".into()),
         });
     }
+    compile_route(level, seed, cfg)
+}
+
+/// [`compile`] without the oracle: plan, replay the route through the real stepper, and cut it.
+///
+/// The oracle is the authority on impossibility, and its verdict is what a warm start reports. It
+/// is not a prerequisite for *learning* from a route the planner has already proved by replay: the
+/// oracle models only the canonical moves, so a level whose spawn stand it does not recognise (a
+/// hand-built fixture with a lip the sweep never stands on) can still be planned and won. `from_plan`
+/// uses this so a demonstration is not refused for a reason the demonstration itself disproves.
+pub fn compile_route(level: &Level, seed: u64, cfg: PlanConfig) -> Result<RoutePlan, CompileError> {
     let outcome = plan::plan_level(level, seed, cfg);
     let Some(route) = outcome.route else {
         return Err(CompileError::Unroutable {

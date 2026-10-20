@@ -86,6 +86,10 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "snapshot-probes",
     "warm",
     "clone-epochs",
+    "leg-rounds",
+    "leg-rollouts",
+    "replan-depth",
+    "dagger-rounds",
     "route-seed",
     "curriculum",
     "curriculum-generations",
@@ -1558,6 +1562,11 @@ fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
     };
     let icfg = ImitateConfig {
         epochs,
+        leg_rounds: usage(a.usize_opt("leg-rounds", ImitateConfig::default().leg_rounds))?,
+        leg_rollouts: usage(a.usize_opt("leg-rollouts", ImitateConfig::default().leg_rollouts))?,
+        replan_depth: usage(a.usize_opt("replan-depth", ImitateConfig::default().replan_depth as usize))?
+            as u32,
+        dagger_rounds: usage(a.usize_opt("dagger-rounds", ImitateConfig::default().dagger_rounds))?,
         ..ImitateConfig::default()
     };
     let plan_cfg = sim::plan::PlanConfig {

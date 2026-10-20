@@ -1121,6 +1121,7 @@ fn segment_demonstration(
     }
     crate::route_play::RoutePlay {
         decisions,
+        segments: vec![0],
         outcome: sim.outcome(),
         frames: sim.stats().frames,
         seed: route.seed,

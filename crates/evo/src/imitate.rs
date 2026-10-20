@@ -86,6 +86,19 @@
 //! `(play, shape, config)` determines the clone bit for bit. Nothing else in the fit is random:
 //! the passes are in demonstration order and the arithmetic is `f32` in a fixed order.
 //!
+//! # Phase 2: teaching the leg that fails
+//!
+//! DAgger repairs the corridor the student leaves; it does not choose *where* to teach. A clone that
+//! dies at `l11`'s first spike spent the whole whole-route pass on the states before it. So
+//! [`from_certified_plan`] now measures **per-leg mastery** ([`measure_mastery`]) after every fit:
+//! the plan's own legs, the crossings the clone cleared, and the leg its episode ended in — the
+//! same index the telemetry reports. The first uncleared leg is the lesson, and the curriculum rolls
+//! out from the leg before it (the approach contains the failure) starting at the state the student
+//! actually reaches, labels off-corridor states with [`sim::plan::plan_leg`], and refits from the
+//! student. Corrections are therefore **planned from where the student is**, one crossing at a
+//! time, and the returned clone is the one the closed loop measured best, never the one the fit
+//! liked.
+//!
 //! # What the fit returns
 //!
 //! The best epoch by training loss is kept ([`ImitationReport::best_epoch`]), because a fit this
@@ -96,11 +109,12 @@
 use sim::physics::AgentAction;
 use sim::rng::rng_from_seed;
 use sim::sensors::N_INPUTS;
-use sim::{Level, ObservationScratch, Sim};
+use sim::route_plan::RoutePlan;
+use sim::{Level, ObservationScratch, Outcome, Sim};
 
-use crate::fitness::{run_episode, EvalConfig};
+use crate::fitness::EvalConfig;
 use crate::genome::{ActScratch, Genome, NetShape, GENE_CLAMP};
-use crate::route_play::{replay, timed_play, RoutePlay};
+use crate::route_play::{replay, timed_play, Decision, RoutePlay};
 
 /// How much a single-action exemplar may outweigh a common one.
 ///
@@ -124,6 +138,27 @@ pub struct ImitateConfig {
     /// can end the episode before evolution ever sees it. It is a selection rule, not a different
     /// objective — the epoch is still chosen from the epochs the same fit produced.
     pub prefer_agreement: bool,
+    /// Outer **leg-curriculum** rounds: after each fit, measure which leg the student fails, roll
+    /// it out from the leg before that one with the planner correcting it, and refit. Zero disables
+    /// the curriculum and leaves the whole-route DAgger pass alone.
+    pub leg_rounds: usize,
+    /// Rollouts collected per curriculum round. Each starts one leg before the failing one, at the
+    /// state the student actually reaches, so the lesson contains the run-up, the crossing and the
+    /// failure rather than only the few blocks the student survives after it.
+    pub leg_rollouts: usize,
+    /// Planner expansions for a **correction** planned from a divergent state. Small on purpose:
+    /// a correction only has to finish the leg the student is already standing on, and the whole
+    /// level's search depth would pay for the corridor it has already walked.
+    pub replan_depth: u32,
+    /// Planner calls one rollout may spend before it falls back to the nearest demonstrated
+    /// action. A correction route covers several blocks, and replanning is only asked for when the
+    /// student is off the demonstrated corridor, so this is a budget on distinct divergences.
+    pub replan_cap: usize,
+    /// Whole-route DAgger rounds, before the leg curriculum. Two is deliberate: a whole-route pass
+    /// teaches recovery along the route, and the curriculum is what spends the budget where the
+    /// student actually stops. Six whole-route rounds were measured to cost a full-level search per
+    /// divergence and to add no leg the curriculum did not reach cheaper.
+    pub dagger_rounds: usize,
 }
 
 impl Default for ImitateConfig {
@@ -136,6 +171,11 @@ impl Default for ImitateConfig {
             lr: 0.05,
             init_seed: 0x1CE_B007,
             prefer_agreement: false,
+            leg_rounds: 2,
+            leg_rollouts: 2,
+            replan_depth: 16,
+            replan_cap: 8,
+            dagger_rounds: 2,
         }
     }
 }
@@ -158,6 +198,100 @@ pub struct ImitationReport {
     pub baseline_agreement: f32,
     /// The epoch whose weights are the ones returned.
     pub best_epoch: usize,
+    /// Per-leg reading of the returned clone against the certified plan, when the fit came from
+    /// one. `None` for a route-walk clone, which has no legs to measure.
+    pub mastery: Option<LegMastery>,
+}
+
+/// What one leg of the plan did for the clone: did it get there, did it leave it, and did the
+/// episode end inside it.
+///
+/// The index is the plan's leg index, deliberately the same number the telemetry reports as
+/// `best_end_leg`: a body that has closed `k` crossings is in leg `k`. That makes "the clone died
+/// in leg 1" readable against both the plan's margins and a run's death column without a
+/// translation table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegSkill {
+    /// Zero-based plan leg.
+    pub leg: u32,
+    /// The clone closed enough crossings to enter this leg.
+    pub reached: bool,
+    /// The clone closed this leg's crossing (or, for a finish leg, reached the flag).
+    pub cleared: bool,
+    /// The episode ended inside this leg.
+    pub ended: bool,
+    /// Frames the clone spent in this leg.
+    pub frames: u32,
+}
+
+/// **Per-leg mastery**: what a clone can actually do, leg by leg, rather than one agreement
+/// fraction over the whole route.
+///
+/// Agreement is a fit statistic measured on the demonstration's own corridor; it cannot say
+/// *where* a student leaves the plan. This is the game's own answer: roll the clone out from the
+/// spawn on the plan's episode and read the crossing count at every block. The first leg that is
+/// not cleared is the leg to spend the next round on, and [`LegMastery::line`] names it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegMastery {
+    /// One entry per plan leg, in order.
+    pub legs: Vec<LegSkill>,
+    pub outcome: Outcome,
+    pub frames: u32,
+    /// Horizontal progress in pixels — the reading the champion's own episode uses.
+    pub progress_pixels: f32,
+    /// The leg the episode ended in.
+    pub end_leg: u32,
+    pub won: bool,
+}
+
+impl LegMastery {
+    /// Legs whose crossing the clone closed.
+    pub fn cleared(&self) -> usize {
+        self.legs.iter().filter(|l| l.cleared).count()
+    }
+
+    /// **The leg the curriculum should teach.** The first leg the clone did not clear — on a win,
+    /// `None`. This is where the episode stopped, and the only leg a correction can be about.
+    pub fn weakest(&self) -> Option<u32> {
+        if self.won {
+            return None;
+        }
+        self.legs
+            .iter()
+            .find(|leg| !leg.cleared)
+            .map(|leg| leg.leg)
+    }
+
+    /// Ordering for "is this student better": a win first, then legs cleared, then progress.
+    pub fn rank(&self) -> (u8, usize, i64) {
+        (
+            u8::from(self.won),
+            self.cleared(),
+            self.progress_pixels as i64,
+        )
+    }
+
+    /// One line a report or a terminal can print: how far the clone got, and which leg stopped it.
+    pub fn line(&self) -> String {
+        let total = self.legs.len();
+        match self.weakest() {
+            Some(leg) => format!(
+                "mastery {}/{} legs cleared, ended in leg {} ({:?} after {} frames, best_x {:.1})",
+                self.cleared(),
+                total,
+                leg,
+                self.outcome,
+                self.frames,
+                self.progress_pixels / 16.0
+            ),
+            None => format!(
+                "mastery {}/{} legs cleared, won in {} frames",
+                self.cleared(),
+                total,
+                self.frames
+            ),
+        }
+    }
 }
 
 impl ImitationReport {
@@ -177,7 +311,7 @@ impl ImitationReport {
 
     /// One line for a terminal, in the trainer's own voice.
     pub fn line(&self) -> String {
-        format!(
+        let mut out = format!(
             "clone: {} exemplars, {} epochs (best {}), agreement {:.1}% ({:.1}% untrained), loss {:.4} -> {:.4}",
             self.exemplars,
             self.epochs,
@@ -186,7 +320,12 @@ impl ImitationReport {
             self.baseline_agreement * 100.0,
             self.first_loss,
             self.final_loss,
-        )
+        );
+        if let Some(mastery) = &self.mastery {
+            out.push_str("; ");
+            out.push_str(&mastery.line());
+        }
+        out
     }
 }
 
@@ -349,6 +488,23 @@ pub fn clone_from_play(
     shape: NetShape,
     cfg: &ImitateConfig,
 ) -> Result<ImitationReport, String> {
+    clone_from_play_init(play, shape, cfg, None)
+}
+
+/// [`clone_from_play`] continuing from an existing policy rather than the random initialisation.
+///
+/// This is what makes DAgger and the leg curriculum **refinements** instead of restarts. A refit
+/// from scratch at a few hundred passes cannot reproduce the whole route *and* a handful of new
+/// corrections; measured on `l11`, every such round made the closed-loop student worse (from leg 1
+/// back to leg 0) and the round was discarded. Continuing from the student lets the corrections move
+/// only the decisions they disagree with, and the agreement-selected epoch then keeps a round that
+/// improves the demonstration's own reproduction.
+pub fn clone_from_play_init(
+    play: &RoutePlay,
+    shape: NetShape,
+    cfg: &ImitateConfig,
+    init: Option<&Genome>,
+) -> Result<ImitationReport, String> {
     shape.validate()?;
     if shape.inputs != N_INPUTS {
         return Err(format!(
@@ -364,6 +520,19 @@ pub fn clone_from_play(
 
     // Inverse-frequency exemplar weights: see the module docs on the Walk majority.
     let n = play.decisions.len();
+    // **Recurrent state starts where an episode starts.** A lesson appended to a DAgger dataset
+    // began from a snapshot — a fresh episode — so carrying the demo's final memory into it would
+    // train the clone on a state the body never had. `segments` marks those boundaries; the fit
+    // resets its context at each one, and the first decision of every run is always a reset.
+    let mut resets = vec![false; n];
+    if n > 0 {
+        resets[0] = true;
+        for &start in &play.segments {
+            if start < n {
+                resets[start] = true;
+            }
+        }
+    }
     let mut counts = [0f32; AgentAction::COUNT];
     for d in &play.decisions {
         counts[d.action.index()] += 1.0;
@@ -379,7 +548,11 @@ pub fn clone_from_play(
     let total_weight: f32 = weights.iter().sum();
 
     let mut rng = rng_from_seed(cfg.init_seed);
-    let mut g = Genome::random(0, shape.clone(), &mut rng);
+    let mut g = match init {
+        Some(init) if init.shape == shape => init.clone(),
+        _ => Genome::random(0, shape.clone(), &mut rng),
+    };
+    g.id = 0;
     // Xavier is the population's own initialisation, and it keeps the clone comparable with a
     // random genome as the *same kind of object*; only the fit differs.
     for v in g.weights.iter_mut().chain(g.biases.iter_mut()) {
@@ -396,6 +569,9 @@ pub fn clone_from_play(
         let mut correct = 0usize;
         ctx.fill(0.0);
         for (i, d) in play.decisions.iter().enumerate() {
+            if resets[i] {
+                ctx.fill(0.0);
+            }
             forward(g, &d.observation, ctx, &ls, t);
             write_ctx(g, t, ctx);
             let target = d.action.index();
@@ -432,6 +608,9 @@ pub fn clone_from_play(
         gb.fill(0.0);
         ctx.fill(0.0);
         for (i, d) in play.decisions.iter().enumerate() {
+            if resets[i] {
+                ctx.fill(0.0);
+            }
             forward(&g, &d.observation, &ctx, &ls, &mut t);
             write_ctx(&g, &t, &mut ctx);
             backward(
@@ -481,6 +660,7 @@ pub fn clone_from_play(
         agreement,
         baseline_agreement,
         best_epoch,
+        mastery: None,
     })
 }
 
@@ -523,17 +703,22 @@ pub fn from_plan(
     // still died on the walk's first spike — and a plan from a mid-level snapshot cannot be cloned
     // into a policy that starts at the spawn at all. So the search must cover the level end to end;
     // if it cannot, there is nothing here a policy can be shown.
-    let outcome = sim::plan::plan_level(level, seed, plan);
-    let route = outcome
-        .route
-        .ok_or_else(|| format!("no timed route was found: {}", outcome.note))?;
-    let (play, report) = from_certified_plan(level, &route, eval, shape, cfg)?;
-    Ok((play, report, route))
+    //
+    // The compiler is the one place that certifies a route (oracle, timed plan, winning replay) and
+    // cuts it into legs, and the leg curriculum needs those legs. Planning through it here rather
+    // than beside it is what keeps the demonstration and the leg boundaries from being two
+    // different answers to the same question.
+    // No oracle here: the planner's route is replayed and must win, and that is the proof a
+    // demonstration needs. `sim::route_plan::compile` adds the oracle and is what the window's
+    // warm start uses, because it also decides whether the *level* is beatable at all.
+    let plan = sim::route_plan::compile_route(level, seed, plan).map_err(|err| err.line())?;
+    let (play, report) = from_certified_plan(level, &plan, eval, shape, cfg)?;
+    Ok((play, report, plan.timed_route()))
 }
 
 /// Clone a route the planner has **already** produced (and [`crate::route_plan::RoutePlan`] has
-/// already certified): replay it, refuse it if it does not win, fit a clone, then run the DAgger
-/// rounds.
+/// already certified): replay it, refuse it if it does not win, fit a clone, run DAgger with
+/// replanning corrections, then spend the remaining budget on the leg the clone fails.
 ///
 /// Split out of [`from_plan`] so the route compiler is paid for once. A window's warm start has to
 /// decide *whether* there is a plan before it decides to clone one, and planning twice to answer
@@ -541,12 +726,13 @@ pub fn from_plan(
 /// The route is still replayed here — a certified plan is checked by the same rule a fresh one is.
 pub fn from_certified_plan(
     level: &Level,
-    route: &sim::plan::TimedRoute,
+    plan: &RoutePlan,
     eval: &EvalConfig,
     shape: NetShape,
     cfg: &ImitateConfig,
 ) -> Result<(RoutePlay, ImitationReport), String> {
-    let play = timed_play(level, route, eval);
+    let route = plan.timed_route();
+    let play = timed_play(level, &route, eval);
     if !play.won() {
         return Err(format!(
             "the planner's route did not replay to the flag: {}",
@@ -557,84 +743,152 @@ pub fn from_certified_plan(
         prefer_agreement: true,
         ..*cfg
     };
+    // Refits continue from the student, so they need a refinement step rather than a from-scratch
+    // one: at the fit's own learning rate a correction round was measured to overshoot the old
+    // decisions and lose a leg it had already cleared.
+    let refine = ImitateConfig {
+        lr: (fit.lr * 0.25).max(1e-3),
+        ..fit
+    };
     let mut report = clone_from_play(&play, shape.clone(), &fit)?;
-    // **DAgger, with the plan as a time-indexed expert.** A closed-loop behaviour clone leaves
-    // the demonstration's corridor at its first mistake and then has no label for the states it
-    // actually visits. Each round rolls the *best* student out on the real sim, labels every state
-    // it reached with the plan's action for the nearest demonstrated state, appends that to the
-    // training set, and refits. The set only grows, so a round that produces a worse student still
-    // contributes the states that student had to recover from; the returned student is the best
-    // one the *closed loop* measured, not the one the fit liked.
     let mut dataset = play.clone();
-    let mut best_solo = run_episode(level, &report.genome, eval, route.seed);
-    for _round in 0..6 {
-        let extra = rollout_states(level, &report.genome, &dataset, eval);
+    let mut best_mastery = measure_mastery(level, &report.genome, plan, eval, route.seed);
+    // **DAgger, with the planner as a replanning expert.** A closed-loop behaviour clone leaves
+    // the demonstration's corridor at its first mistake and then has no label for the states it
+    // actually visits. Each round rolls the *best* student out on the real sim, asks the planner
+    // what it would do **from the state the student reached** (a fresh search from that snapshot,
+    // not the plan's action for that frame index), appends those labels to the training set, and
+    // refits. The set only grows, so a round that produces a worse student still contributes the
+    // states that student had to recover from; the returned student is the best one the closed
+    // loop measured, not the one the fit liked.
+    for _round in 0..cfg.dagger_rounds {
+        let extra = replanning_rollout(
+            level,
+            &report.genome,
+            Sim::new(level, route.seed),
+            plan,
+            &play,
+            eval,
+            play.decisions.len() + 64,
+            cfg,
+            route.seed ^ 0xDA6_6E2,
+        );
         if extra.is_empty() {
             break;
         }
+        dataset.segments.push(dataset.decisions.len());
         dataset.decisions.extend(extra);
-        let next = clone_from_play(&dataset, shape.clone(), &fit)?;
-        let solo = run_episode(level, &next.genome, eval, route.seed);
-        let better = solo.won()
-            || (!best_solo.won()
-                && (solo.progress_pixels > best_solo.progress_pixels
-                    || (solo.progress_pixels == best_solo.progress_pixels
-                        && solo.frames > best_solo.frames)));
-        if better {
-            best_solo = solo;
+        let next = clone_from_play_init(&dataset, shape.clone(), &refine, Some(&report.genome))?;
+        let mastery = measure_mastery(level, &next.genome, plan, eval, route.seed);
+        // **Legs cleared is the selection rule, not the furthest x.** A student that clears one more
+        // crossing has learned something the previous one could not do, even when it then falls back
+        // — and `run_episode`'s progress alone cannot see that (it called the round that first
+        // cleared leg 1 worse than the one that died inside it, because the death was further right).
+        if mastery.rank() > best_mastery.rank() {
             report = next;
-            if best_solo.won() {
+            best_mastery = mastery;
+            if best_mastery.won {
                 break;
             }
         }
     }
+
+    // **The leg curriculum: spend the remaining fit budget where the student is weak.** The whole
+    // route's DAgger pass teaches the states a mistake led to, but a clone that dies at the first
+    // spike spends none of its rounds on the crossing it never made. Each round takes the first
+    // leg the clone did not clear, starts rollouts on the leg **before** it from the state the
+    // student actually reaches, labels every divergent state by a fresh local search, and refits
+    // from the current student. The student that returns is still the best one the closed loop
+    // measured, so a round that teaches nothing is discarded rather than returned.
+    for _round in 0..cfg.leg_rounds {
+        let Some(weak) = best_mastery.weakest() else {
+            break;
+        };
+        // **Start one leg early, where the student actually is.** Starting exactly on the failing
+        // leg gives a lesson of the few blocks the student survives there — on `l11` four, from a
+        // turret it does not know is coming — which teaches the death and not the recovery. The leg
+        // before it is the approach: the same rollout then contains the run-up, the crossing and
+        // the failure, which is the state distribution the correction needs.
+        let lesson_leg = weak.saturating_sub(1);
+        let start = student_leg_start(level, &report.genome, plan, eval, route.seed, lesson_leg)
+            .or_else(|| leg_start(level, plan, lesson_leg, eval));
+        let Some(start) = start else {
+            break;
+        };
+        let blocks = plan.legs[weak as usize]
+            .end_block
+            .saturating_sub(plan.legs[lesson_leg as usize].first_block)
+            + 24;
+        let mut added = 0usize;
+        for k in 0..cfg.leg_rollouts.max(1) {
+            let lesson = replanning_rollout(
+                level,
+                &report.genome,
+                start.clone(),
+                plan,
+                &play,
+                eval,
+                blocks,
+                cfg,
+                route.seed ^ (0x1E6_0000 | (weak as u64) << 8 | k as u64),
+            );
+            if !lesson.is_empty() {
+                added += lesson.len();
+                dataset.segments.push(dataset.decisions.len());
+                dataset.decisions.extend(lesson);
+            }
+        }
+        if added == 0 {
+            break;
+        }
+        let next = clone_from_play_init(&dataset, shape.clone(), &refine, Some(&report.genome))?;
+        let mastery = measure_mastery(level, &next.genome, plan, eval, route.seed);
+        if mastery.rank() > best_mastery.rank() {
+            report = next;
+            best_mastery = mastery;
+            if best_mastery.won {
+                break;
+            }
+        } else {
+            // A round that did not clear the leg it was given is the measurement that the
+            // curriculum cannot help at this budget; stop rather than spend the rest of it.
+            break;
+        }
+    }
+    report.mastery = Some(best_mastery);
     Ok((play, report))
 }
 
-/// The states a student actually visits while following a plan, labelled by the **nearest**
-/// expert state. Empty when the student never made a decision.
+/// The state in which **the student itself** entered a leg: roll it out from the spawn and stop at
+/// the first block whose crossing count is `leg`. `None` when it never gets that far, which is the
+/// case the caller answers with the plan's own leg start.
 ///
-/// The plan is open loop, so labelling the student's block `i` with the plan's block `i` is only
-/// right while the student is on the route. It is not, by definition, after the first mistake:
-/// that is the compounding-error problem. Nearest-neighbour in observation space is the cheap
-/// trajectory-expert answer — the label is "what the plan did when it was where you are now"
-/// — and it uses the same 108-wide vector the student reads, so a body behind the route is
-/// labelled at the state it is actually in rather than at the clock it should have been at.
-fn rollout_states(
+/// This is the snapshot a leg lesson should use: the curriculum exists to teach the crossing the
+/// policy fails, from the position it fails it in.
+fn student_leg_start(
     level: &Level,
     genome: &Genome,
-    expert: &crate::route_play::RoutePlay,
+    plan: &RoutePlan,
     eval: &EvalConfig,
-) -> Vec<crate::route_play::Decision> {
+    seed: u64,
+    leg: u32,
+) -> Option<Sim> {
+    if leg == 0 {
+        return Some(Sim::new(level, seed));
+    }
     let repeat = eval.action_repeat.max(1);
-    let mut sim = Sim::new(level, expert.seed);
+    let mut sim = Sim::new(level, seed);
     let mut scratch = ActScratch::new();
     let mut obs = ObservationScratch::new();
-    let mut out = Vec::new();
-    for _ in 0..expert.decisions.len() {
+    for _ in 0..plan.actions.len() + 64 {
         if sim.outcome().is_finished() {
-            break;
+            return None;
+        }
+        if sim.stats().route_hops_closed >= leg {
+            return Some(sim);
         }
         let observation = sim.observation_into(&mut obs);
         let action = genome.act(&observation, &mut scratch);
-        // Nearest demonstrated state, by the observation the policy itself reads.
-        let mut best = expert.decisions[0].action;
-        let mut best_d = f32::INFINITY;
-        for d in &expert.decisions {
-            let mut dist = 0.0f32;
-            for (a, b) in observation.iter().zip(d.observation.iter()) {
-                let delta = a - b;
-                dist += delta * delta;
-            }
-            if dist < best_d {
-                best_d = dist;
-                best = d.action;
-            }
-        }
-        out.push(crate::route_play::Decision {
-            observation,
-            action: best,
-        });
         for _ in 0..repeat {
             sim.step(action);
             if sim.outcome().is_finished() {
@@ -642,7 +896,240 @@ fn rollout_states(
             }
         }
     }
+    None
+}
+
+/// The snapshot at the **start of a plan leg**, rebuilt by replaying the plan's own actions from
+/// the spawn. `None` when the plan ends before the leg does (which a certified plan does not) or
+/// the leg index is out of range.
+///
+/// This is the state a leg curriculum practises from: the leg's first block, with the episode
+/// clock, hazard phases and mover schedules exactly as the plan met them.
+fn leg_start(level: &Level, plan: &RoutePlan, leg: u32, eval: &EvalConfig) -> Option<Sim> {
+    let entry = plan.legs.get(leg as usize)?;
+    let repeat = eval.action_repeat.max(1);
+    let mut sim = Sim::new(level, plan.seed);
+    for action in plan.actions.iter().take(entry.first_block) {
+        if sim.outcome().is_finished() {
+            return None;
+        }
+        for _ in 0..repeat {
+            sim.step(*action);
+            if sim.outcome().is_finished() {
+                return None;
+            }
+        }
+    }
+    Some(sim)
+}
+
+/// Roll a student out on the real sim, labelling each state it reaches with the action a **fresh
+/// plan from that state** would take.
+///
+/// This is the difference between Phase 1's teacher and this one. Phase 1 labelled the student's
+/// block `i` with the nearest state in the plan's demonstration, which is the plan's answer to
+/// "what did the route do around here" — not to "what should I do from here". After a divergence
+/// the two are different, and on `l11` they are different in the direction that matters: the
+/// nearest demonstrated state behind the first spike says *walk*, while the state the student is
+/// actually in needs the jump. Here the label comes from [`sim::plan::plan_from`] on the student's
+/// own snapshot, so every correction is the teacher's answer to the student's state.
+///
+/// Replanning is bounded twice: `cfg.replan_cap` fresh searches per rollout, and a search only
+/// when the student is **off the demonstrated corridor**. `nearest_d` at or below
+/// [`DIVERGENCE`] means the state is one the demonstration itself visited (the observations are
+/// block-aligned, so an on-route body matches exactly), and the demonstrated action is the correct
+/// label there — asking the planner again at those states was measured to replan at every block of
+/// the corridor while producing the same label, and to spend the whole budget before the failure.
+#[allow(clippy::too_many_arguments)]
+fn replanning_rollout(
+    level: &Level,
+    genome: &Genome,
+    mut sim: Sim,
+    plan: &RoutePlan,
+    demonstration: &RoutePlay,
+    eval: &EvalConfig,
+    blocks: usize,
+    cfg: &ImitateConfig,
+    seed: u64,
+) -> Vec<Decision> {
+    let repeat = eval.action_repeat.max(1);
+    let plan_cfg = sim::plan::PlanConfig {
+        depth: cfg.replan_depth.max(1),
+        ..sim::plan::PlanConfig::default()
+    };
+    let mut scratch = ActScratch::new();
+    let mut obs = ObservationScratch::new();
+    let mut out = Vec::with_capacity(blocks.min(plan.actions.len() + 64));
+    let mut expert: Option<sim::plan::TimedRoute> = None;
+    let mut cursor = 0usize;
+    let mut replans = 0usize;
+    for _ in 0..blocks {
+        if sim.outcome().is_finished() {
+            break;
+        }
+        let observation = sim.observation_into(&mut obs);
+        let near = nearest_distance(demonstration, &observation);
+        if near <= DIVERGENCE {
+            // On the demonstration's own corridor: its action is the teacher.
+            expert = None;
+            cursor = 0;
+        } else if expert
+            .as_ref()
+            .is_none_or(|route| cursor >= route.actions.len())
+        {
+            expert = None;
+            cursor = 0;
+            if replans < cfg.replan_cap {
+                replans += 1;
+                // **One leg, not the level.** The target is the next route crossing, so the
+                // search is local even when the student is a whole deck behind the plan; asking
+                // for "finish the level" from here would pay for the corridor twice and fail at
+                // any realistic depth.
+                let target = sim.stats().route_hops_closed + 1;
+                expert = sim::plan::plan_leg(level, sim.clone(), seed, target, plan_cfg).route;
+            }
+        }
+        let advice = match &expert {
+            Some(route) if cursor < route.actions.len() => route.actions[cursor],
+            _ => nearest_action(demonstration, &observation),
+        };
+        out.push(Decision {
+            observation,
+            action: advice,
+        });
+        let student = genome.act(&observation, &mut scratch);
+        for _ in 0..repeat {
+            sim.step(student);
+            if sim.outcome().is_finished() {
+                break;
+            }
+        }
+        if expert.is_some() {
+            cursor += 1;
+        }
+    }
     out
+}
+
+/// Squared observation distance at or below which the student is **on the demonstration's own
+/// corridor**. The observations are quantised sensor readings taken at block boundaries, so a body
+/// following the plan reproduces them exactly (`0.0`); a body a fraction of a tile off already
+/// reads several units away, and that is where a correction is worth planning.
+const DIVERGENCE: f32 = 0.5;
+
+/// The demonstrated action for the nearest demonstrated state, by the observation the policy
+/// reads. The fallback when a rollout has spent its replanning budget.
+fn nearest_distance(demonstration: &RoutePlay, observation: &[f32; N_INPUTS]) -> f32 {
+    demonstration
+        .decisions
+        .iter()
+        .map(|d| {
+            d.observation
+                .iter()
+                .zip(observation.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn nearest_action(demonstration: &RoutePlay, observation: &[f32; N_INPUTS]) -> AgentAction {
+    let mut best = demonstration.decisions[0].action;
+    let mut best_d = f32::INFINITY;
+    for d in &demonstration.decisions {
+        let mut dist = 0.0f32;
+        for (a, b) in observation.iter().zip(d.observation.iter()) {
+            let delta = a - b;
+            dist += delta * delta;
+        }
+        if dist < best_d {
+            best_d = dist;
+            best = d.action;
+        }
+    }
+    best
+}
+
+/// **Per-leg mastery of a clone**: roll it out from the spawn on the plan's episode and read the
+/// route crossings at every block.
+///
+/// A plan leg is a span of the route, and a body that has closed `k` crossings is in leg `k`, so
+/// the crossing count *is* the leg index — the same identity the telemetry's `best_end_leg` and
+/// the plan's `Leg::index` rest on. The first leg without a cleared crossing is where the clone
+/// stops being able to play the level, and it is the leg the curriculum gets.
+pub fn measure_mastery(
+    level: &Level,
+    genome: &Genome,
+    plan: &RoutePlan,
+    eval: &EvalConfig,
+    seed: u64,
+) -> LegMastery {
+    let repeat = eval.action_repeat.max(1);
+    let n = plan.legs.len();
+    let mut frames = vec![0u32; n];
+    let mut sim = Sim::new(level, seed);
+    let mut scratch = ActScratch::new();
+    let mut obs = ObservationScratch::new();
+    let mut hops = 0u32;
+    let mut guard = 0usize;
+    while !sim.outcome().is_finished() && guard <= plan.actions.len() + 64 {
+        guard += 1;
+        if n > 0 {
+            let leg = (hops as usize).min(n - 1);
+            let before = sim.stats().frames;
+            let observation = sim.observation_into(&mut obs);
+            let action = genome.act(&observation, &mut scratch);
+            for _ in 0..repeat {
+                sim.step(action);
+                if sim.outcome().is_finished() {
+                    break;
+                }
+            }
+            frames[leg] += sim.stats().frames - before;
+            hops = hops.max(sim.stats().route_hops_closed);
+        } else {
+            let observation = sim.observation_into(&mut obs);
+            let action = genome.act(&observation, &mut scratch);
+            for _ in 0..repeat {
+                sim.step(action);
+                if sim.outcome().is_finished() {
+                    break;
+                }
+            }
+        }
+    }
+    let outcome = sim.outcome();
+    let won = outcome == Outcome::Won;
+    let end_leg = if n == 0 {
+        0
+    } else {
+        hops.min(n as u32 - 1)
+    };
+    let legs = (0..n)
+        .map(|i| {
+            let i32l = i as u32;
+            let cleared = if plan.legs[i].hops == 0 {
+                won
+            } else {
+                hops > i32l
+            };
+            LegSkill {
+                leg: i32l,
+                reached: hops >= i32l,
+                cleared,
+                ended: outcome.is_finished() && end_leg == i32l,
+                frames: frames[i],
+            }
+        })
+        .collect();
+    LegMastery {
+        legs,
+        outcome,
+        frames: sim.stats().frames,
+        progress_pixels: sim.stats().progress_pixels,
+        end_leg,
+        won,
+    }
 }
 
 /// The **warm set** a run starts from: the clone plus `siblings` mutated relatives, ids 0..=siblings.
@@ -728,10 +1215,50 @@ mod tests {
             best_stand: None,
             route_hops: None,
             note: "test".into(),
+            segments: vec![0],
             trace: Vec::new(),
         };
         let err = clone_from_play(&play, default_shape(), &ImitateConfig::default()).unwrap_err();
         assert!(err.contains("no decisions"), "{err}");
+    }
+
+    /// **Mastery's index is the crossing count**, and the weak leg is the first one without one.
+    /// The finish-leg case is pinned too: a route that reaches the flag without closing every rung
+    /// is cleared only by winning, not by standing in it.
+    #[test]
+    fn mastery_names_the_first_leg_without_a_crossing() {
+        let skills = |crossings: u32, won: bool| LegMastery {
+            legs: (0..3)
+                .map(|i| LegSkill {
+                    leg: i,
+                    reached: crossings >= i,
+                    cleared: if i == 2 {
+                        won
+                    } else {
+                        crossings > i
+                    },
+                    ended: !won && crossings.min(2) == i,
+                    frames: 10,
+                })
+                .collect(),
+            outcome: if won { Outcome::Won } else { Outcome::Died },
+            frames: 40,
+            progress_pixels: 16.0 * crossings as f32,
+            end_leg: crossings.min(2),
+            won,
+        };
+        let none = skills(0, false);
+        assert_eq!(none.weakest(), Some(0));
+        assert_eq!(none.cleared(), 0);
+        let one = skills(1, false);
+        assert_eq!(one.weakest(), Some(1));
+        assert_eq!(one.cleared(), 1);
+        assert_eq!(skills(2, false).weakest(), Some(2), "the finish leg is the gap");
+        assert_eq!(skills(2, true).weakest(), None);
+        assert!(skills(2, true).rank() > skills(2, false).rank());
+        assert!(skills(1, false).rank() > skills(0, false).rank());
+        assert!(one.line().contains("1/3 legs cleared"));
+        assert!(one.line().contains("leg 1"));
     }
 
     #[test]
@@ -751,6 +1278,7 @@ mod tests {
             best_stand: None,
             route_hops: None,
             note: "test".into(),
+            segments: vec![0],
             trace: Vec::new(),
         };
         let err = clone_from_play(&play, shape, &ImitateConfig::default()).unwrap_err();
@@ -781,6 +1309,7 @@ mod tests {
             best_stand: None,
             route_hops: None,
             note: "test".into(),
+            segments: vec![0],
             trace: Vec::new(),
         };
         let cfg = ImitateConfig {
@@ -819,6 +1348,7 @@ mod tests {
             best_stand: None,
             route_hops: None,
             note: "test".into(),
+            segments: vec![0],
             trace: Vec::new(),
         };
         let cfg = ImitateConfig {

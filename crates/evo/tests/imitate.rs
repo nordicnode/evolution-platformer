@@ -322,6 +322,54 @@ fn a_timed_plan_is_demonstrated_on_the_policys_own_block_grid() {
     );
 }
 
+/// **Phase 2's named failure, at the window's fit budget.** `l11`'s plan clone used to die on the
+/// first spike inside leg 1 (102 frames, x 16.3) at 300 epochs. Replanning DAgger and the leg
+/// curriculum must get it past that crossing, and the report must say which leg stopped it.
+///
+/// Ignored because the planner needs depth 64 on `l11` and a debug build pays for that search in
+/// minutes; the multi-seed version of this claim is the gate (`tools/phase2_gate.py`), which runs a
+/// release binary over several seeds and reports the distribution rather than this one arm.
+#[test]
+#[ignore = "the Phase 2 gate runs this on a release build; see tools/phase2_gate.py"]
+fn the_plan_clone_gets_past_l11s_first_spike() {
+    let level = level("l11-the-elements");
+    let eval = EvalConfig::default();
+    let plan = sim::route_plan::compile(
+        &level,
+        1,
+        sim::plan::PlanConfig {
+            depth: 64,
+            ..Default::default()
+        },
+    )
+    .expect("l11 has a certified plan");
+    let cfg = ImitateConfig {
+        epochs: 300,
+        ..ImitateConfig::default()
+    };
+    let (_, report) = evo::from_certified_plan(&level, &plan, &eval, default_shape(), &cfg)
+        .expect("the plan clones");
+    let mastery = report.mastery.as_ref().expect("a plan clone has legs");
+    assert!(
+        mastery.cleared() >= 2,
+        "the clone has to get past the spike in leg 1, not stop inside it: {}",
+        mastery.line()
+    );
+    assert_eq!(
+        mastery.weakest(),
+        Some(2),
+        "the mastery reading must name where it did stop: {}",
+        mastery.line()
+    );
+    let solo = run_episode(&level, &report.genome, &eval, 1);
+    assert!(
+        solo.best_x > 16.3,
+        "the old failure was x 16.3 by a spike; the clone now reads x {:.1}: {}",
+        solo.best_x,
+        mastery.line()
+    );
+}
+
 /// The clone is a function of `(level, seed, config)`: two runs of the same invocation agree.
 ///
 /// A warm start that is not reproducible is not a warm start — it is a free roll of the dice that a
