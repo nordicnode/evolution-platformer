@@ -159,6 +159,10 @@ pub struct ImitateConfig {
     /// student actually stops. Six whole-route rounds were measured to cost a full-level search per
     /// divergence and to add no leg the curriculum did not reach cheaper.
     pub dagger_rounds: usize,
+    /// Run the demonstration and the local corrections through the **meta-controller** ([`sim::meta`]),
+    /// which owns commit / wait / ride. Off, the plan's blocks and the raw leg routes are the
+    /// teacher and the report has no skill trace — the Phase 2 arm.
+    pub meta: bool,
 }
 
 impl Default for ImitateConfig {
@@ -176,6 +180,7 @@ impl Default for ImitateConfig {
             replan_depth: 16,
             replan_cap: 8,
             dagger_rounds: 2,
+            meta: true,
         }
     }
 }
@@ -201,6 +206,9 @@ pub struct ImitationReport {
     /// Per-leg reading of the returned clone against the certified plan, when the fit came from
     /// one. `None` for a route-walk clone, which has no legs to measure.
     pub mastery: Option<LegMastery>,
+    /// What the meta-controller decided while producing the demonstration: route, commit, wait,
+    /// ride, with the leg and block each first fired in. `None` when the controller was off.
+    pub skills: Option<sim::meta::SkillTrace>,
 }
 
 /// What one leg of the plan did for the clone: did it get there, did it leave it, and did the
@@ -324,6 +332,12 @@ impl ImitationReport {
         if let Some(mastery) = &self.mastery {
             out.push_str("; ");
             out.push_str(&mastery.line());
+        }
+        if let Some(skills) = &self.skills {
+            // The trace is the **demonstration's**, not the clone's: `skills route 30, commit …`
+            // would read as the fitted policy's habits and be wrong by a mile.
+            out.push_str("; demo ");
+            out.push_str(&skills.line());
         }
         out
     }
@@ -661,6 +675,7 @@ pub fn clone_from_play_init(
         baseline_agreement,
         best_epoch,
         mastery: None,
+        skills: None,
     })
 }
 
@@ -732,13 +747,50 @@ pub fn from_certified_plan(
     cfg: &ImitateConfig,
 ) -> Result<(RoutePlay, ImitationReport), String> {
     let route = plan.timed_route();
-    let play = timed_play(level, &route, eval);
-    if !play.won() {
-        return Err(format!(
-            "the planner's route did not replay to the flag: {}",
-            play.note
-        ));
-    }
+    // **The demonstration is the meta-controller's play when it wins.** The controller follows
+    // the plan's blocks and overrides only what the plan has no answer for (a shot closing with no
+    // route jump coming, a window the route is already holding for), and labels every decision as
+    // route / commit / wait / ride for the report. A meta play that does not win is refused and the
+    // certified route is the demonstration again: a skill the level does not need must not cost
+    // the warm start its correctness. On `l11` the two plays are the same actions — the measured
+    // gate in FINDINGS.md records that, rather than claiming a gain.
+    let meta = cfg
+        .meta
+        .then(|| sim::meta::play(level, plan, route.seed, eval.action_repeat))
+        .filter(|play| play.won());
+    let skills = meta.as_ref().map(|play| play.trace.clone());
+    let play = match &meta {
+        Some(meta) => RoutePlay {
+            decisions: meta
+                .events
+                .iter()
+                .map(|(_, observation, action)| Decision {
+                    observation: *observation,
+                    action: *action,
+                })
+                .collect(),
+            segments: vec![0],
+            outcome: meta.outcome,
+            frames: meta.frames,
+            seed: meta.seed,
+            hops_closed: plan.covered,
+            best_block: 0,
+            best_stand: None,
+            route_hops: Some(plan.hops),
+            note: meta.note(),
+            trace: vec![meta.note()],
+        },
+        None => {
+            let play = timed_play(level, &route, eval);
+            if !play.won() {
+                return Err(format!(
+                    "the planner's route did not replay to the flag: {}",
+                    play.note
+                ));
+            }
+            play
+        }
+    };
     let fit = ImitateConfig {
         prefer_agreement: true,
         ..*cfg
@@ -856,6 +908,7 @@ pub fn from_certified_plan(
         }
     }
     report.mastery = Some(best_mastery);
+    report.skills = skills;
     Ok((play, report))
 }
 
@@ -960,7 +1013,7 @@ fn replanning_rollout(
     let mut scratch = ActScratch::new();
     let mut obs = ObservationScratch::new();
     let mut out = Vec::with_capacity(blocks.min(plan.actions.len() + 64));
-    let mut expert: Option<sim::plan::TimedRoute> = None;
+    let mut expert: Option<(sim::plan::TimedRoute, sim::meta::MetaController)> = None;
     let mut cursor = 0usize;
     let mut replans = 0usize;
     for _ in 0..blocks {
@@ -969,13 +1022,20 @@ fn replanning_rollout(
         }
         let observation = sim.observation_into(&mut obs);
         let near = nearest_distance(demonstration, &observation);
+        let spent = if cfg.meta {
+            expert
+                .as_ref()
+                .is_none_or(|(_, controller)| controller.finished())
+        } else {
+            expert
+                .as_ref()
+                .is_none_or(|(route, _)| cursor >= route.actions.len())
+        };
         if near <= DIVERGENCE {
             // On the demonstration's own corridor: its action is the teacher.
             expert = None;
             cursor = 0;
-        } else if expert
-            .as_ref()
-            .is_none_or(|route| cursor >= route.actions.len())
+        } else if spent
         {
             expert = None;
             cursor = 0;
@@ -986,11 +1046,22 @@ fn replanning_rollout(
                 // for "finish the level" from here would pay for the corridor twice and fail at
                 // any realistic depth.
                 let target = sim.stats().route_hops_closed + 1;
-                expert = sim::plan::plan_leg(level, sim.clone(), seed, target, plan_cfg).route;
+                if let Some(route) = sim::plan::plan_leg(level, sim.clone(), seed, target, plan_cfg).route
+                {
+                    // The local route's blocks all belong to this leg; the meta-controller owns
+                    // the commit / wait / ride decision over them, so a correction at a hazard is
+                    // the controller's answer from this state rather than a raw plan block.
+                    let leg = sim.stats().route_hops_closed;
+                    let controller = sim::meta::MetaController::from_route(route.actions.clone(), leg);
+                    expert = Some((route, controller));
+                }
             }
         }
-        let advice = match &expert {
-            Some(route) if cursor < route.actions.len() => route.actions[cursor],
+        let advice = match expert.as_mut() {
+            // The controller owns the sequencing over a local route when the pass asked for it;
+            // otherwise the route's blocks are the teacher, which is the Phase 2 arm.
+            Some((_, controller)) if cfg.meta => controller.decide(&sim).0,
+            Some((route, _)) if cursor < route.actions.len() => route.actions[cursor],
             _ => nearest_action(demonstration, &observation),
         };
         out.push(Decision {
@@ -1004,7 +1075,13 @@ fn replanning_rollout(
                 break;
             }
         }
-        if expert.is_some() {
+        // Both arms walk the route's blocks one per decision. The controller advances its own
+        // cursor in `decide`; the Phase 2 arm advances this one. **Neither drops the route because
+        // the student took a different action**: measured on `l11`, dropping it on the first
+        // mismatch halved the correction labels (183 exemplars, the plan's alone) and cost a leg
+        // on four of eight seeds. The route is a plan from the *student's* state, so it stays a
+        // useful label even when the student ignores it for a block.
+        if expert.is_some() && !cfg.meta {
             cursor += 1;
         }
     }

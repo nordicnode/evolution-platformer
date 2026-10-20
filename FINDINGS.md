@@ -6045,3 +6045,96 @@ Files: `crates/sim/src/plan.rs` (`plan_leg`, leg-targeted search), `crates/evo/s
 `crates/evo/src/route_play.rs` (segment starts), `crates/train-cli/src/{commands,main}.rs`
 (`--dagger-rounds`, `--leg-rounds`, `--leg-rollouts`, `--replan-depth`, mastery on the `clone` line),
 `crates/app/src/lab.rs` (mastery in the run's origin note), `tools/phase2_gate.py`.
+
+## Phase 3: the meta-controller, and a gate that did not move
+
+Phase 2 moved the wall from the first spike to the turret one leg later. Phase 3 was scoped to beat
+that wall with **temporal abstractions** — a jump held to its landing (*commit*), a block spent
+waiting for a window (*wait*), a body staying on a deck (*ride*) — owned by one controller rather
+than smeared across the trainer and the window.
+
+### What was built
+
+`sim::meta` is the owner. `MetaController::decide(&Sim) -> (AgentAction, Skill)` is the single
+sequencing decision; the demonstration builder (`imitate::from_certified_plan`), the DAgger
+corrections (`replanning_rollout`) and both front-ends read it, and `SkillTrace` records every
+decision with its leg, block and frame. A run now prints, on the `clone` line and in the window's
+origin note:
+
+```
+demo skills route 30, commit 131, wait 0, ride 22; first commit leg 0 block 8 frame 32; first ride leg 9 block 137 frame 548
+```
+
+That is the "which behaviour fired and where" the pass asked for, and it is checkable against the
+replay rather than inferred from a death that moved.
+
+### The decisions inside it, and the measurements that forced them
+
+* **The plan's blocks win where the plan has an answer.** Holding a plan jump's take-off action for
+  the whole flight (the first version of commit) overrode the plan's air-steering blocks and flew
+  the body into lava at `l11` x 12.1. Pre-empting the plan's take-off one block early clipped the
+  spike at x 16.4. Both runs won nothing; the fallback to the plain replay is what kept the
+  demonstration correct.
+* **Commit only for a jump the controller starts.** A shot closing with no plan jump within three
+  blocks is jumped in the route's own direction (not the current block's — the plan's `Retreat` at
+  the pinch would have jumped backwards into the same spike).
+* **Wait only outside the row.** A shot fired along the row the body is standing in hits it wherever
+  it stands; on `l11` the rear turret's range (18 tiles) covers the whole corridor and its period
+  (120 ticks, 30 blocks) is shorter than the corridor crossing, so no standing spot and no arrival
+  time is safe. Waiting is therefore offered only for a row the body is about to *enter*, and only
+  where the plan itself is already holding (the plan's own pause is the one wait its later blocks
+  cannot disagree with). Extending a hold inside a moving stretch once walked the body off the
+  second deck into lava.
+* **Ride is a reading, not a rewrite.** The plan's Walk blocks on a deck already are the ride;
+  replacing them with a controller's Walk was a second opinion about where the platform goes.
+* **The DAgger expert is not dropped on a student mismatch.** Dropping the route when the student
+  ignored one label halved the correction set on `l11` (183 exemplars — the plan's alone) and cost
+  a leg on four of eight seeds. Keeping the route through the mismatch and advancing it is what
+  Phase 2 measured, so both arms now do that.
+
+### The gate, as run
+
+`tools/phase3_gate.py --seeds 8`: the same level, plan depth 64, 300-epoch fit (the window's
+budget), pop 8, both arms on this tree, differing only in `--no-meta`. The Phase 2 arms are the
+same numbers this file records above, so the comparison is exact rather than across commits.
+
+| arm | mean / median / min-max legs | past leg 1 | deaths | plan+fit s |
+|---|---|---|---|---|
+| phase 2 (`--no-meta`) | 2.00 / 2.0 / 1-4 | 6/8 | spike 3, turret shot 5 | 5.74 |
+| phase 3 (meta) | **2.00 / 2.0 / 1-4** | **6/8** | spike 3, turret shot 5 | 5.72 |
+
+Per seed, identical: ends `2,2,4,2,2,1,1,2`. Seeds 1, 2, 4, 5, 8 still die on the turret shot in
+leg 2; seeds 6 and 7 still die on the first spike; seed 3 still reaches leg 4. The trace names the
+behaviours (`commit` from leg 0, `ride` from leg 9), but on `l11` they coincide with the plan's own
+blocks, so the fitted clone is byte-identical in outcome.
+
+### What this says, plainly
+
+* **The target — seeds that die at the turret getting past it by waiting — is not met, and on this
+  level it cannot be.** The turret's shot covers the corridor and recurs faster than the corridor
+  can be crossed, so the only surviving answer is a jump over the shot that is already in the air.
+  The plan takes it; a waiting body does not exist. The gate's `wait 0` is the honest count.
+* **The controller is inert here, not harmful.** Both arms produce the same eight outcomes; where an
+  earlier version of it did change the teacher (dropping the expert, holding plan jumps) it lost
+  legs. The shipped form defers to the plan and overrides only where the plan cannot speak.
+* **What it buys is structure and a reading**: one owner of route/commit/wait/ride, a trace with
+  leg/block/frame for each behaviour, and the three abstractions pinned by unit tests
+  (`a_shot_in_the_body_row_is_committed_to`, `a_body_on_a_mover_rides_it`,
+  `a_wait_holds_the_plan_block`). It is not claimed to be a clone improvement.
+* **The wall is fitting, not sequencing.** Five of eight clones miss the plan's one timed jump at
+  300 epochs (84.7 % agreement, 18.6 % untrained) and the DAgger/curriculum path does not supply a
+  label at the states the student actually visits on the corridor — the divergence test only fires
+  off the corridor. That is the next thing to attack, and it is not the meta-controller.
+
+### Gates
+
+`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green except
+the pre-existing `evo --test migration` saved-`l11` fixture, which fails only because `levels/l11`
+is edited in this working tree (unchanged, never touched by this pass); `cargo test -p sim --lib
+meta::` 3/3; `cargo test -p evo --test imitate` 5 passed, 1 ignored (the release-only l11 gate).
+
+Files: `crates/sim/src/meta.rs` (the controller, the trace, three unit tests),
+`crates/sim/src/lib.rs` (module and re-exports), `crates/evo/src/imitate.rs` (`meta` config,
+demonstration and correction sequencing, `demo skills` on the report line),
+`crates/train-cli/src/{commands,main}.rs` (`--no-meta`, help), `crates/app/src/lab.rs` (skills in
+the origin note), `tools/phase3_gate.py`.
