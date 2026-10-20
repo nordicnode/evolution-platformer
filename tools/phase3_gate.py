@@ -8,6 +8,9 @@ window's 300 epochs), same population size and the same seed, differing only in 
                 when the student is off the demonstration's corridor.
 * `labels`    — `--no-meta`: the same, plus a correction planned from an on-corridor state whose
                 chosen action disagrees with the plan's nearest action about the jump button.
+* `fit`       — the labels' teacher with a larger **correction refit** budget
+                (`--correction-epochs 900`, three times the demonstration's 300): the question is
+                whether the turret deaths fall once the label is there and the fit has room.
 * `phase3`    — the default: jump-margin labels plus the meta-controller's sequencing.
 
 The reading is the per-seed leg distribution and the death cause, plus the count of jump-margin
@@ -36,6 +39,7 @@ CLONE_EPOCHS = 300
 ARMS = {
     "baseline": ["--no-meta", "--no-jump-labels"],
     "labels": ["--no-meta"],
+    "fit": ["--no-meta", "--correction-epochs", "900"],
     "phase3": [],
 }
 MASTERY = re.compile(
@@ -113,23 +117,32 @@ def run_arm(seed, arm, out):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=8)
+    ap.add_argument(
+        "--first-seed",
+        type=int,
+        default=1,
+        help="route seed of the first run; seeds 9-16 are the held-out half",
+    )
     ap.add_argument("--out", default=str(ROOT / "out" / "phase3"))
     args = ap.parse_args()
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     rows = []
+    seeds = range(args.first_seed, args.first_seed + args.seeds)
     for arm in ARMS:
-        for seed in range(1, args.seeds + 1):
+        for seed in seeds:
             print(f"{arm:8s} seed {seed}", flush=True)
             rows.append(run_arm(seed, arm, out))
-    (out / "phase3-gate.json").write_text(json.dumps(rows, indent=2))
+    tag = f"{seeds.start}-{seeds.stop - 1}"
+    (out / f"phase3-gate-{tag}.json").write_text(json.dumps(rows, indent=2))
 
     lines = [
         "## Phase 3 gate: jump-margin labels and the meta-controller, per seed",
         "",
         f"`l11-the-elements`, timed plan at depth {PLAN_DEPTH}, clone at {CLONE_EPOCHS} epochs"
-        f" (the window's fit budget), pop 8, seeds 1-{args.seeds}, all three arms on one tree.",
+        f" (the window's fit budget), pop 8, seeds {seeds.start}-{seeds.stop - 1}, all four arms on"
+        " one tree.",
         "",
         "| arm | seeds | legs cleared (mean / median / min-max) | past leg 1 | deaths | end legs | jump corrections | jump legs | plan+fit s |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -163,23 +176,30 @@ def main():
         "",
         "### Paired by seed",
         "",
-        "| seed | baseline legs | labels legs | phase3 legs | baseline ended / cause | phase3 ended / cause | jump corrections | phase3 skills (route/commit/wait/ride) | firsts |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| seed | baseline legs | labels legs | fit legs | phase3 legs | baseline ended / cause | phase3 ended / cause | jump corrections | phase3 skills (route/commit/wait/ride) | firsts |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     by = {(r["arm"], r["seed"]): r for r in rows}
     improved = []
-    for seed in range(1, args.seeds + 1):
-        a, b, c = by.get(("baseline", seed)), by.get(("labels", seed)), by.get(("phase3", seed))
+    for seed in seeds:
+        a, b, f, c = (
+            by.get(("baseline", seed)),
+            by.get(("labels", seed)),
+            by.get(("fit", seed)),
+            by.get(("phase3", seed)),
+        )
         if not a or not b or not c or a["legs"] is None or b["legs"] is None or c["legs"] is None:
-            lines.append(f"| {seed} | — | — | — | — | — | — | — | — |")
+            lines.append(f"| {seed} | — | — | — | — | — | — | — | — | — |")
             continue
         if c["legs"] > a["legs"]:
             improved.append(seed)
+        fit_legs = f["legs"] if f and f["legs"] is not None else "—"
         firsts = "; ".join(
             f"{f['skill']} leg {f['leg']} block {f['block']} frame {f['frame']}" for f in c["firsts"]
         ) or "—"
         lines.append(
-            f"| {seed} | {a['legs']} | {b['legs']} | {c['legs']} | {a['end_leg']} / {a['cause'] or a['outcome']} | "
+            f"| {seed} | {a['legs']} | {b['legs']} | {fit_legs} | {c['legs']} | "
+            f"{a['end_leg']} / {a['cause'] or a['outcome']} | "
             f"{c['end_leg']} / {c['cause'] or c['outcome']} | {c['jump'] or 0}"
             f"{' (' + ', '.join(f'leg {k} x{v}' for k, v in sorted(c['jump_legs'].items())) + ')' if c['jump_legs'] else ''} | "
             f"{'/'.join(map(str, c['skills'])) if c['skills'] else '—'} | {firsts} |"
@@ -190,7 +210,7 @@ def main():
         "",
     ]
     report = "\n".join(lines)
-    (out / "phase3-gate.md").write_text(report + "\n")
+    (out / f"phase3-gate-{tag}.md").write_text(report + "\n")
     print()
     print(report)
 

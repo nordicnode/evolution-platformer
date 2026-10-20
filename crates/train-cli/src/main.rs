@@ -467,6 +467,11 @@ TRAIN OPTIONS:
     --replan-depth <N>    Planner expansions for a correction planned from a divergent state.
                                                                                  [default 16]
     --dagger-rounds <N>   Whole-route DAgger rounds before the leg curriculum.    [default 2]
+    --correction-epochs <N>
+                          Gradient passes for the refits that include DAgger and leg-curriculum
+                          corrections, as opposed to the demonstration fit. 0 (the default) uses
+                          --clone-epochs. A correction is a few exemplars against the whole route,
+                          so the demonstration's budget can leave it unlearned. `--from-plan` only.
     --no-meta             Turn the meta-controller off: the plan's blocks and the raw leg routes
                           are the teacher, with no commit / wait / ride sequencing and no skill
                           line in the clone report. `--from-plan` only. This is the Phase 2 arm.

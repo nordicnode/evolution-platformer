@@ -160,6 +160,16 @@ pub struct ImitateConfig {
     /// student actually stops. Six whole-route rounds were measured to cost a full-level search per
     /// divergence and to add no leg the curriculum did not reach cheaper.
     pub dagger_rounds: usize,
+    /// Gradient passes for the **refits that include corrections**, as opposed to the initial
+    /// demonstration fit. Zero means "the same as [`ImitateConfig::epochs`]".
+    ///
+    /// A correction is a script at one crossing ("jump *this* block, not the next"), and the
+    /// demonstration's hundreds of blocks dominate the dataset, so the same budget that is flat for
+    /// the demo can be short for a handful of corrected states. **It is not a fix on its own**: the
+    /// sweep in `FINDINGS.md`'s third Phase 3 pass found no budget between 600 and 3 000 that moves
+    /// the turret deaths reliably, so the default stays at zero and the knob is a lever for the
+    /// experiment rather than a tuned value.
+    pub correction_epochs: usize,
     /// Run the demonstration and the local corrections through the **meta-controller** ([`sim::meta`]),
     /// which owns commit / wait / ride. Off, the plan's blocks and the raw leg routes are the
     /// teacher and the report has no skill trace — the Phase 2 arm.
@@ -186,6 +196,7 @@ impl Default for ImitateConfig {
             replan_depth: 16,
             replan_cap: 8,
             dagger_rounds: 2,
+            correction_epochs: 0,
             meta: true,
             jump_labels: true,
         }
@@ -832,6 +843,14 @@ pub fn from_certified_plan(
     // decisions and lose a leg it had already cleared.
     let refine = ImitateConfig {
         lr: (fit.lr * 0.25).max(1e-3),
+        // **Corrections get their own budget.** The initial demonstration fit is flat long before
+        // its epochs are spent, but a corrected state is a handful of exemplars against hundreds of
+        // route blocks, and the same budget can leave it unlearned. Zero means the same fit.
+        epochs: if cfg.correction_epochs == 0 {
+            cfg.epochs
+        } else {
+            cfg.correction_epochs
+        },
         ..fit
     };
     let mut report = clone_from_play(&play, shape.clone(), &fit)?;

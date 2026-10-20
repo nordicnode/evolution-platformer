@@ -6239,3 +6239,75 @@ is edited in this working tree.
 Files: `crates/evo/src/imitate.rs` (`jump_labels`, on-corridor jump correction, `jump_corrections`
 in the report and on the line), `crates/train-cli/src/{commands,main}.rs` (`--no-jump-labels`),
 `tools/phase3_gate.py` (three arms, correction count).
+
+## Phase 3, third pass: the correction refit budget, and why it stays at zero
+
+The second pass showed the labels reach the turret leg (30 of 54 corrections planned from leg 2) and
+the clone still dies there. The question this pass tests is the next one: is the remaining wall the
+**fit**? A correction is a handful of exemplars against hundreds of route blocks, so the budget that
+is flat for the demonstration may be short for the corrected states.
+
+`ImitateConfig::correction_epochs` (CLI `--correction-epochs`, default `0` = the demonstration's own
+budget) is the lever; the gate gained a fourth arm, `fit`, which runs the jump-label teacher with
+three times the correction budget (900 at the gate's 300). It is **default off**, and this section is
+why.
+
+### The sweep, seeds 1-8
+
+Legs cleared per seed, jump-label teacher only (`--no-meta`), demonstration fit 300:
+
+| correction epochs | legs by seed | mean | past leg 1 |
+|---|---|---|---|
+| 300 (default) | 2,2,3,2,3,2,2,2 | 2.25 | 8/8 |
+| 600 | 3,2,3,2,2,2,3,2 | 2.38 | 8/8 |
+| 900 | 2,4,3,4,1,3,4,1 | **2.75** | 6/8 |
+| 1 800 | 3,2,4,2,1,2,5,1 | 2.50 | 6/8 |
+| 3 000 | 2,2,4,2,1,2,2,2 | 2.13 | 7/8 |
+
+Nine hundred epochs is the best draw on this half, and it is exactly the trade the mean hides: seeds
+2, 4 and 7 get **past the turret** to leg 4, while seeds 5 and 8 fall back to leg 1 and six of the
+eight deaths become spikes. The curve is not monotone — 3 000 is worse than 300 — so this is a
+budget that reallocates which crossing kills, not one that clears one.
+
+### The held-out half, seeds 9-16
+
+Same gate, `--first-seed 9`, all four arms:
+
+| arm | legs (mean / min-max) | past leg 1 | deaths | plan+fit s |
+|---|---|---|---|---|
+| baseline | 1.38 / 1-2 | 3/8 | spike 5, turret 3 | 4.45 |
+| labels | **2.25 / 2-4** | **8/8** | spike 1, stuck 4, turret 3 | 4.99 |
+| fit (900) | 1.88 / 1-2 | 7/8 | spike 2, stuck 4, turret 2 | 9.59 |
+| phase3 | **2.25 / 2-4** | **8/8** | spike 1, stuck 4, turret 3 | 5.00 |
+
+**The 900-epoch gain reverses.** On seeds 1-8 it is +0.50 legs over the default teacher; on seeds 9-16
+it is -0.38. Over sixteen seeds the two are 2.31 against 2.25 — a wash inside the variance of eight
+seeds, bought for +70 % plan+fit time (6.73 s to 11.49 s on the first half). The turret deaths fall
+from three to two on the held-out half, but one seed falls from leg 2 to leg 1 and another from leg 4
+to leg 2 doing it — the same trade in the other direction.
+
+So the answer to "is the fit the wall?" is **not this way**: raising the correction budget does not
+reliably turn the labels into legs, and the default is left at zero. The knob stays, because it is
+the only way to ask the question again on a different teacher without a new commit, and because a
+future pass with a better *selection* rule will need somewhere to spend the extra epochs.
+
+### A rejected variant
+
+Selecting the correction refit's epoch by **loss** instead of by agreement (agreement is counted over
+the whole dataset, which the demonstration dominates). Measured on the jump-label arm: 2.38 against
+2.25 on seeds 1-8 and 2.38 against 2.25 on seeds 9-16 — a consistent +0.125. But the same change took
+the **baseline** arm from 2.00 to 1.88 on seeds 1-8, so the gain is a redistribution between the two
+teachers rather than an improvement, and a gate compared against a weakened baseline would flatter
+every later pass. Rejected and reverted; settling it needs both arms on sixteen seeds and a reason to
+believe the selection rule should differ per arm.
+
+### Gates
+
+`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace --no-fail-fast`
+green except the pre-existing `evo --test migration` saved-`l11` fixture (the working tree's edited
+level). Both halves of the gate are reproducible: `out/phase3/phase3-gate-1-8.md` and
+`phase3-gate-9-16.md`.
+
+Files: `crates/evo/src/imitate.rs` (`correction_epochs`, used by both correction refits),
+`crates/train-cli/src/{commands,main}.rs` (`--correction-epochs`, help), `tools/phase3_gate.py`
+(the `fit` arm, `--first-seed`, per-range artifacts).
