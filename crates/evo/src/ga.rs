@@ -1067,9 +1067,15 @@ pub struct GenerationReport {
     pub ranking: Vec<usize>,
     /// **Phase 0: what this generation learned, not just what it scored.** Solved rate, the
     /// clock among its winners, where the best genome ended, and the per-leg census of every
-    /// episode ([`crate::telemetry`]). Reporting only: it is not scored, not hashed, and not
-    /// part of any RNG stream.
+    /// episode on the **first** level ([`crate::telemetry`]). Reporting only: it is not scored,
+    /// not hashed, and not part of any RNG stream.
+    ///
+    /// [`GenerationReport::per_level`] is the complete record; this is its first row, kept so a
+    /// single-level run and the window have one obvious reading.
     pub telemetry: Telemetry,
+    /// **One record per level the generation ran**, in the suite's own order. A run on one level
+    /// has one entry, identical to [`GenerationReport::telemetry`].
+    pub per_level: Vec<Telemetry>,
 }
 
 /// Which half of the "best-4 + random-4" split a showcase lane came from (§10 Tier 1.5).
@@ -1110,7 +1116,20 @@ pub fn evaluate_population(
     cfg: &GaConfig,
     generation: u32,
 ) -> Vec<EpisodeResult> {
-    evaluate_suite(std::slice::from_ref(level), genomes, cfg, generation)
+    evaluate_suite(std::slice::from_ref(level), genomes, cfg, generation).results
+}
+
+/// A whole suite's pass: the results selection sees, plus trial 0 of every level per genome.
+///
+/// The second half is what makes the learning record **per level**. `EpisodeResult` is one row per
+/// genome — on a suite its fitness is the worst level's mean — so a telemetry record built from it
+/// can only ever describe level zero. These are the same episodes, kept per level, in genome order
+/// (`per_level[level][genome]`); they add no episode and no RNG draw, only the bookkeeping that
+/// says which level a death happened on.
+pub struct SuitePass {
+    pub results: Vec<EpisodeResult>,
+    /// `per_level[level][genome]`: trial 0 of that level.
+    pub per_level: Vec<Vec<EpisodeResult>>,
 }
 
 /// Evaluate a whole population on a **suite** of levels (REVIEW §4 item 5): one generation
@@ -1129,15 +1148,24 @@ pub fn evaluate_suite(
     genomes: &[Genome],
     cfg: &GaConfig,
     generation: u32,
-) -> Vec<EpisodeResult> {
+) -> SuitePass {
     assert!(!levels.is_empty(), "a suite needs at least one level");
     if cfg.race_episodes && levels.iter().any(|l| cfg.effective_trials(l) > 1) {
         return evaluate_suite_raced(levels, genomes, cfg, generation).0;
     }
-    genomes
+    let scored: Vec<(EpisodeResult, Vec<f32>, Vec<EpisodeResult>)> = genomes
         .par_iter()
-        .map(|g| suite_score(levels, g, cfg, generation).0)
-        .collect()
+        .map(|g| suite_score(levels, g, cfg, generation))
+        .collect();
+    let mut results = Vec::with_capacity(scored.len());
+    let mut per_level: Vec<Vec<EpisodeResult>> = vec![Vec::with_capacity(scored.len()); levels.len()];
+    for (row, _means, level_rows) in scored {
+        results.push(row);
+        for (li, episode) in level_rows.into_iter().enumerate() {
+            per_level[li].push(episode);
+        }
+    }
+    SuitePass { results, per_level }
 }
 
 /// A suite pass in which the extra trials are spent only on the genomes still in contention.
@@ -1168,7 +1196,7 @@ fn evaluate_suite_raced(
     genomes: &[Genome],
     cfg: &GaConfig,
     generation: u32,
-) -> (Vec<EpisodeResult>, usize) {
+) -> (SuitePass, usize) {
     let eval = cfg.eval_config();
     let rounds = levels
         .iter()
@@ -1222,11 +1250,22 @@ fn evaluate_suite_raced(
         contenders = ranked;
     }
 
-    let results = tallies
-        .into_iter()
-        .map(|t| t.result(levels.len()))
-        .collect();
-    (results, spent)
+    let mut results = Vec::with_capacity(tallies.len());
+    let mut per_level: Vec<Vec<EpisodeResult>> = vec![Vec::with_capacity(tallies.len()); levels.len()];
+    for tally in tallies {
+        let (row, level_rows) = tally.into_parts(levels.len());
+        results.push(row);
+        for (li, episode) in level_rows.into_iter().enumerate() {
+            per_level[li].push(episode);
+        }
+    }
+    (
+        SuitePass {
+            results,
+            per_level,
+        },
+        spent,
+    )
 }
 
 /// The seed of one episode of one genome, under this run's own episode policy.
@@ -1326,6 +1365,9 @@ struct SuiteTally {
     won: Vec<bool>,
     /// The lowest single episode, over every level and every trial.
     worst: f32,
+    /// Trial 0 of each level: the per-level rows the learning telemetry reads. Filled by round one
+    /// of a race and by the flat pass alike, so the census is the same episodes either way.
+    first_trial: Vec<Option<EpisodeResult>>,
 }
 
 impl SuiteTally {
@@ -1336,6 +1378,7 @@ impl SuiteTally {
             counts: vec![0; levels],
             won: vec![true; levels],
             worst: f32::INFINITY,
+            first_trial: vec![None; levels],
         }
     }
 
@@ -1347,6 +1390,9 @@ impl SuiteTally {
         self.counts[level] += 1;
         self.worst = self.worst.min(r.fitness);
         self.won[level] &= r.won();
+        if trial == 0 {
+            self.first_trial[level] = Some(r.clone());
+        }
         if level == 0 && trial == 0 {
             self.representative = Some(r);
         }
@@ -1378,6 +1424,22 @@ impl SuiteTally {
     /// The result selection sees, given how many levels the suite has. Consumes the tally: the
     /// representative episode is the one episode this genome's judgement hands on, and copying it
     /// would copy its trajectory.
+    /// The ranked row, and trial 0 of every level in suite order. A level that was never played
+    /// cannot happen on a flat pass — every level is played — so its absence is a bug rather than
+    /// a case, and the representative stands in with the same "nothing ran" reading.
+    fn into_parts(mut self, levels: usize) -> (EpisodeResult, Vec<EpisodeResult>) {
+        let per_level: Vec<EpisodeResult> = self
+            .first_trial
+            .iter_mut()
+            .enumerate()
+            .map(|(li, slot)| {
+                slot.take()
+                    .unwrap_or_else(|| panic!("level {li} of {levels} was never played on trial 0"))
+            })
+            .collect();
+        (self.result(levels), per_level)
+    }
+
     fn result(mut self, levels: usize) -> EpisodeResult {
         let mut result = self
             .representative
@@ -1440,7 +1502,7 @@ pub fn suite_score(
     genome: &Genome,
     cfg: &GaConfig,
     generation: u32,
-) -> (EpisodeResult, Vec<f32>) {
+) -> (EpisodeResult, Vec<f32>, Vec<EpisodeResult>) {
     assert!(!levels.is_empty(), "a suite needs at least one level");
     let eval = cfg.eval_config();
     let mut tally = SuiteTally::new(levels.len());
@@ -1457,7 +1519,8 @@ pub fn suite_score(
     }
 
     let level_means = tally.level_means();
-    (tally.result(levels.len()), level_means)
+    let (row, per_level) = tally.into_parts(levels.len());
+    (row, level_means, per_level)
 }
 
 /// The score every genome in a generation is **ranked and bred by**, given the recorded results.
@@ -2550,14 +2613,11 @@ impl Trainer {
     /// The replay is the same episode: `evaluate_suite` derives its seeds from the generation, the
     /// trial and (under per-genome episodes) the id, all of which are unchanged here, so no world
     /// is drawn twice.
-    fn reconsider_cuts(
-        &self,
-        levels: &[Level],
-        mut results: Vec<EpisodeResult>,
-    ) -> Vec<EpisodeResult> {
-        if results.is_empty() {
-            return results;
+    fn reconsider_cuts(&self, levels: &[Level], mut pass: SuitePass) -> SuitePass {
+        if pass.results.is_empty() {
+            return pass;
         }
+        let results = &mut pass.results;
         let elite = self
             .config
             .elite
@@ -2565,14 +2625,14 @@ impl Trainer {
         let mut scores: Vec<f32> = results.iter().map(|r| r.mean_fitness).collect();
         scores.sort_by(|a, b| b.total_cmp(a));
         let Some(cut_score) = scores.get(elite - 1).copied() else {
-            return results;
+            return pass;
         };
         let margin = self.config.cut_margin.max(0.0);
         let ambiguous: Vec<usize> = (0..results.len())
             .filter(|&i| results[i].cut_early && results[i].mean_fitness + margin >= cut_score)
             .collect();
         if ambiguous.is_empty() {
-            return results;
+            return pass;
         }
         let uncut = GaConfig {
             cut_stuck_frames: 0,
@@ -2581,11 +2641,16 @@ impl Trainer {
         let genomes: Vec<Genome> = ambiguous.iter().map(|&i| self.genomes[i].clone()).collect();
         let full = evaluate_suite(levels, &genomes, &uncut, self.generation);
         for (slot, &i) in ambiguous.iter().enumerate() {
-            if let Some(result) = full.get(slot) {
-                results[i] = result.clone();
+            if let Some(result) = full.results.get(slot) {
+                pass.results[i] = result.clone();
+                for (li, level_rows) in full.per_level.iter().enumerate() {
+                    if let Some(episode) = level_rows.get(slot) {
+                        pass.per_level[li][i] = episode.clone();
+                    }
+                }
             }
         }
-        results
+        pass
     }
 
     /// **Item 5, step 2: spend what the cut saved.**
@@ -2645,7 +2710,7 @@ impl Trainer {
         }
         let genomes: Vec<Genome> = targets.iter().map(|&i| self.genomes[i].clone()).collect();
         let reads = evaluate_suite(levels, &genomes, &cfg, self.generation);
-        for (&i, result) in targets.iter().zip(reads) {
+        for (&i, result) in targets.iter().zip(reads.results) {
             results[i] = result;
             self.cut_refunds += 1;
         }
@@ -2656,17 +2721,18 @@ impl Trainer {
         levels: &[Level],
         keep_population: bool,
     ) -> (GenerationReport, Vec<Genome>) {
-        let mut results = evaluate_suite(levels, &self.genomes, &self.config, self.generation);
+        let mut pass = evaluate_suite(levels, &self.genomes, &self.config, self.generation);
         // **Item 5, step 1: a cut is only kept when it cannot change the ranking band.** A genome
         // whose own score plus the margin reaches the genome that made the selection cut is
         // replayed uncut, so the saving is never bought with an episode that could still have
         // mattered.
         if self.config.cut_stuck_frames > 0 {
-            results = self.reconsider_cuts(levels, results);
+            pass = self.reconsider_cuts(levels, pass);
             if self.config.cut_refund && levels.len() == 1 {
-                self.spend_cut_refund(levels, &mut results);
+                self.spend_cut_refund(levels, &mut pass.results);
             }
         }
+        let results = pass.results;
         // Item 5's reading, taken here rather than recomputed later: the results are the only
         // place a cut is visible, and `self.genomes` is about to be replaced by their children.
         // Counted *after* the reconsideration, so a replay that was paid back is not claimed as a
@@ -2832,17 +2898,29 @@ impl Trainer {
 
         let best_result = results[winner].clone();
 
-        // **Phase 0 telemetry.** Taken here, where the generation's population, results and
-        // winner are all still in hand, and before `breed` replaces the genomes the spawn probe
-        // reads. Reporting only: no fitness, hash or RNG stream sees it.
-        let telemetry = Telemetry::measure(
-            self.generation,
-            &levels[0],
-            &results,
-            winner,
-            &self.genomes,
-            self.config.action_repeat,
-        );
+        // **Phase 0/1 telemetry.** One record **per level**, taken here where the generation's
+        // population and per-level episodes are still in hand and before `breed` replaces the
+        // genomes the spawn probe reads. A suite used to report level zero's census as if it were
+        // the run's; these are the same episodes selection ran, split back out by level. Reporting
+        // only: no fitness, hash or RNG stream sees them.
+        let per_level: Vec<Telemetry> = levels
+            .iter()
+            .zip(pass.per_level.iter())
+            .map(|(level, rows)| {
+                Telemetry::measure(
+                    self.generation,
+                    level,
+                    rows,
+                    winner,
+                    &self.genomes,
+                    self.config.action_repeat,
+                )
+            })
+            .collect();
+        let telemetry = per_level
+            .first()
+            .cloned()
+            .unwrap_or_default();
 
         // ---- the run's record, settled on worlds no generation drew --------------------------
         //
@@ -3113,6 +3191,7 @@ impl Trainer {
                 results,
                 ranking: order,
                 telemetry,
+                per_level,
             },
             pop,
         )
@@ -4353,6 +4432,50 @@ mod tests {
         assert_eq!(t.best_end_leg, best.route_hops_closed.min(t.legs));
     }
 
+    /// **A suite's learning record is per level.**
+    ///
+    /// The defect this pins: `Telemetry` was measured from the generation's `results`, which on a
+    /// suite is one row per genome whose fitness is the *worst* level's mean. A two-level run
+    /// therefore reported one census, taken on level zero, and a reader had no way to tell that the
+    /// population solved the easy level and died on the hard one. The zero genome is the fixture
+    /// that makes the two outcomes different by construction: it always runs, so it wins a flat
+    /// runway and falls into a pit.
+    #[test]
+    fn a_suite_reports_a_record_for_every_level_it_ran() {
+        let easy = flat_level();
+        let hard = pit_level();
+        let cfg = GaConfig {
+            pop_size: 2,
+            ..GaConfig::default()
+        };
+        let first = Genome::zeros(0, cfg.shape.clone());
+        let mut second = first.clone();
+        second.id = 1;
+        let mut trainer = Trainer::resume(cfg, vec![first, second], 0).expect("a two-genome suite");
+        let report = trainer.step_suite(&[easy.clone(), hard.clone()]);
+
+        assert_eq!(
+            report.per_level.len(),
+            2,
+            "two levels ran, so two records, not one"
+        );
+        assert_eq!(report.per_level[0].level, easy.name);
+        assert_eq!(report.per_level[1].level, hard.name);
+        assert_eq!(
+            report.per_level[0].solved, 2,
+            "always-run solves the flat level"
+        );
+        assert_eq!(
+            report.per_level[1].solved, 0,
+            "and dies in the pit level; the two records must not agree"
+        );
+        assert_ne!(report.per_level[0], report.per_level[1]);
+        assert_eq!(
+            report.telemetry, report.per_level[0],
+            "the single-level reading is level zero, and says so by equality"
+        );
+    }
+
     #[test]
     fn the_ga_solves_the_flat_run_level_quickly() {
         // §11 GA smoke test: a loose bound that guards against fitness/sign bugs,
@@ -5436,16 +5559,23 @@ mod tests {
         };
         let g = Genome::zeros(1, cfg.shape.clone());
 
-        let (single, means) = suite_score(std::slice::from_ref(&flat), &g, &cfg, 0);
+        let (single, means, levels) = suite_score(std::slice::from_ref(&flat), &g, &cfg, 0);
         assert_eq!(means.len(), 1);
+        assert_eq!(levels.len(), 1, "one level, one per-level row");
         assert!(single.won(), "always-run solves a flat runway");
         assert_eq!(
             single.suite_wins, 0,
             "one level is not a suite, however solved it is"
         );
 
-        let (split, means) = suite_score(&[flat.clone(), pit.clone()], &g, &cfg, 0);
+        let (split, means, levels) = suite_score(&[flat.clone(), pit.clone()], &g, &cfg, 0);
         assert_eq!(means.len(), 2);
+        assert_eq!(
+            levels.len(),
+            2,
+            "the per-level rows stay per level, even though the ranked row is one"
+        );
+        assert!(levels[0].won() && !levels[1].won(), "flat yes, pit no");
         assert_eq!(
             split.suite_wins, 1,
             "flat is solved and the pit is not: that is one level of two"
@@ -5460,7 +5590,7 @@ mod tests {
             "the representative is trial 0 of level 0"
         );
 
-        let (both, _) = suite_score(&[flat.clone(), flat], &g, &cfg, 0);
+        let (both, _, _) = suite_score(&[flat.clone(), flat], &g, &cfg, 0);
         assert_eq!(both.suite_wins, 2, "two levels, two wins");
     }
 
@@ -6852,8 +6982,13 @@ mod tests {
         );
 
         // Every genome still has a verdict, and the representative episode is untouched.
-        assert_eq!(raced.len(), flat.len());
-        for (r, f) in raced.iter().zip(&flat) {
+        assert_eq!(raced.results.len(), flat.len());
+        assert_eq!(
+            raced.per_level.len(),
+            1,
+            "one level, one per-level row, from the same race"
+        );
+        for (r, f) in raced.results.iter().zip(&flat) {
             assert_eq!(r.genome_id, f.genome_id);
             assert_eq!(
                 (r.fitness, r.seed),
@@ -6893,9 +7028,10 @@ mod tests {
             spent as f32 / trainer.genomes.len() as f32,
             episodes_per_genome(&levels, trainer.genomes.len(), &cfg)
         );
-        assert_eq!(raced.len(), trainer.genomes.len());
+        assert_eq!(raced.results.len(), trainer.genomes.len());
+        assert_eq!(raced.per_level.len(), levels.len());
         assert!(
-            raced.iter().all(|r| r.suite_wins <= levels.len() as u32),
+            raced.results.iter().all(|r| r.suite_wins <= levels.len() as u32),
             "a race still counts suite wins the way a flat pass does"
         );
     }

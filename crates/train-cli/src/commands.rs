@@ -123,6 +123,9 @@ const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose", "timed", 
 /// `fuzz`: the Phase 0 practice suite. `--out` writes the files; without it the command only
 /// prints what it certified.
 const FUZZ_OPTS: &[&str] = &["out"];
+
+/// `routeplan`: the Phase 1 route compiler. One level, or `--all` over a directory of them.
+const ROUTEPLAN_OPTS: &[&str] = &["level", "all", "levels-dir", "seed", "plan-depth", "out"];
 const REPLAY_OPTS: &[&str] = &["champion", "level", "levels-dir"];
 /// `committee`: the Item 10 gate as a command. It validates a saved committee against the run's
 /// own fixed validation episodes and fails the shell if the vote loses to its best member.
@@ -630,14 +633,19 @@ pub fn train(a: &Args) -> Result<(), String> {
             wins: report.wins,
         });
         if let Some(out) = telemetry_out.as_mut() {
-            let line = serde_json::to_string(&report.telemetry)
-                .map_err(|e| format!("cannot serialize telemetry: {e}"))?;
-            writeln!(out, "{line}").map_err(|e| {
-                format!(
-                    "cannot write {}: {e}",
-                    telemetry_path.as_deref().unwrap_or("telemetry")
-                )
-            })?;
+            // **One line per level.** A suite's generation is not one census, so writing only
+            // `report.telemetry` would label level zero's record as the run's. Each line carries
+            // its own `level`, so a reader groups by `generation` and never has to guess.
+            for record in &report.per_level {
+                let line = serde_json::to_string(record)
+                    .map_err(|e| format!("cannot serialize telemetry: {e}"))?;
+                writeln!(out, "{line}").map_err(|e| {
+                    format!(
+                        "cannot write {}: {e}",
+                        telemetry_path.as_deref().unwrap_or("telemetry")
+                    )
+                })?;
+            }
         }
 
         // What "solved" means depends on the run, and it is the **conservative** reading on both.
@@ -696,6 +704,17 @@ pub fn train(a: &Args) -> Result<(), String> {
                     } else {
                         ""
                     }
+                );
+                // Every level's solved rate, so a suite run says which level is the wall rather
+                // than reporting one level's census as if it were the run's.
+                println!(
+                    "{}",
+                    report
+                        .per_level
+                        .iter()
+                        .map(|t| format!("{}: {}/{}", t.level, t.solved, t.pop))
+                        .collect::<Vec<_>>()
+                        .join("  |  ")
                 );
             }
         }
@@ -1066,7 +1085,7 @@ pub fn train(a: &Args) -> Result<(), String> {
         // The claim a suite run makes, level by level, evaluated on the champion with the same
         // seeds its own generation used — so these are the numbers the run was selected on rather
         // than a fresh sample of them.
-        let (_, per_level) =
+        let (_, per_level, _) =
             evo::ga::suite_score(&levels, &best.genome, &effective, best.generation);
         let listed: Vec<String> = levels
             .iter()
@@ -2204,6 +2223,105 @@ pub fn fuzz(a: &Args) -> Result<(), String> {
             practice::SUITE_LEN,
             dir.display()
         );
+    }
+    Ok(())
+}
+
+/// **Phase 1: compile a certified route plan.**
+///
+/// Prints the plan's legs, their margins and the crossings it closed; with `--out` it writes one
+/// `*.routeplan.json` per level. The command fails on any level it cannot certify, so it is the
+/// route compiler's gate as well as its reader: a plan that the oracle refuses, that the planner's
+/// budget cannot route, or that does not survive a replay is a non-zero exit rather than a warning.
+///
+/// `--all --levels-dir levels/practice` is the Phase 1 acceptance run. The practice suite certifies
+/// at depth 48; the command searches at 64 so `l11-the-elements` routes too, and `--plan-depth`
+/// overrides the budget for experiments.
+pub fn routeplan(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(ROUTEPLAN_OPTS))?;
+    let seed = usage(a.u64_opt("seed", 1))?;
+    // 64 by default: the planner's own default (32) is one expansion too shallow for
+    // `l11-the-elements`' 11-leg route, and a compiled artifact that refuses the level the phase
+    // exists for would be a misleading gate. `--plan-depth` lowers it for experiments.
+    let depth = usage(a.usize_opt("plan-depth", 64))? as u32;
+    let cfg = sim::plan::PlanConfig {
+        depth,
+        ..sim::plan::PlanConfig::default()
+    };
+    let paths: Vec<PathBuf> = if a.has_flag("all") {
+        let dir = a.string("levels-dir", "levels");
+        let mut found = pack_levels(&dir)?;
+        found.sort();
+        if found.is_empty() {
+            return Err(format!("no *.json levels found in {dir:?}"));
+        }
+        found
+    } else {
+        vec![PathBuf::from(usage(a.required_path("level"))?)]
+    };
+    let out = a.opt("out").map(PathBuf::from);
+    if let Some(dir) = &out {
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+
+    let mut failed = 0usize;
+    for path in &paths {
+        let level = load_level(&path.to_string_lossy())?;
+        let started = Instant::now();
+        match sim::route_plan::compile(&level, seed, cfg) {
+            Ok(plan) => {
+                println!(
+                    "PLANNED {} ({}) in {:.2}s",
+                    level.name,
+                    path.display(),
+                    started.elapsed().as_secs_f32()
+                );
+                println!("  {}", plan.line());
+                for leg in &plan.legs {
+                    println!(
+                        "  leg {:<2} blocks {:>4}..{:<4} hops {}  {:>7}  ends {:>6}  margin {}",
+                        leg.index,
+                        leg.first_block,
+                        leg.end_block,
+                        leg.hops,
+                        sim::format_time(leg.frames),
+                        sim::format_time(leg.end_frame),
+                        sim::format_time(leg.margin_frames)
+                    );
+                }
+                if let Some(dir) = &out {
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "level".into());
+                    let json = serde_json::to_string_pretty(&plan)
+                        .map_err(|e| format!("cannot serialize the plan: {e}"))?;
+                    std::fs::write(dir.join(format!("{stem}.routeplan.json")), json)
+                        .map_err(|e| format!("cannot write {stem}.routeplan.json: {e}"))?;
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                println!("NO PLAN  {} ({})", level.name, path.display());
+                println!("  {}", err.line());
+                if err.beatable() {
+                    println!(
+                        "  the level is certified beatable; this is a planner budget failure, and \
+                         a warm start must report it rather than clone a weaker route"
+                    );
+                }
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(format!(
+            "{failed} of {} levels have no certified route plan",
+            paths.len()
+        ));
+    }
+    if let Some(dir) = &out {
+        println!("wrote   {} route plans to {}", paths.len(), dir.display());
     }
     Ok(())
 }
@@ -4051,6 +4169,53 @@ mod tests {
         let level = load_level(&wpath("levels/l1-flat-run.json")).expect("ships with the repo");
         assert_eq!(level.name, "L1-flat-run");
         assert_eq!(level.width, 60);
+    }
+
+    /// **The route plan's command is also its gate.** It writes an artifact a later phase can
+    /// read back, and it rejects a flag it does not implement rather than silently ignoring it.
+    #[test]
+    fn routeplan_writes_a_plan_that_passes_its_own_boundary_checks() {
+        let dir = tmpdir("routeplan");
+        let out = dir.join("plans");
+        routeplan(&a(&[
+            "routeplan",
+            "--level",
+            &wpath("levels/practice/p01-gap-t0.json"),
+            "--plan-depth",
+            "48",
+            "--out",
+            out.to_str().expect("a utf-8 path"),
+        ]))
+        .expect("a certified practice level compiles");
+        let text = fs::read_to_string(out.join("p01-gap-t0.routeplan.json"))
+            .expect("the plan is written");
+        let plan: sim::route_plan::RoutePlan =
+            serde_json::from_str(&text).expect("the written plan parses back");
+        assert!(!plan.legs.is_empty());
+        assert_eq!(plan.legs[0].first_block, 0);
+        assert_eq!(plan.legs.last().unwrap().end_block, plan.actions.len());
+        assert_eq!(plan.legs.len() as u32, plan.covered);
+        assert_eq!(plan.covered, plan.hops);
+        assert_eq!(
+            plan.legs.iter().map(|leg| leg.frames).sum::<u32>(),
+            plan.frames
+        );
+        assert!(
+            plan.legs
+                .windows(2)
+                .all(|pair| pair[0].end_block == pair[1].first_block),
+            "the legs are contiguous"
+        );
+
+        // A flag the command does not implement is a usage error, not a silent no-op.
+        assert!(routeplan(&a(&[
+            "routeplan",
+            "--level",
+            &wpath("levels/practice/p01-gap-t0.json"),
+            "--telemetry",
+            "/tmp/ignored.jsonl",
+        ]))
+        .is_err());
     }
 
     #[test]

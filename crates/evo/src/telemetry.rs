@@ -50,6 +50,10 @@ use crate::genome::{ActScratch, Genome};
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Telemetry {
     pub generation: u32,
+    /// The level this record describes. A generation on a suite emits one record per level, in the
+    /// suite's own order, so "solved 3/200" is never a number about one level repeated as if it
+    /// were the run's.
+    pub level: String,
     /// Episodes in the generation's census (the population, not the trial count).
     pub pop: usize,
     /// Genomes that won **every** episode they were judged on.
@@ -90,6 +94,7 @@ impl Default for Telemetry {
     fn default() -> Self {
         Telemetry {
             generation: 0,
+            level: String::new(),
             pop: 0,
             solved: 0,
             wins: 0,
@@ -116,6 +121,10 @@ impl Telemetry {
     ///
     /// `action_repeat` is the cadence the episode ran at, so a decision index is the frame the
     /// policy actually chose on rather than a tick it was coasting through.
+    ///
+    /// `results` is **one level's** results. A suite calls this once per level with that level's
+    /// representative episode for every genome, so a multi-level run has one record per level
+    /// rather than a single record that quietly describes level zero.
     pub fn measure(
         generation: u32,
         level: &Level,
@@ -126,6 +135,7 @@ impl Telemetry {
     ) -> Telemetry {
         let mut out = Telemetry {
             generation,
+            level: level.name.clone(),
             pop: results.len(),
             ..Telemetry::default()
         };
@@ -252,10 +262,13 @@ impl Telemetry {
 }
 
 /// Route crossings from the spawn stand to the flag, or `0` for a level with no route.
+///
+/// **The same function the route plan uses** ([`sim::route_plan::leg_count`]). A leg is a
+/// canonical crossing, so the telemetry's `best_end_leg` and a plan's `Leg::index` are the same
+/// index without a conversion — which is what lets Phase 1's margins be read against a run's
+/// deaths instead of a second, drifting definition of where a leg ends.
 fn level_legs(level: &Level) -> u32 {
-    sim::spawn_route_stand(level)
-        .and_then(|stand| level.routes().hops_to_flag(stand))
-        .unwrap_or(0)
+    sim::route_plan::leg_count(level)
 }
 
 /// The action every genome takes at the spawn observation, with a fresh recurrent state.

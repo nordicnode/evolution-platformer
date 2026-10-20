@@ -31,6 +31,7 @@ pub mod plan;
 pub mod practice;
 pub mod reach;
 pub mod rng;
+pub mod route_plan;
 pub mod sensors;
 
 /// The derived cache beside a level file.

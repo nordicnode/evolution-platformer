@@ -5808,12 +5808,144 @@ levels are certified beatable and routable (oracle 500 ms total, planner 5.92 s 
 Two seeds and a 100-generation cap: this is a recorded baseline, not a significance test, and no
 arm is being claimed as an improvement. The suite is deterministic by design (no patrols, flyers
 or turrets) so its per-leg curves are not phase noise; stochastic mechanics stay the battery's job.
-`plan ms` is today's timed planner, not Phase 1's route compiler — the suite's own certification
-uses depth 48, the pack and battery the shipped default. Nothing in this pass starts Phase 1: there
-is no `RoutePlan` artifact, no DAgger leg learner and no meta-controller yet. The two
-front-ends' existing numbers (max/avg/min, the archive, the chart) are untouched; telemetry is an
-addition, not a replacement.
+`plan ms` is the timed planner's search cost before Phase 1's compiler existed (the suite certifies
+at depth 48, the pack and battery at the shipped default); the compiler and its margins are the
+next section. The two front-ends' existing numbers (max/avg/min, the archive, the chart) are
+untouched; telemetry is an addition, not a replacement.
 
 Files: `crates/evo/src/telemetry.rs`, `crates/sim/src/practice.rs`, `levels/practice/` (24 files),
 `tools/phase0_baseline.py`; wiring in `crates/evo/src/ga.rs`, `crates/train-cli/src/{commands,watch,main}.rs`,
 `crates/app/src/{lab,panel}.rs`.
+
+## Phase 1: the route plan, and the warm start it replaces
+
+The route compiler now exists. `sim::route_plan::compile` certifies a level **twice** — the
+reachability oracle says the flag can be reached, the timed planner returns a block-aligned route,
+and that route is replayed through the real `Sim::step` and must win — then cuts the route into the
+legs the telemetry already counts. `train-cli routeplan` prints the plan and writes it as JSON; the
+window's generation-0 warm start now clones it instead of walking the tick-indexed route.
+
+### The artifact
+
+* **A leg is a span, not a crossing.** Leg `k` is the blocks from crossing `k` (or the spawn) to
+  crossing `k+1` — and on a route that reaches the flag before closing the level's last rung, the
+  last leg is that finish span, with no crossing of its own. Its index is therefore exactly the
+  telemetry's `best_end_leg`: a body that has closed `k` crossings is in leg `k`.
+  `route_plan::leg_count` is one function, and `Telemetry::measure` reads it, so the census and the
+  compiler cannot disagree about what a leg is. Checkpoints are not legs; a checkpoint is a reward
+  zone and a leg is a geodesic crossing.
+* **Two boundary cases are pinned rather than smoothed over.** A block that lands two rungs closer
+  closes two crossings: the plan reports two legs, the second with zero blocks and zero frames. A
+  route that ends on the flag without closing every rung gets a finish leg with `hops == 0`.
+  Merging either would keep the legs contiguous but make a plan's index off by one against the
+  telemetry, which is the whole property the artifact exists for.
+* **A margin is time, and it is measured.** Each leg's `margin_frames` is
+  `budget_frames - end_frame` at the leg's end: the frames still in the episode's budget when the
+  crossing completes. That is the slack a learner has before the clock runs out, and it is the one
+  margin the planner can actually price — the search works in blocks and frames, not in clearance
+  to a hazard, and a geometric margin the planner never measured would be a number without a
+  witness. Margins are non-increasing along a plan, and the last leg's is the plan's own win
+  margin.
+* **Three failures, kept apart.** `Unbeatable` (the oracle says no), `Unroutable` (the oracle
+  certifies the level, this planner budget found no line; `beatable()` is true) and
+  `ReplayFailed` (the planner's route did not survive the sim's own replay). A warm start reads
+  the distinction: it reports the failure in the run's origin note and starts **random**. It never
+  falls back to the tick-indexed route walk, which is the weaker demonstration this replaced.
+
+### The warm start
+
+The window's `RunPlan::warm_from_plan` (formerly `warm_from_route`) compiles the plan at depth 64 —
+`l11-the-elements` needs 64 for its 11-rung route, and the planner's shipped default of 32 is one
+expansion short — and clones it with `from_plan`'s block-aligned fit plus its six DAgger rounds at
+the window's 300-epoch budget. `evo::from_certified_plan` is the split that lets the compiler be
+paid for once: the window decides *whether* there is a plan, then clones the certified route.
+`train-cli --from-route` still exists as the older arm; `--from-plan` is the thorough terminal
+version (10× the epochs).
+
+Measured cost, release build, one level: the compiler is 0.07–0.42 s per practice level (all 24 in
+**5.25 s**); the full plan + DAgger warm start is **6.16 s** on `l11` and **9.4 s** on
+`l2-first-gap` at 300 epochs. It runs once, but it runs synchronously at run start, so the window
+is unresponsive for that long on a hard level.
+
+### The gate, as run
+
+`tools/phase1_gate.py --gens 60 --seeds 1`, pop 200, one episode per genome, stop on first solve,
+curriculum off.
+
+**A. The artifact.** `routeplan --all` over the practice suite plus `l11`, at depth 64; the script
+checks the written JSON rather than the printer: one leg per span (`legs == hops`), legs contiguous
+from block 0 to `actions.len()`, `sum(frames) == frames`, `sum(hops) == covered`, margins
+non-increasing with the last equal to the win margin.
+
+| level | legs | rungs closed | blocks | frames | slack at leg 1 | win margin |
+|---|---|---|---|---|---|---|
+| l11-the-elements | 12 | 11/12 | 183 | 731 | 2808 | 2149 |
+| p01-gap-t0 | 2 | 2/2 | 99 | 395 | 2488 | 2165 |
+| p06-mixed-t0 | 3 | 3/3 | 100 | 397 | 2292 | 2003 |
+| p14-spike-t2 | 3 | 3/3 | 127 | 508 | 3088 | 2652 |
+| p17-mover-t2 | 8 | 8/8 | 118 | 469 | 2948 | 2571 |
+| p19-gap-t3 | 5 | 5/5 | 145 | 578 | 3408 | 2942 |
+| p20-spike-t3 | 6 | 6/6 | 153 | 609 | 3316 | 2791 |
+| p23-mover-t3 | 11 | 11/11 | 230 | 919 | 3368 | 2521 |
+| p24-mixed-t3 | 4 | 4/4 | 145 | 580 | 3292 | 2900 |
+
+(The other sixteen rows are in the script's output; every row passes the same assertions.) **25 of
+25 plans compiled** — 24/24 practice levels and `l11` — with exact boundaries and margins.
+`l11` is the one route that reaches the flag with a rung unclosed (11 of 12): its last leg is the
+finish span. `l9-wait-and-climb` is the oracle-certified, planner-unroutable control: refused at
+depth 64 and still refused at 128 ("beatable in principle, but no timed route after 128
+expansions"), which is the report the warm start gives instead of cloning the walk.
+
+**B. The warm start.** Three arms on the suite's hard tail plus `l9` and `l11`; `g0/first` is the
+solved count at generation 0 and the first generation that solved anything.
+
+| level | legs | plan clone | random g0 / first | route g0 / first | plan g0 / first |
+|---|---|---|---|---|---|
+| p02-spike-t0 | 3 | died | 0/200 / g9 | 0/200 / g5 | 1/200 / g0 |
+| p14-spike-t2 | 3 | stuck | 0/200 / g21 | 0/200 / g7 | 0/200 / g1 |
+| p17-mover-t2 | 8 | died | 0/200 / — | 0/200 / g16 | 4/200 / g0 |
+| p18-mixed-t2 | 5 | died | 0/200 / g3 | 0/200 / g7 | 0/200 / g1 |
+| p19-gap-t3 | 5 | won | 0/200 / g1 | 26/200 / g0 | 26/200 / g0 |
+| p20-spike-t3 | 6 | died | 0/200 / — | 0/200 / g37 | 0/200 / g2 |
+| p22-crumble-t3 | 5 | stuck | 0/200 / g2 | 0/200 / g1 | 5/200 / g0 |
+| p23-mover-t3 | 11 | died | 0/200 / — | 0/200 / — | 0/200 / — |
+| l9-wait-and-climb | — | — | 0/200 / — | 0/200 / — | no plan (reported) |
+| l11-the-elements | 12 | died | 0/200 / — | 0/200 / — | 0/200 / — |
+
+Over the nine levels with a plan, **generation 0 solved: random 0, route 1, plan 4** (p02, p17,
+p19, p22). Where the plan arm did not solve outright it still reached a first solve sooner than
+both alternatives — p14 g1 against g21/g7, p18 g1 against g3/g7, p20 g2 against never/g37 — with
+two exceptions: p19 ties at g0, and p23 is unsolved by all three arms at 60 generations.
+
+### What the numbers say, and what they do not
+
+* **The plan is the warm start the route walk was not.** Four of nine levels are solved by
+  generation 0 from the plan clone, against one from the walk and none from random; on the spike
+  and mixed tiers the plan arm's first win is 3–10× sooner. That is the Phase 1 claim, measured on
+  the suite Phase 0 certified.
+* **`l11` is honest about its limit.** The plan routes (12 legs, 11 rungs, 35.8 s of its 48 s
+  budget unspent) and the window now uses it, but at 300 epochs the clone reproduces 84.7 % of the
+  decisions and dies on the first spike; no arm solved `l11` in 60 generations. The CLI's 3 000
+  epochs is the budget where the plan's clone reaches the second deck, so closing this needs
+  either that budget (≈60 s of startup) or Phase 2's leg learner — not a weaker fallback.
+* **The reported refusal works.** `l9` starts random and says why; it is not silently warmed from
+  the walk (which also solves nothing on it in 60 generations at pop 200).
+* **Cost is real.** The compiler is cheap; the DAgger warm start is not, and it blocks run start
+  for 6–9 s in the window. Moving it off the UI thread is the natural next step, not done here.
+
+### Gates
+
+`cargo clippy --workspace --all-targets -- -D warnings` is clean. `cargo test --workspace
+--no-fail-fast` runs all 21 test binaries and passes every test except one: `evo --test migration`'s
+saved-`l11` replay. That failure is the **working tree's** uncommitted edit to
+`levels/l11-the-elements.json` (an added obstacle chain), not this pass: the fixture's champion was
+recorded on HEAD's terrain (1567 frames) and the edited level ends the same policy at 49. Temporarily
+restoring HEAD's file makes the binary pass 3/3; the file is left exactly as it was found. Nothing
+in Phase 1 depends on that level's terrain — `l11`'s plan was compiled against the edited file and is
+the one quoted above.
+
+Files: `crates/sim/src/route_plan.rs` (artifact and compiler), `crates/evo/src/imitate.rs`
+(`from_certified_plan`), `crates/evo/src/telemetry.rs` (shared `leg_count`, per-level record),
+`crates/evo/src/ga.rs` (per-level suite pass and `GenerationReport::per_level`),
+`crates/app/src/lab.rs` (plan warm start, refusal note), `crates/train-cli/src/commands.rs`
+(`routeplan`, per-level JSONL), `tools/phase1_gate.py`.
