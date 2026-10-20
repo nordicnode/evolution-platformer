@@ -26,6 +26,7 @@
 
 pub mod hash;
 pub mod level;
+pub mod meta;
 pub mod physics;
 pub mod plan;
 pub mod practice;
@@ -40,6 +41,7 @@ mod route_cache;
 use crate::physics::tile_span;
 
 pub use crate::hash::StateHasher;
+pub use crate::meta::{MetaController, MetaPlay, Skill, SkillEvent, SkillTrace};
 pub use crate::level::{FlyerSpec, Level, PlatformSpec, Rect, Scenery, Tile, TurretSpec};
 pub use crate::physics::{
     AgentAction, Flyer, LavaBall, Mover, Physics, PlayerState, Shot, Turret, Walker, WalkerMode,

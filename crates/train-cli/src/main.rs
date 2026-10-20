@@ -467,6 +467,9 @@ TRAIN OPTIONS:
     --replan-depth <N>    Planner expansions for a correction planned from a divergent state.
                                                                                  [default 16]
     --dagger-rounds <N>   Whole-route DAgger rounds before the leg curriculum.    [default 2]
+    --no-meta             Turn the meta-controller off: the plan's blocks and the raw leg routes
+                          are the teacher, with no commit / wait / ride sequencing and no skill
+                          line in the clone report. `--from-plan` only. This is the Phase 2 arm.
     --route-seed <N>      Episode seed of the replay that produces the demonstration: the walk is
                           deterministic, so this is what makes a warm start reproducible.
                                                                     [default --seed]

@@ -214,12 +214,20 @@ fn warm_seed_from_plan_with(
         .as_ref()
         .map(|m| format!("; {}", m.line()))
         .unwrap_or_default();
+    // And what the *controller* did on the way: commit / wait / ride, with the leg and block each
+    // first fired on. Only printed when one fired — a note that always says "route 183" is noise.
+    let skills = report
+        .skills
+        .as_ref()
+        .filter(|s| s.counts()[1..].iter().any(|n| *n > 0))
+        .map(|s| format!("; {}", s.line()))
+        .unwrap_or_default();
     (
         Some(pop),
         format!(
             "warmed from this level's timed plan: {coverage} in {} blocks and {}; a genome was \
              cloned from the plan ({:.0}% of the demonstrated decisions reproduced) and {warm} of \
-             {} genomes start from that clone, the rest are random; {}{mastery}",
+             {} genomes start from that clone, the rest are random; {}{mastery}{skills}",
             plan.actions.len(),
             sim::format_time(plan.frames),
             report.agreement * 100.0,

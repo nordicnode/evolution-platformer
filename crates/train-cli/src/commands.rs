@@ -90,6 +90,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "leg-rollouts",
     "replan-depth",
     "dagger-rounds",
+    "no-meta",
     "route-seed",
     "curriculum",
     "curriculum-generations",
@@ -1567,6 +1568,10 @@ fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
         replan_depth: usage(a.usize_opt("replan-depth", ImitateConfig::default().replan_depth as usize))?
             as u32,
         dagger_rounds: usage(a.usize_opt("dagger-rounds", ImitateConfig::default().dagger_rounds))?,
+        // The meta-controller is on by default; `--no-meta` is the Phase 2 arm, where the plan's
+        // blocks and the raw leg routes are the teacher. It exists so a gate can compare the two
+        // teachers on the same tree rather than across commits.
+        meta: !a.has_flag("no-meta"),
         ..ImitateConfig::default()
     };
     let plan_cfg = sim::plan::PlanConfig {
