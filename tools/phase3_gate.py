@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Phase 3's acceptance gate: does the meta-controller's sequencing get a plan clone past the pinch?
+"""Phase 3's acceptance gate: do jump-margin labels move the seeds that die at the timed jump?
 
-Two arms, same level (`l11-the-elements`), same planner budget (depth 64), same fit budget (the
+Three arms, same level (`l11-the-elements`), same planner budget (depth 64), same fit budget (the
 window's 300 epochs), same population size and the same seed, differing only in the teacher:
 
-* `phase2`  — `--no-meta`: the plan's blocks and the raw leg routes are the teacher. This is the
-              arm Phase 2 shipped, and the baseline this gate is measured against.
-* `phase3`  — the same fit, with every demonstration and every leg correction sequenced by
-              `sim::meta`: route, commit (a jump held to its landing), wait (a window that is not
-              open), ride (a deck the body is standing on).
+* `baseline`  — `--no-meta --no-jump-labels`: the Phase 2 teacher. Corrections are planned only
+                when the student is off the demonstration's corridor.
+* `labels`    — `--no-meta`: the same, plus a correction planned from an on-corridor state whose
+                chosen action disagrees with the plan's nearest action about the jump button.
+* `phase3`    — the default: jump-margin labels plus the meta-controller's sequencing.
 
-The reading is paired by seed: legs cleared, the leg the episode ended in, the outcome and the
-death cause, plus the skill line the run prints (`skills route N, commit N, wait N, ride N; first
-commit leg L block B frame F`) so the gate can say *which behaviour fired and where*, not merely
-that a death moved.
+The reading is the per-seed leg distribution and the death cause, plus the count of jump-margin
+corrections the run reports (`; jump corrections N`) and the leg each was planned from (`leg L xN`)
+so the widening can be checked against the pinch rather than assumed to reach it.
 
 Usage:
     cargo build --release -p train-cli
@@ -35,7 +34,8 @@ LEVEL = ROOT / "levels" / "l11-the-elements.json"
 PLAN_DEPTH = 64
 CLONE_EPOCHS = 300
 ARMS = {
-    "phase2": ["--no-meta"],
+    "baseline": ["--no-meta", "--no-jump-labels"],
+    "labels": ["--no-meta"],
     "phase3": [],
 }
 MASTERY = re.compile(
@@ -44,6 +44,8 @@ MASTERY = re.compile(
 PLAYS = re.compile(r"clone plays (\w+) after (\d+) frames .*best_x ([\d.]+)(?:, killed by ([\w ]+))?")
 SKILLS = re.compile(r"demo skills route (\d+), commit (\d+), wait (\d+), ride (\d+)[^\n]*")
 FIRST = re.compile(r"first (\w+) leg (\d+) block (\d+) frame (\d+)")
+JUMP = re.compile(r"jump corrections (\d+)(?: \(([^)]*)\))?")
+JUMP_LEG = re.compile(r"leg (\d+) x(\d+)")
 PLAN_TIME = re.compile(r"\(seed \d+, ([\d.]+)s\)")
 
 
@@ -77,6 +79,8 @@ def run_arm(seed, arm, out):
         "cause": None,
         "skills": None,
         "firsts": [],
+        "jump": None,
+        "jump_legs": {},
         "seconds": None,
     }
     if m := MASTERY.search(text):
@@ -95,6 +99,10 @@ def run_arm(seed, arm, out):
             row["firsts"].append(
                 {"skill": f.group(1), "leg": int(f.group(2)), "block": int(f.group(3)), "frame": int(f.group(4))}
             )
+    if m := JUMP.search(text):
+        row["jump"] = int(m.group(1))
+        for leg, n in JUMP_LEG.findall(m.group(2) or ""):
+            row["jump_legs"][int(leg)] = int(n)
     if m := PLAN_TIME.search(text):
         row["seconds"] = float(m.group(1))
     if row["legs"] is None:
@@ -113,23 +121,23 @@ def main():
     rows = []
     for arm in ARMS:
         for seed in range(1, args.seeds + 1):
-            print(f"{arm:7s} seed {seed}", flush=True)
+            print(f"{arm:8s} seed {seed}", flush=True)
             rows.append(run_arm(seed, arm, out))
     (out / "phase3-gate.json").write_text(json.dumps(rows, indent=2))
 
     lines = [
-        "## Phase 3 gate: the meta-controller against the Phase 2 teacher, per seed",
+        "## Phase 3 gate: jump-margin labels and the meta-controller, per seed",
         "",
         f"`l11-the-elements`, timed plan at depth {PLAN_DEPTH}, clone at {CLONE_EPOCHS} epochs"
-        f" (the window's fit budget), pop 8, seeds 1-{args.seeds}.",
+        f" (the window's fit budget), pop 8, seeds 1-{args.seeds}, all three arms on one tree.",
         "",
-        "| arm | seeds | legs cleared (mean / median / min-max) | past leg 1 | deaths | end legs | plan+fit s |",
-        "|---|---|---|---|---|---|---|",
+        "| arm | seeds | legs cleared (mean / median / min-max) | past leg 1 | deaths | end legs | jump corrections | jump legs | plan+fit s |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for arm in ARMS:
         arm_rows = [r for r in rows if r["arm"] == arm and r["legs"] is not None]
         if not arm_rows:
-            lines.append(f"| {arm} | 0 | — | — | — | — | — |")
+            lines.append(f"| {arm} | 0 | — | — | — | — | — | — | — |")
             continue
         legs = [r["legs"] for r in arm_rows]
         past = sum(1 for r in arm_rows if r["legs"] >= 2)
@@ -138,34 +146,47 @@ def main():
             causes[r["cause"] or r["outcome"] or "none"] = causes.get(r["cause"] or r["outcome"] or "none", 0) + 1
         cause_txt = ", ".join(f"{k} {v}" for k, v in sorted(causes.items()))
         ends = ",".join(str(r["end_leg"]) for r in arm_rows)
+        jumps = sum(r["jump"] or 0 for r in arm_rows)
+        legs_seen: dict[int, int] = {}
+        for r in arm_rows:
+            for leg, n in r["jump_legs"].items():
+                legs_seen[leg] = legs_seen.get(leg, 0) + n
+        jump_legs = ", ".join(f"{leg}:{n}" for leg, n in sorted(legs_seen.items())) or "—"
         secs = [r["seconds"] for r in arm_rows if r["seconds"] is not None]
         clock = f"{statistics.mean(secs):.2f}" if secs else "—"
         lines.append(
             f"| {arm} | {len(arm_rows)} | {statistics.mean(legs):.2f} / "
             f"{statistics.median(legs):.1f} / {min(legs)}-{max(legs)} | {past}/{len(arm_rows)} | "
-            f"{cause_txt} | {ends} | {clock} |"
-        )
-    lines += ["", "### Paired by seed", "", "| seed | phase2 legs | phase3 legs | phase2 ended / cause | phase3 ended / cause | phase3 skills (route/commit/wait/ride) | firsts |", "|---|---|---|---|---|---|---|"]
-    by = {(r["arm"], r["seed"]): r for r in rows}
-    improved = []
-    for seed in range(1, args.seeds + 1):
-        a, b = by.get(("phase2", seed)), by.get(("phase3", seed))
-        if not a or not b or a["legs"] is None or b["legs"] is None:
-            lines.append(f"| {seed} | — | — | — | — | — | — |")
-            continue
-        if b["legs"] > a["legs"]:
-            improved.append(seed)
-        firsts = "; ".join(
-            f"{f['skill']} leg {f['leg']} block {f['block']} frame {f['frame']}" for f in b["firsts"]
-        ) or "—"
-        lines.append(
-            f"| {seed} | {a['legs']} | {b['legs']} | {a['end_leg']} / {a['cause'] or a['outcome']} | "
-            f"{b['end_leg']} / {b['cause'] or b['outcome']} | "
-            f"{'/'.join(map(str, b['skills'])) if b['skills'] else '—'} | {firsts} |"
+            f"{cause_txt} | {ends} | {jumps} | {jump_legs} | {clock} |"
         )
     lines += [
         "",
-        f"Seeds where the meta-controller arm cleared more legs: {improved or 'none'}.",
+        "### Paired by seed",
+        "",
+        "| seed | baseline legs | labels legs | phase3 legs | baseline ended / cause | phase3 ended / cause | jump corrections | phase3 skills (route/commit/wait/ride) | firsts |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    by = {(r["arm"], r["seed"]): r for r in rows}
+    improved = []
+    for seed in range(1, args.seeds + 1):
+        a, b, c = by.get(("baseline", seed)), by.get(("labels", seed)), by.get(("phase3", seed))
+        if not a or not b or not c or a["legs"] is None or b["legs"] is None or c["legs"] is None:
+            lines.append(f"| {seed} | — | — | — | — | — | — | — | — |")
+            continue
+        if c["legs"] > a["legs"]:
+            improved.append(seed)
+        firsts = "; ".join(
+            f"{f['skill']} leg {f['leg']} block {f['block']} frame {f['frame']}" for f in c["firsts"]
+        ) or "—"
+        lines.append(
+            f"| {seed} | {a['legs']} | {b['legs']} | {c['legs']} | {a['end_leg']} / {a['cause'] or a['outcome']} | "
+            f"{c['end_leg']} / {c['cause'] or c['outcome']} | {c['jump'] or 0}"
+            f"{' (' + ', '.join(f'leg {k} x{v}' for k, v in sorted(c['jump_legs'].items())) + ')' if c['jump_legs'] else ''} | "
+            f"{'/'.join(map(str, c['skills'])) if c['skills'] else '—'} | {firsts} |"
+        )
+    lines += [
+        "",
+        f"Seeds where the meta-controller arm cleared more legs than the Phase 2 teacher: {improved or 'none'}.",
         "",
     ]
     report = "\n".join(lines)

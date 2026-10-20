@@ -152,7 +152,8 @@ pub struct ImitateConfig {
     pub replan_depth: u32,
     /// Planner calls one rollout may spend before it falls back to the nearest demonstrated
     /// action. A correction route covers several blocks, and replanning is only asked for when the
-    /// student is off the demonstrated corridor, so this is a budget on distinct divergences.
+    /// student is off the demonstrated corridor or disagreeing with it about the jump button, so
+    /// this is a budget on distinct divergences of either kind.
     pub replan_cap: usize,
     /// Whole-route DAgger rounds, before the leg curriculum. Two is deliberate: a whole-route pass
     /// teaches recovery along the route, and the curriculum is what spends the budget where the
@@ -163,6 +164,11 @@ pub struct ImitateConfig {
     /// which owns commit / wait / ride. Off, the plan's blocks and the raw leg routes are the
     /// teacher and the report has no skill trace — the Phase 2 arm.
     pub meta: bool,
+    /// Label an **on-corridor** state whose chosen action disagrees with the nearest demonstrated
+    /// action about the jump button, by planning from the student's own snapshot. On by default;
+    /// the switch exists so the gate can measure the widening on the same tree (`--no-jump-labels`
+    /// is the Phase 2 teacher).
+    pub jump_labels: bool,
 }
 
 impl Default for ImitateConfig {
@@ -181,6 +187,7 @@ impl Default for ImitateConfig {
             replan_cap: 8,
             dagger_rounds: 2,
             meta: true,
+            jump_labels: true,
         }
     }
 }
@@ -209,6 +216,16 @@ pub struct ImitationReport {
     /// What the meta-controller decided while producing the demonstration: route, commit, wait,
     /// ride, with the leg and block each first fired in. `None` when the controller was off.
     pub skills: Option<sim::meta::SkillTrace>,
+    /// Corrections planned at an **on-corridor jump disagreement**: the student stood on the
+    /// demonstration's own corridor but wanted a different jump-button state from the plan's
+    /// nearest action, so a fresh local search labelled that state. Bounded by
+    /// [`ImitateConfig::replan_cap`] per rollout and reported so a widening can be measured rather
+    /// than assumed; zero for a route walk or a run with no DAgger.
+    pub jump_corrections: usize,
+    /// Those corrections **by the leg they were planned from**, `jump_legs[leg]` per leg. The
+    /// total says the widening fires; this says which crossing it reaches, which is what a gate
+    /// has to read to know whether the label got to the failure or was spent on an earlier jump.
+    pub jump_legs: Vec<usize>,
 }
 
 /// What one leg of the plan did for the clone: did it get there, did it leave it, and did the
@@ -338,6 +355,19 @@ impl ImitationReport {
             // would read as the fitted policy's habits and be wrong by a mile.
             out.push_str("; demo ");
             out.push_str(&skills.line());
+        }
+        if self.jump_corrections > 0 {
+            out.push_str(&format!("; jump corrections {}", self.jump_corrections));
+            let legs: Vec<String> = self
+                .jump_legs
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| **n > 0)
+                .map(|(leg, n)| format!("leg {leg} x{n}"))
+                .collect();
+            if !legs.is_empty() {
+                out.push_str(&format!(" ({})", legs.join(", ")));
+            }
         }
         out
     }
@@ -676,6 +706,8 @@ pub fn clone_from_play_init(
         best_epoch,
         mastery: None,
         skills: None,
+        jump_corrections: 0,
+        jump_legs: Vec::new(),
     })
 }
 
@@ -805,6 +837,7 @@ pub fn from_certified_plan(
     let mut report = clone_from_play(&play, shape.clone(), &fit)?;
     let mut dataset = play.clone();
     let mut best_mastery = measure_mastery(level, &report.genome, plan, eval, route.seed);
+    let mut jump_legs: Vec<usize> = Vec::new();
     // **DAgger, with the planner as a replanning expert.** A closed-loop behaviour clone leaves
     // the demonstration's corridor at its first mistake and then has no label for the states it
     // actually visits. Each round rolls the *best* student out on the real sim, asks the planner
@@ -814,7 +847,7 @@ pub fn from_certified_plan(
     // states that student had to recover from; the returned student is the best one the closed
     // loop measured, not the one the fit liked.
     for _round in 0..cfg.dagger_rounds {
-        let extra = replanning_rollout(
+        let (extra, jumps) = replanning_rollout(
             level,
             &report.genome,
             Sim::new(level, route.seed),
@@ -825,6 +858,7 @@ pub fn from_certified_plan(
             cfg,
             route.seed ^ 0xDA6_6E2,
         );
+        count_jump_legs(&mut jump_legs, &jumps);
         if extra.is_empty() {
             break;
         }
@@ -873,7 +907,7 @@ pub fn from_certified_plan(
             + 24;
         let mut added = 0usize;
         for k in 0..cfg.leg_rollouts.max(1) {
-            let lesson = replanning_rollout(
+            let (lesson, jumps) = replanning_rollout(
                 level,
                 &report.genome,
                 start.clone(),
@@ -884,6 +918,7 @@ pub fn from_certified_plan(
                 cfg,
                 route.seed ^ (0x1E6_0000 | (weak as u64) << 8 | k as u64),
             );
+            count_jump_legs(&mut jump_legs, &jumps);
             if !lesson.is_empty() {
                 added += lesson.len();
                 dataset.segments.push(dataset.decisions.len());
@@ -909,6 +944,8 @@ pub fn from_certified_plan(
     }
     report.mastery = Some(best_mastery);
     report.skills = skills;
+    report.jump_corrections = jump_legs.iter().sum();
+    report.jump_legs = jump_legs;
     Ok((play, report))
 }
 
@@ -988,11 +1025,24 @@ fn leg_start(level: &Level, plan: &RoutePlan, leg: u32, eval: &EvalConfig) -> Op
 /// own snapshot, so every correction is the teacher's answer to the student's state.
 ///
 /// Replanning is bounded twice: `cfg.replan_cap` fresh searches per rollout, and a search only
-/// when the student is **off the demonstrated corridor**. `nearest_d` at or below
-/// [`DIVERGENCE`] means the state is one the demonstration itself visited (the observations are
-/// block-aligned, so an on-route body matches exactly), and the demonstrated action is the correct
-/// label there — asking the planner again at those states was measured to replan at every block of
-/// the corridor while producing the same label, and to spend the whole budget before the failure.
+/// when the student is **off the demonstrated corridor** or **on it but disagreeing about the jump
+/// button**.
+///
+/// `nearest_d` at or below [`DIVERGENCE`] means the state is one the demonstration itself visited
+/// (the observations are block-aligned, so an on-route body matches exactly), and for most blocks
+/// the demonstrated action is the correct label there — asking the planner again at every corridor
+/// block was measured to replan at every step while producing the same label. But the corridor is
+/// not uniform: at a timed jump, two adjacent demonstrated states differ by a fraction of a tile
+/// and by the whole jump decision, and the student that stands between them gets the *previous*
+/// state's action. That is the pinch five of eight `l11` clones died in, and no epoch budget can
+/// fit a state the demonstration labels wrongly. The margin that matters there is the jump button:
+/// when the student's chosen action and the nearest demonstrated action disagree about
+/// [`AgentAction::wants_jump`], the state is planned from the student's own snapshot exactly like
+/// an off-corridor divergence.
+///
+/// The extra labels are bounded by `replan_cap` per rollout and counted in
+/// [`ImitationReport::jump_corrections`]; the returned legs say which crossing each was planned
+/// from.
 #[allow(clippy::too_many_arguments)]
 fn replanning_rollout(
     level: &Level,
@@ -1004,7 +1054,7 @@ fn replanning_rollout(
     blocks: usize,
     cfg: &ImitateConfig,
     seed: u64,
-) -> Vec<Decision> {
+) -> (Vec<Decision>, Vec<usize>) {
     let repeat = eval.action_repeat.max(1);
     let plan_cfg = sim::plan::PlanConfig {
         depth: cfg.replan_depth.max(1),
@@ -1016,12 +1066,36 @@ fn replanning_rollout(
     let mut expert: Option<(sim::plan::TimedRoute, sim::meta::MetaController)> = None;
     let mut cursor = 0usize;
     let mut replans = 0usize;
+    let mut jump_legs: Vec<usize> = Vec::new();
+    // **One leg, not the level.** The target is the next route crossing, so the search is local
+    // even when the student is a whole deck behind the plan; asking for "finish the level" from
+    // here would pay for the corridor twice and fail at any realistic depth.
+    let correction = |sim: &Sim, replans: &mut usize| {
+        if *replans >= cfg.replan_cap {
+            return None;
+        }
+        *replans += 1;
+        let target = sim.stats().route_hops_closed + 1;
+        let route = sim::plan::plan_leg(level, sim.clone(), seed, target, plan_cfg).route?;
+        // The local route's blocks all belong to this leg; the meta-controller owns the
+        // commit / wait / ride decision over them, so a correction at a hazard is the
+        // controller's answer from this state rather than a raw plan block.
+        let leg = sim.stats().route_hops_closed;
+        let controller = sim::meta::MetaController::from_route(route.actions.clone(), leg);
+        Some((route, controller))
+    };
     for _ in 0..blocks {
         if sim.outcome().is_finished() {
             break;
         }
         let observation = sim.observation_into(&mut obs);
+        let student = genome.act(&observation, &mut scratch);
         let near = nearest_distance(demonstration, &observation);
+        let demonstrated = nearest_action(demonstration, &observation);
+        // **The jump button is the margin that matters at a jump.** Two horizontal gears at the
+        // same crossing are a fit detail; a missed or wasted jump ends the episode.
+        let jump_disagrees = student.wants_jump() != demonstrated.wants_jump();
+        let on_corridor = near <= DIVERGENCE;
         let spent = if cfg.meta {
             expert
                 .as_ref()
@@ -1031,44 +1105,35 @@ fn replanning_rollout(
                 .as_ref()
                 .is_none_or(|(route, _)| cursor >= route.actions.len())
         };
-        if near <= DIVERGENCE {
-            // On the demonstration's own corridor: its action is the teacher.
-            expert = None;
+        if on_corridor {
+            // The demonstration is the teacher on its own corridor — except at the jump margin,
+            // where the nearest demonstrated state's answer belongs to a fractionally different
+            // body and is the wrong label for this one.
             cursor = 0;
-        } else if spent
-        {
-            expert = None;
-            cursor = 0;
-            if replans < cfg.replan_cap {
-                replans += 1;
-                // **One leg, not the level.** The target is the next route crossing, so the
-                // search is local even when the student is a whole deck behind the plan; asking
-                // for "finish the level" from here would pay for the corridor twice and fail at
-                // any realistic depth.
-                let target = sim.stats().route_hops_closed + 1;
-                if let Some(route) = sim::plan::plan_leg(level, sim.clone(), seed, target, plan_cfg).route
-                {
-                    // The local route's blocks all belong to this leg; the meta-controller owns
-                    // the commit / wait / ride decision over them, so a correction at a hazard is
-                    // the controller's answer from this state rather than a raw plan block.
-                    let leg = sim.stats().route_hops_closed;
-                    let controller = sim::meta::MetaController::from_route(route.actions.clone(), leg);
-                    expert = Some((route, controller));
+            expert = if cfg.jump_labels && jump_disagrees {
+                let correction = correction(&sim, &mut replans);
+                if correction.is_some() {
+                    jump_legs.push(sim.stats().route_hops_closed as usize);
                 }
-            }
+                correction
+            } else {
+                None
+            };
+        } else if spent {
+            cursor = 0;
+            expert = correction(&sim, &mut replans);
         }
         let advice = match expert.as_mut() {
             // The controller owns the sequencing over a local route when the pass asked for it;
             // otherwise the route's blocks are the teacher, which is the Phase 2 arm.
             Some((_, controller)) if cfg.meta => controller.decide(&sim).0,
             Some((route, _)) if cursor < route.actions.len() => route.actions[cursor],
-            _ => nearest_action(demonstration, &observation),
+            _ => demonstrated,
         };
         out.push(Decision {
             observation,
             action: advice,
         });
-        let student = genome.act(&observation, &mut scratch);
         for _ in 0..repeat {
             sim.step(student);
             if sim.outcome().is_finished() {
@@ -1085,7 +1150,17 @@ fn replanning_rollout(
             cursor += 1;
         }
     }
-    out
+    (out, jump_legs)
+}
+
+/// Fold one rollout's jump-margin corrections into a per-leg count, growing it as needed.
+fn count_jump_legs(counts: &mut Vec<usize>, legs: &[usize]) {
+    if let Some(&last) = legs.iter().max() {
+        counts.resize(counts.len().max(last + 1), 0);
+    }
+    for &leg in legs {
+        counts[leg] += 1;
+    }
 }
 
 /// Squared observation distance at or below which the student is **on the demonstration's own

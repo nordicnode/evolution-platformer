@@ -470,6 +470,9 @@ TRAIN OPTIONS:
     --no-meta             Turn the meta-controller off: the plan's blocks and the raw leg routes
                           are the teacher, with no commit / wait / ride sequencing and no skill
                           line in the clone report. `--from-plan` only. This is the Phase 2 arm.
+    --no-jump-labels      Do not plan a correction from an on-corridor state whose chosen action
+                          disagrees with the plan's about the jump button. `--from-plan` only.
+                          With --no-meta this is exactly the Phase 2 teacher.
     --route-seed <N>      Episode seed of the replay that produces the demonstration: the walk is
                           deterministic, so this is what makes a warm start reproducible.
                                                                     [default --seed]
