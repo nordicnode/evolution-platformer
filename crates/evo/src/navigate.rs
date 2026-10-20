@@ -204,13 +204,17 @@ pub fn aim_point(sim: &Sim) -> (f32, f32) {
     let player = sim.player();
     let cx = player.x + player.w * 0.5;
     let cy = player.y + player.h * 0.5;
-    let goal = level.goals.first().map(|g| (g.x + g.w * 0.5, g.y + g.h * 0.5));
+    let goal = level
+        .goals
+        .first()
+        .map(|g| (g.x + g.w * 0.5, g.y + g.h * 0.5));
     let stand = sim.route_stand().or(sim.stats().best_stand);
-    let waypoint = stand
-        .and_then(|stand| level.routes().next_waypoint(stand, cx, level.goals.first().copied()));
-    waypoint
-        .or(goal)
-        .unwrap_or((cx, cy))
+    let waypoint = stand.and_then(|stand| {
+        level
+            .routes()
+            .next_waypoint(stand, cx, level.goals.first().copied())
+    });
+    waypoint.or(goal).unwrap_or((cx, cy))
 }
 
 /// Choose one decision block by searching the simulator.
@@ -324,8 +328,7 @@ fn value(sim: &Sim, aim: (f32, f32), cfg: ThinkConfig) -> f32 {
     // action that clears a spike before it lands. `progress_pixels` is the sim's
     // monotone best-ever approach to the flag, which a good jump improves immediately.
     let progress = stats.progress_pixels * 0.5;
-    -distance * cfg.aim_weight * 0.25 + progress - hops * cfg.hop_weight + landings * 6.0
-        - time
+    -distance * cfg.aim_weight * 0.25 + progress - hops * cfg.hop_weight + landings * 6.0 - time
 }
 
 /// Keep a beam without throwing away an option before its payoff.
@@ -389,11 +392,7 @@ pub fn planned_actions(
 ) -> Option<Vec<AgentAction>> {
     let outcome = sim::plan::plan_level(level, seed, cfg);
     let route = outcome.route?;
-    let play = crate::route_play::timed_play(
-        level,
-        &route,
-        &crate::fitness::EvalConfig::default(),
-    );
+    let play = crate::route_play::timed_play(level, &route, &crate::fitness::EvalConfig::default());
     play.won().then(|| {
         play.decisions
             .iter()

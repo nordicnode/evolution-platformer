@@ -394,12 +394,8 @@ impl Replay {
         // this second.
         if let Some(runner) = self.runners.first() {
             let p = runner.sim().player();
-            let (water, lava) = crate::sound::proximity(
-                &self.level,
-                p.x + p.w * 0.5,
-                p.y + p.h * 0.5,
-                p.in_water,
-            );
+            let (water, lava) =
+                crate::sound::proximity(&self.level, p.x + p.w * 0.5, p.y + p.h * 0.5, p.in_water);
             crate::sound::set_ambience(water, lava);
         }
     }
@@ -1314,7 +1310,10 @@ mod tests {
         run_to_end(&mut replay, 4_000);
         let done = replay.summary();
         assert!(
-            done.contains(&format!("recorded {}", format_fitness(replay.star().fitness))),
+            done.contains(&format!(
+                "recorded {}",
+                format_fitness(replay.star().fitness)
+            )),
             "the record the replay has to match is not on the line: {done}"
         );
         assert!(done.contains(replay.star().outcome.as_str()), "{done}");
@@ -1348,7 +1347,10 @@ mod tests {
         assert_eq!(replay.ghost_count(), packet.agents.len());
         let line = replay.summary();
         assert!(
-            !line.contains(&format!("generation {}", replay.population().generation + 1)),
+            !line.contains(&format!(
+                "generation {}",
+                replay.population().generation + 1
+            )),
             "the strip names the field's own generation: {line}"
         );
     }

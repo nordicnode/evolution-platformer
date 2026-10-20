@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sim::{AgentAction, Level};
 
-use crate::fitness::{EvalConfig, EpisodeResult};
+use crate::fitness::{EpisodeResult, EvalConfig};
 use crate::genome::Genome;
 use crate::technique::TECHNIQUE_RULES;
 
@@ -358,12 +358,7 @@ mod tests {
     fn a_technique_fires_at_its_threshold_and_nowhere_else() {
         let level = level();
         let genome = crate::genome::Genome::zeros(1, crate::genome::default_shape());
-        let mut result = crate::fitness::run_episode(
-            &level,
-            &genome,
-            &EvalConfig::default(),
-            1,
-        );
+        let mut result = crate::fitness::run_episode(&level, &genome, &EvalConfig::default(), 1);
         // A synthetic reading, because the point is the table and not the episode: a genome
         // that has not learned the level cannot be asked to stomp three walkers on demand.
         result.max_stomp_chain = 2;
@@ -402,13 +397,17 @@ mod tests {
             "a rediscovery is not a new entry"
         );
         assert_eq!(
-            codex.entries()[0].frames, 300,
+            codex.entries()[0].frames,
+            300,
             "the evidence attached is the quicker run"
         );
-        assert_eq!(codex.record_all(vec![
-            discovery("Corpse Bridge", 200, None),
-            discovery("Fusesurf", 250, None),
-        ]), vec!["Fusesurf".to_string()]);
+        assert_eq!(
+            codex.record_all(vec![
+                discovery("Corpse Bridge", 200, None),
+                discovery("Fusesurf", 250, None),
+            ]),
+            vec!["Fusesurf".to_string()]
+        );
         assert_eq!(codex.len(), 2);
     }
 

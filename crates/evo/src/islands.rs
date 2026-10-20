@@ -115,9 +115,7 @@ impl Islands {
         let islands = populations
             .into_iter()
             .enumerate()
-            .map(|(i, genomes)| {
-                Trainer::resume(config.island_config(i), genomes, generation)
-            })
+            .map(|(i, genomes)| Trainer::resume(config.island_config(i), genomes, generation))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Islands {
             config,

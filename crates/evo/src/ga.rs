@@ -1158,7 +1158,8 @@ pub fn evaluate_suite(
         .map(|g| suite_score(levels, g, cfg, generation))
         .collect();
     let mut results = Vec::with_capacity(scored.len());
-    let mut per_level: Vec<Vec<EpisodeResult>> = vec![Vec::with_capacity(scored.len()); levels.len()];
+    let mut per_level: Vec<Vec<EpisodeResult>> =
+        vec![Vec::with_capacity(scored.len()); levels.len()];
     for (row, _means, level_rows) in scored {
         results.push(row);
         for (li, episode) in level_rows.into_iter().enumerate() {
@@ -1251,7 +1252,8 @@ fn evaluate_suite_raced(
     }
 
     let mut results = Vec::with_capacity(tallies.len());
-    let mut per_level: Vec<Vec<EpisodeResult>> = vec![Vec::with_capacity(tallies.len()); levels.len()];
+    let mut per_level: Vec<Vec<EpisodeResult>> =
+        vec![Vec::with_capacity(tallies.len()); levels.len()];
     for tally in tallies {
         let (row, level_rows) = tally.into_parts(levels.len());
         results.push(row);
@@ -1259,13 +1261,7 @@ fn evaluate_suite_raced(
             per_level[li].push(episode);
         }
     }
-    (
-        SuitePass {
-            results,
-            per_level,
-        },
-        spent,
-    )
+    (SuitePass { results, per_level }, spent)
 }
 
 /// The seed of one episode of one genome, under this run's own episode policy.
@@ -2704,10 +2700,7 @@ impl Trainer {
                 .total_cmp(&results[a].mean_fitness)
                 .then(a.cmp(&b))
         });
-        let elite = self
-            .config
-            .elite
-            .min(order.len().saturating_sub(1));
+        let elite = self.config.elite.min(order.len().saturating_sub(1));
         let mut cfg = self.config.clone();
         cfg.trials = self.config.effective_trials(&levels[0]) + 1;
         cfg.auto_trials = false;
@@ -2934,10 +2927,7 @@ impl Trainer {
                 )
             })
             .collect();
-        let telemetry = per_level
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        let telemetry = per_level.first().cloned().unwrap_or_default();
 
         // ---- the run's record, settled on worlds no generation drew --------------------------
         //
@@ -7048,7 +7038,10 @@ mod tests {
         assert_eq!(raced.results.len(), trainer.genomes.len());
         assert_eq!(raced.per_level.len(), levels.len());
         assert!(
-            raced.results.iter().all(|r| r.suite_wins <= levels.len() as u32),
+            raced
+                .results
+                .iter()
+                .all(|r| r.suite_wins <= levels.len() as u32),
             "a race still counts suite wins the way a flat pass does"
         );
     }

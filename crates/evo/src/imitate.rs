@@ -108,8 +108,8 @@
 
 use sim::physics::AgentAction;
 use sim::rng::rng_from_seed;
-use sim::sensors::N_INPUTS;
 use sim::route_plan::RoutePlan;
+use sim::sensors::N_INPUTS;
 use sim::{Level, ObservationScratch, Outcome, Sim};
 
 use crate::fitness::EvalConfig;
@@ -292,10 +292,7 @@ impl LegMastery {
         if self.won {
             return None;
         }
-        self.legs
-            .iter()
-            .find(|leg| !leg.cleared)
-            .map(|leg| leg.leg)
+        self.legs.iter().find(|leg| !leg.cleared).map(|leg| leg.leg)
     }
 
     /// Ordering for "is this student better": a win first, then legs cleared, then progress.
@@ -1271,11 +1268,7 @@ pub fn measure_mastery(
     }
     let outcome = sim.outcome();
     let won = outcome == Outcome::Won;
-    let end_leg = if n == 0 {
-        0
-    } else {
-        hops.min(n as u32 - 1)
-    };
+    let end_leg = if n == 0 { 0 } else { hops.min(n as u32 - 1) };
     let legs = (0..n)
         .map(|i| {
             let i32l = i as u32;
@@ -1403,11 +1396,7 @@ mod tests {
                 .map(|i| LegSkill {
                     leg: i,
                     reached: crossings >= i,
-                    cleared: if i == 2 {
-                        won
-                    } else {
-                        crossings > i
-                    },
+                    cleared: if i == 2 { won } else { crossings > i },
                     ended: !won && crossings.min(2) == i,
                     frames: 10,
                 })
@@ -1424,7 +1413,11 @@ mod tests {
         let one = skills(1, false);
         assert_eq!(one.weakest(), Some(1));
         assert_eq!(one.cleared(), 1);
-        assert_eq!(skills(2, false).weakest(), Some(2), "the finish leg is the gap");
+        assert_eq!(
+            skills(2, false).weakest(),
+            Some(2),
+            "the finish leg is the gap"
+        );
         assert_eq!(skills(2, true).weakest(), None);
         assert!(skills(2, true).rank() > skills(2, false).rank());
         assert!(skills(1, false).rank() > skills(0, false).rank());

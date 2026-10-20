@@ -177,9 +177,7 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
             }
             "--champions" => lab.champions = PathBuf::from(value("--champions")?),
             "--resume" => lab.resume = Some(PathBuf::from(value("--resume")?)),
-            "--from-champion" => {
-                lab.from_champion = Some(PathBuf::from(value("--from-champion")?))
-            }
+            "--from-champion" => lab.from_champion = Some(PathBuf::from(value("--from-champion")?)),
             // The easier level is *not* read here: whether it exists is the app's answer,
             // because it is the run that needs it, and a run that is never started must
             // not fail over a file it would never have opened.

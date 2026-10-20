@@ -183,12 +183,11 @@ pub struct Bevel {
     pub content: Rect,
     /// The face's fill.
     pub fill: Color32,
-    /// The lit edge: along the top when resting, along the bottom when pressed.
-    pub light: Color32,
-    /// The shaded edge: the other of the two.
-    pub dark: Color32,
     /// The content's colour.
     pub text: Color32,
+    /// Whether the plate is pushed in: the one state that lowers it onto its socket instead of
+    /// standing above it.
+    pub pressed: bool,
 }
 
 /// Resolve one control's look. Pure: no `Ui`, no painter, no input.
@@ -204,57 +203,30 @@ pub fn bevel(state: PlateState, rect: Rect) -> Bevel {
     // keyline around a pressed tile in the game's own art is two pixels — a one-pixel rim at
     // forty points is a hairline the eye reads as anti-aliasing rather than as an outline.
     let face = rect.shrink(2.0);
-    // The content is inset far enough that an icon or a word never touches the lip, and the
+    // The content is inset far enough that an icon or a word never touches the outline, and the
     // pressed sink is applied *here* rather than to the face: a face that moved would take the
-    // socket's lit edge with it, and the two edges are what say which way the plate went.
+    // plate's own boundary with it.
     let mut content = face.shrink(CELL_PAD);
     if pressed {
         content = content.translate(Vec2::new(0.0, theme::PRESS_SINK));
     }
 
-    // The five faces, in the order they are tested. Two of them are worth a word, because on a
-    // *light* chrome the depth has to be carried by the shaded edge rather than the lit one: a
-    // white top edge on a near-white face is invisible, so a resting plate reads as raised
-    // because of what is under it and because it casts a shadow, not because of a highlight.
-    let (fill, light, dark, text) = if !state.enabled {
-        (
-            theme::CARD_OFF,
-            theme::CONTROL_EDGE.gamma_multiply(0.55),
-            theme::CONTROL_EDGE,
-            theme::TEXT_FAINT,
-        )
+    // The five faces, in the order they are tested. Depth is not one of these: a raised plate
+    // casts a shadow and a pressed one does not (see [`paint`]), which is a fact about where the
+    // plate is rather than about its colour. Two of the faces are worth a word — a selected
+    // plate is the palette's gold with the frame's ink on it, so it reads as *chosen* rather than
+    // as lit, and a pressed plate darkens because less light reaches a face that has gone into
+    // its socket.
+    let (fill, text) = if !state.enabled {
+        (theme::CARD_OFF, theme::TEXT_FAINT)
     } else if state.selected {
-        (
-            theme::ACCENT,
-            theme::ACCENT.gamma_multiply(1.22),
-            theme::GOLD_EDGE.gamma_multiply(0.72),
-            theme::INK_ON_ACCENT,
-        )
+        (theme::ACCENT, theme::INK_ON_ACCENT)
     } else if pressed {
-        (
-            // Pressed is darker *and* inset: the face has gone into its socket, so less light
-            // reaches it.
-            theme::CARD.gamma_multiply(0.9),
-            // Inverted on purpose: the light is under the content and the shadow above it, which
-            // is what a face pushed *into* its socket looks like from the front.
-            theme::BEVEL_DARK,
-            theme::BEVEL_LIGHT,
-            theme::TEXT,
-        )
+        (theme::CARD.gamma_multiply(0.9), theme::TEXT)
     } else if state.hovered {
-        (
-            theme::CARD_HOVER,
-            theme::BEVEL_LIGHT,
-            theme::BEVEL_DARK,
-            theme::TEXT,
-        )
+        (theme::CARD_HOVER, theme::TEXT)
     } else {
-        (
-            theme::CARD,
-            theme::BEVEL_LIGHT,
-            theme::BEVEL_DARK,
-            theme::TEXT,
-        )
+        (theme::CARD, theme::TEXT)
     };
 
     Bevel {
@@ -262,40 +234,40 @@ pub fn bevel(state: PlateState, rect: Rect) -> Bevel {
         face,
         content,
         fill,
-        light,
-        dark,
         text,
+        pressed,
     }
 }
 
-/// Paint a resolved plate: the socket, the face, then its two edges.
+/// How far a resting plate's shadow falls below it.
+///
+/// **No line is drawn on a plate's face at all.** It has had two goes at a bevel — a pair of
+/// one-pixel bars inset from the face's sides, then a lit rim with a shaded lip — and both read
+/// as a line lying across the control rather than as its shape, on the cream plates this window
+/// is made of. The depth is a shadow *under* the plate and the plate's own outline; the face is
+/// one colour, edge to edge, with nothing drawn on it but the icon and the word.
+const LIFT: f32 = 2.0;
+
+/// Paint a resolved plate: its shadow, its socket, and its one flat face.
 pub fn paint(painter: &Painter, b: &Bevel) {
     let radius = CornerRadius::same(theme::RADIUS_LG);
-    // The socket first, and it is the *outline* rather than the plate's shaded colour: a control
-    // in this window is a printed tile, so it carries the same warm brown boundary as the panels
-    // it stands on, and the face's own lit and shaded edges are drawn inside it.
+    // A resting plate is lifted off the bar it sits on, and a pressed one is not: the shadow is
+    // the whole of the depth cue, so it is also the whole of the "this has been pushed" cue.
+    if !b.pressed {
+        painter.rect_filled(
+            b.socket.translate(Vec2::new(0.0, LIFT)),
+            radius,
+            theme::SHADOW,
+        );
+    }
+    // The socket, and it is the *outline* rather than the plate's shaded colour: a control in
+    // this window is a printed tile, so it carries the same warm brown boundary as the panels it
+    // stands on.
     painter.rect_filled(b.socket, radius, theme::OUTLINE);
-    painter.rect_filled(b.face, radius, b.fill);
-    // The two edges, drawn inside the face and inset from its corners so they do not fight the
-    // rounded lip at the ends.
-    let inset = 3.0;
-    let w = (b.face.width() - inset * 2.0).max(0.0);
-    painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(b.face.min.x + inset, b.face.min.y + 1.5),
-            Vec2::new(w, 1.0),
-        ),
-        CornerRadius::ZERO,
-        b.light,
-    );
-    painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(b.face.min.x + inset, b.face.max.y - 2.5),
-            Vec2::new(w, 1.0),
-        ),
-        CornerRadius::ZERO,
-        b.dark,
-    );
+    // One face, flat, corners inside the outline. Nothing is painted on it: the bevel this
+    // window used to draw was a line across every button, and the menu it belongs to looks like
+    // a game because of its palette and its outline rather than because of its highlight.
+    painter.rect_filled(b.face, CornerRadius::same(theme::RADIUS_LG - 2), b.fill);
 }
 
 /// One glyph, centred in `rect` and clamped to the smaller of its two sides.
@@ -454,7 +426,10 @@ pub fn menu_row(
     if side >= 8.0
         && draw_glyph(
             &painter,
-            Rect::from_min_size(b.content.left_center() - Vec2::new(0.0, side * 0.5), Vec2::splat(side)),
+            Rect::from_min_size(
+                b.content.left_center() - Vec2::new(0.0, side * 0.5),
+                Vec2::splat(side),
+            ),
             atlas,
             icon,
             enabled,
@@ -590,7 +565,10 @@ pub fn segmented_sized(
     let mut hit = ui.interact(outer, base, Sense::hover());
     for (i, (icon, label)) in options.iter().enumerate() {
         let cell = Rect::from_min_size(
-            Pos2::new(outer.min.x + 4.0 + i as f32 * cell_size.x, outer.min.y + 4.0),
+            Pos2::new(
+                outer.min.x + 4.0 + i as f32 * cell_size.x,
+                outer.min.y + 4.0,
+            ),
             cell_size,
         );
         let id = base.with(("segment", i));
@@ -717,12 +695,8 @@ pub fn stat_row(ui: &mut Ui, label: &str, value: impl Into<String>) {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(label)
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    )
-                    .truncate(),
+                    egui::Label::new(egui::RichText::new(label).small().color(theme::TEXT_DIM))
+                        .truncate(),
                 );
             },
         );
@@ -809,7 +783,10 @@ mod tests {
             theme::PRESS_SINK,
             "a pressed plate's content must sit exactly the press depth below a resting one's"
         );
-        assert_eq!(down.content.min.x, rest.content.min.x, "and not move sideways");
+        assert_eq!(
+            down.content.min.x, rest.content.min.x,
+            "and not move sideways"
+        );
         // The *face* does not move: the socket's edges are what say which way the plate went.
         assert_eq!(down.face, rest.face);
 
@@ -826,11 +803,16 @@ mod tests {
         assert_eq!(off.content.min.y, rest.content.min.y);
     }
 
-    /// A pressed plate is inset — its shaded edge above its lit one — and a resting plate is raised.
-    /// Reversing the pair is how a control says "pushed in", and it is invisible to anything that
-    /// only checks that the colours differ.
+    /// **A plate's depth is its shadow, and a pressed plate has none.**
+    ///
+    /// The window has had two goes at a bevel drawn *on* the face — one-pixel bars inset from
+    /// the sides, then a rim with a shaded lip — and both read as a line lying across every
+    /// button rather than as the button's shape. What is left is the truth about depth: a resting
+    /// plate stands on a shadow, a pressed one has gone down onto its socket, and its face darkens
+    /// because less light reaches it. This test is the reason the shadow cannot quietly disappear:
+    /// without it, a pressed and a resting plate differ only in a nine-percent tint.
     #[test]
-    fn a_pressed_plate_inverts_its_edges() {
+    fn a_pressed_plate_sits_on_no_shadow_and_a_resting_one_does() {
         fn luma(c: Color32) -> f32 {
             0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
         }
@@ -842,22 +824,51 @@ mod tests {
             },
             rect(),
         );
-        // Asserted as the *relation* rather than as two colour expressions, because the relation
-        // is the claim and it has to survive a retune of either surface — this pass retuned both.
-        // A raised face is lit along its top edge and shaded along its bottom one; an inset face
-        // is the other way up.
-        assert!(
-            luma(rest.light) > luma(rest.dark),
-            "a resting plate should be lit above and shaded below"
-        );
-        assert!(
-            luma(down.light) < luma(down.dark),
-            "a pressed plate should be shaded above and lit below"
-        );
-        assert_ne!(down.fill, rest.fill, "and its face darkens as well");
+        assert!(!rest.pressed, "a resting plate is raised");
+        assert!(down.pressed, "a pressed plate is pushed into its socket");
+        assert_ne!(down.fill, rest.fill, "and its face darkens");
         assert!(
             luma(down.fill) < luma(rest.fill),
             "and darkens towards the socket rather than away from it"
+        );
+        // Nothing is drawn *on* the face: the ink is the palette's and the fill is one colour, so
+        // the old bevel's two edges are gone rather than merely retuned.
+        assert_eq!(rest.text, theme::TEXT);
+
+        // And the shadow reaches the painter: a resting plate puts one more rounded rect on the
+        // screen than a pressed one, which is the only way from here to see what a person sees.
+        let painted = |state: PlateState| -> usize {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 120.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::background());
+                    let b = bevel(
+                        state,
+                        Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::splat(80.0)),
+                    );
+                    paint(&painter, &b);
+                },
+            );
+            let mut vertices = 0;
+            for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+                if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                    vertices += mesh.vertices.len();
+                }
+            }
+            vertices
+        };
+        assert!(
+            painted(PlateState::default())
+                > painted(PlateState {
+                    pressed: true,
+                    ..Default::default()
+                }),
+            "a resting plate must paint its shadow; a pressed one has none to paint"
         );
     }
 
@@ -944,15 +955,7 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::default())
                     .show(ctx, |ui| {
-                        let r = icon_button(
-                            ui,
-                            None,
-                            None,
-                            "Save",
-                            TOOL_SIZE,
-                            false,
-                            true,
-                        );
+                        let r = icon_button(ui, None, None, "Save", TOOL_SIZE, false, true);
                         assert!(!r.clicked(), "a button nobody clicked is not a click");
                         icon_button(ui, None, Some("ground_1"), "Ground", TOOL_SIZE, true, true);
                         // A disabled control answers no pointer: the state resolver gates hover and
@@ -981,7 +984,8 @@ mod tests {
                         // The group answers as a whole too, which is what a caller hangs its
                         // own sentence on rather than tooltipping every cell.
                         assert!(!row.hovered(), "no pointer, no hover either");
-                        let sign = banner(ui, "gen 43/300  best 218.2  wins 2/200", theme::GOOD, 400.0);
+                        let sign =
+                            banner(ui, "gen 43/300  best 218.2  wins 2/200", theme::GOOD, 400.0);
                         assert!(
                             sign.is_some_and(|w| w > 200.0),
                             "a reading that fits is drawn, and reported as drawn"
@@ -1085,7 +1089,15 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::default())
                     .show(ctx, |ui| {
-                        icon_button(ui, None, Some("not_a_sprite"), "New", TOOL_SIZE, false, true);
+                        icon_button(
+                            ui,
+                            None,
+                            Some("not_a_sprite"),
+                            "New",
+                            TOOL_SIZE,
+                            false,
+                            true,
+                        );
                     });
             },
         );

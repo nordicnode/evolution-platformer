@@ -165,7 +165,12 @@ pub fn play(level: &Level, seed: u64, actions: &[AgentAction]) -> TasPlay {
 /// oracle does not value, replayed from spawn so its frames and final state hash are measured
 /// rather than asserted. A non-winning fragment is still recorded — that is the point of a
 /// discovery — while [`TasRoute::won`] keeps the distinction available to every reader.
-pub fn route_from_actions(level: &Level, seed: u64, actions: &[AgentAction], note: String) -> TasRoute {
+pub fn route_from_actions(
+    level: &Level,
+    seed: u64,
+    actions: &[AgentAction],
+    note: String,
+) -> TasRoute {
     let played = play(level, seed, actions);
     TasRoute {
         format: TAS_FORMAT.into(),
@@ -187,12 +192,7 @@ pub fn route_from_actions(level: &Level, seed: u64, actions: &[AgentAction], not
 /// The sequence is exactly the actions the policy held, one per tick, so replaying it under the
 /// same seed reproduces the champion's episode bit for bit. If the episode did not win, the route
 /// is returned anyway with `frames == 0` and a note saying so; polish will refuse it.
-pub fn route_from_genome(
-    level: &Level,
-    genome: &Genome,
-    cfg: &EvalConfig,
-    seed: u64,
-) -> TasRoute {
+pub fn route_from_genome(level: &Level, genome: &Genome, cfg: &EvalConfig, seed: u64) -> TasRoute {
     let repeat = cfg.action_repeat.max(1);
     let mut sim = Sim::new(level, seed);
     let mut scratch = ActScratch::new();
@@ -302,7 +302,8 @@ pub fn polish(level: &Level, route: &TasRoute, cfg: TasConfig) -> TasReport {
     // Truncation is exact for a winning route; assert it rather than trusting the input.
     if !best_play.won() {
         let mut refused = route.clone();
-        refused.note = "tas refused: the route's recorded frame count does not replay to a win".into();
+        refused.note =
+            "tas refused: the route's recorded frame count does not replay to a win".into();
         return TasReport {
             route: refused,
             before_frames,
@@ -330,9 +331,15 @@ pub fn polish(level: &Level, route: &TasRoute, cfg: TasConfig) -> TasReport {
             if evaluated >= cfg.iterations {
                 break;
             }
-            if let Some((candidate, play)) =
-                try_substitutions(level, route.seed, &best.actions, at, &mut rng, &mut evaluated, cfg.iterations)
-            {
+            if let Some((candidate, play)) = try_substitutions(
+                level,
+                route.seed,
+                &best.actions,
+                at,
+                &mut rng,
+                &mut evaluated,
+                cfg.iterations,
+            ) {
                 if play.won() && play.frames < best_play.frames {
                     best.actions = candidate;
                     best_play = play;
@@ -429,8 +436,7 @@ fn try_substitutions(
             return None;
         }
         let action = AgentAction::ALL
-            [(sim::rng::next_f32(rng) * AgentAction::COUNT as f32) as usize
-                % AgentAction::COUNT];
+            [(sim::rng::next_f32(rng) * AgentAction::COUNT as f32) as usize % AgentAction::COUNT];
         if action == actions[at] {
             continue;
         }

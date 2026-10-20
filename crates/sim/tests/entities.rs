@@ -479,8 +479,7 @@ fn waiting_at_the_lip_for_a_deck_is_not_stuck() {
         &rows,
         (1, 4),
         &[
-            "{\"type\":\"platform\",\"x\":8,\"y\":3,\"tiles\":2,\"span\":8,\"dir\":-1}"
-                .to_string(),
+            "{\"type\":\"platform\",\"x\":8,\"y\":3,\"tiles\":2,\"span\":8,\"dir\":-1}".to_string(),
             goal(19, 4),
         ],
     );
@@ -974,8 +973,14 @@ fn a_shelf_travels_the_way_the_file_says_it_does() {
 #[test]
 fn a_mirrored_shelf_travels_the_mirrored_way() {
     let mut level = Level::starter("mirror-shelf", 24, 8);
-    assert!(level.add_platform_tile(6, 5, 3, 4, false, -1), "a leftward slider");
-    assert!(level.add_platform_tile(14, 5, 3, 4, true, -1), "a downward lift");
+    assert!(
+        level.add_platform_tile(6, 5, 3, 4, false, -1),
+        "a leftward slider"
+    );
+    assert!(
+        level.add_platform_tile(14, 5, 3, 4, true, -1),
+        "a downward lift"
+    );
 
     let mirrored = level.mirrored_horizontal();
     assert_eq!(mirrored.platforms.len(), 2);

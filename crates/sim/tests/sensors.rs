@@ -51,16 +51,7 @@ const ADJACENT_SPIKE: &[&str] = &[
 /// of a shaft, a flag overhead and a flag down a corridor both read as "not to either
 /// side".
 const SHAFT: &[&str] = &[
-    ".....",
-    ".....",
-    ".....",
-    ".....",
-    ".....",
-    ".....",
-    ".....",
-    ".....",
-    "#####",
-    "#####",
+    ".....", ".....", ".....", ".....", ".....", ".....", ".....", ".....", "#####", "#####",
 ];
 
 /// A pen: ground rows 4..5 with two wall columns (5 and 9) standing on it, so a walker
@@ -176,7 +167,10 @@ fn the_vector_has_the_documented_named_layout() {
     assert_eq!(names[93], "sprint_charge");
     assert_eq!(names[94], "gap_left", "v4 appends the leftward probe");
     assert_eq!(names[95], "enemy_dir", "v7 appends the walker's heading");
-    assert_eq!(names[96], "waypoint_dx", "v8 appends the route's next waypoint");
+    assert_eq!(
+        names[96], "waypoint_dx",
+        "v8 appends the route's next waypoint"
+    );
     assert_eq!(names[97], "waypoint_dy");
     assert_eq!(
         names[98], "phase_x",
@@ -193,10 +187,7 @@ fn the_vector_has_the_documented_named_layout() {
     assert_eq!(names[105], "mover_vy");
     assert_eq!(names[106], "mover_phase");
     assert_eq!(names[107], "ground_air");
-    assert_eq!(
-        names.len(),
-        90 + 3 + sensors::N_ABILITY_INPUTS + 2 + 2 + 8
-    );
+    assert_eq!(names.len(), 90 + 3 + sensors::N_ABILITY_INPUTS + 2 + 2 + 8);
 }
 
 /// **Where the goal vector is clamped, the phase slots are the only sub-tile position there is.**
@@ -238,7 +229,8 @@ fn inside_one_tile_only_the_phase_slots_move() {
                 continue;
             }
             assert_eq!(
-                here[i], first[i],
+                here[i],
+                first[i],
                 "slot {i} ({}) moved inside one tile: {} against {}",
                 sensors::input_names()[i],
                 here[i],
@@ -289,7 +281,11 @@ fn inside_one_tile_only_the_phase_slots_move() {
 #[test]
 fn the_enemy_direction_slot_follows_the_walker_as_it_turns() {
     let level = common::fixture("pen", PEN, (2, 3), &[("walker", 7, 3), ("goal", 10, 3)]);
-    assert_eq!(level.walkers.len(), 1, "the fixture must put a walker in the pen");
+    assert_eq!(
+        level.walkers.len(),
+        1,
+        "the fixture must put a walker in the pen"
+    );
     let mut sim = sim::Sim::new(&level, 47);
     common::settle(&mut sim);
 
@@ -299,7 +295,10 @@ fn the_enemy_direction_slot_follows_the_walker_as_it_turns() {
         dir == 1 || dir == -1,
         "the walker is walking one way or the other, got {dir}"
     );
-    assert_eq!(obs[95], dir as f32, "the slot is the walker's own direction");
+    assert_eq!(
+        obs[95], dir as f32,
+        "the slot is the walker's own direction"
+    );
     assert!(
         obs[81].abs() > 0.0,
         "and it is only reported for a walker that is actually in sight"
@@ -335,7 +334,12 @@ fn the_enemy_direction_slot_follows_the_walker_as_it_turns() {
     // Out of sight is `0.0`, exactly like the two position slots it is appended after: there
     // is no walker to have a heading, and a phantom ±1 from across the level would be the same
     // lie v5 set out to remove.
-    let far = common::fixture("pen-far", PEN, (2, 3), &[("walker", 10, 3), ("goal", 10, 3)]);
+    let far = common::fixture(
+        "pen-far",
+        PEN,
+        (2, 3),
+        &[("walker", 10, 3), ("goal", 10, 3)],
+    );
     let mut sim_far = sim::Sim::new(&far, 47);
     common::settle(&mut sim_far);
     let far_obs = sim_far.observation();
@@ -440,7 +444,10 @@ fn the_boolean_and_velocity_slots_track_the_body() {
         (sim.player().vx / sim::PHYSICS.sprint_speed - obs[85]).abs() < 1e-4,
         "slot 85 must be vx / sprint_speed, not some other normalisation"
     );
-    assert_eq!(obs[84], 1.0, "still grounded while running along the ground");
+    assert_eq!(
+        obs[84], 1.0,
+        "still grounded while running along the ground"
+    );
 
     // The jump needs the button released first: it is edge-triggered.
     sim.step(AgentAction::RunJump);
@@ -469,7 +476,11 @@ fn the_gap_slots_fire_on_the_side_the_ground_runs_out() {
     let ledge = common::fixture("ledge", LEDGE, (9, 3), &[("goal", 1, 3)]);
     let mut sim = sim::Sim::new(&ledge, 41);
     common::settle(&mut sim);
-    assert_eq!(sim.player().vx, 0.0, "the body must be at rest for this to mean anything");
+    assert_eq!(
+        sim.player().vx,
+        0.0,
+        "the body must be at rest for this to mean anything"
+    );
     assert_eq!(
         sim.observation()[83],
         1.0,
@@ -503,7 +514,11 @@ fn the_gap_slots_fire_on_the_side_the_ground_runs_out() {
     let solid = common::fixture("ground", GROUND, (8, 3), &[("goal", 1, 3)]);
     let mut sim2 = sim::Sim::new(&solid, 41);
     common::settle(&mut sim2);
-    assert_eq!(sim2.observation()[83], 0.0, "ground continues both ways on flat ground");
+    assert_eq!(
+        sim2.observation()[83],
+        0.0,
+        "ground continues both ways on flat ground"
+    );
     assert_eq!(sim2.observation()[94], 0.0);
 }
 
@@ -518,10 +533,20 @@ fn the_gap_slots_ignore_the_direction_the_body_is_moving() {
     let mut leaving = sim::Sim::new(&level, 41);
     common::step_n(&mut leaving, AgentAction::Retreat, 1);
 
-    for (name, s) in [("standing", &standing), ("running right", &running), ("running left", &leaving)] {
+    for (name, s) in [
+        ("standing", &standing),
+        ("running right", &running),
+        ("running left", &leaving),
+    ] {
         let obs = s.observation();
-        assert_eq!(obs[83], 1.0, "{name}: the hole to the right is still to the right");
-        assert_eq!(obs[94], 0.0, "{name}: and the ledge to the left is still to the left");
+        assert_eq!(
+            obs[83], 1.0,
+            "{name}: the hole to the right is still to the right"
+        );
+        assert_eq!(
+            obs[94], 0.0,
+            "{name}: and the ledge to the left is still to the left"
+        );
     }
 }
 
@@ -533,7 +558,11 @@ fn the_goal_slots_point_at_the_goal_on_both_axes() {
     let mut sim = sim::Sim::new(&right, 33);
     common::settle(&mut sim);
     let obs = sim.observation();
-    assert!(obs[88] > 0.0, "the goal is to the right: goal_dx {}", obs[88]);
+    assert!(
+        obs[88] > 0.0,
+        "the goal is to the right: goal_dx {}",
+        obs[88]
+    );
     assert!(
         obs[89].abs() < 0.1,
         "and at the body's height, so goal_dy is near zero: {}",
@@ -662,7 +691,12 @@ fn the_enemy_slots_point_at_the_nearest_live_walker() {
     );
 
     // A walker beyond ENEMY_VIEW_DISTANCE is out of sight and reads (0.0, 0.0).
-    let far = common::fixture("far-enemy", GROUND, (1, 3), &[("walker", 10, 3), ("goal", 11, 3)]);
+    let far = common::fixture(
+        "far-enemy",
+        GROUND,
+        (1, 3),
+        &[("walker", 10, 3), ("goal", 11, 3)],
+    );
     let mut sim_far = sim::Sim::new(&far, 47);
     common::settle(&mut sim_far);
     let obs_far = sim_far.observation();
@@ -721,7 +755,10 @@ fn the_ability_slots_report_the_wall_and_the_sprint() {
     // state, so a body cannot slide down a wall it is not pushing into.
     sim.step(AgentAction::Walk);
     let obs = sim.observation();
-    assert_eq!(obs[91], 0.0, "releasing the direction drops the wall contact");
+    assert_eq!(
+        obs[91], 0.0,
+        "releasing the direction drops the wall contact"
+    );
     assert_eq!(obs[92], 0.0, "and the slide with it");
 
     // Sprint: the charge ramps while it is asked for and coasts back down when it is not.
@@ -786,7 +823,12 @@ fn the_ability_slots_report_the_wall_and_the_sprint() {
 fn golden_observation_hash_at_a_fixed_state() {
     const GOLDEN_OBSERVATION_HASH: u64 = 12_842_302_117_604_028_991;
 
-    let level = common::fixture("ground", GROUND, (5, 3), &[("walker", 9, 3), ("goal", 11, 3)]);
+    let level = common::fixture(
+        "ground",
+        GROUND,
+        (5, 3),
+        &[("walker", 9, 3), ("goal", 11, 3)],
+    );
     let mut sim = sim::Sim::new(&level, 5);
     common::settle(&mut sim);
     let obs = sim.observation();
@@ -825,10 +867,22 @@ fn a_cracked_tile_and_a_spring_read_differently_in_the_patch() {
     // The patch is 9x9 row-major around the tile the body's centre is in, top-left first.
     let cell = |dx: i32, dy: i32| -> f32 { obs[((dy + 4) * 9 + (dx + 4)) as usize] };
 
-    assert_eq!(cell(0, 1), sensors::ENC_SOLID, "control: the ground under it");
+    assert_eq!(
+        cell(0, 1),
+        sensors::ENC_SOLID,
+        "control: the ground under it"
+    );
     assert_eq!(cell(1, -1), sensors::ENC_SPRING, "the pad reads as a pad");
-    assert_eq!(cell(3, -1), sensors::ENC_CRUMBLE, "the brittle tile reads as brittle");
-    assert_eq!(cell(5, -1), sensors::ENC_SOLID, "the sound ground beside it reads as ground");
+    assert_eq!(
+        cell(3, -1),
+        sensors::ENC_CRUMBLE,
+        "the brittle tile reads as brittle"
+    );
+    assert_eq!(
+        cell(5, -1),
+        sensors::ENC_SOLID,
+        "the sound ground beside it reads as ground"
+    );
 
     // And the readings are mutually distinct, which is the whole claim: a body can tell a pad from
     // the air it stands in, and brittle ground from the ground that will still be there next frame.

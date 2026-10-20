@@ -213,7 +213,8 @@ impl CommitteeFile {
         let path = path.as_ref();
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        serde_json::from_str(&src).map_err(|e| format!("{}: malformed committee: {e}", path.display()))
+        serde_json::from_str(&src)
+            .map_err(|e| format!("{}: malformed committee: {e}", path.display()))
     }
 
     /// Where a run on `level` writes its committee: beside `champions/`, named after the level.
@@ -223,10 +224,8 @@ impl CommitteeFile {
     /// rebuilds this name from the level it opened, so two different slug rules would write a
     /// file the window never finds.
     pub fn path_for(level: &Level) -> std::path::PathBuf {
-        std::path::Path::new(COMMITTEE_DIR).join(format!(
-            "{}.committee.json",
-            level_slug(&level.name)
-        ))
+        std::path::Path::new(COMMITTEE_DIR)
+            .join(format!("{}.committee.json", level_slug(&level.name)))
     }
 }
 
@@ -633,9 +632,7 @@ mod tests {
     #[test]
     fn a_committee_file_round_trips_and_refuses_another_level() {
         let level = crate::fixture::flat_runway("committee-file", 20, 18);
-        let members: Vec<Genome> = (0..3)
-            .map(|i| always(i, AgentAction::Run))
-            .collect();
+        let members: Vec<Genome> = (0..3).map(|i| always(i, AgentAction::Run)).collect();
         let file = CommitteeFile::new(&level, 7, 12, 4, &members).expect("a file");
         assert_eq!(
             CommitteeFile::path_for(&level).file_name().unwrap(),

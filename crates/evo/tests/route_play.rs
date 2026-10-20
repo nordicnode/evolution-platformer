@@ -172,8 +172,14 @@ fn a_replay_is_deterministic() {
         let a = replay(&lv, 7, &EvalConfig::default());
         let b = replay(&lv, 7, &EvalConfig::default());
         assert_eq!(a.decisions, b.decisions, "{slug}: two replays disagreed");
-        assert_eq!(a.frames, b.frames, "{slug}: two replays took different times");
-        assert_eq!(a.outcome, b.outcome, "{slug}: two replays ended differently");
+        assert_eq!(
+            a.frames, b.frames,
+            "{slug}: two replays took different times"
+        );
+        assert_eq!(
+            a.outcome, b.outcome,
+            "{slug}: two replays ended differently"
+        );
     }
 }
 

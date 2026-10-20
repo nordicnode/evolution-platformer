@@ -541,11 +541,7 @@ fn choose_plan(
 /// and its `note` says so. Callers that need a guarantee (a seeded run, a report) should read
 /// [`RoutePlay::won`] rather than assume one.
 ///
-pub fn timed_play(
-    level: &Level,
-    route: &sim::plan::TimedRoute,
-    cfg: &EvalConfig,
-) -> RoutePlay {
+pub fn timed_play(level: &Level, route: &sim::plan::TimedRoute, cfg: &EvalConfig) -> RoutePlay {
     timed_play_from(level, route, &Sim::new(level, route.seed), cfg)
 }
 
@@ -557,7 +553,11 @@ pub fn timed_play_from(
     start: &Sim,
     cfg: &EvalConfig,
 ) -> RoutePlay {
-    debug_assert_eq!(level.width, start.level().width, "a plan replays on its own geometry");
+    debug_assert_eq!(
+        level.width,
+        start.level().width,
+        "a plan replays on its own geometry"
+    );
     let repeat = cfg.action_repeat.max(1);
     let mut sim = start.clone();
     let mut obs = ObservationScratch::new();

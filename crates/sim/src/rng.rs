@@ -115,8 +115,16 @@ mod tests {
         let a = common_episode_seed(7, 3, 0);
         let b = common_episode_seed(7, 3, 0);
         assert_eq!(a, b, "the same episode for the population");
-        assert_ne!(a, common_episode_seed(7, 4, 0), "a new generation is a new world");
-        assert_ne!(a, common_episode_seed(7, 3, 1), "a second trial is a second phase");
+        assert_ne!(
+            a,
+            common_episode_seed(7, 4, 0),
+            "a new generation is a new world"
+        );
+        assert_ne!(
+            a,
+            common_episode_seed(7, 3, 1),
+            "a second trial is a second phase"
+        );
         assert_ne!(a, common_episode_seed(8, 3, 0), "a different master seed");
         assert_eq!(a, episode_seed(7, 3, NO_GENOME, 0), "one mixer, not two");
         // And it is nobody's own episode: the ids a genome can carry are issued from a counter.
@@ -133,10 +141,16 @@ mod tests {
     fn common_episode_seed_pins_known_values() {
         // Frozen beside `episode_seed`'s golden values: a change here re-scores every run taken
         // under shared episodes and is a `sim_version` bump.
-        assert_eq!(common_episode_seed(1, 0, 0), episode_seed(1, 0, NO_GENOME, 0));
+        assert_eq!(
+            common_episode_seed(1, 0, 0),
+            episode_seed(1, 0, NO_GENOME, 0)
+        );
         assert_eq!(common_episode_seed(0, 0, 0), 0x73b1_3ba2_aff1_81c0);
         assert_eq!(common_episode_seed(1, 0, 0), 0xc42c_5a1a_a382_0138);
-        assert_eq!(common_episode_seed(0xDEAD_BEEF, 87, 2), 0x8252_05ec_7505_74e2);
+        assert_eq!(
+            common_episode_seed(0xDEAD_BEEF, 87, 2),
+            0x8252_05ec_7505_74e2
+        );
     }
 
     #[test]

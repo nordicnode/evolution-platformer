@@ -470,17 +470,18 @@ pub fn observe_scene(
     // One vector for every threat, nearest wins. Ties keep the earlier kind, which is why the
     // order is walkers, then flyers, then shots: the three the pack has had longest come first,
     // so a level with none of the new kinds observes exactly what it observed before.
-    let consider = |bx: f32, by: f32, dir: i8, best: &mut Option<(f32, f32, i8)>, best_d2: &mut f32| {
-        let (dx, dy) = (bx - cx, by - cy);
-        if dx.abs() > ENEMY_VIEW_DISTANCE || dy.abs() > ENEMY_VIEW_DISTANCE {
-            return;
-        }
-        let d2 = dx * dx + dy * dy;
-        if d2 < *best_d2 {
-            *best_d2 = d2;
-            *best = Some((dx, dy, dir));
-        }
-    };
+    let consider =
+        |bx: f32, by: f32, dir: i8, best: &mut Option<(f32, f32, i8)>, best_d2: &mut f32| {
+            let (dx, dy) = (bx - cx, by - cy);
+            if dx.abs() > ENEMY_VIEW_DISTANCE || dy.abs() > ENEMY_VIEW_DISTANCE {
+                return;
+            }
+            let d2 = dx * dx + dy * dy;
+            if d2 < *best_d2 {
+                *best_d2 = d2;
+                *best = Some((dx, dy, dir));
+            }
+        };
     for w in walkers.iter().filter(|w| w.alive) {
         let (wx, wy) = w.aabb(ph).center();
         consider(wx, wy, w.dir, &mut best, &mut best_d2);
@@ -491,14 +492,26 @@ pub fn observe_scene(
     }
     for s in scene.shots.iter().filter(|s| s.alive) {
         let (sx, sy) = s.aabb().center();
-        consider(sx, sy, if s.vx < 0.0 { -1 } else { 1 }, &mut best, &mut best_d2);
+        consider(
+            sx,
+            sy,
+            if s.vx < 0.0 { -1 } else { 1 },
+            &mut best,
+            &mut best_d2,
+        );
     }
     // A lava ball, last for the same reason: the three kinds the pack has had longest keep
     // their tie-break. Its heading is its lateral drift, which is the only horizontal motion
     // it has — the arc itself is vertical and the two slots above already say where it is.
     for b in scene.lava_balls.iter().filter(|b| b.alive) {
         let (bx, by) = b.aabb().center();
-        consider(bx, by, if b.vx < 0.0 { -1 } else { 1 }, &mut best, &mut best_d2);
+        consider(
+            bx,
+            by,
+            if b.vx < 0.0 { -1 } else { 1 },
+            &mut best,
+            &mut best_d2,
+        );
     }
     if let Some((dx, dy, dir)) = best {
         out[81] = (dx / ENEMY_VIEW_DISTANCE).clamp(-1.0, 1.0);
@@ -703,9 +716,17 @@ fn next_event(
         if sb.bottom() < body.y - 0.35 || sb.y > body.bottom() + 0.35 || s.vx.abs() < 1e-6 {
             continue;
         }
-        let towards = if s.vx > 0.0 { sb.center().0 < cx } else { sb.center().0 > cx };
+        let towards = if s.vx > 0.0 {
+            sb.center().0 < cx
+        } else {
+            sb.center().0 > cx
+        };
         if towards {
-            consider(((sb.center().0 - cx) / s.vx).abs(), sb.center().0, sb.center().1);
+            consider(
+                ((sb.center().0 - cx) / s.vx).abs(),
+                sb.center().0,
+                sb.center().1,
+            );
         }
     }
     // A turret that has not fired yet: cooldown plus the shot's flight time.
@@ -714,10 +735,18 @@ fn next_event(
         if tb.bottom() < body.y - 0.35 || tb.y > body.bottom() + 0.35 {
             continue;
         }
-        let towards = if t.dir > 0 { cx > tb.right() } else { cx < tb.x };
+        let towards = if t.dir > 0 {
+            cx > tb.right()
+        } else {
+            cx < tb.x
+        };
         if towards {
             let dist = (cx - t.muzzle_x()).abs();
-            consider(t.cooldown as f32 + dist / ph.shot_speed.max(1e-6), t.muzzle_x(), tb.center().1);
+            consider(
+                t.cooldown as f32 + dist / ph.shot_speed.max(1e-6),
+                t.muzzle_x(),
+                tb.center().1,
+            );
         }
     }
     // A lava ball in flight: its arc is vertical, so the ETA is the closing distance.

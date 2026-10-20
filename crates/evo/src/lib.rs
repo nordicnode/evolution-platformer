@@ -36,8 +36,8 @@ pub mod telemetry;
 
 pub use autoshape::{apply as apply_auto_shape, scan as scan_level_shape, AutoShape};
 pub use champion::{
-    check_reproducibility, measure_phase_gap, ChampionFile, ChampionMetadata, NetworkSpec, PhaseGap,
-    TrainingSummary, CHAMPION_FORMAT, CHAMPION_VERSION,
+    check_reproducibility, measure_phase_gap, ChampionFile, ChampionMetadata, NetworkSpec,
+    PhaseGap, TrainingSummary, CHAMPION_FORMAT, CHAMPION_VERSION,
 };
 pub use committee::{
     Committee, CommitteeFile, CommitteeReport, COMMITTEE_DIR, COMMITTEE_FORMAT, COMMITTEE_VERSION,

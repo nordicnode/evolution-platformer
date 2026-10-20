@@ -135,9 +135,9 @@ impl Args {
     pub fn usize_opt(&self, name: &str, default: usize) -> Result<usize, ParseError> {
         match self.opt(name) {
             None => Ok(default),
-            Some(v) => v
-                .parse::<usize>()
-                .map_err(|_| ParseError::Bad(format!("--{name} expects a positive integer, got {v:?}"))),
+            Some(v) => v.parse::<usize>().map_err(|_| {
+                ParseError::Bad(format!("--{name} expects a positive integer, got {v:?}"))
+            }),
         }
     }
 
@@ -158,7 +158,9 @@ impl Args {
                     ParseError::Bad(format!("--{name} expects a number, got {v:?}"))
                 })?;
                 if !parsed.is_finite() {
-                    return Err(ParseError::Bad(format!("--{name} must be finite, got {v:?}")));
+                    return Err(ParseError::Bad(format!(
+                        "--{name} must be finite, got {v:?}"
+                    )));
                 }
                 Ok(parsed)
             }
@@ -208,7 +210,9 @@ mod tests {
 
     #[test]
     fn long_options_take_the_next_argument_or_an_equals_form() {
-        let a = parse(&["train", "--pop", "200", "--seed=7"]).ok().expect("parses");
+        let a = parse(&["train", "--pop", "200", "--seed=7"])
+            .ok()
+            .expect("parses");
         assert_eq!(a.command, "train");
         assert_eq!(a.usize_opt("pop", 1).ok(), Some(200));
         assert_eq!(a.u64_opt("seed", 1).ok(), Some(7));
@@ -238,7 +242,10 @@ mod tests {
 
     #[test]
     fn positional_arguments_are_rejected() {
-        assert!(matches!(parse(&["train", "extra"]), Err(ParseError::Bad(_))));
+        assert!(matches!(
+            parse(&["train", "extra"]),
+            Err(ParseError::Bad(_))
+        ));
     }
 
     #[test]

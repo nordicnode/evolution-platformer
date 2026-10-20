@@ -261,16 +261,11 @@ impl TechniqueArchive {
                 weight > held_weight
                     || (weight == held_weight
                         && (result.max_stomp_chain, result.wall_jumps, result.springs)
-                            > (
-                                held.max_stomp_chain,
-                                held.wall_jumps,
-                                held.springs,
-                            ))
+                            > (held.max_stomp_chain, held.wall_jumps, held.springs))
             }
         };
         if replace {
-            self.cells
-                .insert(signature, (genome.clone(), entry));
+            self.cells.insert(signature, (genome.clone(), entry));
         }
         let mut firsts = self.seen.absorb(result);
         for first in &mut firsts {
@@ -355,7 +350,8 @@ mod tests {
         archive.observe(4, &louder, &result(2, 8, 0, 0, 0));
         assert_eq!(archive.occupied(), 1, "both are in the same coarse cell");
         assert_eq!(
-            archive.entries()[0].genome_id, 2,
+            archive.entries()[0].genome_id,
+            2,
             "the genome that did more of the technique must be the incumbent"
         );
     }

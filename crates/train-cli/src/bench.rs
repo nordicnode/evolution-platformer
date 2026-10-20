@@ -1134,14 +1134,10 @@ mod tests {
             "c.json"
         ]))
         .contains("champion c.json"));
-        assert!(start_of(&a(&[
-            "bench",
-            "--protocol",
-            "chain",
-            "--resume",
-            "p.json"
-        ]))
-        .contains("checkpoint p.json"));
+        assert!(
+            start_of(&a(&["bench", "--protocol", "chain", "--resume", "p.json"]))
+                .contains("checkpoint p.json")
+        );
         assert_eq!(
             start_of(&a(&["bench", "--protocol", "chain", "--from-route"])),
             "route clone"
@@ -1231,7 +1227,10 @@ mod tests {
         assert_eq!(read_back.lesson_every, 1);
         assert_eq!(read_back.plateau_window, 0);
         let default = evo::GaConfig::default();
-        assert_eq!(read_back.plateau_cem_generations, default.plateau_cem_generations);
+        assert_eq!(
+            read_back.plateau_cem_generations,
+            default.plateau_cem_generations
+        );
         assert_eq!(read_back.plateau_cem_events, default.plateau_cem_events);
         assert!(
             read_back.rows[0].lessons > 0,

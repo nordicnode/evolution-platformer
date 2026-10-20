@@ -35,9 +35,39 @@
       "y": 14
     },
     {
+      "type": "flyer",
+      "x": 12,
+      "y": 8,
+      "span": 12
+    },
+    {
+      "type": "flyer",
+      "x": 39,
+      "y": 4,
+      "span": 12
+    },
+    {
+      "type": "flyer",
+      "x": 60,
+      "y": 4,
+      "span": 12
+    },
+    {
       "type": "turret",
       "x": 66,
       "y": 7,
+      "dir": -1
+    },
+    {
+      "type": "turret",
+      "x": 0,
+      "y": 12,
+      "dir": 1
+    },
+    {
+      "type": "turret",
+      "x": 19,
+      "y": 12,
       "dir": -1
     },
     {

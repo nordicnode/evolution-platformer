@@ -117,7 +117,10 @@ fn a_level_without_walkers_is_correctly_seed_independent() {
     let lv = level("l1-flat-run");
     assert!(lv.walkers.is_empty());
 
-    let digests: Vec<u64> = [1u64, 2, 3].iter().map(|s| play_digest(&lv, *s, 600)).collect();
+    let digests: Vec<u64> = [1u64, 2, 3]
+        .iter()
+        .map(|s| play_digest(&lv, *s, 600))
+        .collect();
     assert_eq!(
         digests[0], digests[1],
         "walker-free levels have nothing for the seed to vary"

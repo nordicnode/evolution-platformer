@@ -182,7 +182,10 @@ fn direction(values: &[f32]) -> Direction {
     let total = slope(values) * (values.len() as f32 - 1.0);
     let magnitude = values
         .iter()
-        .fold(0.0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m })
+        .fold(
+            0.0f32,
+            |m, v| if v.is_finite() { m.max(v.abs()) } else { m },
+        )
         .max(1.0);
     let relative = total / magnitude;
     if relative > TREND_TOLERANCE {
@@ -409,7 +412,13 @@ fn fit(s: &str, width: usize) -> String {
 /// A placeholder of exactly `height` lines of exactly `width` characters.
 fn placeholder(width: usize, height: usize, msg: &str) -> Vec<String> {
     (0..height)
-        .map(|i| if i == height / 2 { fit(msg, width) } else { fit("", width) })
+        .map(|i| {
+            if i == height / 2 {
+                fit(msg, width)
+            } else {
+                fit("", width)
+            }
+        })
         .collect()
 }
 
@@ -524,7 +533,11 @@ pub fn progress_bar(fraction: f32, width: usize) -> String {
     if width == 1 {
         return "=".to_string();
     }
-    let f = if fraction.is_nan() { 0.0 } else { fraction.clamp(0.0, 1.0) };
+    let f = if fraction.is_nan() {
+        0.0
+    } else {
+        fraction.clamp(0.0, 1.0)
+    };
     let inner = width - 2;
     let filled = ((f * inner as f32).round() as usize).min(inner);
 
@@ -817,8 +830,14 @@ mod tests {
         let history = learning();
         let lines = fitness_chart(&history, 48, 8);
         let body = lines.join("\n");
-        assert!(body.contains(MAX_GLYPH), "the max series must be drawn:\n{body}");
-        assert!(body.contains(AVG_GLYPH), "the avg series must be drawn:\n{body}");
+        assert!(
+            body.contains(MAX_GLYPH),
+            "the max series must be drawn:\n{body}"
+        );
+        assert!(
+            body.contains(AVG_GLYPH),
+            "the avg series must be drawn:\n{body}"
+        );
     }
 
     #[test]
@@ -834,7 +853,10 @@ mod tests {
             .collect();
         let lines = fitness_chart(&history, 60, 10);
         let body = lines.join("\n");
-        assert!(body.contains(AVG_GLYPH), "avg must survive the squeeze:\n{body}");
+        assert!(
+            body.contains(AVG_GLYPH),
+            "avg must survive the squeeze:\n{body}"
+        );
 
         let axis = lines.last().expect("axis row");
         let margin: String = axis.chars().take(MARGIN).collect();
@@ -843,7 +865,10 @@ mod tests {
             "the axis margin must report the avg series' own peak, got {margin:?}"
         );
         // 30 + 19*15 = 315, which compacts to "315.0".
-        assert!(margin.contains("315.0"), "expected the avg peak in {margin:?}");
+        assert!(
+            margin.contains("315.0"),
+            "expected the avg peak in {margin:?}"
+        );
         // And the shared scale's top must be the champion-sized number, so the
         // reader can see *why* the average line is low.
         let top_margin: String = lines[0].chars().take(MARGIN).collect();
@@ -954,7 +979,11 @@ mod tests {
 
     #[test]
     fn panel_lines_are_all_exactly_the_requested_width() {
-        let body = vec!["first".to_string(), String::new(), "a much longer line than fits".into()];
+        let body = vec![
+            "first".to_string(),
+            String::new(),
+            "a much longer line than fits".into(),
+        ];
         for width in [4usize, 10, 20, 40] {
             let lines = panel("title", &body, width);
             assert_eq!(lines.len(), body.len() + 4, "width {width}");
@@ -974,7 +1003,11 @@ mod tests {
         // empty rows pretending to be a box. Asserted separately because it is a
         // different contract from "narrow", which is why it is not in the loop
         // above.
-        assert_eq!(panel("t", &body, 0).len(), 0, "a zero-width panel is nothing");
+        assert_eq!(
+            panel("t", &body, 0).len(),
+            0,
+            "a zero-width panel is nothing"
+        );
     }
 
     #[test]
@@ -1181,7 +1214,10 @@ mod tests {
             "x = 10.0, 10.4 and 10.9 are one tile-column cluster"
         );
         // Ties go to the leftmost obstacle, which is the one met first.
-        assert_eq!(death_cluster(&[(5.0, 1.0, 1), (30.0, 1.0, 2)], 60), Some((5, 1)));
+        assert_eq!(
+            death_cluster(&[(5.0, 1.0, 1), (30.0, 1.0, 2)], 60),
+            Some((5, 1))
+        );
         // Outside the level, non-finite, or a level with no width: not attributable.
         assert_eq!(
             death_cluster(&[(-1.0, 1.0, 1), (99.0, 1.0, 2), (f32::NAN, 1.0, 3)], 60),

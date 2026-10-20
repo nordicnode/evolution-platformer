@@ -237,7 +237,11 @@ pub fn hunt(level: &Level, seed: u64, cfg: PlanConfig, objective: HuntObjective)
     };
     HuntOutcome {
         objective,
-        best: if best_value.is_finite() { best_value } else { 0.0 },
+        best: if best_value.is_finite() {
+            best_value
+        } else {
+            0.0
+        },
         route,
         best_x: best.as_ref().map(|n| n.sim.player().x).unwrap_or(0.0),
         best_y: best.as_ref().map(|n| n.sim.player().y).unwrap_or(0.0),
@@ -305,14 +309,7 @@ pub fn solve_anytime(
     };
     let mut depth = step.min(max_depth);
     loop {
-        let outcome = plan_level(
-            level,
-            seed,
-            PlanConfig {
-                depth,
-                ..cfg
-            },
-        );
+        let outcome = plan_level(level, seed, PlanConfig { depth, ..cfg });
         if outcome.route.is_some() {
             return outcome;
         }
@@ -519,8 +516,8 @@ fn plan_from_until(
         let children = expand(&frontier, cfg.max_flight_blocks);
         let mut kept: Vec<Node> = Vec::with_capacity(children.len());
         for child in children {
-            let reached_target = target
-                .is_some_and(|hops| child.sim.stats().route_hops_closed >= hops);
+            let reached_target =
+                target.is_some_and(|hops| child.sim.stats().route_hops_closed >= hops);
             if child.won || reached_target {
                 let route = route_of(&child, start_hops, seed, expanded);
                 let note = match target {
@@ -587,7 +584,11 @@ fn score_node(sim: &Sim, actions: &Option<Vec<AgentAction>>) -> (u32, i64, u32) 
     if actions.is_none() {
         return (u32::MAX, i64::MAX, u32::MAX);
     }
-    (stand_hops(sim).unwrap_or(u32::MAX), -(sim.stats().progress_pixels as i64), sim.stats().frames)
+    (
+        stand_hops(sim).unwrap_or(u32::MAX),
+        -(sim.stats().progress_pixels as i64),
+        sim.stats().frames,
+    )
 }
 
 fn route_of(node: &Node, start_hops: Option<u32>, seed: u64, expanded: u32) -> TimedRoute {
@@ -663,7 +664,8 @@ fn select(children: Vec<Node>, cfg: PlanConfig) -> Vec<Node> {
     let mut ranked = children;
     ranked.sort_by_key(score);
     let mut kept: Vec<Node> = Vec::new();
-    let mut buckets: std::collections::BTreeMap<(u32, u32), usize> = std::collections::BTreeMap::new();
+    let mut buckets: std::collections::BTreeMap<(u32, u32), usize> =
+        std::collections::BTreeMap::new();
     for node in ranked {
         if kept.len() >= cfg.beam {
             break;
@@ -743,7 +745,9 @@ fn apply(mut sim: Sim, m: Macro, max_flight_blocks: u32) -> Option<Node> {
             // Walking off a lip is a landing too: chase it down with the same intent instead
             // of throwing away a node that is merely in the air.
             let mut flight = 0u32;
-            while !sim.outcome().is_finished() && !sim.player().grounded && flight < max_flight_blocks
+            while !sim.outcome().is_finished()
+                && !sim.player().grounded
+                && flight < max_flight_blocks
             {
                 step_block(&mut sim, action);
                 actions.push(action);
@@ -791,7 +795,10 @@ fn apply(mut sim: Sim, m: Macro, max_flight_blocks: u32) -> Option<Node> {
             // never comes down inside the budget is a fall or a missed ledge, not a node.
             let chase = walk_action(dir, sprint);
             let mut flight = 0u32;
-            while !sim.outcome().is_finished() && !sim.player().grounded && flight < max_flight_blocks {
+            while !sim.outcome().is_finished()
+                && !sim.player().grounded
+                && flight < max_flight_blocks
+            {
                 step_block(&mut sim, chase);
                 actions.push(chase);
                 flight += 1;
@@ -805,11 +812,7 @@ fn apply(mut sim: Sim, m: Macro, max_flight_blocks: u32) -> Option<Node> {
     if !won && (sim.outcome().is_finished() || !sim.player().grounded) {
         return None;
     }
-    Some(Node {
-        sim,
-        actions,
-        won,
-    })
+    Some(Node { sim, actions, won })
 }
 
 fn step_block(sim: &mut Sim, action: AgentAction) {
@@ -961,7 +964,11 @@ mod tests {
             1,
             "the leg route closes the crossing it was asked for"
         );
-        assert_ne!(sim.outcome(), crate::Outcome::Won, "and stops before the flag");
+        assert_ne!(
+            sim.outcome(),
+            crate::Outcome::Won,
+            "and stops before the flag"
+        );
     }
 
     #[test]

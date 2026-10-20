@@ -4,11 +4,12 @@
 //! thing for a person who already knows what the four tabs are and a cold start for everyone
 //! else. So the first frame is this: the game's own picture — the same sky gradient, the same
 //! parallax hills and drifting clouds, the same grass, trees and butterflies, drawn by the
-//! same functions — and the whole thing is **running**. The wordmark stands in the level as a
-//! terraced hill; an agent on a small level built for the occasion runs at it from the left,
-//! climbs its face, crosses its top edge and drops down to the flag on the right. The scene
-//! holds on the waving flag for a moment before starting again, so what a person watches while
-//! deciding to press a key is the game being played rather than a picture of it.
+//! same functions — and the whole thing is **running**. The name is set in the sky over it in
+//! the window's pixel face, with a tagline under it and a framed menu beneath the level; an
+//! agent runs the little level built for the occasion, clearing a pit, hopping a block and
+//! climbing the hill to the flag. The scene holds on the waving flag for a moment before
+//! starting again, so what a person watches while deciding to press a key is the game being
+//! played rather than a picture of it.
 //!
 //! What this module owns is the *screen*: the level, the little episode, the camera pull-back
 //! and the words. The world is drawn by [`crate::view`], and the episode is a
@@ -52,25 +53,49 @@ use crate::theme;
 use crate::ui;
 use crate::view::{self, Camera, RenderOpts, Sheet, Sprites};
 
-/// The lockup is the game's logo itself: the approved wordmark, drawn as art rather than
-/// set as type.
+/// The wordmark is **set, not pasted**.
 ///
-/// It used to be the words EVOLUTION PLATFORMER lettered in the window's monospace with a
-/// bevel, which said what the program *is* and nothing about the game it had become. The
-/// game is called One Two Hundred now, and it has a logo — chunky pixel letters cycling the
-/// game's own palette on a strip of its own ground — so the front door carries the logo the
-/// way a box carries its cover art: as a picture, embedded in the binary
-/// (`crates/app/assets/logo.png`), not redrawn in a font that happens to be nearby. A
-/// redrawn logo is a second logo, and the two would drift.
+/// The screen used to draw `crates/app/assets/logo.png` — rainbow letters over a strip of
+/// ground — as a picture hanging in the sky. On a title card it read as a decal: a baked strip of
+/// terrain floating over the clouds, lettering in six colours that the game itself never uses,
+/// and no relationship to the type in the menu two hundred points below it. A title screen's job
+/// is to look like the game it opens, so the name is drawn in the same face every other word on
+/// this screen is drawn in — Press Start 2P, the pixel face the window already embeds — and made
+/// the way the game's own objects are: cream letters with a hard brown edge, standing on a shelf
+/// of the accent gold, the way the menu's plates sit on the palette's rim.
 ///
-const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
-/// The logo's own aspect, width over height, so its rectangle on screen is the picture's
-/// shape rather than a guess at it.
-const LOGO_ASPECT: f32 = 1515.0 / 420.0;
+/// Two lines, because the name is three words and the big one is the last: `ONE TWO` sits over
+/// `HUNDRED` the way a box's title does, and the size difference is the whole of the hierarchy.
+///
+/// Both lines are **set to one measure**, the way a lockup is: `HUNDRED` sets the width, and a
+/// gold rule either side of `ONE TWO` carries that width up to the small line. That single rule
+/// is most of what separates a logo from two words in a font — the block of type has a shape of
+/// its own, and the small line stops looking like a caption somebody forgot to centre. (The
+/// first attempt stretched `ONE TWO` itself out to the measure with tracking, and at that
+/// spacing its letters came apart into shapes with holes between them.)
+const TITLE_ONE: &str = "ONE TWO";
+const TITLE_TWO: &str = "HUNDRED";
+/// The hard edge around every letter, as a fraction of its size, and how far the block it
+/// stands on comes forward.
+///
+/// The block is measured in the **face's own pixels** — the eight-by-eight grid the letterforms
+/// were drawn on — not in screen pixels. The first version extruded the letters one screen pixel
+/// at a time and the side came out smeared: sixteen antialiased copies of a curve make a grey
+/// edge, and a pixel logo's side is supposed to be made of squares. A grid pixel and a quarter
+/// is deeper than the face's own strokes, so the side reads as a side, and shallow enough that
+/// the letters are still the word.
+const TITLE_EDGE: f32 = 0.5;
+const TITLE_BLOCK: f32 = 1.25;
+/// How far the small line is tracked beyond the face's own fit — a hair, so `ONE TWO` is a
+/// deliberate line of letters rather than a default one.
+const TITLE_TRACK: f32 = 1.03;
+/// How much air a space gets, over and above the tracking one glyph already carries — enough
+/// that `ONE TWO` reads as two words at the tracking the lockup needs.
+const TITLE_WORD_GAP: f32 = 0.55;
 /// The only instruction the screen needs: move the selection, then take it.
 ///
 /// Arrow glyphs are not in the pixel face, so the keys are spelled out.
-const MENU_HINT: &str = "UP / DOWN    ENTER";
+const MENU_HINT: &str = "UP / DOWN   CHOOSE      ENTER   GO";
 
 /// What a person asked for by dismissing the screen.
 ///
@@ -94,13 +119,12 @@ pub enum Action {
 /// game?" in the first second: a camera that starts on the runner and pulls back to the level
 /// says *a person, in a place* in a way a wide shot from the first frame does not.
 const PULLBACK: f32 = 1.8;
-/// When the logo starts arriving, and how long its whole entrance takes.
+/// When the title starts arriving, and how long its whole entrance takes.
 ///
-/// The mark fades up and drifts a few points into place. Nothing assembles letter by letter
-/// and nothing bounces: the picture is already the game's name, and the screen's motion is
-/// the episode running behind it.
-const LOGO_AT: f32 = 0.15;
-const LOGO_FADE: f32 = 0.70;
+/// The wordmark fades up and drifts a few points into place. Nothing assembles letter by letter
+/// and nothing bounces: the screen's motion is the episode running behind the name.
+const TITLE_AT: f32 = 0.15;
+const TITLE_FADE: f32 = 0.70;
 /// When the menu arrives. The mark has settled by then.
 const HINT_AT: f32 = 1.15;
 /// How long the finished episode is held before the little run starts over.
@@ -146,17 +170,23 @@ const DOORS_LAG: f32 = 0.20;
 ///
 /// Wide enough for the longest option at the size it is set, and no wider. A menu is an
 /// object, not a toolbar stretched across the window.
-const MENU_W: f32 = 360.0;
+const MENU_W: f32 = 430.0;
 /// One option line's height.
-const LINE_H: f32 = 44.0;
+const LINE_H: f32 = 56.0;
 /// The panel's padding.
-const PANEL_PAD: f32 = 14.0;
+const PANEL_PAD: f32 = 12.0;
+/// The square a door's icon is drawn in, and how far it sits from the plate's left edge.
+const MENU_ICON: f32 = 26.0;
+const MENU_ICON_LEFT: f32 = 26.0;
+/// Where a door's word starts, measured from the plate's left edge: past the icon and its gap.
+const MENU_LABEL_LEFT: f32 = 58.0;
 /// Padding from the window's bottom edge, for the box and the prompt under it.
 const MENU_BOTTOM_PAD: f32 = 56.0;
 /// The prompt's baseline above the window's bottom edge.
-const PROMPT_BOTTOM: f32 = 40.0;
-/// The champion credit's baseline above the window's bottom edge.
-const CREDIT_BOTTOM: f32 = 14.0;
+const PROMPT_BOTTOM: f32 = 42.0;
+/// The champion credit's baseline above the window's bottom edge — above the footer's own line,
+/// and centred so it reads under the menu rather than colliding with the build number.
+const CREDIT_BOTTOM: f32 = 24.0;
 
 /// One door: what it is called and where it leads.
 ///
@@ -166,20 +196,31 @@ const CREDIT_BOTTOM: f32 = 14.0;
 struct Door {
     name: &'static str,
     action: Action,
+    /// The sprite that stands for the activity, out of the shipped atlas.
+    ///
+    /// The same four pictures the window's own mode switch uses (`ground_1`, `player_run_1`,
+    /// `walker_a`), because the front door and the dock are the same menu seen from two sides:
+    /// a person who learned "the ground tile is Edit" on this screen should not have to learn
+    /// it again one keypress later. The icons are the reason the rows read as a game's menu
+    /// rather than as three words in a box.
+    icon: &'static str,
 }
 
 const DOORS: [Door; 3] = [
     Door {
         name: "EDIT",
         action: Action::Edit,
+        icon: "ground_1",
     },
     Door {
         name: "PLAY",
         action: Action::Play,
+        icon: "player_run_1",
     },
     Door {
         name: "EVOLVE",
         action: Action::Evolve,
+        icon: "walker_a",
     },
 ];
 
@@ -205,11 +246,6 @@ pub struct Splash {
     /// go. Two cursors that could disagree would be a menu that shows one thing and does
     /// another.
     selected: usize,
-    /// The logo, decoded and uploaded on the first frame that draws it.
-    ///
-    /// Lazy because a texture needs the context, and the splash is built before the window
-    /// hands it one. One upload for the screen's whole life: the picture never changes.
-    logo: Option<egui::TextureHandle>,
 }
 
 /// What is running the level in the picture.
@@ -322,7 +358,6 @@ impl Splash {
                 clock: 0.0,
                 hold: 0.0,
                 selected: 0,
-                logo: None,
             };
         }
         let Some(run) = champion_run(level, champions, level_path) else {
@@ -342,7 +377,6 @@ impl Splash {
             clock: 0.0,
             hold: 0.0,
             selected: 0,
-            logo: None,
         }
     }
 
@@ -358,7 +392,6 @@ impl Splash {
             clock: 0.0,
             hold: 0.0,
             selected: 0,
-            logo: None,
         }
     }
 
@@ -376,12 +409,12 @@ impl Splash {
     ///
     /// A screenshot cannot show a reveal, and the opening frame has the runner still on the
     /// left. `--splash --screenshot` therefore asks for the splash at the moment the demo run
-    /// is climbing the wordmark, which is the frame a person would photograph if they were
-    /// showing somebody the screen. The episode is advanced as well, so the runner in that
-    /// frame is running rather than standing on the spawn tile.
+    /// is over the pit, which is the frame a person would photograph if they were showing
+    /// somebody the screen. The episode is advanced as well, so the runner in that frame is
+    /// running rather than standing on the spawn tile.
     pub fn skip_opening(&mut self) {
-        // Two and a half seconds puts the runner on the upper face of the mark on the demo
-        // level; a champion's level lands wherever its own episode is at that instant.
+        // Two and a half seconds puts the runner past the pit on the demo level; a champion's
+        // level lands wherever its own episode is at that instant.
         let skip = 2.6;
         let steps = (skip / sim::DT).ceil() as u32;
         for _ in 0..steps {
@@ -449,26 +482,6 @@ impl Splash {
         }
     }
 
-    /// The logo as a texture, decoded and uploaded on first use.
-    ///
-    /// Nearest filtering, like the atlas: the picture is pixel art, and a smoothed logo
-    /// over a nearest-neighbour world would be two rendering decisions on one screen.
-    fn logo_texture(&mut self, ctx: &Context) -> egui::TextureHandle {
-        if let Some(handle) = &self.logo {
-            return handle.clone();
-        }
-        let decoded = image::load_from_memory(LOGO_PNG).expect("the embedded logo decodes");
-        let rgba = decoded.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            rgba.as_raw(),
-        );
-        let handle = ctx.load_texture("one-two-hundred-logo", image, egui::TextureOptions::NEAREST);
-        self.logo = Some(handle.clone());
-        handle
-    }
-
     /// Draw the screen, and say which way the viewer asked to go — or `None` if they have not
     /// asked yet.
     ///
@@ -494,21 +507,18 @@ impl Splash {
         let camera = self.camera(rect);
         let sheet = Sheet::new(&painter, atlas, sprites, &camera, rect);
         // The world, exactly as the play view draws it: the sky and its parallax, then the
-        // level, then the logo, then the agent with its dust. The level's own bounds box is
-        // the one thing the play view draws that belongs to a document rather than to a
-        // picture, so it is off.
+        // level, then the agent with its dust. The level's own bounds box is the one thing the
+        // play view draws that belongs to a document rather than to a picture, so it is off.
+        // The title is painted after the world, in screen space, so it is a card in front of
+        // the picture rather than a piece of the terrain.
         view::draw_background(sheet, &self.level, view::Backdrop::Sky, self.clock);
         let opts = RenderOpts {
             bounds: false,
             ..RenderOpts::playing()
         };
         let scripted = matches!(self.policy, Policy::Script);
-        let logo = self.logo_texture(ctx);
         if scripted {
-            // The demo logo is part of the level: terrain first, then the mark, then the
-            // runner so the climb happens *on* the logo rather than behind it.
             view::draw_level(sheet, &self.level, opts, None, self.clock);
-            paint_logo(&painter, logo_world_rect(camera, rect), self.clock, &logo);
             view::draw_agents(
                 sheet,
                 self.session.sim(),
@@ -527,20 +537,30 @@ impl Splash {
             );
         }
 
-        // The band under the level's own floor is the stage. Measured from the floor rather
-        // than from a fraction of the window, because a champion is played on whatever level
-        // the window opened on and this is the one line the composition can trust.
+        // The picture is framed like a title card: the corners fall away, the wordmark hangs
+        // in the sky above the level, and the band under the level's own floor is the stage the
+        // menu stands on. The vignette goes down *before* the mark so the title is the
+        // brightest thing on the screen rather than the thing the dark edges are cutting into.
+        vignette(&painter, rect);
+        title(&painter, rect, self.clock);
+
         let floor = sheet
             .camera
             .to_screen(0.0, (self.level.height - 1) as f32, rect)
             .y;
         stage(&painter, rect, floor);
-        if !scripted {
-            lockup(&painter, rect, self.clock, &logo);
-        }
+        footer(&painter, rect, self.clock);
 
         let panel = menu_panel(rect);
-        let from_menu = menu(ctx, &painter, rect, panel, &mut self.selected, self.clock);
+        let from_menu = menu(
+            ctx,
+            &painter,
+            rect,
+            panel,
+            &mut self.selected,
+            self.clock,
+            atlas,
+        );
         champion_credit(&painter, rect, self.credit());
         // The sound switch belongs on the front door too: the music is already
         // playing here, and the alternative is asking a person to start the
@@ -716,60 +736,48 @@ fn framed(level: &Level, rect: Rect) -> Camera {
 /// — is not placed here at all: the view scatters all of it from the tile coordinates, so the
 /// level only has to say where the ground is and the screen dresses itself.
 fn level() -> Level {
-    // Ten rows of sky over a two-row lawn, and thirty-four tiles long: as short as the two
-    // moves need and no taller than a level ever is. The shape is a framing decision — the
-    // fit is width-limited on a window this wide, so a longer level would draw every tile
-    // smaller and put the runner's head at eight pixels.
-    let mut level = Level::starter("splash", 34, 15);
-    // A deeper frame than the old demo: the extra sky above the wordmark and the extra ground
-    // below it are what put the mark near the top and the land low in the window.
+    // Ten rows of sky over a two-row lawn, and forty tiles long: long enough that a person
+    // watching sees a *level* running past rather than a diorama, short enough that the fit
+    // still draws the runner at a readable size on a wide window.
+    //
+    // The shape is the whole of the game in three moves, in the order a player meets them: a
+    // run, a pit to clear, a block to climb, and a low hill up to the flag. The old scene put
+    // a nineteen-tile stone pyramid in the middle for the wordmark to stand on, and the picture
+    // read as a grey mountain with a logo on it: the name now hangs in the sky where a title
+    // belongs, and the ground does what ground in this game does.
+    let mut level = Level::starter("splash", 40, 15);
     for tx in 0..level.width {
         level.set_tile(tx, 13, Tile::Solid);
         level.set_tile(tx, 14, Tile::Solid);
     }
     // `starter` placed the spawn and the flag on the single row it knows about; with the
     // floor two rows lower they move down with it. A goal tile is the *pole* — the lower of
-    // the flag's two cells, and the one that has to have ground under it — so it is row 12,
-    // the tile standing on the lawn. A level has one flag, so both calls are *moves*: the
-    // spawn's and the goal's place in the row are what changes, not how many of them there
-    // are.
+    // the flag's two cells, and the one that has to have ground under it — so its row is the
+    // one above the hill's summit.
     level.set_spawn_tile(1, 12);
-    level.set_goal_tile(31, 12);
 
-    // A terraced hill in the middle, ten tiles from the ground to the summit. The summit sits
-    // one row below the top of the mark, so the runner crosses the wordmark's face and top
-    // edge without its jump carrying it out of the window. The lower terraces stay visible as
-    // the mountain the mark stands on. One tile per terrace is the shape the script can read;
-    // the jump can carry several treads at once, which is why the steps are here at all rather
-    // than a wall.
-    const TERRACES: [(i32, i32, i32); 19] = [
-        (5, 6, 12),
-        (6, 7, 11),
-        (7, 8, 10),
-        (8, 9, 9),
-        (9, 10, 8),
-        (10, 11, 7),
-        (11, 12, 6),
-        (12, 13, 5),
-        (13, 14, 4),
-        (14, 20, 3),
-        (20, 21, 4),
-        (21, 22, 5),
-        (22, 23, 6),
-        (23, 24, 7),
-        (24, 25, 8),
-        (25, 26, 9),
-        (26, 27, 10),
-        (27, 28, 11),
-        (28, 29, 12),
-    ];
-    for (left, right, top) in TERRACES {
-        for tx in left..right {
-            for ty in top..13 {
-                level.set_tile(tx, ty, Tile::Solid);
-            }
+    // The pit: two tiles of nothing in the lawn, wide enough that the script has to commit to
+    // the jump and narrow enough that the game's own jump clears it with room to spare.
+    for tx in 14..16 {
+        level.set_tile(tx, 13, Tile::Empty);
+        level.set_tile(tx, 14, Tile::Empty);
+    }
+    // The block: a chest-high step, which is the second thing every level in this pack asks
+    // for and the reason the script reads the tile above the runner's feet.
+    for tx in 22..25 {
+        for ty in 11..13 {
+            level.set_tile(tx, ty, Tile::Solid);
         }
     }
+    // The finish: a two-tile hill with the flag on top, so the run ends on a rise with the
+    // flag against the sky instead of on the flat at the edge of the frame.
+    for tx in 31..37 {
+        level.set_tile(tx, 12, Tile::Solid);
+    }
+    for tx in 33..37 {
+        level.set_tile(tx, 11, Tile::Solid);
+    }
+    level.set_goal_tile(35, 10);
     level
 }
 
@@ -917,81 +925,412 @@ fn champion_file(
     })
 }
 
-/// How far the logo's entrance has run: 0 not yet, 1 settled.
+/// How far the title's entrance has run: 0 not yet, 1 settled.
 ///
 /// A pure function of the clock, so the reveal can be tested without a screen, and so the
-/// logo being settled before the menu arrives is a fact about the timing constants rather
+/// wordmark being settled before the menu arrives is a fact about the timing constants rather
 /// than something to eyeball.
-fn logo_in(clock: f32) -> f32 {
-    let t = ((clock - LOGO_AT) / LOGO_FADE).clamp(0.0, 1.0);
+fn title_in(clock: f32) -> f32 {
+    let t = ((clock - TITLE_AT) / TITLE_FADE).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The size the overhead logo is drawn at on a champion's level.
+/// How big the two lines of the wordmark are, from the window's width.
 ///
-/// Wide enough to be the thing the screen is *about* — a logo a third of the window wide
-/// is a caption — and capped, because past a size the picture is just nearer, not bigger
-/// in any way that matters. The height follows from the picture's own aspect.
-fn logo_size(rect: Rect) -> Vec2 {
-    let width = (rect.width() * 0.56).clamp(400.0, 760.0);
-    Vec2::new(width, width / LOGO_ASPECT)
+/// The big line is the one that has to fit: `HUNDRED` is seven characters of a face whose glyphs
+/// are square, so the size *is* roughly width-over-seven, and the small line follows at half.
+/// The clamp keeps the title a title on a laptop and on a wall rather than letting a wide window
+/// turn it into a banner; the small line is deliberately half the big one rather than a third,
+/// because at a third its letterforms are a texture and not words.
+///
+/// Sizes are snapped to multiples of eight, the grid the face was drawn on. At any other size the
+/// stems land between pixels and the renderer shades their edges — a whole word of grey fringes,
+/// on a screen whose art is entire pixels and whose type is supposed to be, too.
+fn title_sizes(rect: Rect) -> (f32, f32) {
+    let fit = (rect.width() * 0.060 / 8.0).round() * 8.0;
+    let big = fit.clamp(40.0, 120.0);
+    (big * 0.50, big)
 }
 
-/// Where the logo's top edge sits at rest, as a fraction of the window's height.
-///
-/// Only the champion path uses this overhead placement; the scripted demo puts the mark in
-/// the level so the runner can climb it.
-const LOGO_TOP: f32 = 0.105;
-
-/// The demo level's logo: five tiles tall, high over the terraced hill.
-///
-/// The width follows the picture's own aspect. The logo spans the upper face of the hill, so
-/// the runner climbs it and crosses its top edge, while the land stays low below.
-const LOGO_WORLD_TOP: f32 = 2.0;
-const LOGO_WORLD_BOTTOM: f32 = 7.0;
-const LOGO_WORLD_CENTRE: f32 = 17.0;
-
-/// The logo's rectangle in the demo level, in screen space.
-///
-/// The height is five tiles; its bottom sits above the ground, leaving the lower terraces of
-/// the hill visible underneath. The width comes from the picture so the mark keeps its shape
-/// at whatever zoom the camera is at.
-fn logo_world_rect(camera: Camera, rect: Rect) -> Rect {
-    let height = LOGO_WORLD_BOTTOM - LOGO_WORLD_TOP;
-    let width = height * LOGO_ASPECT;
-    let min = camera.to_screen(LOGO_WORLD_CENTRE - width * 0.5, LOGO_WORLD_TOP, rect);
-    let max = camera.to_screen(LOGO_WORLD_CENTRE + width * 0.5, LOGO_WORLD_BOTTOM, rect);
-    Rect::from_min_max(min, max)
+/// One pixel of the face's own grid at `size`: the face is drawn on an eight-by-eight cell, so
+/// this is the width of the marks a letterform is built from.
+fn title_grid(size: f32) -> f32 {
+    (size / 8.0).max(1.0).round()
 }
 
-/// Draw the logo at `dest`, fading up into place.
+/// The width of one cell of the pixel face at `size` — the glyph's own advance, measured once.
 ///
-/// One paint for both placements: the overhead mark on a champion's level, and the mark in
-/// the demo level the runner climbs.
-fn paint_logo(painter: &Painter, dest: Rect, clock: f32, logo: &egui::TextureHandle) {
-    let arrived = logo_in(clock);
+/// Everything about the lockup's spacing comes from this number rather than from a guessed ratio:
+/// a face whose advance is not exactly its size still gets a title whose letters sit where the
+/// eye expects them. Measured on two glyphs, because one galley's width can carry the leading
+/// of the pair and two halves the error.
+fn title_cell(painter: &Painter, size: f32) -> f32 {
+    let galley = painter.layout_no_wrap("00".to_string(), theme::pixel_font(size), Color32::WHITE);
+    galley.size().x * 0.5
+}
+
+/// How much ink `text` takes when set at `size`, at the lockup's own tracking.
+fn title_width(painter: &Painter, text: &str, size: f32) -> f32 {
+    let cell = title_cell(painter, size) * TITLE_TRACK;
+    text.chars()
+        .map(|c| {
+            if c == ' ' {
+                cell * (1.0 + TITLE_WORD_GAP)
+            } else {
+                cell
+            }
+        })
+        .sum()
+}
+
+/// One line of the lockup: a block extrusion, a hard edge, and a cream face.
+///
+/// Drawn a glyph at a time, because the spacing here is the lockup's and not the font's, and in
+/// plates rather than one pass per word: the block's outline, the block, the letters' outline,
+/// the letters. That ordering is what makes a pixel title without a bevel font — the letters
+/// keep a hard silhouette in the frame's brown and a solid gold side, so a 60-point letter is a
+/// made object rather than a white slab. The return value is the line's width, so the caller can
+/// hang a rule off its edges.
+fn title_line(
+    painter: &Painter,
+    mid: Pos2,
+    text: &str,
+    size: f32,
+    face: Color32,
+    block: Color32,
+    arrived: f32,
+) -> f32 {
+    let font = theme::pixel_font(size);
+    let alpha = |colour: Color32, a: f32| {
+        Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), (a * 255.0) as u8)
+    };
+    let cell = title_cell(painter, size) * TITLE_TRACK;
+    let width = title_width(painter, text, size);
+    let mut cursor = mid.x - width * 0.5;
+    let mut places = Vec::new();
+    for ch in text.chars() {
+        let step = if ch == ' ' {
+            cell * (1.0 + TITLE_WORD_GAP)
+        } else {
+            cell
+        };
+        if ch != ' ' {
+            places.push((ch, Pos2::new((cursor + step * 0.5).round(), mid.y.round())));
+        }
+        cursor += step;
+    }
+
+    let grid = title_grid(size);
+    let edge = (grid * TITLE_EDGE).round().max(1.0);
+    let depth = (grid * TITLE_BLOCK).round().max(2.0);
+    // A *plate* is the line drawn as a solid shape: the glyphs themselves, plus the same
+    // glyphs eight times around each one, which thickens the silhouette by `grow` in every
+    // direction. Whole pixels, so the edge stays crisp where a stroked outline would go soft.
+    let plate = |colour: Color32, off: Vec2, grow: f32| {
+        let ring = if grow > 0.0 {
+            vec![
+                (-grow, 0.0),
+                (grow, 0.0),
+                (0.0, -grow),
+                (0.0, grow),
+                (-grow, -grow),
+                (grow, -grow),
+                (-grow, grow),
+                (grow, grow),
+            ]
+        } else {
+            Vec::new()
+        };
+        for (dx, dy) in ring {
+            for (ch, at) in &places {
+                painter.text(
+                    *at + off + Vec2::new(dx, dy),
+                    Align2::CENTER_CENTER,
+                    *ch,
+                    font.clone(),
+                    alpha(colour, arrived),
+                );
+            }
+        }
+        for (ch, at) in &places {
+            painter.text(
+                *at + off,
+                Align2::CENTER_CENTER,
+                *ch,
+                font.clone(),
+                alpha(colour, arrived),
+            );
+        }
+    };
+
+    // The mark is three plates, back to front: the block's own outline in the frame's brown,
+    // the block in the accent, and the letters on top. That ordering is the whole of the 3D —
+    // the gold reads as the *side* of the letters because the front plate is outlined, so the
+    // block shows as a band of gold on the bottom and right rather than as a pale echo of the
+    // word behind it. The letters stand on a gold shelf, which is the one thing this screen's
+    // furniture and its art already agree on.
+    let back = Vec2::splat(depth);
+    plate(theme::OUTLINE, back, edge * 2.0);
+    plate(block, back, edge);
+    plate(theme::OUTLINE, Vec2::ZERO, edge);
+    plate(face, Vec2::ZERO, 0.0);
+    width
+}
+
+/// Where the wordmark's top edge sits at rest, as a fraction of the window's height.
+///
+/// High in the sky, above the horizon the level draws, because that band is the title card: the
+/// wordmark and its tagline are the only things on the screen between the top edge and the level,
+/// and everything a person needs to read is below them.
+const TITLE_TOP: f32 = 0.055;
+/// The one line under the mark: what the game is, in the space the menu does not need.
+const TAGLINE: &str = "A PLATFORMER THAT LEARNS";
+/// How far under the mark's block that line sits.
+const TITLE_TAGLINE_GAP: f32 = 46.0;
+
+/// Where the two lines sit and how wide the mark is, for a window of `rect`'s size.
+///
+/// The numbers are computed once, in a function a test can call without a screen, because the
+/// lockup has to hold at every window size the app allows: both lines inside the measure, the
+/// rules long enough to read as rules, and the caption clear of the menu below it.
+struct Lockup {
+    small: f32,
+    big: f32,
+    /// The axis the mark is set on — the window's centre, less half the block.
+    centre: f32,
+    one: Pos2,
+    two: Pos2,
+    /// The width of the mark: `HUNDRED`'s ink, which the rules carry up to `ONE TWO`.
+    measure: f32,
+    /// `ONE TWO`'s own ink, inside the measure.
+    one_w: f32,
+    rule: f32,
+    gap: f32,
+}
+
+impl Lockup {
+    /// The bottom edge of the block under the big line, which is the mark's real bottom.
+    fn bottom(&self) -> f32 {
+        self.two.y + self.big * 0.5 + (title_grid(self.big) * TITLE_BLOCK).round()
+    }
+}
+
+fn lockup(painter: &Painter, rect: Rect, clock: f32) -> Lockup {
+    let (small, big) = title_sizes(rect);
+    let measure = title_width(painter, TITLE_TWO, big);
+    let one_w = title_width(painter, TITLE_ONE, small);
+    let rise = (1.0 - title_in(clock)) * 12.0;
+    // The block leans to the bottom right, so the mark is set half a block to the left of the
+    // window's centre: a person centres a logo by its ink, and the shelf is ink.
+    let centre = rect.center().x - (title_grid(big) * TITLE_BLOCK).round() * 0.5;
+    let top = rect.top() + rect.height() * TITLE_TOP - rise;
+    let one = Pos2::new(centre, top + small * 0.5);
+    // The gap between the lines is the small line's own shelf plus a share of the big one's
+    // size, so the block under `ONE TWO` sits over the cap height of `HUNDRED` instead of
+    // touching it.
+    let bevel = (title_grid(small) * TITLE_BLOCK).round().max(2.0);
+    let two = Pos2::new(centre, one.y + small * 0.5 + bevel + big * 0.20 + big * 0.5);
+    Lockup {
+        small,
+        big,
+        centre,
+        one,
+        two,
+        measure,
+        one_w,
+        rule: (small * 0.10).round().max(3.0),
+        gap: small * 0.62,
+    }
+}
+
+/// The title card: the two-line wordmark, its rules, and the line under it.
+///
+/// The mark used to be a picture — the committed `logo.png`, rainbow letters on a strip of baked
+/// terrain — hung in the sky over the level. It read as a decal rather than as a title: its own
+/// palette was six colours this game never uses, its base was a piece of somebody else's ground,
+/// and nothing on the menu below it was set in the same hand. This is the same name drawn the way
+/// every other word on the screen is drawn, in the embedded pixel face, and made the way the
+/// game's own objects are: cream letters with a hard brown edge, standing on a shelf of the
+/// accent gold, the small line ruled out to the big line's measure. Cream on gold on brown is the
+/// hierarchy and the material at once, which is what a title needs and the old picture, six
+/// colours of somebody else's logotype, did not have.
+fn title(painter: &Painter, rect: Rect, clock: f32) {
+    let arrived = title_in(clock);
     if arrived <= 0.0 {
         return;
     }
-    let rise = (1.0 - arrived) * 10.0;
-    let dest = dest.translate(Vec2::new(0.0, rise));
-    painter.image(
-        logo.id(),
-        dest,
-        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-        // A pure alpha fade rather than a gamma multiply: the multiply darkens as it
-        // thins, so the mark's first frames would read as a grey watermark instead of as
-        // the picture arriving.
-        Color32::from_rgba_unmultiplied(255, 255, 255, (arrived * 255.0) as u8),
+    let alpha = |colour: Color32, a: f32| {
+        Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), (a * 255.0) as u8)
+    };
+    let mark = lockup(painter, rect, clock);
+
+    // The big line sets the measure; the small one is centred on the same axis and the rules
+    // either side of it carry that measure up, so the mark reads as one block of width.
+    //
+    // It was first solved the other way — `ONE TWO` tracked all the way out to `HUNDRED`'s two
+    // edges — and at that tracking its letters came apart into six shapes with holes between
+    // them. A rule is the classic answer to the same problem and the better one: the small line
+    // stays a word, and the width of the mark is still one width.
+    let bar = |from: f32, to: f32| {
+        if to - from > mark.rule {
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(from, (mark.one.y - mark.rule * 0.5).round()),
+                    Vec2::new(to - from, mark.rule),
+                ),
+                CornerRadius::ZERO,
+                alpha(theme::ACCENT, arrived),
+            );
+        }
+    };
+    bar(
+        mark.centre - mark.measure * 0.5,
+        mark.one.x - mark.one_w * 0.5 - mark.gap,
+    );
+    bar(
+        mark.one.x + mark.one_w * 0.5 + mark.gap,
+        mark.centre + mark.measure * 0.5,
+    );
+
+    title_line(
+        painter,
+        mark.one,
+        TITLE_ONE,
+        mark.small,
+        theme::PLATE,
+        theme::ACCENT,
+        arrived,
+    );
+    title_line(
+        painter,
+        mark.two,
+        TITLE_TWO,
+        mark.big,
+        theme::PLATE,
+        theme::ACCENT,
+        arrived,
+    );
+
+    // The tagline fades in a beat behind the mark: the name lands, then the sentence about it,
+    // and then the menu asks for a decision. It is set exactly like the title above it — cream
+    // letters with a one-pixel brown outline — because that is what makes the two lines one
+    // lockup instead of a title with a caption under it.
+    let tag = ((clock - TITLE_AT - TITLE_FADE * 0.55) / 0.45).clamp(0.0, 1.0);
+    if tag > 0.0 {
+        // Under the block, not under the baseline: the shelf is part of the mark's height.
+        let at = Pos2::new(mark.centre, mark.bottom() + TITLE_TAGLINE_GAP);
+        let font = theme::pixel_font(12.0);
+        // On a chip, because the sky behind it is not a surface: there are clouds, hills and the
+        // sun crossing this line at any moment of the loop, and white type with a one-pixel edge
+        // disappears into a cloud. A dark pill is the same bargain the stage under the menu makes
+        // — the words get a surface of their own rather than hoping the picture stays quiet.
+        let galley = painter.layout_no_wrap(TAGLINE.to_string(), font.clone(), theme::PLATE);
+        let chip = Rect::from_center_size(at, galley.size() + Vec2::new(26.0, 14.0));
+        painter.rect_filled(
+            chip,
+            CornerRadius::same(6),
+            Color32::from_rgba_unmultiplied(
+                STAGE_INK.r(),
+                STAGE_INK.g(),
+                STAGE_INK.b(),
+                (tag * 168.0) as u8,
+            ),
+        );
+        painter.text(
+            at,
+            Align2::CENTER_CENTER,
+            TAGLINE,
+            font,
+            Color32::from_rgba_unmultiplied(
+                theme::PLATE.r(),
+                theme::PLATE.g(),
+                theme::PLATE.b(),
+                (tag * 255.0) as u8,
+            ),
+        );
+    }
+}
+
+/// The corners of the picture fall away, so the level is the subject and the frame is a frame.
+///
+/// Three bands rather than a radial blur — a pixel-art title screen does not vignette with a
+/// soft lens. The top band is the one that matters: it is what the wordmark is read against on a
+/// bright sky. The side bands are deliberately gentle, because the level runs off both edges and
+/// cutting into it would hide the thing the screen is showing.
+fn vignette(painter: &Painter, rect: Rect) {
+    let clear = Color32::from_rgba_unmultiplied(STAGE_INK.r(), STAGE_INK.g(), STAGE_INK.b(), 0);
+    let band = |x0: f32, x1: f32, y0: f32, y1: f32, top: Color32, bottom: Color32| {
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(Pos2::new(x0, y0), top);
+        mesh.colored_vertex(Pos2::new(x1, y0), top);
+        mesh.colored_vertex(Pos2::new(x1, y1), bottom);
+        mesh.colored_vertex(Pos2::new(x0, y1), bottom);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(mesh);
+    };
+    let ink =
+        |a: u8| Color32::from_rgba_unmultiplied(STAGE_INK.r(), STAGE_INK.g(), STAGE_INK.b(), a);
+    band(
+        rect.left(),
+        rect.right(),
+        rect.top(),
+        rect.top() + rect.height() * 0.34,
+        ink(96),
+        clear,
+    );
+    band(
+        rect.left(),
+        rect.right(),
+        rect.bottom() - rect.height() * 0.22,
+        rect.bottom(),
+        clear,
+        ink(70),
+    );
+    band(
+        rect.left(),
+        rect.left() + rect.width() * 0.10,
+        rect.top(),
+        rect.bottom(),
+        ink(48),
+        clear,
+    );
+    band(
+        rect.right() - rect.width() * 0.10,
+        rect.right(),
+        rect.top(),
+        rect.bottom(),
+        clear,
+        ink(48),
     );
 }
 
-/// The overhead logo, for a champion playing a level the screen did not build.
-fn lockup(painter: &Painter, rect: Rect, clock: f32, logo: &egui::TextureHandle) {
-    let size = logo_size(rect);
-    let top = rect.top() + rect.height() * LOGO_TOP;
-    let dest = Rect::from_min_size(Pos2::new(rect.center().x - size.x * 0.5, top), size);
-    paint_logo(painter, dest, clock, logo);
+/// The line along the window's bottom edge: the name on the left, the build on the right.
+///
+/// A title screen with nothing under the menu is a screen that stops rather than a screen that
+/// is finished. Two small capitals on the frame's own edge finish it, and the build number on
+/// the right is also the one thing on this screen that a bug report needs.
+fn footer(painter: &Painter, rect: Rect, clock: f32) {
+    let arrived = ((clock - HINT_AT - DOORS_LAG) / 0.6).clamp(0.0, 1.0);
+    if arrived <= 0.0 {
+        return;
+    }
+    let ink = FOOT_INK.gamma_multiply(arrived * 0.85);
+    let y = rect.bottom() - 10.0;
+    painter.text(
+        Pos2::new(rect.left() + 16.0, y),
+        Align2::LEFT_CENTER,
+        "ONE TWO HUNDRED",
+        theme::pixel_font(8.0),
+        ink,
+    );
+    painter.text(
+        Pos2::new(rect.right() - 16.0, y),
+        Align2::RIGHT_CENTER,
+        format!("v{}", env!("CARGO_PKG_VERSION")),
+        theme::pixel_font(8.0),
+        ink,
+    );
 }
 
 /// The stage: the band under the level's floor, darkened to a near-black gradient.
@@ -1105,6 +1444,7 @@ fn menu(
     panel: Rect,
     selected: &mut usize,
     clock: f32,
+    atlas: &Atlas,
 ) -> Option<Action> {
     if !menu_is_up(clock) {
         return None;
@@ -1137,7 +1477,7 @@ fn menu(
             }
         });
     if arrived > 0.0 {
-        paint_menu(painter, panel, *selected, arrived);
+        paint_menu(painter, panel, *selected, arrived, atlas);
         prompt(painter, rect, clock);
     }
     action
@@ -1147,31 +1487,65 @@ fn menu(
 ///
 /// One surface, one accent, no decoration: a warm plate with a dark outline, the chosen row
 /// filled in the window's gold, and the verbs themselves as the only labels.
-fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32) {
+fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, atlas: &Atlas) {
     let ink = |colour: Color32| colour.gamma_multiply(arrived);
     let radius = CornerRadius::same(theme::RADIUS_LG);
+    // A drop shadow under the box, then the plate: the menu is an object standing on the stage
+    // under the level, and without the shadow it is a white rectangle laid over a picture.
+    painter.rect_filled(
+        panel.translate(Vec2::new(0.0, 5.0)),
+        radius,
+        ink(Color32::from_rgba_premultiplied(16, 10, 8, 120)),
+    );
     painter.rect_filled(panel, radius, ink(theme::CARD));
     painter.rect_stroke(
         panel,
         radius,
-        Stroke::new(2.0_f32, ink(theme::OUTLINE)),
+        Stroke::new(3.0_f32, ink(theme::OUTLINE)),
         egui::StrokeKind::Inside,
     );
     for (index, door) in DOORS.iter().enumerate() {
         let line = line_rect(panel, index);
         let chosen = index == selected;
+        let plate = line.shrink2(Vec2::new(8.0, 4.0));
         if chosen {
-            painter.rect_filled(
-                line.shrink2(Vec2::new(8.0, 4.0)),
+            // The chosen row is a *plate*, not a tint: the same gold the dock gives the mode
+            // being used, with the same brown boundary, so the two menus agree about what a
+            // selected control looks like.
+            painter.rect_filled(plate, CornerRadius::same(theme::RADIUS), ink(theme::ACCENT));
+            painter.rect_stroke(
+                plate,
                 CornerRadius::same(theme::RADIUS),
-                ink(theme::ACCENT),
+                Stroke::new(2.0_f32, ink(theme::OUTLINE)),
+                egui::StrokeKind::Inside,
+            );
+        } else if index + 1 < DOORS.len() {
+            // A hairline between the rows, so the list reads as a list rather than as three
+            // words floating in a box.
+            let y = line.bottom();
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(line.left() + 12.0, y - 0.5),
+                    Pos2::new(line.right() - 12.0, y + 0.5),
+                ),
+                CornerRadius::ZERO,
+                ink(theme::EDGE),
             );
         }
+        // The icon, on the same left margin as the word it belongs to, in the game's own art:
+        // the ground tile for Edit, the runner for Play, a walker for Evolve.
+        let icon = Rect::from_center_size(
+            Pos2::new(plate.left() + MENU_ICON_LEFT, plate.center().y),
+            Vec2::splat(MENU_ICON),
+        );
+        if let Ok(uv) = atlas.uv(door.icon) {
+            painter.image(atlas.texture_id(), icon, uv, ink(Color32::WHITE));
+        }
         painter.text(
-            line.center(),
-            Align2::CENTER_CENTER,
+            Pos2::new(plate.left() + MENU_LABEL_LEFT, plate.center().y),
+            Align2::LEFT_CENTER,
             door.name,
-            theme::pixel_font(17.0),
+            theme::pixel_font(18.0),
             ink(if chosen {
                 theme::INK_ON_ACCENT
             } else {
@@ -1469,9 +1843,17 @@ mod tests {
             "the splash's own runner did not get to the flag in {seconds:.1}s: {}",
             splash.session.summary()
         );
+        // The scene's two moves really happened: a jump over the pit and a jump onto the block,
+        // before the hill at the end. A runner that walked along the flat and reached a flag on
+        // the same row would satisfy "won" and show nothing the game is about.
         assert!(
-            highest < LOGO_WORLD_TOP + 1.0,
-            "the runner only reached y {highest:.1}; it never climbed over the logo"
+            splash.session.sim().stats().jumps >= 2,
+            "the runner won with {} jumps: it never cleared the pit and the block",
+            splash.session.sim().stats().jumps
+        );
+        assert!(
+            highest < 11.9,
+            "the runner only reached y {highest:.1}; it never climbed the hill to the flag"
         );
         assert!(
             seconds < 12.0,
@@ -1479,11 +1861,11 @@ mod tests {
         );
     }
 
-    /// The camera keeps the runner inside the window even on the tall summit jump.
+    /// The camera keeps the runner inside the window through the whole run.
     ///
-    /// The mark now sits high and the hill is long; a full jump from the top terrace would
-    /// otherwise put the agent's head above the frame. The target camera eases down by the
-    /// missing margin, and this drives the whole run to prove it never loses the runner.
+    /// The finish hill puts the flag two tiles above the lawn, and a full jump from the top of
+    /// it would otherwise carry the agent's head above the frame. The target camera eases down
+    /// by the missing margin, and this drives the whole run to prove it never loses the runner.
     #[test]
     fn the_camera_keeps_the_runner_in_frame() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0));
@@ -1574,30 +1956,106 @@ mod tests {
         );
     }
 
-    /// The logo is fully revealed before the menu arrives to be read.
+    /// The title is fully revealed before the menu arrives to be read.
     ///
     /// Both halves matter: a mark that is still arriving while the menu is already solid is a
     /// screen that is still assembling itself while it asks the viewer to choose, and a reveal
-    /// that takes longer than a person waits is a logo nobody reads.
+    /// that takes longer than a person waits is a title nobody reads.
     #[test]
-    fn the_logo_arrives_before_the_menu() {
-        assert_eq!(logo_in(0.0), 0.0, "the logo is up before the clock is");
+    fn the_title_arrives_before_the_menu() {
+        // The wordmark itself is laid out and checked in
+        // [`the_wordmark_is_one_lockup_at_every_window_size`]; this is the clock.
+        assert_eq!(title_in(0.0), 0.0, "the title is up before the clock is");
         assert_eq!(
-            logo_in(LOGO_AT - 0.01),
+            title_in(TITLE_AT - 0.01),
             0.0,
-            "the logo arrives before its moment"
+            "the title arrives before its moment"
         );
-        let done = LOGO_AT + LOGO_FADE;
-        assert_eq!(logo_in(done + 0.01), 1.0, "the logo never settles");
+        let done = TITLE_AT + TITLE_FADE;
+        assert_eq!(title_in(done + 0.01), 1.0, "the title never settles");
         assert!(
             done < HINT_AT,
-            "the logo is still arriving at {done:.2}s, after the menu at {HINT_AT}s"
+            "the title is still arriving at {done:.2}s, after the menu at {HINT_AT}s"
         );
         // Halfway through the fade it is halfway there: the reveal is a ramp, not a cut,
         // because a picture that snaps in at full strength reads as a pop rather than as a
         // landing.
-        let mid = logo_in(LOGO_AT + LOGO_FADE * 0.5);
+        let mid = title_in(TITLE_AT + TITLE_FADE * 0.5);
         assert!(mid > 0.4 && mid < 0.6, "halfway reads {mid}");
+    }
+
+    /// The wordmark is one lockup at every window size: both lines inside one measure, the rules
+    /// long enough to read as rules, and the caption clear of the menu.
+    ///
+    /// The sizes here are the window's own floor and a wall. A title that only holds at the size
+    /// it was designed at is a title that breaks on somebody else's screen, and “the lines line
+    /// up” is arithmetic: three window sizes are checked here because no eye checks three at once.
+    #[test]
+    fn the_wordmark_is_one_lockup_at_every_window_size() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        for (w, h) in [(900.0, 560.0), (1360.0, 800.0), (2560.0, 1440.0)] {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+            let mut laid = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Background,
+                        egui::Id::new("wordmark"),
+                    ));
+                    laid = Some(lockup(&painter, rect, 2.4));
+                },
+            );
+            let mark = laid.expect("the lockup is laid out inside a frame");
+            let at = format!("{w:.0}×{h:.0}");
+            assert_eq!(
+                mark.small * 2.0,
+                mark.big,
+                "the small line is not half of {at}"
+            );
+            assert_eq!(
+                mark.big % 8.0,
+                0.0,
+                "{at} is off the face's grid: {}",
+                mark.big
+            );
+            assert!(
+                (40.0..=120.0).contains(&mark.big),
+                "{at} sets the big line at {}",
+                mark.big
+            );
+            assert!(
+                mark.measure > w * 0.28 && mark.measure < w * 0.62,
+                "{at} sets the mark {} wide",
+                mark.measure
+            );
+            let rules = mark.measure - mark.one_w;
+            assert!(
+                rules > 2.0 * (mark.gap + mark.rule),
+                "{at} leaves the rules {rules} for two rules and two gaps"
+            );
+            assert!(
+                mark.one.y - mark.small > rect.top(),
+                "{at} starts the mark above the window's top edge"
+            );
+            assert!(
+                mark.centre - mark.measure * 0.5 > rect.left()
+                    && mark.centre + mark.measure * 0.5 < rect.right(),
+                "{at} runs the mark off the side"
+            );
+            // The caption sits under the block and above the menu: the screen's three objects,
+            // in that order, at every size.
+            let caption = mark.bottom() + TITLE_TAGLINE_GAP + 20.0;
+            assert!(
+                caption < menu_panel(rect).top() || rect.height() < 620.0,
+                "{at} puts the caption at {caption} under a menu starting at {}",
+                menu_panel(rect).top()
+            );
+        }
     }
 
     /// The screen is a doorway: a key or a click opens the game, and an event in the first
@@ -1966,14 +2424,13 @@ mod tests {
         assert!(menu_panel(tall).bottom() > panel.bottom());
     }
 
-    /// The screen draws the world, the logo and the words, and the world changes with the
-    /// clock.
+    /// The screen draws the world and the words, and both change with the clock.
     ///
     /// Read back the way the renderer left it — the tessellated shapes, counted by which
     /// texture they sampled — rather than by asking the code that drew them: the world is a
-    /// great many atlas quads, the logo is a quad sampling its own texture, and the words are
-    /// a great many glyphs from the font texture, and a clock that stops moving any of them
-    /// is the one bug a splash can have that a person would notice immediately.
+    /// great many atlas quads, the title and the menu are glyphs from the font texture, and a
+    /// clock that stops moving the world is the one bug a splash can have that a person would
+    /// notice immediately.
     #[test]
     fn the_splash_draws_the_world_and_the_words() {
         let ctx = egui::Context::default();
@@ -1982,7 +2439,7 @@ mod tests {
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let size = Vec2::new(1360.0, 800.0);
         let rect = Rect::from_min_size(Pos2::ZERO, size);
-        let counts = |clock: f32| -> (usize, usize, usize, u32) {
+        let counts = |clock: f32| -> (usize, usize, u32) {
             let mut splash = {
                 let mut splash = Splash::scripted();
                 while splash.clock() < clock {
@@ -1999,22 +2456,13 @@ mod tests {
                     splash.show(ctx, &atlas, &sprites);
                 },
             );
-            // The frame just drawn uploaded the logo; its id is how its quad is known from
-            // every other quad on the screen.
-            let logo_id = splash.logo.as_ref().map(|handle| handle.id());
-            let (mut world, mut words, mut logo) = (0, 0, 0);
+            let (mut world, mut words) = (0, 0);
             for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
                 let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
                     continue;
                 };
                 if mesh.texture_id == atlas.texture_id() {
                     world += mesh.vertices.len() / 4;
-                    continue;
-                }
-                if Some(mesh.texture_id) == logo_id {
-                    // The demo logo is in the level, so count every quad that samples its
-                    // texture rather than only those in a screen band.
-                    logo += mesh.vertices.len() / 4;
                     continue;
                 }
                 if mesh.texture_id != egui::TextureId::default() {
@@ -2038,26 +2486,30 @@ mod tests {
                     words += 1;
                 }
             }
-            (world, words, logo, splash.session.sim().stats().frames)
+            (world, words, splash.session.sim().stats().frames)
         };
 
-        let (world, words, logo, frames) = counts(2.4);
+        let (world, words, frames) = counts(2.4);
         assert!(
             world > 40,
             "the splash drew {world} sprite quads: the world is not on the screen"
         );
         assert!(
-            words > 20,
-            "the splash drew {words} glyph quads: the menu and prompt are not on the screen"
+            words > 40,
+            "the splash drew {words} glyph quads: the title, menu and prompt are not on screen"
         );
+        // The title arrives before the menu: at 0.9s the wordmark and its tagline are up (the
+        // two lines are seven letters each and the tagline is twenty-four), and the menu is not
+        // yet, so a frame in that window has words but fewer of them than the finished screen.
+        let (_, early_words, _) = counts(0.0);
+        assert_eq!(early_words, 0, "the title is already up at the first frame");
+        let (_, title_words, _) = counts(0.95);
         assert!(
-            logo >= 1,
-            "the splash drew {logo} logo quads: the logo is not on the screen"
+            title_words > 10 && title_words < words,
+            "at 0.95s there are {title_words} glyph quads and the finished screen has {words}: \
+             the title and the menu are not arriving at separate times"
         );
-        let (_, early_words, early_logo, _) = counts(0.0);
-        assert_eq!(early_words, 0, "the menu is already up at the first frame");
-        assert_eq!(early_logo, 0, "the logo is already up at the first frame");
-        let (_, _, _, later_frames) = counts(6.0);
+        let (_, _, later_frames) = counts(6.0);
         assert!(
             later_frames != frames,
             "the episode is on the same tick at 2.4s and 6.0s: nothing in it is running"

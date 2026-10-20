@@ -837,12 +837,11 @@ impl Generator {
                 // beside the level: seed from that rather than resume a solved run with no winner.
                 let record = match checkpoint.best_genome()? {
                     Some(record) => Some(record),
-                    None => ChampionFile::load_for_level(
-                        out_dir.join(format!("{stem}.json")),
-                        &level,
-                    )
-                    .ok()
-                    .and_then(|champion| champion.to_genome().ok()),
+                    None => {
+                        ChampionFile::load_for_level(out_dir.join(format!("{stem}.json")), &level)
+                            .ok()
+                            .and_then(|champion| champion.to_genome().ok())
+                    }
                 };
                 if let Some(record) = record {
                     trainer.seed_record_from_checkpoint(&level, record)?;
@@ -1758,8 +1757,8 @@ impl Lab {
             out_dir.clone(),
             stem.clone(),
         )?;
-    let origin = generator.origin().map(str::to_string);
-    let rate = cfg.mutation_rate;
+        let origin = generator.origin().map(str::to_string);
+        let rate = cfg.mutation_rate;
         let hub = Arc::new(Hub {
             state: Mutex::new(State {
                 // A fresh run should produce its first generation immediately: waiting
@@ -2820,18 +2819,26 @@ mod tests {
         )
         .expect("the run starts");
         generator.start_over(level.clone(), 7, 0.05, "l1-flat-run", Some(seed));
-        let origin = generator.origin().expect("the restart says where it started");
+        let origin = generator
+            .origin()
+            .expect("the restart says where it started");
         assert!(origin.contains("seeded from"), "{origin}");
         let held = generator.best().expect("the record came with the champion");
         assert_eq!(held.genome.id, champion.metadata.genome_id);
 
         generator.start_over(level, 8, 0.05, "l1-flat-run", None);
-        assert!(generator.origin().is_none(), "a plain restart starts from nothing");
+        assert!(
+            generator.origin().is_none(),
+            "a plain restart starts from nothing"
+        );
         assert!(
             generator.plan().seed_from_champion.is_none(),
             "a champion is a way into a run, not a setting of every restart"
         );
-        assert!(generator.best().is_none(), "a fresh population has no record yet");
+        assert!(
+            generator.best().is_none(),
+            "a fresh population has no record yet"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(path.parent().unwrap());

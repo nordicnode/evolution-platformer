@@ -256,7 +256,10 @@ fn a_clone_plays_the_level_only_at_the_demonstrations_own_cadence() {
     // The shipped grid: the same level, the same fit budget, the same evaluation seeds, and the
     // demonstration recorded at the cadence a real run decides on. Every seed gets to the pit.
     let shipped = EvalConfig::default();
-    assert!(shipped.action_repeat > 1, "the shipped cadence is the point");
+    assert!(
+        shipped.action_repeat > 1,
+        "the shipped cadence is the point"
+    );
     let play = replay(&level, 1, &shipped);
     assert!(play.won(), "the route of l2-first-gap: {}", play.note);
     let fitted = clone_from_play(&play, default_shape(), &cfg).expect("the demonstration fits");
@@ -391,4 +394,3 @@ fn a_warm_start_is_reproducible() {
     assert_eq!(ca.genome.biases, cb.genome.biases);
     assert_eq!(ca.agreement, cb.agreement);
 }
-

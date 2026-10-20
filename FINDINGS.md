@@ -4382,6 +4382,62 @@ colours (`theme::tests::every_type_colour_clears_the_contrast_floor`), and the w
 by rendering a frame of each view (`--screenshot`, `--play`, `--evolve`, `--splash`), but "does it
 feel like a Mario menu" is a judgement no test makes.
 
+## The title card: a wordmark that is set, not pasted
+
+The title screen opened by drawing `crates/app/assets/logo.png` — the name in rainbow letters over
+a strip of baked ground — as a picture hanging in the sky above the level. Hung over its own game,
+it read as a decal: six colours the game never uses, a base made of somebody else's terrain, and no
+relationship to the type in the menu two hundred points below it. The name is now **set**, in the
+same embedded pixel face (Press Start 2P) every other word on the screen is drawn in, and made the
+way the game's own objects are: cream letters with a hard brown edge standing on a shelf of the
+accent gold — cream on gold on brown, which is the hierarchy and the material at once. Nothing in
+the window reads `logo.png` any more; the file stays for the README's header.
+
+Four decisions, and what forced each:
+
+* **Two lines, one measure.** `ONE TWO` sits over `HUNDRED` at half its size, and a gold rule
+either side of the small line carries it out to the big line's width. The width has to be one
+width, or the small line reads as a caption somebody forgot to centre. The first attempt got there
+by *tracking `ONE TWO` itself* out to `HUNDRED`'s two edges, and at that spacing its letters came
+apart into six shapes with holes between them — the letters were doing the rule's job and doing it
+badly. A rule is what a lockup uses for the same problem, and it leaves the small line a word.
+  Every spacing number comes from the face's own advance measured once (`title_cell`, on two
+glyphs, because one galley's width can carry the pair's leading) rather than from a guessed ratio
+of the size.
+* **The block is measured in the face's own pixels, not the screen's.** The first version extruded
+the letters one screen pixel at a time and the side came out smeared: sixteen antialiased copies
+of a curve make a grey edge, and a pixel logo's side is supposed to be made of squares. The face
+is drawn on an eight-by-eight cell, so the extrusion steps on that grid — a grid pixel and a
+quarter deep (`TITLE_BLOCK = 1.25`) — deep enough that the side reads as a side, shallow enough
+that the letters are still the word. `title_grid` is the one function that answers "what is one
+pixel of this face at this size", and the test asserts the big line is set on it at every size.
+* **The mark is centred by its ink.** The block leans bottom-right, so the type is set half a block
+left of the window's centre: a person centres a logo by the thing they can see, and the shelf is
+ink. `Lockup::bottom()` exists for the same reason — the caption is hung under the *shelf*, not
+under the baseline, so the clearance between the mark and the menu is arithmetic instead of a
+number that happened to look right at 1360×800.
+* **The caption gets a surface.** `A PLATFORMER THAT LEARNS` is white type with a one-pixel edge,
+and the sky behind it has clouds, hills and the sun crossing that line at some point in the loop,
+so it sits on a dark pill — the same bargain the menu's stage makes. The tagline arrives a beat
+behind the mark and the menu a beat after that: name, sentence, decision, in that order.
+
+**It holds at every window.** `title_sizes` derives both sizes from the window's width, snapped to
+the face's grid and clamped to 40–120 points; `lockup()` turns that plus the measured widths into a
+`Lockup` a test can call with no screen behind it. `the_wordmark_is_one_lockup_at_every_window_size`
+lays it out at 900×560, 1360×800 and 2560×1440 and asserts the half-size relationship, the grid,
+the measure's share of the window, room for two rules and two gaps, the mark inside the window, and
+the caption above the menu — "the lines line up" is arithmetic, and no eye checks three sizes at
+once.
+
+**Verified, and not.** `cargo test -p app` passes 274 tests (2 ignored) and `cargo clippy -p app
+--all-targets -- -D warnings` is clean; a frame was rendered with `--splash --screenshot` and read
+back, which is where the first two versions of the block were rejected. What no test covers is
+whether the card *reads* as a title, which is a judgement — as is whether the speed it arrives at
+is right. The workspace's one red test is unrelated: `evo --test migration` replays the l11
+fixture against the *uncommitted* edit to `levels/l11-the-elements.json` recorded above (1 567
+frames on HEAD's terrain, 49 on the working copy's, because one of the added turrets fires past
+the spawn), and it passes on a clean checkout.
+
 ## Three ways a level and its window disagreed
 
 Three reports, one theme: the picture in the window was not always the level the simulation was
@@ -5938,12 +5994,12 @@ two exceptions: p19 ties at g0, and p23 is unsolved by all three arms at 60 gene
 
 `cargo clippy --workspace --all-targets -- -D warnings` is clean. `cargo test --workspace
 --no-fail-fast` runs all 21 test binaries and passes every test except one: `evo --test migration`'s
-saved-`l11` replay. That failure is the **working tree's** uncommitted edit to
+saved-`l11` replay. That failure was the **working tree's** then-uncommitted edit to
 `levels/l11-the-elements.json` (an added obstacle chain), not this pass: the fixture's champion was
-recorded on HEAD's terrain (1567 frames) and the edited level ends the same policy at 49. Temporarily
-restoring HEAD's file makes the binary pass 3/3; the file is left exactly as it was found. Nothing
+recorded on HEAD's terrain (1567 frames) and the edited level ended the same policy at 49. Nothing
 in Phase 1 depends on that level's terrain — `l11`'s plan was compiled against the edited file and is
-the one quoted above.
+the one quoted above. When the level was committed, the fixture was re-recorded on it
+(`make_migration_fixture`, 757 frames) and the binary passes 3/3 without touching the level.
 
 Files: `crates/sim/src/route_plan.rs` (artifact and compiler), `crates/evo/src/imitate.rs`
 (`from_certified_plan`), `crates/evo/src/telemetry.rs` (shared `leg_count`, per-level record),
@@ -6032,8 +6088,8 @@ a leg over DAgger, every other seed unchanged, and it costs about 2 s of startup
 * **Two seeds show no gain at all.** The gate reports them rather than averaging them away.
 * **Cost is real.** Replanning adds ~0.9 s and the curriculum ~2 s to startup; both are inside the
   synchronous warm start, which the window still runs on its worker before generation 0.
-* **`l11`'s plan is compiled against the working tree's level file**, which is the user's
-  uncommitted edit; the gate's numbers are about that terrain.
+* **`l11`'s plan is compiled against the level file with the added obstacle chain** — three
+  flyers and two turrets, since committed; the gate's numbers are about that terrain.
 
 ### Gates
 
@@ -6316,9 +6372,10 @@ non-zero**, with the same legs, deaths and correction counts per seed as before 
 ### Gates
 
 `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace --no-fail-fast`
-green except the pre-existing `evo --test migration` saved-`l11` fixture (the working tree's edited
-level). Both halves of the gate are reproducible: `out/phase3/phase3-gate-1-8.md` and
-`phase3-gate-9-16.md`.
+green. The `evo --test migration` saved-`l11` fixture was red while the level's added obstacle chain
+was uncommitted and the fixture still recorded HEAD's terrain; it was re-recorded on the committed
+level (757 frames) and passes. Both halves of the gate are reproducible:
+`out/phase3/phase3-gate-1-8.md` and `phase3-gate-9-16.md`.
 
 Files: `crates/evo/src/imitate.rs` (`correction_epochs`, used by both correction refits),
 `crates/train-cli/src/{commands,main}.rs` (`--correction-epochs`, help), `tools/phase3_gate.py`
@@ -6475,22 +6532,24 @@ direction in the record, it is not significant, and this gate is the one the pla
 summary is that lessons help a level a plain search already solves in tens of generations, and do
 not touch a plateau that solves once in twenty-four seeds.
 
-**Which level bytes these numbers came from, stated exactly.** This working tree carries an
-*uncommitted* edit to `levels/l11-the-elements.json` — three flyers and two turrets added, thirty
-lines — and both arms above ran on that file, not on the level as committed. The comparison is
-still a valid paired one (both arms played identical bytes, seed for seed), but two consequences
-have to be recorded rather than glossed:
+**Which level bytes these numbers came from, stated exactly.** Both arms above ran on an edit to
+`levels/l11-the-elements.json` — three flyers and two turrets added, thirty lines — that was
+uncommitted when the gate ran and has since been committed as it was measured, so the tree and the
+numbers are about the same terrain at last. The comparison was a valid paired one either way (both
+arms played identical bytes, seed for seed), and two consequences have to be recorded rather than
+glossed:
 
 * **The level hash cannot tell them apart.** `Level::content_hash_string` returns
   `fnv1a64:6ffbb73687a02bde` for the committed level and for the edited one, so the arm files,
   champion provenance and committee compatibility checks all treat a level whose hazards were
   moved or added as the same level. The migration fixture is the proof that the entities matter:
-  its champion replays 1 567 frames on the committed level and **49 frames on the working copy**
-  (a new turret at the spawn side kills it), which is also why
-  `the_saved_l11_champion_survives_growth_and_replays_bit_identically` fails on this working tree
-  and passes on a clean checkout. The hash fix is a provenance change (it moves every level's
-  hash and every file that quotes one), so it is not folded into this gate; it is recorded here
-  as the next thing the numbers need.
+  its champion replayed 1 567 frames on HEAD's terrain and **49 frames on the edited one** (an added
+  turret on the spawn side kills it) — which is why
+  `the_saved_l11_champion_survives_growth_and_replays_bit_identically` was red until the fixture was
+  re-recorded on the level now committed. That re-recording makes the test pass; it does not make the
+  hash tell two levels apart, which is still the next thing the numbers need. The fix is a provenance
+  change (it moves every level's hash and every file that quotes one), so it is not folded into this
+  gate.
 * **The control's own reading reproduces what this tree recorded.** Seed 2's solve at generation
   658 was the elements protocol's single solve in the twelve-seed arms taken earlier in this same tree, so
   the two readings are the same level and the same search. What this gate does not establish is

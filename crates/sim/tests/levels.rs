@@ -191,7 +191,10 @@ fn every_battery_level_contains_the_mechanic_it_names() {
     let bait = common::level("bat-pit-bait");
     let raised = (0..bait.height)
         .any(|y| (0..bait.width).any(|x| bait.is_solid(x, y) && y < bait.height - 4));
-    assert!(raised, "the pit-bait level needs a route above the ground line");
+    assert!(
+        raised,
+        "the pit-bait level needs a route above the ground line"
+    );
 }
 
 /// Every level in the pack must be beatable in principle.
@@ -1226,4 +1229,3 @@ fn a_shuttle_across_lava_is_the_crossing_the_verdict_reports() {
          answer above was not about the shuttle"
     );
 }
-

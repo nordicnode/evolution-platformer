@@ -340,7 +340,11 @@ mod tests {
             );
             for row in rows {
                 assert!(!row.keys.is_empty(), "a {view} row has no key");
-                assert!(!row.what.is_empty(), "a {view} row has no words: {}", row.keys);
+                assert!(
+                    !row.what.is_empty(),
+                    "a {view} row has no words: {}",
+                    row.keys
+                );
             }
         }
     }
@@ -388,7 +392,9 @@ mod tests {
         assert!(play.iter().any(|k| k.keys.contains('W')));
         let (_, edit) = rows(Mode::Edit);
         assert!(
-            !edit.iter().any(|k| k.keys.contains('W') || k.keys.contains("space")),
+            !edit
+                .iter()
+                .any(|k| k.keys.contains('W') || k.keys.contains("space")),
             "the editor's card offers the playtest's keys"
         );
         for mode in [Mode::Evolve, Mode::Replay] {

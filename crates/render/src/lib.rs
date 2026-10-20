@@ -34,7 +34,7 @@ pub use chart::{
     death_strip, fitness_chart, fitness_trend, format_fitness, panel, progress_bar, HistoryPoint,
     Trend,
 };
-pub use play::{play, hint, PlaySummary, FRAME_TIME};
+pub use play::{hint, play, PlaySummary, FRAME_TIME};
 pub use trace::{
     ChampionTrace, TraceLog, TracePoint, GLYPH_TRAIL, TRACE_CAP, TRACE_IMPROVEMENT,
     TRACE_SAMPLE_FRAMES,

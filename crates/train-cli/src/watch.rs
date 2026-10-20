@@ -228,10 +228,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
         )?,
         // Item 14: repair children bred from the best genome's own losing decisions. The default
         // lives in the config, as for `train`, so a watched run and a trained one agree.
-        repair_children: usage(a.usize_opt(
-            "repair-children",
-            GaConfig::default().repair_children,
-        ))?,
+        repair_children: usage(
+            a.usize_opt("repair-children", GaConfig::default().repair_children),
+        )?,
         // The same default as `train` and the window: after the record solves, the second phase
         // ranks winners by the clock. `--no-mastery` is the plain run.
         mastery: !a.has_flag("no-mastery"),
@@ -361,8 +360,8 @@ pub fn watch(a: &Args) -> Result<(), String> {
     let telemetry_path = a.opt("telemetry").map(|p| p.to_string());
     let mut telemetry_out = match &telemetry_path {
         Some(path) => {
-            let file = std::fs::File::create(path)
-                .map_err(|e| format!("cannot write {path}: {e}"))?;
+            let file =
+                std::fs::File::create(path).map_err(|e| format!("cannot write {path}: {e}"))?;
             Some(std::io::BufWriter::new(file))
         }
         None => None,
@@ -382,8 +381,7 @@ pub fn watch(a: &Args) -> Result<(), String> {
         if let Some(out) = telemetry_out.as_mut() {
             let line = serde_json::to_string(&report.telemetry)
                 .map_err(|e| format!("cannot serialize telemetry: {e}"))?;
-            writeln!(out, "{line}")
-                .map_err(|e| format!("cannot write {telemetry_path:?}: {e}"))?;
+            writeln!(out, "{line}").map_err(|e| format!("cannot write {telemetry_path:?}: {e}"))?;
         }
         history.push(HistoryPoint {
             generation: report.generation,

@@ -41,8 +41,8 @@ mod route_cache;
 use crate::physics::tile_span;
 
 pub use crate::hash::StateHasher;
-pub use crate::meta::{MetaController, MetaPlay, Skill, SkillEvent, SkillTrace};
 pub use crate::level::{FlyerSpec, Level, PlatformSpec, Rect, Scenery, Tile, TurretSpec};
+pub use crate::meta::{MetaController, MetaPlay, Skill, SkillEvent, SkillTrace};
 pub use crate::physics::{
     AgentAction, Flyer, LavaBall, Mover, Physics, PlayerState, Shot, Turret, Walker, WalkerMode,
     PHYSICS,
@@ -1266,10 +1266,7 @@ impl Sim {
     /// [`Sim::observation`] returns: the scratch changes where the intermediate vectors
     /// live, never what they contain (pinned by a test that compares the two over an
     /// episode on a level with movers).
-    pub fn observation_into(
-        &self,
-        scratch: &mut ObservationScratch,
-    ) -> [f32; sensors::N_INPUTS] {
+    pub fn observation_into(&self, scratch: &mut ObservationScratch) -> [f32; sensors::N_INPUTS] {
         let frames = self.stats.frames;
         scratch.movers.clear();
         scratch
@@ -1464,7 +1461,10 @@ mod tests {
         let points = (0..=20)
             .map(|i| {
                 let t = i as f32 / 20.0;
-                (start.0 + (goal.0 - start.0) * t, start.1 + (goal.1 - start.1) * t)
+                (
+                    start.0 + (goal.0 - start.0) * t,
+                    start.1 + (goal.1 - start.1) * t,
+                )
             })
             .collect();
         sim.set_plan_guide(PlanGuide {
@@ -1478,7 +1478,10 @@ mod tests {
             assert!(reached >= last, "the plan cursor must be monotone");
             last = reached;
         }
-        assert!(last > 1, "a body that ran along the plan reached nothing: {last}");
+        assert!(
+            last > 1,
+            "a body that ran along the plan reached nothing: {last}"
+        );
         assert!(
             sim.plan_progress().0 <= sim.plan_progress().1,
             "the cursor cannot pass the guide's end"

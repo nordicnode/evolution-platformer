@@ -531,6 +531,15 @@ impl EvoApp {
             None
         };
 
+        // The soundtrack follows the screen: the title has its own theme, and every level picks
+        // one from its name (see [`crate::sound::Song::for_level`]). Set before the first frame,
+        // so the music a person hears over the title is the title's rather than whatever the
+        // last window on the machine happened to leave in the speaker.
+        crate::sound::set_song(match &splash {
+            Some(_) => crate::sound::Song::Title,
+            None => crate::sound::Song::for_level(&editor.level),
+        });
+
         let mut app = EvoApp {
             atlas,
             sprites,
@@ -1858,6 +1867,8 @@ impl EvoApp {
         self.editor = editor;
         self.pending_size = (self.editor.level.width, self.editor.level.height);
         self.fit_pending = true;
+        // A new document is a new world, and the soundtrack says so.
+        crate::sound::set_song(crate::sound::Song::for_level(&self.editor.level));
         // Every view that was about the old document, dropped rather than left drawing it.
         self.session = None;
         self.replay = None;
@@ -4238,6 +4249,9 @@ impl EvoApp {
             if let Some(action) = action {
                 crate::sound::play(crate::sound::Sfx::MenuConfirm, 1.0);
                 self.splash = None;
+                // Leaving the title is leaving its theme: the document's own song starts here,
+                // on the frame the door opens, rather than at the next level change.
+                crate::sound::set_song(crate::sound::Song::for_level(&self.editor.level));
                 // The door leads where the sign says: the two keys the title screen names
                 // enter the activity they name instead of dropping the viewer into the
                 // editor to press the same key again.

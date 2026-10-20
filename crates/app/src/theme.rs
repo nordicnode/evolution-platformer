@@ -96,11 +96,10 @@ pub const INK_ON_ACCENT: Color32 = Color32::from_rgb(58, 42, 12);
 /// where the *controls* are. This is the plank's own colour — brighter than a panel, because
 /// it is the surface the light reaches first.
 pub const DOCK: Color32 = Color32::from_rgb(255, 244, 214);
-/// The lit edge of a raised surface: its top and left sides, where the light comes from.
-pub const BEVEL_LIGHT: Color32 = Color32::from_rgb(255, 255, 255);
-/// The shaded edge of a raised surface: its bottom and right sides.
-pub const BEVEL_DARK: Color32 = Color32::from_rgb(176, 167, 144);
 /// The soft drop shadow a raised surface casts on what is behind it.
+///
+/// It is also, since the plates lost their bevel lines, the *only* thing that says a control is
+/// raised rather than printed: a resting plate casts it, a pressed one does not.
 pub const SHADOW: Color32 = Color32::from_rgba_premultiplied(60, 50, 30, 60);
 /// The plate a label sits on when it has to read as a *sign*: the level's name in the dock,
 /// a banner over the canvas. The brightest surface in the window, so the type on it leads.
@@ -312,10 +311,9 @@ pub fn apply(ctx: &Context) {
         TextStyle::Heading,
         FontId::new(HEADING_SIZE, FontFamily::Monospace),
     );
-    style.text_styles.insert(
-        TextStyle::Body,
-        FontId::new(14.0, FontFamily::Proportional),
-    );
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
         FontId::new(14.0, FontFamily::Proportional),
@@ -665,7 +663,10 @@ mod tests {
         );
         // And the ink follows the surface it is for: dark on chrome, light on a screen.
         assert!(luma(TEXT) < 90.0, "type on a cream panel has to be dark");
-        assert!(luma(SCREEN_INK) > 190.0, "type on a dark plot has to be light");
+        assert!(
+            luma(SCREEN_INK) > 190.0,
+            "type on a dark plot has to be light"
+        );
         // The accent is a *fill*, so there is an ink for the type that goes on it, and it is
         // dark enough to read on the gold.
         assert!(luma(INK_ON_ACCENT) < 90.0);
@@ -703,7 +704,11 @@ mod tests {
             assert_eq!(style.visuals.window_fill, ours.window_fill, "{theme:?}");
             assert_eq!(style.visuals.panel_fill, ours.panel_fill, "{theme:?}");
             assert_eq!(style.visuals.override_text_color, Some(TEXT), "{theme:?}");
-            assert_eq!(style.spacing.button_padding, egui::vec2(12.0, 7.0), "{theme:?}");
+            assert_eq!(
+                style.spacing.button_padding,
+                egui::vec2(12.0, 7.0),
+                "{theme:?}"
+            );
         }
         // And the preference is pinned, so egui never swaps the two under us in the first place.
         assert_eq!(

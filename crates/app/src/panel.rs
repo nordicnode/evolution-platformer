@@ -535,7 +535,10 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
     let font = FontId::monospace(12.0);
     let galley = painter.layout_no_wrap(title.to_uppercase(), font, Color32::WHITE);
     painter.galley(
-        Pos2::new(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5 - 1.0),
+        Pos2::new(
+            rect.left() + 10.0,
+            rect.center().y - galley.size().y * 0.5 - 1.0,
+        ),
         galley,
         Color32::WHITE,
     );
@@ -559,11 +562,7 @@ fn reading(ui: &mut egui::Ui, value: impl Into<String>, unit: &str) {
             .color(theme::TEXT),
     );
     if !unit.is_empty() {
-        ui.label(
-            egui::RichText::new(unit)
-                .small()
-                .color(theme::TEXT_DIM),
-        );
+        ui.label(egui::RichText::new(unit).small().color(theme::TEXT_DIM));
     }
 }
 
@@ -736,17 +735,14 @@ pub fn pace_step(rung: usize, up: bool) -> i32 {
 }
 
 fn speed_rung(speed: u32) -> usize {
-    SPEEDS
-        .iter()
-        .position(|s| *s == speed)
-        .unwrap_or_else(|| {
-            SPEEDS
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, s)| s.abs_diff(speed))
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        })
+    SPEEDS.iter().position(|s| *s == speed).unwrap_or_else(|| {
+        SPEEDS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.abs_diff(speed))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    })
 }
 
 /// The four things the run's panel says, and no more.
@@ -813,7 +809,11 @@ pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
             } else {
                 "nothing has reached the flag yet".to_string()
             },
-            colour: if summary.fastest.is_some() { GOOD } else { TEXT_DIM },
+            colour: if summary.fastest.is_some() {
+                GOOD
+            } else {
+                TEXT_DIM
+            },
         },
         Reading {
             value: format_fitness(summary.max_fitness),
@@ -1004,9 +1004,17 @@ pub fn lab_panel(
     {
         actions.restart = true;
     }
-    if ui::menu_row(ui, atlas, Some(ui::GLYPH_INFO), "Details", width, false, true)
-        .on_hover_text("everything else about this run: the search, the field, the record")
-        .clicked()
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_INFO),
+        "Details",
+        width,
+        false,
+        true,
+    )
+    .on_hover_text("everything else about this run: the search, the field, the record")
+    .clicked()
     {
         actions.details = true;
     }
@@ -1121,11 +1129,7 @@ pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState
     // not a perturbation of the population, it is a correction of one decision, and a viewer
     // looking at a generation that suddenly moved is owed the difference.
     if summary.repairs > 0 {
-        ui::stat_row(
-            ui,
-            "children from a mistake",
-            summary.repairs.to_string(),
-        );
+        ui::stat_row(ui, "children from a mistake", summary.repairs.to_string());
     }
     // The run's own account of the one detour it took, in the words `evo` gave it: the window has no
     // opinion about how the step went, it only has to say it happened.
@@ -1202,11 +1206,7 @@ pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState
             ui::stat_row(
                 ui,
                 "quickest win",
-                format!(
-                    "{} ({} frames)",
-                    sim::format_time(fast.frames),
-                    fast.frames
-                ),
+                format!("{} ({} frames)", sim::format_time(fast.frames), fast.frames),
             );
             // The budget beside the time, because a time on its own is not a statement about
             // anything: 8.42 s is quick on a level that allows 40 s and impossible on one that
@@ -1268,7 +1268,10 @@ pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState
             ui::stat_row(
                 ui,
                 "reached",
-                format!("x {:.1}, {:.1} tiles from the flag", best.best_x, best.distance_to_goal),
+                format!(
+                    "x {:.1}, {:.1} tiles from the flag",
+                    best.best_x, best.distance_to_goal
+                ),
             );
         }
         // A run's first generation is always scored, so this is the moment before the first packet
@@ -1411,10 +1414,7 @@ pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState
                     ),
                 );
             }
-            None => small_dim(
-                ui,
-                "live: the canvas is drawing this generation's agents",
-            ),
+            None => small_dim(ui, "live: the canvas is drawing this generation's agents"),
         }
     }
 
@@ -1591,9 +1591,17 @@ pub fn replay_panel(
     if pause.clicked() {
         actions.pause = true;
     }
-    if ui::menu_row(ui, atlas, Some(ui::GLYPH_RESTART), "Again", width, false, true)
-        .on_hover_text("run these episodes again, from the first tick — R")
-        .clicked()
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_RESTART),
+        "Again",
+        width,
+        false,
+        true,
+    )
+    .on_hover_text("run these episodes again, from the first tick — R")
+    .clicked()
     {
         actions.restart = true;
     }
@@ -1627,9 +1635,17 @@ pub fn replay_panel(
     {
         actions.follow = true;
     }
-    if ui::menu_row(ui, atlas, Some(ui::GLYPH_INFO), "Details", width, false, true)
-        .on_hover_text("whose record this is, the field behind it, and how fast it plays")
-        .clicked()
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_INFO),
+        "Details",
+        width,
+        false,
+        true,
+    )
+    .on_hover_text("whose record this is, the field behind it, and how fast it plays")
+    .clicked()
     {
         actions.details = true;
     }
@@ -2431,7 +2447,11 @@ mod tests {
         let geometry = chart_geometry(&points, plot());
         assert!(geometry.max.len() <= columns, "max: {}", geometry.max.len());
         assert!(geometry.avg.len() <= columns, "avg: {}", geometry.avg.len());
-        assert!(geometry.wins.len() <= columns, "wins: {}", geometry.wins.len());
+        assert!(
+            geometry.wins.len() <= columns,
+            "wins: {}",
+            geometry.wins.len()
+        );
         assert_eq!(geometry.first_generation, 0);
         assert_eq!(geometry.last_generation, 11_999);
         assert_eq!(
@@ -2782,7 +2802,11 @@ mod tests {
         assert_eq!(speed_rung(9), SPEEDS.iter().position(|s| *s == 8).unwrap());
         assert!(SPEEDS.contains(&crate::lab::step_speed(SPEEDS[speed_rung(9)], true)));
         assert!(SPEEDS.contains(&crate::lab::step_speed(SPEEDS[speed_rung(9)], false)));
-        assert_eq!(pace_step(speed_rung(9), true), 1, "9 is nowhere near an end");
+        assert_eq!(
+            pace_step(speed_rung(9), true),
+            1,
+            "9 is nowhere near an end"
+        );
         assert_eq!(pace_step(speed_rung(9), false), -1);
         draw_panel(&summary, &mut view);
 
@@ -3057,8 +3081,9 @@ mod tests {
         let mut no_record = packet.clone();
         no_record.fastest = None;
         no_record.fastest_agent = None;
-        let mut replay = crate::replay::Replay::new(&no_record, &level, &evo::EvalConfig::default())
-            .expect("a scored generation holds an agent to replay");
+        let mut replay =
+            crate::replay::Replay::new(&no_record, &level, &evo::EvalConfig::default())
+                .expect("a scored generation holds an agent to replay");
         // And when the draw did win, the same packet with its record intact says so: one word per
         // record, from the record's own name rather than from this module's choice of phrase.
         if packet.fastest_agent.is_some() {
@@ -3116,13 +3141,13 @@ mod tests {
         // The ends are *requests of zero*, not a step the run would have to refuse: the same number
         // decides whether the button is drawn enabled, so there is no state where a lit button asks
         // for nothing.
-        assert_eq!(pace_step(0, false), 0, "the bottom of the ladder has nowhere to go");
-        assert_eq!(pace_step(0, true), 1);
         assert_eq!(
-            pace_step(SPEEDS.len() - 1, true),
+            pace_step(0, false),
             0,
-            "nor does the top"
+            "the bottom of the ladder has nowhere to go"
         );
+        assert_eq!(pace_step(0, true), 1);
+        assert_eq!(pace_step(SPEEDS.len() - 1, true), 0, "nor does the top");
         assert_eq!(pace_step(SPEEDS.len() - 1, false), -1);
         for (rung, here) in SPEEDS.iter().enumerate() {
             // One rung, never a jump: `lab::step_speed` is what turns the request into a rung, and a

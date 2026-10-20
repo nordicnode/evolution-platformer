@@ -171,7 +171,10 @@ mod tests {
         }
         archive.observe(&a, 0);
         archive.observe(&b, 0);
-        assert!(archive.len() >= 2, "different world clocks are different cells");
+        assert!(
+            archive.len() >= 2,
+            "different world clocks are different cells"
+        );
         let first = archive.sample().expect("a cell");
         let second = archive.sample().expect("a cell");
         assert_ne!(first.0, second.0, "the sampler moves on after a visit");
@@ -184,7 +187,11 @@ mod tests {
         sim.step(sim::physics::AgentAction::Run);
         let clock = sim.stats().frames;
         let restarted = sim.restart_from_snapshot();
-        assert_eq!(restarted.stats().frames, clock, "the world clock is preserved");
+        assert_eq!(
+            restarted.stats().frames,
+            clock,
+            "the world clock is preserved"
+        );
         assert_eq!(restarted.stats().progress_pixels, 0.0);
         assert_eq!(
             restarted.outcome(),

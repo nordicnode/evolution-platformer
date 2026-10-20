@@ -184,10 +184,7 @@ pub fn check(style: Style, route: &TasRoute, result: &EpisodeResult) -> StyleChe
 ///
 /// Ties go to the lower genome id so a report is deterministic; the input order does not decide a
 /// title.
-pub fn award(
-    style: Style,
-    candidates: &[(u32, &TasRoute, &EpisodeResult)],
-) -> Option<StyleTitle> {
+pub fn award(style: Style, candidates: &[(u32, &TasRoute, &EpisodeResult)]) -> Option<StyleTitle> {
     let mut best: Option<(u32, f32, &TasRoute, &EpisodeResult)> = None;
     for (genome_id, route, result) in candidates {
         let check = check(style, route, result);
@@ -314,10 +311,7 @@ mod tests {
         let slow = route(vec![AgentAction::Walk; 20]);
         let fast_result = result(1, 2, 0);
         let slow_result = result(2, 1, 0);
-        let candidates = [
-            (1, &fast, &fast_result),
-            (2, &slow, &slow_result),
-        ];
+        let candidates = [(1, &fast, &fast_result), (2, &slow, &slow_result)];
         let titles = gallery(&candidates);
         let fastest = titles
             .iter()

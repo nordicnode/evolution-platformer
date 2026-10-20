@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
 use crossterm::terminal::{
     self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
-use crossterm::execute;
 use sim::{AgentAction, Level, Outcome, Sim};
 
 use crate::ascii::{self, Viewport};
@@ -267,9 +267,7 @@ fn read_keys(keys: &mut Keys, now: Instant) -> io::Result<()> {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => keys.quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                keys.quit = true
-            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => keys.quit = true,
             KeyCode::Char('r') | KeyCode::Char('R') => keys.restart = true,
             KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('A') => hold(Held::Left),
             KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('D') => hold(Held::Right),
@@ -302,13 +300,7 @@ fn read_keys(keys: &mut Keys, now: Instant) -> io::Result<()> {
 /// fast move. It did not, until the action table gained the leftward pair — holding shift
 /// and left produced a plain `Retreat`, so sprinting left was a move the keyboard could
 /// not ask for and the population could not use. See `sim::physics::AgentAction`.
-pub fn action_for(
-    left: bool,
-    right: bool,
-    jump: bool,
-    sprint: bool,
-    brake: bool,
-) -> AgentAction {
+pub fn action_for(left: bool, right: bool, jump: bool, sprint: bool, brake: bool) -> AgentAction {
     if jump && right && sprint {
         AgentAction::SprintJump
     } else if jump && right {
@@ -428,7 +420,11 @@ mod tests {
         // played from the keyboard any more than it could be evolved.
         for (dir, run_gear, jump_gear) in [
             (Held::Right, AgentAction::Sprint, AgentAction::SprintJump),
-            (Held::Left, AgentAction::RetreatSprint, AgentAction::RetreatSprintJump),
+            (
+                Held::Left,
+                AgentAction::RetreatSprint,
+                AgentAction::RetreatSprintJump,
+            ),
         ] {
             let mut sprint = keys();
             sprint.press(dir, now);
@@ -502,7 +498,10 @@ mod tests {
         k.quit = true;
         k.restart = true;
         assert!(k.take_quit());
-        assert!(!k.take_quit(), "a latched quit would fire on every later frame");
+        assert!(
+            !k.take_quit(),
+            "a latched quit would fire on every later frame"
+        );
         assert!(k.take_restart());
         assert!(!k.take_restart());
     }

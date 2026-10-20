@@ -374,7 +374,10 @@ mod tests {
         let level = fixture::gap_runway("mistake-flat", 12, 10, &[]);
         let genome = Genome::zeros(0, default_shape());
         let result = crate::run_episode(&level, &genome, &eval(), 3);
-        assert!(result.won(), "the fixture must be won, or this proves nothing");
+        assert!(
+            result.won(),
+            "the fixture must be won, or this proves nothing"
+        );
         assert!(
             find_mistakes(&level, &genome, &eval(), 3, 3).is_empty(),
             "a win has no failure state for this module to repair"

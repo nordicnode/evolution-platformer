@@ -2480,15 +2480,7 @@ impl GoalRoutes {
             let target_col = from_col.clamp(x0, x1);
             let point = (target_col as f32 + 0.5, self.zone_surface(j) - 0.5);
             let d_from = ((target_col - from_col) as f32).hypot((row - from_row) as f32);
-            consider(
-                &mut best,
-                from_hops,
-                goal,
-                hops,
-                d_from,
-                point,
-                Some(edge),
-            );
+            consider(&mut best, from_hops, goal, hops, d_from, point, Some(edge));
         }
         // The ride: a stand whose next step is being carried waits where it stands, so its aim
         // point is the body itself — a zero waypoint, which is the only honest way to say "hold

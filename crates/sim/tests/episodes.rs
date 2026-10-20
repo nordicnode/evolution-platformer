@@ -257,7 +257,10 @@ fn a_finished_episode_is_frozen() {
     let level = common::long_runway();
     let mut sim = sim::Sim::new(&level, 5);
     common::step_n(&mut sim, AgentAction::Walk, sim::NO_PROGRESS_FRAMES + 4);
-    assert!(sim.outcome().is_finished(), "the camper rule should have fired");
+    assert!(
+        sim.outcome().is_finished(),
+        "the camper rule should have fired"
+    );
 
     let frozen_hash = sim.state_hash();
     let frozen_frames = sim.stats().frames;
@@ -279,7 +282,11 @@ fn the_rng_probe_is_stable_and_seed_dependent() {
     let mut a = sim::Sim::new(&level, 0xBEEF);
     let mut b = sim::Sim::new(&level, 0xBEEF);
 
-    assert_eq!(a.rng_probe(), b.rng_probe(), "same seed, same stream position");
+    assert_eq!(
+        a.rng_probe(),
+        b.rng_probe(),
+        "same seed, same stream position"
+    );
     assert_eq!(
         a.rng_probe(),
         a.rng_probe(),

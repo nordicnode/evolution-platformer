@@ -109,15 +109,39 @@ pub const GLYPHS: [(char, &str); 26] = [
     // The brittle four sit with the materials they are, because that is the whole of what they
     // are: the table keeps one line per material and then one per material's cracked self, so a
     // reader looking up `s` finds it where `S` is rather than at the end of the list.
-    (GLYPH_CRACKED, "cracked ground (solid, breaks away underfoot)"),
-    (GLYPH_CRACKED_SAND, "cracked sand (solid, breaks away underfoot)"),
-    (GLYPH_CRACKED_BRICK, "cracked brick (solid, breaks away underfoot)"),
-    (GLYPH_CRACKED_PLANK, "cracked timber (solid, breaks away underfoot)"),
-    (sim::level::GLYPH_ONEWAY, "one-way platform (ground from above, air from below)"),
+    (
+        GLYPH_CRACKED,
+        "cracked ground (solid, breaks away underfoot)",
+    ),
+    (
+        GLYPH_CRACKED_SAND,
+        "cracked sand (solid, breaks away underfoot)",
+    ),
+    (
+        GLYPH_CRACKED_BRICK,
+        "cracked brick (solid, breaks away underfoot)",
+    ),
+    (
+        GLYPH_CRACKED_PLANK,
+        "cracked timber (solid, breaks away underfoot)",
+    ),
+    (
+        sim::level::GLYPH_ONEWAY,
+        "one-way platform (ground from above, air from below)",
+    ),
     (GLYPH_SPIKE, "spike (lethal, not solid)"),
-    (GLYPH_SPRING, "spring pad (not solid, throws a falling body up)"),
-    (GLYPH_WATER, "water (not solid: a body sinks in it and swims out)"),
-    (GLYPH_LAVA, "lava (not solid, lethal, and a vent when open to the air)"),
+    (
+        GLYPH_SPRING,
+        "spring pad (not solid, throws a falling body up)",
+    ),
+    (
+        GLYPH_WATER,
+        "water (not solid: a body sinks in it and swims out)",
+    ),
+    (
+        GLYPH_LAVA,
+        "lava (not solid, lethal, and a vent when open to the air)",
+    ),
     (GLYPH_VINE, "vine (not solid, climbable)"),
     (GLYPH_EMPTY, "empty space"),
     (GLYPH_GOAL, "goal flag"),
@@ -177,7 +201,13 @@ impl Viewport {
     /// mode can follow one of several simultaneously drawn agents.
     ///
     /// Still clamped to the level, and still parks at 0 when the level fits.
-    pub fn following_body(level: &Level, center_x: f32, center_y: f32, cols: u16, rows: u16) -> Viewport {
+    pub fn following_body(
+        level: &Level,
+        center_x: f32,
+        center_y: f32,
+        cols: u16,
+        rows: u16,
+    ) -> Viewport {
         Viewport {
             col0: camera(center_x.floor() as i32, cols as i32, level.width),
             row0: camera(center_y.floor() as i32, rows as i32, level.height),
@@ -560,7 +590,11 @@ pub fn header(sim: &Sim) -> String {
             "alive  vx {:+.3}  vy {:+.3}  {}",
             sim.player().vx,
             sim.player().vy,
-            if sim.player().grounded { "grounded" } else { "airborne" }
+            if sim.player().grounded {
+                "grounded"
+            } else {
+                "airborne"
+            }
         )),
     }
     lines.join("\n")
@@ -964,7 +998,12 @@ mod tests {
     #[test]
     fn from_sim_puts_the_player_first_so_it_is_the_primary() {
         let level = fixture(
-            &["............", "............", "............", "############"],
+            &[
+                "............",
+                "............",
+                "............",
+                "############",
+            ],
             (1, 2),
             &[("walker", 6, 2), ("goal", 10, 2)],
         );

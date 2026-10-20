@@ -239,8 +239,8 @@ impl PopulationFile {
         let path = path.as_ref();
         let src = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let file = PopulationFile::from_json_str(&src)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let file =
+            PopulationFile::from_json_str(&src).map_err(|e| format!("{}: {e}", path.display()))?;
         file.check_compat()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(file)
@@ -313,8 +313,8 @@ mod tests {
         let object = value.as_object_mut().expect("a checkpoint is an object");
         assert!(object.remove("best").is_some(), "best is written");
         assert!(object.remove("best_id").is_some(), "best_id is written");
-        let old = PopulationFile::from_json_str(&value.to_string())
-            .expect("an older checkpoint parses");
+        let old =
+            PopulationFile::from_json_str(&value.to_string()).expect("an older checkpoint parses");
         assert_eq!(old.best_genome().expect("no record is not an error"), None);
     }
 
@@ -349,7 +349,10 @@ mod tests {
         let mut stale = checkpoint();
         stale.sensor_version = sensors::VERSION + 1;
         assert!(
-            stale.check_compat().unwrap_err().contains("sensor_version mismatch"),
+            stale
+                .check_compat()
+                .unwrap_err()
+                .contains("sensor_version mismatch"),
             "{:?}",
             stale.check_compat().unwrap_err()
         );

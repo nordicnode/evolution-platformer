@@ -10,9 +10,9 @@ use evo::ga::MUTATION_SIGMA_RANGE;
 use evo::{
     curriculum_step, fit_demo, from_plan, from_route, fused_seeding, polish,
     practice_level_for_stall, practice_step, run_episode, save_practice_level, warm_population,
-    ChampionFile, CommitteeFile, EsConfig, EsTrainer, FuseConfig, HumanDemo,
-    EvalConfig, GaConfig, ImitateConfig, ImitationReport, PolishConfig, PopulationFile, RoutePlay,
-    Trainer, DEFAULT_CURRICULUM_GENERATIONS, FITNESS_VERSION,
+    ChampionFile, CommitteeFile, EsConfig, EsTrainer, EvalConfig, FuseConfig, GaConfig, HumanDemo,
+    ImitateConfig, ImitationReport, PolishConfig, PopulationFile, RoutePlay, Trainer,
+    DEFAULT_CURRICULUM_GENERATIONS, FITNESS_VERSION,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use sim::physics::{AgentAction, PHYSICS};
@@ -613,12 +613,14 @@ pub fn train(a: &Args) -> Result<(), String> {
     let telemetry_path = a.opt("telemetry").map(|p| p.to_string());
     let mut telemetry_out = match &telemetry_path {
         Some(path) => {
-            if let Some(parent) = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Some(parent) = Path::new(path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }
-            let file = fs::File::create(path)
-                .map_err(|e| format!("cannot write {path}: {e}"))?;
+            let file = fs::File::create(path).map_err(|e| format!("cannot write {path}: {e}"))?;
             Some(std::io::BufWriter::new(file))
         }
         None => None,
@@ -1579,8 +1581,10 @@ fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
         epochs,
         leg_rounds: usage(a.usize_opt("leg-rounds", ImitateConfig::default().leg_rounds))?,
         leg_rollouts: usage(a.usize_opt("leg-rollouts", ImitateConfig::default().leg_rollouts))?,
-        replan_depth: usage(a.usize_opt("replan-depth", ImitateConfig::default().replan_depth as usize))?
-            as u32,
+        replan_depth: usage(a.usize_opt(
+            "replan-depth",
+            ImitateConfig::default().replan_depth as usize,
+        ))? as u32,
         dagger_rounds: usage(a.usize_opt("dagger-rounds", ImitateConfig::default().dagger_rounds))?,
         // The fit that includes corrections, separate from the demonstration fit: a corrected
         // state is a few exemplars against the whole route, and the same budget can leave it
@@ -1724,10 +1728,8 @@ pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
         archive_children: usage(a.usize_opt("archive-children", default.archive_children))?,
         // Item 5: end an episode after this many no-progress ticks and score what was played.
         // Off at 0, which is the ordinary full episode.
-        cut_stuck_frames: usage(a.usize_opt(
-            "cut-stuck",
-            default.cut_stuck_frames as usize,
-        ))? as u32,
+        cut_stuck_frames: usage(a.usize_opt("cut-stuck", default.cut_stuck_frames as usize))?
+            as u32,
         // Item 5, step 1: a cut is kept only if the genome could not reach the selection cut even
         // with this much extra score. Defaults to a win plus its clock.
         cut_margin: usage(a.f32_opt("cut-margin", default.cut_margin))?,
@@ -1737,10 +1739,7 @@ pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
         // Item 11: a share of the parents drawn from the technique archive's cells rather than
         // from the leaderboard. Off by default; the gate is a 24-seed paired arm with the
         // occupied-cell count reported beside it.
-        technique_children: usage(a.usize_opt(
-            "technique-children",
-            default.technique_children,
-        ))?,
+        technique_children: usage(a.usize_opt("technique-children", default.technique_children))?,
         archive_on_diversity: a.has_flag("archive-on-diversity"),
         // The reward-level half of the quality-diversity question: fitness units paid to a genome
         // for behaving rarely, added to the **selection** score and never to a recorded one. Default
@@ -2177,8 +2176,7 @@ pub fn fuzz(a: &Args) -> Result<(), String> {
     }
     let out = a.opt("out").map(PathBuf::from);
     if let Some(dir) = &out {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
     println!(
         "suite   {} levels, {} archetypes x {} tiers (generator v{})",
@@ -2205,8 +2203,8 @@ pub fn fuzz(a: &Args) -> Result<(), String> {
         let json = level
             .to_json_pretty()
             .map_err(|e| format!("cannot write {stem}: {e}"))?;
-        let fresh = Level::from_json_str(&json)
-            .map_err(|e| format!("cannot re-read {stem}: {e}"))?;
+        let fresh =
+            Level::from_json_str(&json).map_err(|e| format!("cannot re-read {stem}: {e}"))?;
         let t_reach = Instant::now();
         let _ = reach::report(&fresh);
         let reach_ms = t_reach.elapsed().as_secs_f64() * 1000.0;
@@ -2299,8 +2297,7 @@ pub fn routeplan(a: &Args) -> Result<(), String> {
     };
     let out = a.opt("out").map(PathBuf::from);
     if let Some(dir) = &out {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
 
     let mut failed = 0usize;
@@ -2559,18 +2556,15 @@ pub fn committee(a: &Args) -> Result<(), String> {
     let file = CommitteeFile::load(&path)?;
     let level = match a.opt("level") {
         Some(p) => load_level(p)?,
-        None => find_level_by_hash(
-            &a.string("levels-dir", "levels"),
-            &file.level_hash,
-        )?
-        .ok_or_else(|| {
-            format!(
-                "no level in {} hashes to {} (committee was built on {:?}); pass --level",
-                a.string("levels-dir", "levels"),
-                file.level_hash,
-                file.level_name
-            )
-        })?,
+        None => find_level_by_hash(&a.string("levels-dir", "levels"), &file.level_hash)?
+            .ok_or_else(|| {
+                format!(
+                    "no level in {} hashes to {} (committee was built on {:?}); pass --level",
+                    a.string("levels-dir", "levels"),
+                    file.level_hash,
+                    file.level_name
+                )
+            })?,
     };
     file.check_compat(&level)?;
     let report = file.validate(&level)?;
@@ -3484,10 +3478,7 @@ pub fn generalist(a: &Args) -> Result<(), String> {
         if !quiet && (report.generation % 10 == 0 || report.solved > 0) {
             println!(
                 "generation {:5}  {}  max {:10.1}  solved {}",
-                report.generation,
-                levels[index].name,
-                report.max_fitness,
-                report.solved
+                report.generation, levels[index].name, report.max_fitness, report.solved
             );
         }
     }
@@ -4225,8 +4216,8 @@ mod tests {
             out.to_str().expect("a utf-8 path"),
         ]))
         .expect("a certified practice level compiles");
-        let text = fs::read_to_string(out.join("p01-gap-t0.routeplan.json"))
-            .expect("the plan is written");
+        let text =
+            fs::read_to_string(out.join("p01-gap-t0.routeplan.json")).expect("the plan is written");
         let plan: sim::route_plan::RoutePlan =
             serde_json::from_str(&text).expect("the written plan parses back");
         assert!(!plan.legs.is_empty());
@@ -4563,7 +4554,10 @@ mod tests {
         ]))
         .expect("a generalist resumes");
         let second = PopulationFile::load(dir.join("generalist.json")).expect("checkpoint loads");
-        assert_eq!(second.generation, 6, "the cursor is the checkpoint's own count");
+        assert_eq!(
+            second.generation, 6,
+            "the cursor is the checkpoint's own count"
+        );
 
         // Pack champions come back in through --refresh.
         train(&a(&[
@@ -4595,7 +4589,8 @@ mod tests {
             "--quiet",
         ]))
         .expect("a refresh runs without training a generation");
-        let refreshed = PopulationFile::load(dir.join("generalist.json")).expect("checkpoint loads");
+        let refreshed =
+            PopulationFile::load(dir.join("generalist.json")).expect("checkpoint loads");
         assert_eq!(refreshed.generation, 6, "a refresh trains nothing");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4614,14 +4609,8 @@ mod tests {
         // The default band is exact: cut only what is already below the cut.
         assert_eq!(cfg.cut_margin, 0.0);
         // And a positive margin is accepted, because some levels need the slack.
-        let widened = train_config(&a(&[
-            "train",
-            "--cut-stuck",
-            "60",
-            "--cut-margin",
-            "12000",
-        ]))
-        .expect("a widened band is a run");
+        let widened = train_config(&a(&["train", "--cut-stuck", "60", "--cut-margin", "12000"]))
+            .expect("a widened band is a run");
         assert_eq!(widened.cut_margin, 12_000.0);
     }
 

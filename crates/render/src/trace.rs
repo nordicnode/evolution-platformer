@@ -306,7 +306,10 @@ mod tests {
         assert_eq!(log.span(), Some((0, 5)));
         assert_eq!(log.get(3).map(|t| t.max_fitness), Some(102.0));
         assert_eq!(log.get(4), None);
-        assert_eq!(log.improvement_threshold(), 120.0 * (1.0 + TRACE_IMPROVEMENT));
+        assert_eq!(
+            log.improvement_threshold(),
+            120.0 * (1.0 + TRACE_IMPROVEMENT)
+        );
         assert!(log.would_record(121.5));
         assert!(!log.would_record(120.0));
     }
@@ -323,7 +326,10 @@ mod tests {
         assert!(!log.observe(trace(2, f32::INFINITY)));
         assert!(!log.observe(trace(3, f32::NEG_INFINITY)));
         assert_eq!(log.len(), 1);
-        assert!(log.observe(trace(4, 100.0)), "the record still moves afterwards");
+        assert!(
+            log.observe(trace(4, 100.0)),
+            "the record still moves afterwards"
+        );
         assert_eq!(log.span(), Some((1, 4)));
     }
 
@@ -386,7 +392,10 @@ mod tests {
         for i in 0..(TRACE_CAP as u32 + 1) {
             assert!(dropped.observe(trace(i, 100.0 + i as f32 * 10.0)));
         }
-        assert!(dropped.get(0).is_none(), "generation 0 fell out of the window");
+        assert!(
+            dropped.get(0).is_none(),
+            "generation 0 fell out of the window"
+        );
         assert_eq!(dropped.step_back(Some(0)), None);
         assert_eq!(dropped.step_forward(Some(0)), None);
     }
@@ -404,7 +413,11 @@ mod tests {
             },
         );
         let bodies = t.bodies();
-        assert_eq!(bodies.len(), 4, "3 distinct cells of 4 samples, plus the end");
+        assert_eq!(
+            bodies.len(),
+            4,
+            "3 distinct cells of 4 samples, plus the end"
+        );
 
         // The end marker is the primary body: first, and alive, so the renderer
         // keeps it out of the "dead bodies underneath" pass and draws it last.

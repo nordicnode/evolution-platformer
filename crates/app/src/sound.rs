@@ -9,14 +9,17 @@
 //! shell calls [`init`] (or on a machine with no audio device, where init
 //! fails quietly) every call is a no-op, which is what lets the headless
 //! tests and the screenshot runs construct sessions without a sound card.
-//! And the music: one original theme, written as score data and rendered by
-//! the same synth, long enough (a minute and a quarter) and arranged in
-//! enough sections that it does not wear out on the second pass.
+//! And the music: a soundtrack of six pieces, written as score data and rendered
+//! by the same synth. The first is the original theme — a minute and a quarter,
+//! arranged in sections so it does not wear out on the second pass — and the
+//! other five are the rest of the game's moods: a title theme, and four worlds'
+//! worth of loops in four different keys and tempos, picked per level from its
+//! own name (see [`Song::for_level`]).
 //!
 //! The sim is never touched: an ear only reads, so determinism, replays and
 //! state hashes are exactly what they were in silence.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rodio::buffer::SamplesBuffer;
@@ -241,7 +244,7 @@ fn midi(m: i32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// The music: one song, arranged in sections.
+// The first song, arranged in sections.
 // ---------------------------------------------------------------------------
 //
 // The first version was a fourteen-second two-phrase loop, and fourteen
@@ -1116,8 +1119,12 @@ fn place_drums(track: &mut [f32], index: usize, grid: usize, bar_len: usize) {
     }
 }
 
-/// The song the player hears, as one loop of samples.
-fn music_loop() -> Vec<f32> {
+/// The first song, as one loop of samples.
+///
+/// The soundtrack's original theme, kept whole and kept first: it is the one the game shipped with,
+/// every reading of its arrangement below was taken against it, and it is still the song a level
+/// whose name does not pick another one plays.
+fn main_loop() -> Vec<f32> {
     let tracks = music_tracks();
     let mut out = vec![0.0f32; tracks.bass.len()];
     for (track, gain) in [
@@ -1135,6 +1142,396 @@ fn music_loop() -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// The soundtrack: one song per world, and a level picks its own
+// ---------------------------------------------------------------------------
+//
+// One theme is a menu, not a soundtrack. The game shipped with [`Song::Main`] — a single
+// minute-and-a-quarter piece in A minor — and it was the same piece on a beach, in a cavern, on a
+// lava crossing and on a flat field, which is the definition of a placeholder. The songs below are
+// the rest of it: five short loops, each a different key, tempo and arrangement, so that two
+// levels in a row are not the same piece twice.
+//
+// They are **data, not code paths**: a plan is a tempo, a bar count, a chord cycle and three
+// pattern names, and one renderer turns any plan into samples with the same voices the first song
+// uses. That is deliberate — a soundtrack written as five bespoke functions is five places for a
+// voice or an envelope to drift, and the point of the synth is that every sound in this game comes
+// out of the same handful of primitives.
+//
+// The melody is the arpeggio. These are short loops under a platformer's diegetic noise, not
+// concert pieces: the harmony carries them, and the counterline only enters on the middle eight
+// where the arrangement has room for a second voice.
+
+/// One track of the soundtrack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Song {
+    /// The first theme, in A minor: the one the game shipped with.
+    Main,
+    /// The title screen: stately, major, and quiet enough to sit under a menu.
+    Title,
+    /// Open ground: bright, fast, and major — the everyday level.
+    Wilds,
+    /// Underground: minor sevenths, a rolled bass and no cymbals.
+    Under,
+    /// Heat and machinery: four on the floor, sixteenth hats, and a temper.
+    Forge,
+    /// Something high and calm: a walking bass and an offbeat comp.
+    Glide,
+}
+
+impl Song {
+    /// Every song, in the order they were written.
+    pub const ALL: [Song; 6] = [
+        Song::Main,
+        Song::Title,
+        Song::Wilds,
+        Song::Under,
+        Song::Forge,
+        Song::Glide,
+    ];
+
+    /// A name for the thing, for a test's message.
+    #[cfg(test)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Song::Main => "main",
+            Song::Title => "title",
+            Song::Wilds => "wilds",
+            Song::Under => "under",
+            Song::Forge => "forge",
+            Song::Glide => "glide",
+        }
+    }
+
+    /// The song a level plays, decided by its name.
+    ///
+    /// A hash rather than a table of level slugs, because a table is a thing every new level has to
+    /// be added to and forgets to be — and a level that draws its music from its own name is a
+    /// level that has music the first time it is opened. FNV-1a over the name, the same seed for the
+    /// same level on every run and every machine, which is what makes the choice reproducible
+    /// without storing it anywhere.
+    pub fn for_level(level: &Level) -> Song {
+        const ROTATION: [Song; 5] = [
+            Song::Wilds,
+            Song::Under,
+            Song::Forge,
+            Song::Glide,
+            Song::Main,
+        ];
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in level.name.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        ROTATION[(hash % ROTATION.len() as u64) as usize]
+    }
+
+    fn index(self) -> usize {
+        Song::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    fn from_index(index: usize) -> Song {
+        Song::ALL.get(index).copied().unwrap_or(Song::Main)
+    }
+}
+
+/// The bass part's shape: where in the bar it plays and which chord tone each note takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bass {
+    /// Two half notes a bar.
+    Pulse,
+    /// Eighths rolling root, fifth and octave: the NES triangle's job.
+    Eighths,
+    /// Four notes walking up through the chord.
+    Walk,
+}
+
+/// The arpeggio's density and contour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arp {
+    Quarters,
+    Eighths,
+    /// The offbeat comp: the chord answers the pulse rather than doubling it.
+    Offbeat,
+    Sixteenths,
+}
+
+/// The drum kit's character.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drums {
+    /// Hats and a soft kick: a title screen.
+    Soft,
+    /// Kick, snare and eighth hats.
+    Standard,
+    /// Four on the floor, sixteenth hats.
+    Drive,
+    /// Kick and snare swapped for toms.
+    Toms,
+}
+
+/// One song, as data.
+struct Plan {
+    bpm: f32,
+    bars: usize,
+    /// One chord per bar, cycled when the song is longer than the cycle.
+    chords: &'static [Chord],
+    bass: Bass,
+    arp: Arp,
+    drums: Drums,
+    /// Whether the middle eight gets a held counterline under it.
+    counter: bool,
+}
+
+/// D major, I-vi-IV-V. The title's progression: the lift the game opens on.
+static TITLE_CHORDS: [Chord; 4] = [major(50), minor(47), major(43), major(45)];
+/// E minor: i-VI-III-VII, the everyday heroic loop.
+static WILDS_CHORDS: [Chord; 4] = [minor(52), major(48), major(43), major(50)];
+/// A minor: i-VI-III-V, with the dominant dimmed by its seventh.
+static UNDER_CHORDS: [Chord; 4] = [minor(45), major(41), major(48), dominant(40)];
+/// G minor: i-VI-III-VII, played hard.
+static FORGE_CHORDS: [Chord; 4] = [minor(43), major(39), major(46), major(41)];
+/// C major: I-vi-IV-V, at a walk.
+static GLIDE_CHORDS: [Chord; 4] = [major(48), minor(45), major(41), major(43)];
+
+fn plan(song: Song) -> Option<&'static Plan> {
+    const TITLE: Plan = Plan {
+        bpm: 96.0,
+        bars: 32,
+        chords: &TITLE_CHORDS,
+        bass: Bass::Pulse,
+        arp: Arp::Quarters,
+        drums: Drums::Soft,
+        counter: true,
+    };
+    const WILDS: Plan = Plan {
+        bpm: 142.0,
+        bars: 32,
+        chords: &WILDS_CHORDS,
+        bass: Bass::Eighths,
+        arp: Arp::Sixteenths,
+        drums: Drums::Standard,
+        counter: false,
+    };
+    const UNDER: Plan = Plan {
+        bpm: 108.0,
+        bars: 32,
+        chords: &UNDER_CHORDS,
+        bass: Bass::Walk,
+        arp: Arp::Eighths,
+        drums: Drums::Toms,
+        counter: true,
+    };
+    const FORGE: Plan = Plan {
+        bpm: 162.0,
+        bars: 32,
+        chords: &FORGE_CHORDS,
+        bass: Bass::Eighths,
+        arp: Arp::Offbeat,
+        drums: Drums::Drive,
+        counter: false,
+    };
+    const GLIDE: Plan = Plan {
+        bpm: 124.0,
+        bars: 32,
+        chords: &GLIDE_CHORDS,
+        bass: Bass::Walk,
+        arp: Arp::Offbeat,
+        drums: Drums::Standard,
+        counter: true,
+    };
+    match song {
+        Song::Main => None,
+        Song::Title => Some(&TITLE),
+        Song::Wilds => Some(&WILDS),
+        Song::Under => Some(&UNDER),
+        Song::Forge => Some(&FORGE),
+        Song::Glide => Some(&GLIDE),
+    }
+}
+
+/// Render a plan into one loop of samples.
+///
+/// The arrangement is four rules rather than four written sections: the first two bars count the
+/// tempo in with hats alone, bars 16 to 24 are the middle eight (where the counterline enters, if
+/// the plan has one), and the last two bars are a fill. Everything else is the plan's own patterns,
+/// one bar at a time, which is what keeps five songs this short to write and impossible to mistake
+/// for each other.
+fn plan_loop(plan: &Plan) -> Vec<f32> {
+    let step = 60.0 / plan.bpm / 4.0;
+    let grid = (step * RATE as f32) as usize;
+    let bar_len = grid * STEPS_PER_BAR;
+    let len = bar_len * plan.bars;
+    let mut bass = vec![0.0f32; len];
+    let mut arp = vec![0.0f32; len];
+    let mut drums = vec![0.0f32; len];
+    let mut counter = vec![0.0f32; len];
+
+    for bar in 0..plan.bars {
+        let chord = plan.chords[bar % plan.chords.len()];
+        let at = |s: usize| bar * bar_len + s * grid;
+        let tones = chord.tones();
+        let intro = bar < 2;
+        let fill = bar + 2 >= plan.bars;
+
+        let notes: Vec<(usize, i32, usize)> = match plan.bass {
+            Bass::Pulse => vec![(0, 0, 7), (8, 7, 7)],
+            Bass::Eighths => vec![
+                (0, 0, 1),
+                (2, 0, 1),
+                (4, 7, 1),
+                (6, 0, 1),
+                (8, 12, 1),
+                (10, 0, 1),
+                (12, 7, 1),
+                (14, 0, 1),
+            ],
+            Bass::Walk => vec![(0, 0, 3), (4, chord.third(), 3), (8, 7, 3), (12, 12, 3)],
+        };
+        for (s, off, steps) in notes {
+            place(
+                &mut bass,
+                at(s),
+                bass_voice(midi(chord.root + off), step * steps as f32 * 0.95, 0.20),
+                1.0,
+            );
+        }
+
+        let (steps, order, vol): (&[usize], &[usize], f32) = match plan.arp {
+            Arp::Quarters => (&[0, 4, 8, 12], &[0, 1, 2, 3], 0.050),
+            Arp::Eighths => (
+                &[0, 2, 4, 6, 8, 10, 12, 14],
+                &[0, 1, 2, 3, 2, 1, 2, 3],
+                0.050,
+            ),
+            Arp::Offbeat => (&[2, 6, 10, 14], &[0, 2, 1, 3], 0.055),
+            Arp::Sixteenths => (
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                &[0, 1, 2, 3, 2, 1, 0, 1, 2, 3, 2, 1, 0, 1, 2, 3],
+                0.050,
+            ),
+        };
+        for (i, s) in steps.iter().enumerate() {
+            let tone = tones[order[i % order.len()] % tones.len()];
+            place(
+                &mut arp,
+                at(*s),
+                pluck_voice(midi(chord.root + 24 + tone), step * 1.3, vol),
+                1.0,
+            );
+        }
+
+        match plan.drums {
+            Drums::Soft => {
+                for s in [0, 4, 8, 12] {
+                    let gain = if s % 8 == 0 { 0.20 } else { 0.14 };
+                    place(&mut drums, at(s), hat_voice(false), gain);
+                }
+                if !intro {
+                    place(&mut drums, at(0), kick_voice(), 0.35);
+                    place(&mut drums, at(8), kick_voice(), 0.28);
+                }
+            }
+            Drums::Standard => {
+                if !intro {
+                    for s in [0, 8] {
+                        place(&mut drums, at(s), kick_voice(), 0.55);
+                    }
+                    for s in [4, 12] {
+                        place(&mut drums, at(s), snare_voice(), 0.42);
+                    }
+                }
+                for s in (0..STEPS_PER_BAR).step_by(2) {
+                    let gain = if s % 4 == 0 { 0.28 } else { 0.20 };
+                    place(&mut drums, at(s), hat_voice(false), gain);
+                }
+            }
+            Drums::Drive => {
+                if !intro {
+                    for s in [0, 4, 8, 12] {
+                        place(&mut drums, at(s), kick_voice(), 0.50);
+                    }
+                    for s in [4, 12] {
+                        place(&mut drums, at(s), snare_voice(), 0.40);
+                    }
+                }
+                for s in 0..STEPS_PER_BAR {
+                    let gain = if s % 4 == 0 { 0.26 } else { 0.15 };
+                    place(&mut drums, at(s), hat_voice(false), gain);
+                }
+            }
+            Drums::Toms => {
+                if !intro {
+                    place(&mut drums, at(0), kick_voice(), 0.50);
+                    place(&mut drums, at(10), kick_voice(), 0.34);
+                    place(&mut drums, at(4), kick_voice(), 0.26);
+                    place(&mut drums, at(12), kick_voice(), 0.26);
+                    place(&mut drums, at(8), snare_voice(), 0.34);
+                }
+                for s in [0, 6, 8, 14] {
+                    place(&mut drums, at(s), hat_voice(false), 0.20);
+                }
+            }
+        }
+        if bar % 16 == 0 {
+            place(&mut drums, at(0), hat_voice(true), 0.18);
+        }
+        if fill {
+            for s in 8..STEPS_PER_BAR {
+                let gain = 0.20 + (s - 8) as f32 * 0.03;
+                place(&mut drums, at(s), snare_voice(), gain);
+            }
+        }
+
+        if plan.counter && (16..24).contains(&bar) {
+            place(
+                &mut counter,
+                at(0),
+                note(
+                    midi(chord.root + 12 + tones[1]),
+                    step * 7.0,
+                    0.075,
+                    Wave::Triangle,
+                ),
+                1.0,
+            );
+            place(
+                &mut counter,
+                at(8),
+                note(
+                    midi(chord.root + 12 + tones[2]),
+                    step * 7.0,
+                    0.075,
+                    Wave::Triangle,
+                ),
+                1.0,
+            );
+        }
+    }
+
+    let mut out = vec![0.0f32; len];
+    for (track, gain) in [
+        (&counter, 1.0f32),
+        (&bass, 1.0),
+        (&arp, 1.25),
+        (&drums, 1.05),
+    ] {
+        for (o, s) in out.iter_mut().zip(track.iter()) {
+            *o += s * gain;
+        }
+    }
+    normalize(&mut out, 0.9);
+    // The wrap is a continuation rather than a cut, the same way the element beds are looped.
+    loopify(out, grid)
+}
+
+/// The samples for one song, as one loop.
+fn music_loop(song: Song) -> Vec<f32> {
+    match plan(song) {
+        None => main_loop(),
+        Some(plan) => plan_loop(plan),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The player: a dedicated thread that owns the audio device.
 // ---------------------------------------------------------------------------
 
@@ -1148,6 +1545,8 @@ enum Cmd {
     /// How loud the water and lava beds should be, each in `0..=1`.
     Ambience(f32, f32),
     SetMuted(bool),
+    /// Change what the music sink is playing: the level opened, or the title screen.
+    Music(Song),
 }
 
 /// The most either bed reaches at full proximity. Under the music, because
@@ -1160,6 +1559,8 @@ struct Player {
     _stream: OutputStream,
     handle: OutputStreamHandle,
     music: Sink,
+    /// What the music sink is playing, so a request for the song already on is not a restart.
+    song: Song,
     water: Sink,
     lava: Sink,
 }
@@ -1167,8 +1568,9 @@ struct Player {
 impl Player {
     fn open() -> Option<Player> {
         let (stream, handle) = OutputStream::try_default().ok()?;
+        let song = Song::from_index(SONG_INDEX.load(Ordering::Relaxed));
         let music = Sink::try_new(&handle).ok()?;
-        let looped = SamplesBuffer::new(1, RATE, music_loop()).repeat_infinite();
+        let looped = SamplesBuffer::new(1, RATE, music_loop(song)).repeat_infinite();
         music.append(looped);
         music.set_volume(MUSIC_VOLUME);
 
@@ -1187,12 +1589,37 @@ impl Player {
             _stream: stream,
             handle,
             music,
+            song,
             water,
             lava,
         })
     }
 
-    fn run(self, rx: std::sync::mpsc::Receiver<Cmd>) {
+    /// Start `song` on the music sink, replacing whatever was playing.
+    ///
+    /// A new sink rather than a re-fill: `Sink::stop` cannot be undone, and this thread owns one
+    /// device for the whole process, so the old sink is stopped and dropped and the new one takes
+    /// its place at the same volume. The cut is one sample — a song change happens when the level
+    /// changes or the title screen is left, which is a scene change with a black beat in it, not a
+    /// mix point.
+    fn switch(&mut self, song: Song) {
+        if song == self.song {
+            return;
+        }
+        self.music.stop();
+        let Ok(sink) = Sink::try_new(&self.handle) else {
+            return;
+        };
+        sink.append(SamplesBuffer::new(1, RATE, music_loop(song)).repeat_infinite());
+        sink.set_volume(MUSIC_VOLUME);
+        if MUTED.load(Ordering::Relaxed) {
+            sink.pause();
+        }
+        self.music = sink;
+        self.song = song;
+    }
+
+    fn run(mut self, rx: std::sync::mpsc::Receiver<Cmd>) {
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 Cmd::Play(kind, gain) => {
@@ -1215,6 +1642,7 @@ impl Player {
                     self.water.play();
                     self.lava.play();
                 }
+                Cmd::Music(song) => self.switch(song),
             }
         }
     }
@@ -1222,6 +1650,12 @@ impl Player {
 
 static SENDER: OnceLock<Mutex<Option<std::sync::mpsc::Sender<Cmd>>>> = OnceLock::new();
 static MUTED: AtomicBool = AtomicBool::new(false);
+/// The song the game is on, as an index into [`Song::ALL`].
+///
+/// Kept here rather than in the player because the player may not exist yet — `--splash` asks for
+/// the title theme before any device is open, and a machine with no device still has to answer
+/// "which song is the game playing" the same way a machine with one does.
+static SONG_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 fn sender() -> &'static Mutex<Option<std::sync::mpsc::Sender<Cmd>>> {
     SENDER.get_or_init(|| Mutex::new(None))
@@ -1284,6 +1718,29 @@ pub fn toggle_mute() -> bool {
 /// rather than keeping a second copy that could disagree with the player.
 pub fn muted() -> bool {
     MUTED.load(Ordering::Relaxed)
+}
+
+/// Choose the song the game plays, now and after the player reopens.
+///
+/// The whole of the soundtrack's interface: the title screen asks for [`Song::Title`], a level asks
+/// for the one its name picks, and the player thread does the rest. Asking for the song that is
+/// already playing is a no-op, which matters because this is called on every level open — a
+/// restart would put the music back to bar one every time somebody walked into a door.
+pub fn set_song(song: Song) {
+    let index = song.index();
+    if SONG_INDEX.swap(index, Ordering::Relaxed) == index {
+        return;
+    }
+    send(Cmd::Music(song));
+}
+
+/// Which song the game is on.
+///
+/// Read by the tests: the answer does not depend on whether a device ever opened, which is what
+/// lets a headless machine check that opening a level really did choose its track.
+#[cfg(test)]
+pub fn current_song() -> Song {
+    Song::from_index(SONG_INDEX.load(Ordering::Relaxed))
 }
 
 /// How loud the water and lava beds should be, each in `0..=1`. Called every
@@ -1544,7 +2001,7 @@ mod tests {
         // volume) has to stay well above the loudest trimmed effect, and above
         // the element beds, or adding another effect or raising one's render
         // level quietly turns the soundtrack into an afterthought.
-        let music = peak(&music_loop()) * MUSIC_VOLUME;
+        let music = peak(&main_loop()) * MUSIC_VOLUME;
         let effect = EVERY_EFFECT
             .iter()
             .map(|kind| peak(&render(*kind)) * SFX_LEVEL)
@@ -1579,7 +2036,7 @@ mod tests {
         // seconds and the ear wore it out in two passes. A song is a minute
         // at least, and it must still end on a bar line so the loop does not
         // restart mid-phrase.
-        let samples = music_loop();
+        let samples = main_loop();
         let secs = samples.len() as f32 / RATE as f32;
         assert!(secs >= 70.0, "the loop is only {secs:.1}s long");
         assert_eq!(samples.len(), bar_samples() * MUSIC_BARS);
@@ -1616,6 +2073,142 @@ mod tests {
             }
         }
         assert!(energy(&tracks.counter, B_BAR, 8) > 0.0);
+    }
+
+    /// **Every song is a whole number of bars, bounded, and long enough to be a loop.**
+    ///
+    /// The soundtrack is five plans rather than five functions, so the properties that make one
+    /// song usable have to be true of all of them: the samples are finite and inside the unit
+    /// range (a mix that clips is a bug the synth cannot see), the loop is a whole number of bars
+    /// less the one-step crossfade [`loopify`] takes, and the mix reaches a real level rather than
+    /// rendering silence with a tempo.
+    #[test]
+    fn every_song_is_a_whole_loop_with_a_real_mix() {
+        for song in Song::ALL {
+            let samples = music_loop(song);
+            assert!(!samples.is_empty(), "{} rendered nothing", song.label());
+            assert!(
+                samples.iter().all(|s| s.is_finite() && s.abs() <= 1.0),
+                "{} leaves the unit range",
+                song.label()
+            );
+            let peak = peak(&samples);
+            assert!(peak > 0.4, "{} peaks at {peak:.2}", song.label());
+            let secs = samples.len() as f32 / RATE as f32;
+            assert!(
+                secs >= 30.0,
+                "{} is only {secs:.1}s: a loop that short is a jingle",
+                song.label()
+            );
+            if let Some(plan) = plan(song) {
+                let grid = (60.0 / plan.bpm / 4.0 * RATE as f32) as usize;
+                let full = grid * STEPS_PER_BAR * plan.bars;
+                assert_eq!(
+                    samples.len(),
+                    full - grid,
+                    "{} is not a whole number of bars",
+                    song.label()
+                );
+            }
+        }
+    }
+
+    /// **The songs are different pieces, not the same one transposed.**
+    ///
+    /// The whole reason for five of them. Two plans that agreed on tempo, length, key and
+    /// arrangement would be one song written twice, which is the failure a table of songs makes
+    /// easy: a copy-pasted row with a new name. Compared by their own data first and by their
+    /// samples second, because the samples are the claim.
+    #[test]
+    fn the_songs_are_not_the_same_piece_under_another_name() {
+        let songs: Vec<(Song, &Plan)> = Song::ALL
+            .iter()
+            .filter_map(|song| plan(*song).map(|p| (*song, p)))
+            .collect();
+        assert_eq!(
+            songs.len(),
+            Song::ALL.len() - 1,
+            "every song but the original has a plan"
+        );
+        let loops: Vec<(Song, Vec<f32>)> = songs
+            .iter()
+            .map(|(song, _)| (*song, music_loop(*song)))
+            .collect();
+        for (i, (song_a, a)) in songs.iter().enumerate() {
+            for (j, (song_b, b)) in songs.iter().enumerate().skip(i + 1) {
+                assert!(
+                    a.bpm != b.bpm || a.chords != b.chords || a.arp != b.arp || a.drums != b.drums,
+                    "{} and {} agree on tempo, harmony and arrangement",
+                    song_a.label(),
+                    song_b.label()
+                );
+                // And as audio: a different tempo or key has to reach the samples.
+                let (x, y) = (&loops[i].1, &loops[j].1);
+                let n = x.len().min(y.len()).min(RATE as usize);
+                let same = x[..n]
+                    .iter()
+                    .zip(&y[..n])
+                    .all(|(p, q)| (p - q).abs() < 1e-6);
+                assert!(
+                    !same,
+                    "{} and {} render the same first second",
+                    song_a.label(),
+                    song_b.label()
+                );
+            }
+        }
+    }
+
+    /// **A level's song comes from its name, and the pack is spread across the soundtrack.**
+    ///
+    /// Deterministic (the same level asks for the same track on every launch, on every machine)
+    /// and without a table: a level added tomorrow has music without anybody wiring it. The spread
+    /// is the other half — five songs and twelve levels that all land on one of them would be one
+    /// song with extra steps.
+    #[test]
+    fn a_levels_name_picks_its_song_and_the_pack_is_spread_across_them() {
+        let names = [
+            "L1-flat-run",
+            "L2-first-gap",
+            "L3-gauntlet",
+            "L4-rhythm",
+            "L5-tightrope",
+            "L6-marathon",
+            "L7-the-ascent",
+            "L8-long-jump",
+            "L9-wait-and-climb",
+            "L10-the-hunt",
+            "L11-the-elements",
+            "L12-the-siege",
+        ];
+        let mut chosen = Vec::new();
+        for name in names {
+            let level = Level::starter(name, 20, 12);
+            let song = Song::for_level(&level);
+            assert_eq!(song, Song::for_level(&level), "{name} changed its song");
+            assert_ne!(song, Song::Title, "{name} picked the title theme");
+            chosen.push(song);
+        }
+        let distinct: std::collections::BTreeSet<&str> = chosen.iter().map(|s| s.label()).collect();
+        assert!(
+            distinct.len() >= 3,
+            "the pack lands on {} songs: {distinct:?}",
+            distinct.len()
+        );
+    }
+
+    /// Asking for the song that is already playing is not a restart, and asking for another one
+    /// changes the answer even on a machine with no device: the choice is state, not a side effect
+    /// of the speaker.
+    #[test]
+    fn choosing_a_song_is_idempotent_and_does_not_need_a_device() {
+        let before = current_song();
+        set_song(Song::Forge);
+        assert_eq!(current_song(), Song::Forge);
+        set_song(Song::Forge);
+        assert_eq!(current_song(), Song::Forge);
+        set_song(before);
+        assert_eq!(current_song(), before);
     }
 
     /// A pool two tiles deep with a rim, for the water sounds.

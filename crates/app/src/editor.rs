@@ -1229,8 +1229,7 @@ impl Editor {
             format!("saved {name} to {}", target.display())
         };
         if let Some(verdict) = &self.plan_verdict {
-            self.message
-                .push_str(&format!(" ({})", verdict.label()));
+            self.message.push_str(&format!(" ({})", verdict.label()));
         }
         Ok(target)
     }

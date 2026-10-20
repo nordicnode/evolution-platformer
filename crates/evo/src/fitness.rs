@@ -1126,12 +1126,8 @@ mod tests {
             "############",
             "############",
         ];
-        let level = crate::fixture::level(
-            "fitness-wall-stander",
-            &rows,
-            (1, 5),
-            &[("goal", 10, 5)],
-        );
+        let level =
+            crate::fixture::level("fitness-wall-stander", &rows, (1, 5), &[("goal", 10, 5)]);
         // The all-zero genome runs right and stops against the wall: no jump, no climb.
         let genome = Genome::zeros(0, default_shape());
 
@@ -1283,7 +1279,10 @@ mod tests {
         let level = level();
         let mut rng = rng_from_seed(3);
         let g = Genome::random(1, default_shape(), &mut rng);
-        let cfg = EvalConfig { action_repeat: 1, cut_stuck_frames: 0 };
+        let cfg = EvalConfig {
+            action_repeat: 1,
+            cut_stuck_frames: 0,
+        };
         let r = run_episode(&level, &g, &cfg, 99);
         assert!(r.outcome.is_finished());
     }
