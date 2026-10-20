@@ -111,6 +111,10 @@ def run_arm(seed, arm, out):
         row["seconds"] = float(m.group(1))
     if row["legs"] is None:
         row["error"] = text.strip().splitlines()[-1] if text.strip() else "no output"
+    elif done.returncode != 0:
+        # The reading may be parseable, but a run that exited non-zero is a failed arm, not a
+        # data point: the legs it printed could be from a half-finished warm start.
+        row["error"] = text.strip().splitlines()[-1] if text.strip() else "no output"
     return row
 
 
@@ -209,10 +213,18 @@ def main():
         f"Seeds where the meta-controller arm cleared more legs than the Phase 2 teacher: {improved or 'none'}.",
         "",
     ]
+    failed = [r for r in rows if r["exit"] != 0]
+    lines += [
+        f"Runs that exited non-zero: {len(failed)} of {len(rows)}."
+        + ("" if not failed else f" First: {failed[0]['arm']} seed {failed[0]['seed']} — {failed[0].get('error')}"),
+        "",
+    ]
     report = "\n".join(lines)
     (out / f"phase3-gate-{tag}.md").write_text(report + "\n")
     print()
     print(report)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
