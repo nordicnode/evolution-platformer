@@ -85,6 +85,7 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         "es" => commands::es(&args),
         "watch" => watch::watch(&args),
         "reach" => commands::reach(&args),
+        "fuzz" => commands::fuzz(&args),
         "battery" => commands::battery(&args),
         "codex" => commands::codex(&args),
         "break" => commands::break_my_level(&args),
@@ -139,6 +140,10 @@ COMMANDS:
     watch     Train with the evolution on screen: chart, best-4 + random-4 agents per
               generation, speed control, pause, death markers, genius splash (M3).
     reach     Check that a level is beatable in principle (jump-reachability oracle).
+    fuzz      Generate the certified practice suite (six archetypes x four tiers), print what
+              the oracle and the planner say about each, and with --out write the level files.
+              Deterministic: level i is a pure function of i, so the committed suite is
+              reproducible byte for byte.
     battery   Run the §9 adversarial battery: every bat-* level must be both reachable and
               routable by the timed planner, reported together with its timings.
     codex     Detect what a champion's winning episode discovered and record it in the level's
@@ -449,6 +454,11 @@ TRAIN OPTIONS:
                                                                     [default --seed]
     --out <DIR>           Champion output directory.                  [default champions]
     --csv <PATH>          Also write the (generation, max, avg) history as CSV.
+    --telemetry <PATH>    Also write the learning record as JSONL, one object per generation:
+                          solved/wins, the winning clock (best and median), the leg and frame
+                          the best genome ended on, the per-leg census of every episode, and
+                          the population's first-action entropy at spawn. Reporting only; no
+                          fitness or RNG sees it.
     --max-seconds <S>     Stop early after S wall-clock seconds.
     --stop-on-win         Stop as soon as the first genome wins **every** episode it was
                           judged on: every trial, and on a suite every level. On a walker
@@ -494,6 +504,9 @@ WATCH OPTIONS:
     --frames <N>          Stop after N rendered frames (always on when headless).[default 6]
     --headless            Plain text frames, no keyboard. Implied without a TTY.
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
+    --telemetry <PATH>    Also write the learning record as JSONL, one object per generation
+                          (as for `train`): solved rate, clock, where the best genome ended,
+                          the per-leg census and the first-action spread.
     --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --jump-timing-share,
     --repair-children, --commitment, --growth-units, --growth-events, --lesson-every,
     --plateau-window,
@@ -512,7 +525,8 @@ BENCH OPTIONS:
     every knob that was in force to <out>/<protocol>-<arm>.json, then read two arms back
     paired, seed by seed. `bench` accepts every TRAIN flag, because an arm *is* a training
     configuration and nothing else; it refuses the flags that would change what a sweep
-    measures (--suite, --curriculum, --curriculum-generations, --csv, --max-seconds), and
+    measures (--suite, --curriculum, --curriculum-generations, --csv, --telemetry,
+    --max-seconds), and
     it never fires a detour or reads a clock: it drives the trainer one level at a time for
     a fixed number of generations and stops at the first win, which is exactly what
     FINDINGS.md's own `for seed in $(seq 1 12)` loops do by hand. `--stop-on-validated`
@@ -576,6 +590,10 @@ REACH OPTIONS:
                           here (a climb or a vine is outside the planner's macro set), and that
                           is the honest answer rather than a contradiction.
     --seed <N>            Episode seed the timed plan is searched against.      [default 1]
+
+FUZZ OPTIONS:
+    --out <DIR>           Write the suite's level files here (e.g. levels/practice). Without
+                          it the command only prints the certification table.
 
 REPLAY OPTIONS:
     --champion <PATH>     Champion JSON to replay.                      [required]
@@ -705,6 +723,7 @@ EXAMPLES:
     train-cli train --level levels/l5-tightrope.json --from-champion champions/l3-gauntlet.json
     train-cli es --level levels/scratch-tower.json --generations 300 --stop-on-win
     train-cli reach --all
+    train-cli fuzz --out levels/practice
     train-cli watch --level levels/l2-first-gap.json
     train-cli watch --champion champions/l1-flat-run.json --speed 16
     train-cli replay --champion champions/l1-flat-run.json

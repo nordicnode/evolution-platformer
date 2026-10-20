@@ -60,6 +60,7 @@ use crate::genome::{
     crossover, default_shape, mutate, mutate_few, mutate_jump_timing, reheat, Genome, NetShape,
     MAX_FEEDBACK, MAX_HIDDEN_LAYERS, MAX_HIDDEN_WIDTH,
 };
+use crate::telemetry::Telemetry;
 
 /// GA hyperparameters (§7.5). Populated with the plan's v1 values.
 #[derive(Clone, Debug)]
@@ -1064,6 +1065,11 @@ pub struct GenerationReport {
     /// Stored rather than recomputed so breeding and lane selection cannot
     /// disagree about what "the best genomes" means.
     pub ranking: Vec<usize>,
+    /// **Phase 0: what this generation learned, not just what it scored.** Solved rate, the
+    /// clock among its winners, where the best genome ended, and the per-leg census of every
+    /// episode ([`crate::telemetry`]). Reporting only: it is not scored, not hashed, and not
+    /// part of any RNG stream.
+    pub telemetry: Telemetry,
 }
 
 /// Which half of the "best-4 + random-4" split a showcase lane came from (§10 Tier 1.5).
@@ -2826,6 +2832,18 @@ impl Trainer {
 
         let best_result = results[winner].clone();
 
+        // **Phase 0 telemetry.** Taken here, where the generation's population, results and
+        // winner are all still in hand, and before `breed` replaces the genomes the spawn probe
+        // reads. Reporting only: no fitness, hash or RNG stream sees it.
+        let telemetry = Telemetry::measure(
+            self.generation,
+            &levels[0],
+            &results,
+            winner,
+            &self.genomes,
+            self.config.action_repeat,
+        );
+
         // ---- the run's record, settled on worlds no generation drew --------------------------
         //
         // The generation score is a fine *trigger* and a bad *verdict* on a stochastic level: the
@@ -3094,6 +3112,7 @@ impl Trainer {
                 fastest: self.fastest,
                 results,
                 ranking: order,
+                telemetry,
             },
             pop,
         )
@@ -3738,6 +3757,7 @@ fn lane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture;
     use sim::hash::StateHasher;
 
     /// The ladder is the range §7.5 documents, and the trainer's own default is a rung,
@@ -4301,6 +4321,36 @@ mod tests {
             );
             assert_eq!(one[i].trajectory_hash, six[i].trajectory_hash, "row {i}");
         }
+    }
+
+    /// **Phase 0:** a generation's report says where its episodes ended, not only how they
+    /// scored. Built from the population the step actually evaluated, so the census and the
+    /// ranking cannot describe different generations.
+    #[test]
+    fn a_generation_reports_the_legs_its_population_ended_on() {
+        let level = fixture::gap_runway("telemetry-step", 48, 46, &[(20, 3), (32, 3)]);
+        let cfg = GaConfig {
+            pop_size: 16,
+            master_seed: 5,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg);
+        let report = trainer.step(&level);
+        let t = &report.telemetry;
+        assert_eq!(t.generation, 0);
+        assert_eq!(t.pop, 16);
+        assert_eq!(t.legs, 2, "two gaps are two route crossings");
+        assert_eq!(t.ended_legs.len(), 2);
+        assert_eq!(t.died_legs.len(), 2);
+        assert_eq!(t.reached_legs.len(), 2);
+        assert_eq!(t.first_actions.iter().sum::<u32>(), 16);
+        assert!(t.best_end_leg <= t.legs);
+        // The census adds up to the population: every episode either won or ended in one leg.
+        let ended: u32 = t.ended_legs.iter().sum();
+        assert_eq!(ended as usize + t.wins, t.pop);
+        // And the best genome's place is the one its own result recorded.
+        let best = &report.results[report.ranking[0]];
+        assert_eq!(t.best_end_leg, best.route_hops_closed.min(t.legs));
     }
 
     #[test]

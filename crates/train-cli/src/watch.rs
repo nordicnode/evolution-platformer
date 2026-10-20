@@ -94,6 +94,7 @@ const WATCH_OPTS: &[&str] = &[
     "race-episodes",
     "no-race-episodes",
     "out",
+    "telemetry",
     "speed",
     "best",
     "random",
@@ -353,6 +354,20 @@ pub fn watch(a: &Args) -> Result<(), String> {
     // search is partly paid for — so the moment the record falls is a moment worth a line.
     let mut fastest_seen: Option<evo::FastWin> = None;
 
+    // **Phase 0 learning telemetry.** A watched run is a real run, so it can leave the same
+    // JSONL record a headless one does — one object per generation. The screen shows the same
+    // readings in the desktop window's Details panel; the file is what makes a watched run's
+    // curve checkable after the fact.
+    let telemetry_path = a.opt("telemetry").map(|p| p.to_string());
+    let mut telemetry_out = match &telemetry_path {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .map_err(|e| format!("cannot write {path}: {e}"))?;
+            Some(std::io::BufWriter::new(file))
+        }
+        None => None,
+    };
+
     for _ in 0..generations {
         if live.quit {
             break;
@@ -364,6 +379,12 @@ pub fn watch(a: &Args) -> Result<(), String> {
         // genomes (with the exact ids) the report describes.
         let (report, population) = trainer.step_verbose(&level);
         generations_run += 1;
+        if let Some(out) = telemetry_out.as_mut() {
+            let line = serde_json::to_string(&report.telemetry)
+                .map_err(|e| format!("cannot serialize telemetry: {e}"))?;
+            writeln!(out, "{line}")
+                .map_err(|e| format!("cannot write {telemetry_path:?}: {e}"))?;
+        }
         history.push(HistoryPoint {
             generation: report.generation,
             max_fitness: report.max_fitness,
@@ -539,6 +560,12 @@ pub fn watch(a: &Args) -> Result<(), String> {
                 });
             }
         }
+    }
+
+    if let (Some(path), Some(mut out)) = (&telemetry_path, telemetry_out) {
+        out.flush()
+            .map_err(|e| format!("cannot write {path}: {e}"))?;
+        println!("wrote   {path} (one learning record per generation)");
     }
 
     // A watched run is a real run: its best genome is saved exactly like `train`'s,

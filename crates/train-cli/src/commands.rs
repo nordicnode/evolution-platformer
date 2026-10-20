@@ -1,6 +1,7 @@
 //! Subcommand implementations.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -15,6 +16,7 @@ use evo::{
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use sim::physics::{AgentAction, PHYSICS};
+use sim::practice;
 use sim::reach;
 use sim::{Level, Outcome, SIM_VERSION};
 
@@ -89,6 +91,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "curriculum-generations",
     "out",
     "csv",
+    "telemetry",
     "max-seconds",
     "stop-on-win",
     "stop-on-validated",
@@ -117,6 +120,9 @@ const ES_OPTS: &[&str] = &[
     "quiet",
 ];
 const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose", "timed", "seed"];
+/// `fuzz`: the Phase 0 practice suite. `--out` writes the files; without it the command only
+/// prints what it certified.
+const FUZZ_OPTS: &[&str] = &["out"];
 const REPLAY_OPTS: &[&str] = &["champion", "level", "levels-dir"];
 /// `committee`: the Item 10 gate as a command. It validates a saved committee against the run's
 /// own fixed validation episodes and fails the shell if the vote loses to its best member.
@@ -540,8 +546,8 @@ pub fn train(a: &Args) -> Result<(), String> {
             FITNESS_VERSION
         );
         println!(
-            "\n{:>4}  {:>10}  {:>10}  {:>10}  {:>9}  {:>5}  {:>7}",
-            "gen", "max", "avg", "min", "wins", "sigma", "secs"
+            "\n{:>4}  {:>10}  {:>10}  {:>10}  {:>9}  {:>5}  {:>7}  {:>6}  {:<16}  learning",
+            "gen", "max", "avg", "min", "wins", "sigma", "secs", "solved", "clock"
         );
     }
 
@@ -585,10 +591,28 @@ pub fn train(a: &Args) -> Result<(), String> {
 
     if suite && !quiet {
         println!(
-            "\n{:>4}  {:>10}  {:>10}  {:>10}  {:>9}  {:>5}  {:>7}  {:>5}",
-            "gen", "max", "avg", "min", "wins", "sigma", "secs", "suite"
+            "\n{:>4}  {:>10}  {:>10}  {:>10}  {:>9}  {:>5}  {:>7}  {:>5}  {:>6}  {:<16}  learning",
+            "gen", "max", "avg", "min", "wins", "sigma", "secs", "suite", "solved", "clock"
         );
     }
+
+    // **Phase 0 learning telemetry.** One JSON object per generation, so a run's learning curve
+    // is a file a later phase can gate on rather than a screenshot. Opened before the loop
+    // (and written inside it) so a run killed at `--max-seconds` still leaves every generation
+    // it actually ran.
+    let telemetry_path = a.opt("telemetry").map(|p| p.to_string());
+    let mut telemetry_out = match &telemetry_path {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            let file = fs::File::create(path)
+                .map_err(|e| format!("cannot write {path}: {e}"))?;
+            Some(std::io::BufWriter::new(file))
+        }
+        None => None,
+    };
 
     for _ in 0..generations {
         let t0 = Instant::now();
@@ -605,6 +629,16 @@ pub fn train(a: &Args) -> Result<(), String> {
             avg_fitness: report.avg_fitness,
             wins: report.wins,
         });
+        if let Some(out) = telemetry_out.as_mut() {
+            let line = serde_json::to_string(&report.telemetry)
+                .map_err(|e| format!("cannot serialize telemetry: {e}"))?;
+            writeln!(out, "{line}").map_err(|e| {
+                format!(
+                    "cannot write {}: {e}",
+                    telemetry_path.as_deref().unwrap_or("telemetry")
+                )
+            })?;
+        }
 
         // What "solved" means depends on the run, and it is the **conservative** reading on both.
         // On one level it is the first genome that won every episode it was judged on, which on a
@@ -627,7 +661,7 @@ pub fn train(a: &Args) -> Result<(), String> {
         if !quiet {
             if suite {
                 println!(
-                    "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}  {:>3}/{:<2}{}",
+                    "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}  {:>3}/{:<2}  {:>6}  {:<16}  l0: {}{}",
                     report.generation,
                     report.max_fitness,
                     report.avg_fitness,
@@ -638,11 +672,14 @@ pub fn train(a: &Args) -> Result<(), String> {
                     secs,
                     report.suite_solved,
                     effective.pop_size,
+                    report.solved,
+                    report.telemetry.clock_line(),
+                    report.telemetry.best_end_line(),
                     if report.genius { "  <-- GENIUS AGENT" } else { "" }
                 );
             } else {
                 println!(
-                    "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}{}",
+                    "{:>4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>5}/{:<3}  {:>5.2}  {:>7.2}  {:>6}  {:<16}  {}{}",
                     report.generation,
                     report.max_fitness,
                     report.avg_fitness,
@@ -651,6 +688,9 @@ pub fn train(a: &Args) -> Result<(), String> {
                     effective.pop_size,
                     report.mutation_sigma,
                     secs,
+                    report.solved,
+                    report.telemetry.clock_line(),
+                    report.telemetry.best_end_line(),
                     if report.genius {
                         "  <-- GENIUS AGENT"
                     } else {
@@ -752,6 +792,14 @@ pub fn train(a: &Args) -> Result<(), String> {
                     None => summary,
                 });
             }
+        }
+    }
+
+    if let (Some(path), Some(mut out)) = (&telemetry_path, telemetry_out) {
+        out.flush()
+            .map_err(|e| format!("cannot write {path}: {e}"))?;
+        if !quiet {
+            println!("wrote   {path} (one learning record per generation)");
         }
     }
 
@@ -2054,6 +2102,108 @@ pub fn battery(a: &Args) -> Result<(), String> {
             "{failures} of {} battery level(s) failed the gate",
             paths.len()
         ));
+    }
+    Ok(())
+}
+
+/// **`fuzz`: the Phase 0 practice suite.** Generate every level, certify it with the reachability
+/// oracle and the timed planner, print the table, and — with `--out` — write the level files.
+///
+/// The suite is fixed at [`practice::SUITE_LEN`] levels: `--out` does not change *what* is
+/// generated, only where it lands. A level that fails either authority is reported and the command
+/// exits non-zero, because a suite with an uncertified member is worse than no suite: every later
+/// gate would be reading a problem whose answer nobody has checked.
+pub fn fuzz(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(FUZZ_OPTS))?;
+    if a.has_flag("out") && a.opt("out").is_none() {
+        return Err("usage: --out needs a directory, e.g. --out levels/practice".into());
+    }
+    let out = a.opt("out").map(PathBuf::from);
+    if let Some(dir) = &out {
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    println!(
+        "suite   {} levels, {} archetypes x {} tiers (generator v{})",
+        practice::SUITE_LEN,
+        practice::ARCHETYPES.len(),
+        practice::SUITE_LEN / practice::ARCHETYPES.len(),
+        practice::SUITE_VERSION
+    );
+    println!(
+        "\n{:<20}  {:>6}  {:>4}  {:>7}  {:>6}  {:>9}  {:>8}",
+        "level", "oracle", "plan", "frames", "blocks", "oracle ms", "plan ms"
+    );
+    let mut uncertified = 0usize;
+    let mut plan_total = 0.0f64;
+    let mut reach_total = 0.0f64;
+    let mut plan_worst = 0.0f64;
+    for index in 0..practice::SUITE_LEN {
+        let (level, cert) = practice::generate(index);
+        let stem = practice::stem(index);
+        // Timed on a **fresh parse**, so the reading is "open this file and certify it" rather
+        // than a warm repeat against the route table `generate` just built. The oracle is timed
+        // first; the plan search then reads the same warm level, so the two numbers do not
+        // double-count each other.
+        let json = level
+            .to_json_pretty()
+            .map_err(|e| format!("cannot write {stem}: {e}"))?;
+        let fresh = Level::from_json_str(&json)
+            .map_err(|e| format!("cannot re-read {stem}: {e}"))?;
+        let t_reach = Instant::now();
+        let _ = reach::report(&fresh);
+        let reach_ms = t_reach.elapsed().as_secs_f64() * 1000.0;
+        let t_plan = Instant::now();
+        let _ = sim::plan::plan_level(
+            &fresh,
+            0x5EED,
+            sim::plan::PlanConfig {
+                depth: 48,
+                ..sim::plan::PlanConfig::default()
+            },
+        );
+        let plan_ms = t_plan.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "{:<20}  {:>6}  {:>4}  {:>7}  {:>6}  {:>9.1}  {:>8.1}",
+            stem,
+            if cert.beatable { "yes" } else { "NO" },
+            if cert.planned { "yes" } else { "NO" },
+            cert.frames
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "-".into()),
+            cert.blocks
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "-".into()),
+            reach_ms,
+            plan_ms
+        );
+        if !cert.certified() {
+            uncertified += 1;
+            println!("    {}", cert.note);
+        }
+        plan_total += plan_ms;
+        reach_total += reach_ms;
+        plan_worst = plan_worst.max(plan_ms);
+        if let Some(dir) = &out {
+            std::fs::write(dir.join(format!("{stem}.json")), json)
+                .map_err(|e| format!("cannot write {stem}: {e}"))?;
+        }
+    }
+    println!(
+        "\ntotal   oracle {reach_total:.1} ms   plan {plan_total:.1} ms (worst {plan_worst:.1} ms per level)"
+    );
+    if uncertified > 0 {
+        return Err(format!(
+            "{uncertified} of {} generated levels did not certify",
+            practice::SUITE_LEN
+        ));
+    }
+    if let Some(dir) = &out {
+        println!(
+            "wrote   {} level files to {}",
+            practice::SUITE_LEN,
+            dir.display()
+        );
     }
     Ok(())
 }

@@ -72,6 +72,12 @@ ghosted beside it.
   or point at the jump that cannot be made.
 - **Evolution you can watch:** a live fitness chart, champions you can save,
   continue from and race against, and replays with ghost populations.
+- **Learning you can read, not just a score:** every run reports how many agents
+  solved, the best and median clock, the route leg and frame where the best
+  genome ended, a per-leg census of the whole population, and how spread out
+  its first decisions were. The window shows it in the Details panel, `train`
+  prints it per generation, and `--telemetry <PATH>` writes one JSON object per
+  generation for a later gate to read.
 - **Runs that get unstuck:** if a population stalls, the run can fall back to
   an easier version of the level, learn there, and carry what it learned back.
   Once a level is solved, a mastery mode keeps evolving for a faster time
@@ -112,6 +118,12 @@ There is also a set of small adversarial levels (`levels/bat-*.json`), one per
 skill the AI is meant to have, and working levels named `levels/scratch-*.json`,
 including the showcase level in the screenshot above.
 
+`levels/practice/` is a **generated, certified practice suite**: twenty-four
+levels, six mechanics at four tiers, every one checked by the reachability
+oracle *and* the timed planner before it is written. `train-cli fuzz` prints that
+certification table, and `train-cli fuzz --out levels/practice` regenerates the
+suite byte for byte from its own seed.
+
 ## Quick start
 
 You need a Rust toolchain. From the top of the repo:
@@ -129,7 +141,9 @@ cargo run --release -p app -- --replay --generations 20 --level levels/l3-gauntl
 
 # Headless: train a level, check whether a level can be beaten at all
 ./target/release/train-cli train --level levels/l3-gauntlet.json --generations 200 --pop 200 --stop-on-win
+./target/release/train-cli train --level levels/practice/p17-mover-t2.json --telemetry out/p17.jsonl
 ./target/release/train-cli reach --level levels/l11-the-elements.json
+./target/release/train-cli fuzz --out levels/practice
 
 cargo test --workspace   # the test suite
 ```

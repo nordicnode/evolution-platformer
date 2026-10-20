@@ -212,6 +212,11 @@ pub struct RunSummary {
     /// when it stalled (§12 M5). A fact about the run rather than a reading of its
     /// history, so it is carried through from the packet and not derived here.
     pub curriculum: Option<String>,
+    /// **Phase 0: what this generation learned.** Solved rate, the winning clock, the leg and
+    /// frame the best genome ended on, and the per-leg census of the population. Carried from
+    /// the trainer's report rather than recomputed: the panel is a view of the run, and a second
+    /// implementation of the leg census would be a second answer to "where did they die".
+    pub telemetry: evo::Telemetry,
     /// Whether a champion file exists for this level, and so whether *Continue champion*
     /// has anything to continue.
     ///
@@ -279,6 +284,7 @@ impl RunSummary {
             discovery: packet.discovery.clone(),
             codex_len: packet.codex_len,
             curriculum: packet.curriculum.clone(),
+            telemetry: packet.telemetry.clone(),
             champion_saved: false,
             finished: packet.finished,
             deaths_at: None,
@@ -1125,6 +1131,65 @@ pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState
     // opinion about how the step went, it only has to say it happened.
     if let Some(note) = &summary.curriculum {
         ui.colored_label(TEXT, note.clone());
+    }
+
+    // --- what the generation learned --------------------------------------
+    // Its own section between the search and the clock, because it is the bridge: the rows above
+    // say what the search did to itself and the rows below time the one win it has. These say
+    // *where the population actually got*, which is the reading a viewer needs when a score that
+    // will not move is the only thing the chart can show. A maximum that is flat while the deaths
+    // march one leg deeper is a run that is learning; the reverse is a run that is not, and no
+    // single scalar distinguishes them.
+    section(ui, "What it learned");
+    let learning = &summary.telemetry;
+    if learning.pop == 0 {
+        small_dim(ui, "waiting for the first scored generation");
+    } else {
+        ui::stat_row(
+            ui,
+            "solved this generation",
+            format!(
+                "{} / {} ({:.0}%)",
+                learning.solved,
+                learning.pop,
+                100.0 * learning.solved as f32 / learning.pop as f32
+            ),
+        );
+        ui::stat_row(ui, "clock, best / median", learning.clock_line());
+        if learning.legs > 0 {
+            ui::stat_row(
+                ui,
+                "best genome crossed",
+                format!("{} / {} legs", learning.best_end_leg, learning.legs),
+            );
+        }
+        // The end, not only the score: `died in leg 3 at frame 412 (decision 103)` is a place a
+        // viewer can point at, and the panel has the room for the whole clause.
+        ui::stat_row(ui, "best genome", learning.best_end_line());
+        ui::stat_row(
+            ui,
+            "first-action spread",
+            format!(
+                "{:.0}% of the table ({:.2} bits)",
+                learning.spread() * 100.0,
+                learning.first_action_entropy
+            ),
+        );
+        // The census, one row per leg anybody ended on. Legs nobody ended on are the stretches the
+        // population walks through, and printing twelve rows of zeroes to say that would bury the
+        // two places it does not. `ended` is every non-win; `died` is the sim's own verdict, so a
+        // timed-out or stuck episode is counted in the first and not the second.
+        for (leg, ended, died, through) in learning.leg_rows() {
+            if ended == 0 && died == 0 {
+                continue;
+            }
+            let label = format!("leg {leg}");
+            ui::stat_row(
+                ui,
+                &label,
+                format!("{ended} ended ({died} died), {through} crossed"),
+            );
+        }
     }
 
     // --- the clock ---------------------------------------------------------
@@ -2205,6 +2270,27 @@ mod tests {
             // discovery line's own tests build their packet with both set.
             discovery: None,
             codex_len: 0,
+            // A generation with a solved handful, a timed win and a population that ended
+            // deepest on leg 2: the section only reads as intended when every one of its rows
+            // has a number in it, so the fixture is a real census rather than a default.
+            telemetry: evo::Telemetry {
+                generation: 4,
+                pop: 200,
+                solved: if won { 3 } else { 0 },
+                wins: if won { 3 } else { 0 },
+                legs: 4,
+                best_frames: if won { Some(505) } else { None },
+                median_frames: if won { Some(620) } else { None },
+                best_end_leg: if won { 4 } else { 2 },
+                best_died: !won,
+                best_end_frame: if won { None } else { Some(412) },
+                best_end_decision: if won { None } else { Some(103) },
+                ended_legs: vec![40, 25, 10, 2],
+                died_legs: vec![12, 8, 4, 1],
+                reached_legs: vec![160, 120, 60, 3],
+                first_actions: [50, 35, 28, 22, 18, 14, 11, 9, 6, 4, 3],
+                first_action_entropy: 3.06,
+            },
         }
     }
 

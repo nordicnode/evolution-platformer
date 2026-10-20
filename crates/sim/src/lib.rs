@@ -28,6 +28,7 @@ pub mod hash;
 pub mod level;
 pub mod physics;
 pub mod plan;
+pub mod practice;
 pub mod reach;
 pub mod rng;
 pub mod sensors;
