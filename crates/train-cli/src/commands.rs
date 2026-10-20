@@ -91,6 +91,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "replan-depth",
     "dagger-rounds",
     "no-meta",
+    "no-jump-labels",
     "route-seed",
     "curriculum",
     "curriculum-generations",
@@ -1572,6 +1573,9 @@ fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
         // blocks and the raw leg routes are the teacher. It exists so a gate can compare the two
         // teachers on the same tree rather than across commits.
         meta: !a.has_flag("no-meta"),
+        // The widened labelling is on by default; `--no-jump-labels` is the Phase 2 teacher, kept
+        // so the gate can measure the widening on one tree rather than across commits.
+        jump_labels: !a.has_flag("no-jump-labels"),
         ..ImitateConfig::default()
     };
     let plan_cfg = sim::plan::PlanConfig {

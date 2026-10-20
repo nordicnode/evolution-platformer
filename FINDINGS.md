@@ -6138,3 +6138,104 @@ Files: `crates/sim/src/meta.rs` (the controller, the trace, three unit tests),
 demonstration and correction sequencing, `demo skills` on the report line),
 `crates/train-cli/src/{commands,main}.rs` (`--no-meta`, help), `crates/app/src/lab.rs` (skills in
 the origin note), `tools/phase3_gate.py`.
+
+## Phase 3, second pass: label the student's own jump disagreement
+
+The first Phase 3 pass shipped the controller and a gate that proved it inert on `l11`. This pass
+attacks the wall that gate exposed from the other side: the teacher only spoke when the student was
+*off* the demonstration's corridor, so a student standing **on** the corridor but choosing the wrong
+jump button got the nearest demonstrated action as its label — and no epoch budget fixes a state
+labelled wrongly.
+
+### The change
+
+`replanning_rollout` now plans from the student's own snapshot when the state is on the corridor and
+`student.wants_jump() != nearest_demonstrated.wants_jump()`. The jump button is the margin that
+matters at a crossing; two horizontal gears at the same state are a fit detail, a missed or wasted
+jump ends the episode. The extra searches are bounded by the same `replan_cap` per rollout as the
+off-corridor ones and counted in `ImitationReport::jump_corrections` (printed as `; jump corrections
+N` on the clone line). `--no-jump-labels` selects the Phase 2 teacher on the same tree, so the gate
+compares arms rather than commits.
+
+### The gate, as run
+
+`tools/phase3_gate.py --seeds 8`: `l11`, plan depth 64, clone 300 epochs (the window's budget), pop
+8, three arms on one tree. `baseline` is `--no-meta --no-jump-labels` (the tuned Phase 2 teacher),
+`labels` adds the jump-margin correction, `phase3` adds the controller too.
+
+| arm | mean / median / min-max legs | past leg 1 | deaths | jump corrections | by leg | plan+fit s |
+|---|---|---|---|---|---|---|
+| baseline | 2.00 / 2.0 / 1-4 | 6/8 | spike 3, turret shot 5 | 0 | — | 5.68 |
+| labels | **2.25** / 2.0 / 2-3 | **8/8** | spike 1, stuck 3, turret shot 4 | 54 | 0:22, 1:2, 2:30 | 6.79 |
+| phase3 | **2.25** / 2.0 / 2-3 | **8/8** | spike 1, stuck 3, turret shot 4 | 54 | 0:22, 1:2, 2:30 | 6.78 |
+
+The `by leg` column is the new reading: **30 of the 54 corrections are planned from leg 2, the leg
+the turret deaths end in** — the condition the last pass identified does fire at the pinch. `phase3`
+is identical to `labels` on every seed, deaths included, so the controller remains inert on this
+level exactly as the first pass measured; what it adds here is nothing, and it costs nothing.
+
+The baseline arm reproduces the shipped Phase 2 numbers exactly (2.00 legs, 6/8 past leg 1), which is
+the check that this comparison is against the same teacher and not a stricter one.
+
+Per seed:
+
+| seed | baseline | labels | phase3 | baseline ended | labels / phase3 ended | jump corr. (legs) |
+|---|---|---|---|---|---|---|
+| 1 | 2 | 2 | 2 | turret shot | turret shot | 7 (0 x4, 2 x3) |
+| 2 | 2 | 2 | 2 | turret shot | turret shot | 5 (0 x3, 2 x2) |
+| 3 | **4** | 3 | 3 | spike | stuck | 6 (2 x6) |
+| 4 | 2 | 2 | 2 | turret shot | turret shot | 6 (0 x3, 2 x3) |
+| 5 | 2 | **3** | **3** | turret shot | stuck | 8 (0 x2, 1 x1, 2 x5) |
+| 6 | **1** | **2** | **2** | spike | turret shot | 6 (0 x3, 2 x3) |
+| 7 | **1** | **2** | **2** | spike | stuck | 9 (0 x3, 2 x6) |
+| 8 | 2 | 2 | 2 | turret shot | spike | 7 (0 x4, 1 x1, 2 x2) |
+
+**What moved.** The two seeds that died at the first crossing (6, 7) now clear it — `8/8` past leg 1
+instead of `6/8` — and seed 5 gains a leg. The mean rises 2.00 → 2.25 and every seed is at 2 or more,
+where the baseline had two at 1. The labels fire: 54 corrections in the `labels` arm and 54 in
+`phase3` — about seven per run, well inside the 8-per-rollout cap (no run exhausted it) — at +1.1 s
+of plan+fit (20 %). Two runs of this gate produced the same legs, deaths and correction counts per
+seed, so the distribution is the tree's, not a draw.
+
+**What did not.** The turret pinch is still the wall: four of the five seeds that die there still die
+there, one (seed 8) changes cause to a spike, and seed 3 — the only seed that ever reached leg 4 —
+**loses a leg** to `stuck`. And the corrections *reach* the pinch: 30 of the 54 are planned from leg
+2, the leg the turret deaths end in, on every turret seed (three on seed 1, two on 2, three on 4,
+five on 5, three on 6, six on 7, two on 8). So the state the last pass said carried no correction now
+carries one, and the clone still dies there. The labelling condition was **one** thing wrong, not the
+only one: what remains is what the 300-epoch fit does with a correction it is given, and that is not
+measured by this gate. The pass therefore ships the widening as a better-conditioned teacher, not as
+a solution to the turret, and says so with these numbers.
+
+### Wait and ride on the certified suite
+
+`train --from-plan --generations 0` on all 24 practice levels, demo skill line per level:
+
+| levels | ride | wait |
+|---|---|---|
+| `p05`, `p11`, `p17`, `p23` (movers) | 1, 8, 7, 20 | 0, 0, 0, 0 |
+| `p18`, `p24` (mixed, tiers 2-3) | 5, 9 | 0, 0 |
+| the other 18 | 0 | 0 |
+
+**Ride is demonstrated on a certified practice level** — the controller labels the blocks it stands
+on a deck, and the counts rise with the tier's deck count. **Wait cannot be shown there.** Every block
+of every certified plan is a route move, a jump or a ride (`p05`: 39 + 49 + 1 = 89); `wait` is only
+ever inserted at a turret window the plan itself holds through (`should_wait`), and no suite level has
+a turret. On `l11`, the only level with turrets in the gate, it reads 0 for the earlier reason: a wait
+in a shot's own row is unwinnable there.
+
+A variant was tried and **rejected**: labelling a hold at a mover's boarding edge as `Skill::Wait`.
+It measured `wait 0` on all four mover levels before and after, because those plans contain no hold
+block to relabel — the code was unreachable, so it was removed rather than shipped. `wait`'s only
+coverage is the unit test `a_wait_holds_the_plan_block`; that is stated as a limitation, not a
+demonstration.
+
+### Gates
+
+`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace` green except
+the pre-existing `evo --test migration` saved-`l11` fixture, which fails only because that level file
+is edited in this working tree.
+
+Files: `crates/evo/src/imitate.rs` (`jump_labels`, on-corridor jump correction, `jump_corrections`
+in the report and on the line), `crates/train-cli/src/{commands,main}.rs` (`--no-jump-labels`),
+`tools/phase3_gate.py` (three arms, correction count).
