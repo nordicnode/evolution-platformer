@@ -5627,3 +5627,49 @@ episode on l11 (which has a mover), and every champion/replay determinism test i
 stands behind it. No before/after timing is quoted: the readings that would make the claim
 belong on the reference machine, and this change was made because the allocations were
 there, not because a percentage was promised.
+
+## Item 14: repair children — a mistake the run can name
+
+The complaint this starts from is not a number: a run reaches the flag and then stops getting
+better, because nothing in the objective says *which decision* was wrong. Fitness is whole-episode
+(progress, the win bonus, the speed bonus paid on a win, and the clock under mastery), so a policy
+that dies at the same flyer two hundred times and one that dies there once and dawdles look alike to
+selection. Every operator in `ga` asks "what if this genome were slightly different"; none asks
+"what did it do wrong".
+
+`evo::mistakes` adds the second question. Per generation, the best genome replays its own
+representative episode with the last eight decisions captured (`EpisodeRunner::capture_decisions`),
+every one of the eleven actions is held for 32 ticks from those states in a restarted snapshot, and
+the earliest decision where an alternative **survives** and the chosen action does not becomes a
+mistake. `learn` then moves that action's output row toward the hidden activation it saw and the
+losing row away from it, by the smallest step that actually flips the argmax at that state. The
+child is injected into the next generation and judged on a full episode like any other genome: no
+fitness term, no champion, no recorded episode is touched.
+
+**The first version was wrong, and the arm said so.** It also accepted a plain progress gain — "this
+sprint got four pixels further before the same death" — and eight paired seeds on the custom level
+came back 5 of 8 solved either way, median first win 131 generations with repairs against 101
+without. A 32-tick rollout that prefers one dying action to another is describing the arc of the
+fall, and the nudge then teaches an action at a state nothing could have saved. Survivors only, and
+the earliest such decision rather than the last, is the shipped rule.
+
+**Paired arm, 12 seeds, one level.** `train --level levels/custom-l1-flat-run.json --generations 200
+--stop-on-win`, seeds 1–12, measured against `--repair-children 3` on the same seeds. First-win
+generation, `—` for a seed still unsolved at 200:
+
+| seed | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| off | 135 | — | 73 | 127 | — | 101 | — | 60 | — | — | — | 175 |
+| **on** | 180 | **83** | 78 | 127 | — | **47** | **85** | 119 | **59** | **59** | **144** | **157** |
+
+- **Solved: 6 of 12 without repairs, 11 of 12 with them.** The five seeds that only solve with
+  repairs are the whole effect: 5 discordant pairs toward the arm, none against, exact McNemar
+  p = 0.0625 (one-sided 0.031).
+- **Among seeds that solve either way it does not speed anything up.** Six such pairs: 3 to the
+  plain run, 2 to repairs, 1 tie; sign p = 1.0. The mechanism buys *arrival*, not tempo — which is
+  the honest reading, because it only fires on episodes that lost.
+- **Cost: about 3 ms on a 15 ms generation** (mean 0.015 → 0.018 s/gen at pop 200 on this machine),
+  one replay plus 11 × 8 short rollouts.
+- **Not the 24-seed gate.** One level, one machine, twelve seeds. `GaConfig::repair_children` is 0 by
+  default and `--repair-children` is the arm; the window runs 3 because a watched run is where the
+  mistake is legible. A 24-seed gate across the pack is still owed before this becomes a default.

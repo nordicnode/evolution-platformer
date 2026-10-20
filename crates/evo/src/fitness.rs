@@ -522,6 +522,27 @@ impl EpisodeResult {
     }
 }
 
+/// How many recent decisions an episode keeps when it is asked to capture them.
+///
+/// Eight decisions is two jump arcs at the shipped cadence: long enough that the last thing that
+/// *could* have been done differently is still in the window when the body dies, short enough that
+/// the states are still about the mistake rather than about the approach to it.
+pub const CAPTURED_DECISIONS: usize = 8;
+
+/// One decision, with the world and the network's memory exactly as they stood when it was made.
+///
+/// [`crate::mistakes`] replays these: the world to ask "what would another action have done?",
+/// the observation and the recurrent context to ask the network the same question it was asked
+/// then. Public fields rather than accessors because it is a capture, not a policy object.
+#[derive(Clone, Debug)]
+pub struct Decision {
+    pub sim: Sim,
+    pub observation: Vec<f32>,
+    pub context: Vec<f32>,
+    pub action: AgentAction,
+    pub frame: u32,
+}
+
 /// Step-by-step episode driver.
 ///
 /// [`run_episode`] is this plus a loop, deliberately, so the decision cadence has
@@ -556,6 +577,11 @@ pub struct EpisodeRunner {
     cut_stuck_frames: u32,
     /// Whether this episode was ended by that cut rather than by the sim.
     cut: bool,
+    /// Whether this episode keeps its recent decisions (see [`EpisodeRunner::capture_decisions`]).
+    /// Off on every ordinary evaluation: the capture clones the world once per decision.
+    capture: bool,
+    /// The most recent decisions, oldest first, capped at [`CAPTURED_DECISIONS`].
+    decisions: Vec<Decision>,
 }
 
 impl EpisodeRunner {
@@ -579,6 +605,8 @@ impl EpisodeRunner {
             guard,
             cut_stuck_frames: cfg.cut_stuck_frames,
             cut: false,
+            capture: false,
+            decisions: Vec::new(),
         }
     }
 
@@ -602,7 +630,26 @@ impl EpisodeRunner {
             guard,
             cut_stuck_frames: cfg.cut_stuck_frames,
             cut: false,
+            capture: false,
+            decisions: Vec::new(),
         }
+    }
+
+    /// Keep the world and the observation at each of the last [`CAPTURED_DECISIONS`] decisions.
+    ///
+    /// Off by default because it clones the sim once per decision. A trainer that wants to point
+    /// at the moment a policy went wrong turns it on for one replay of that policy, not for the
+    /// evaluation that scored it.
+    pub fn capture_decisions(&mut self, on: bool) {
+        self.capture = on;
+        if !on {
+            self.decisions.clear();
+        }
+    }
+
+    /// The decisions captured so far, oldest first.
+    pub fn decisions(&self) -> &[Decision] {
+        &self.decisions
     }
 
     /// Live view of the episode. Read-only, so a renderer cannot disturb it.
@@ -648,6 +695,18 @@ impl EpisodeRunner {
             }
             self.trace.u32(frames);
             self.trace.u8(self.action.index() as u8);
+            if self.capture {
+                self.decisions.push(Decision {
+                    sim: self.sim.clone(),
+                    observation: observation.to_vec(),
+                    context: self.scratch.context().to_vec(),
+                    action: self.action,
+                    frame: frames,
+                });
+                if self.decisions.len() > CAPTURED_DECISIONS {
+                    self.decisions.remove(0);
+                }
+            }
         }
 
         self.sim.step(self.action);

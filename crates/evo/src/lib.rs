@@ -22,6 +22,7 @@ pub mod ga;
 pub mod genome;
 pub mod imitate;
 pub mod islands;
+pub mod mistakes;
 pub mod navigate;
 pub mod polish;
 pub mod population;
@@ -68,6 +69,7 @@ pub use imitate::{
     ImitationReport,
 };
 pub use islands::{IslandConfig, IslandStep, Islands};
+pub use mistakes::{find_mistake, find_mistakes, learn as learn_from_mistake, Mistake};
 pub use navigate::{aim_point, planned_actions, play as think, Driver, ThinkConfig, ThinkReport};
 pub use polish::{output_slots, polish, PolishConfig, PolishReport};
 pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};

@@ -35,6 +35,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "fine-children",
     "fine-sigma-scale",
     "jump-timing-share",
+    "repair-children",
     "commitment",
     "mastery",
     "no-mastery",
@@ -1577,6 +1578,9 @@ pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
         crossover_rate: usage(a.f32_opt("crossover", default.crossover_rate))?,
         fine_children: usage(a.usize_opt("fine-children", default.fine_children))?,
         jump_timing_share: usage(a.f32_opt("jump-timing-share", default.jump_timing_share))?,
+        // Item 14: children bred from the best genome's own losing decisions. Off by default, like
+        // every unmeasured arm; `--repair-children 3` is the window's configuration.
+        repair_children: usage(a.usize_opt("repair-children", default.repair_children))?,
         // **On by default**, matching the window: a run that solves and then spends thousands of
         // generations on the crowned score is not improving the clock at all, and the second
         // phase only arms once the record has solved, so learning is unchanged. `--mastery`

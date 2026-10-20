@@ -164,6 +164,12 @@ impl NetShape {
         self.outputs + usize::from(self.commitment)
     }
 
+    /// Fan-in of the final layer — the width of its activation vector, and the vector a
+    /// one-sample output-layer update moves along (see [`Genome::last_layer_input`]).
+    pub fn last_fan_in(&self) -> usize {
+        self.layer(self.n_layers() - 1).0
+    }
+
     /// The same topology with the cadence head present. See [`Genome::grown_with_commitment`].
     pub fn with_commitment(&self) -> NetShape {
         NetShape {
@@ -260,6 +266,10 @@ pub struct ActScratch {
     b: Vec<f32>,
     out: Vec<f32>,
     ctx: Vec<f32>,
+    /// The input vector the **last** layer was given by the most recent pass (see
+    /// [`Genome::last_layer_input`]). One copy of sixteen floats per decision, which is what a
+    /// one-sample output-layer update needs and what the forward pass already has in registers.
+    last_in: Vec<f32>,
 }
 
 impl ActScratch {
@@ -292,6 +302,20 @@ impl ActScratch {
         if self.ctx.len() < shape.feedback_width() {
             self.ctx.resize(shape.feedback_width(), 0.0);
         }
+        if self.last_in.len() < shape.last_fan_in() {
+            self.last_in.resize(shape.last_fan_in(), 0.0);
+        }
+    }
+
+    /// Put a captured recurrent state back, so a network with memory makes the same decision it
+    /// made when that state was live.
+    ///
+    /// [`ActScratch::reset_context`] is the episode boundary; this is the opposite — a replay of
+    /// one *decision*, for [`crate::mistakes`] and for any inspector that wants to ask the network
+    /// what it saw. The vector is copied, never borrowed, so the caller can keep the capture.
+    pub fn restore_context(&mut self, ctx: &[f32]) {
+        self.ctx.clear();
+        self.ctx.extend_from_slice(ctx);
     }
 
     /// Forget everything carried from the previous decision.
@@ -418,6 +442,7 @@ impl Genome {
             b,
             out,
             ctx,
+            last_in,
         } = s;
         let ins = self.shape.inputs;
         let fb = self.shape.feedback_width();
@@ -439,6 +464,7 @@ impl Genome {
                 // hidden layer at all has nothing but its scores to remember, and those are
                 // what is fed back.
                 let src: &[f32] = if is_last {
+                    last_in[..fan_in].copy_from_slice(&input[..fan_in]);
                     dense(&input[..fan_in], out, self, w_off, b_off, fan_in, fan_out);
                     &out[..fan_out]
                 } else {
@@ -461,6 +487,7 @@ impl Genome {
                 }
             } else if fresh_a {
                 if is_last {
+                    last_in[..fan_in].copy_from_slice(&a[..fan_in]);
                     dense(&a[..fan_in], out, self, w_off, b_off, fan_in, fan_out);
                 } else {
                     dense(
@@ -475,6 +502,7 @@ impl Genome {
                     fresh_a = false;
                 }
             } else if is_last {
+                last_in[..fan_in].copy_from_slice(&b[..fan_in]);
                 dense(&b[..fan_in], out, self, w_off, b_off, fan_in, fan_out);
             } else {
                 dense(
@@ -497,6 +525,17 @@ impl Genome {
     /// network inspector (§10 Tier 3) and for tests.
     pub fn last_outputs<'a>(&self, s: &'a ActScratch) -> &'a [f32] {
         &s.out[..self.shape.outputs]
+    }
+
+    /// The activations the **last layer** was given by the most recent pass.
+    ///
+    /// This is the one vector an output-layer update needs: moving the row for an action by
+    /// `step × this` raises that action's score at *this* observation and leaves every other
+    /// observation's alone up to the change in hidden state. [`crate::mistakes`] uses it for the
+    /// one-sample repair; nothing in the policy reads it.
+    pub fn last_layer_input<'a>(&self, s: &'a ActScratch) -> &'a [f32] {
+        let fan_in = self.shape.last_fan_in();
+        &s.last_in[..fan_in]
     }
 
     /// Argmax over the action scores (§7.3). Ties go to the lowest index, so the

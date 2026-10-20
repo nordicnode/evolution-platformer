@@ -41,10 +41,13 @@ Landed, with unit/integration tests and no version moves:
   A **patrol** is a walker, a chaser or a flyer (`Level::has_patrols`); the auto-trial
   rule now uses the same predicate, which is the fix for `l11-the-elements` being judged
   on one phase while its scan named `patrols`.
-- **WP3 — the thinking dial.** `THINKING = [1, 4, 16, 64]` on the run panel: one request
-  computes that many generations and queues the last, so the worker still never runs
-  more than one request past the screen. **Best-of-N restarts are not implemented**;
-  the dial is the generations-per-screen half only.
+- **WP3 — the thinking dial — retired.** `THINKING = [1, 4, 16, 64]` shipped on the run
+  panel: one request computed that many generations and queued the last, so the worker
+  never ran more than one request past the screen. Removed after real runs on the
+  delivered levels: a batched request holds the evaluation pool for the whole batch and
+  yields no frame, so the window stutters for as long as the batch runs, while the
+  generations it skips are real steps nobody gets to watch. The run now always computes
+  one generation per request. **Best-of-N restarts were never implemented** either.
 - **WP9 — CEM output-layer polish.** `evo::polish` + `train --polish` (with
   `--from-champion`): mirrored CEM over the last layer's weights and biases, hidden
   genes frozen, judged on fixed seeds, certified only on a separate held-out set, and
@@ -340,21 +343,24 @@ Known blind spots, evidenced in code (sensors.rs unless noted):
 - **Effort:** S–M (1–2 days; the scan exists in pieces in `reach.rs` and the
   level loader).
 
-### WP3. The thinking dial (window)
+### WP3. The thinking dial (window) — **retired**
 
 - **Problem.** AI_REVIEW §2.6, still open: the window builds
   `GaConfig::default()` and idles 95%+ of a watched run at 15–19 ms/gen.
   The in-game AI is the least capable configuration the project ships.
-- **Change.** A panel control: generations computed per displayed generation
-  (1×/4×/16×/64×), plus best-of-N restarts behind the same dial. Pure
-  scheduling — the trainer already runs off-thread (`app.rs`).
+- **Change as shipped.** A panel control: generations computed per displayed
+  generation (1×/4×/16×/64×). Pure scheduling — the trainer already runs
+  off-thread (`app.rs`).
+- **Why it was removed.** The gate below measured the frame budget at a
+  steady state, not the cost of a *batch*: one request computing 16 or 64
+  generations holds the evaluation pool for the whole batch without yielding
+  a frame, so the window stutters for as long as the batch runs — and the
+  skipped generations are real trainer steps, none of them shown, so the run
+  reads as stalled while it is working hardest. Runs on the delivered levels
+  made the trade look plainly wrong, so the window now computes exactly one
+  generation per request and the panel has no thinking control.
 - **Version impact:** none.
-- **Gate.** Not a competence claim; verify frame budget only: at 64× the
-  window must still animate at watch speed on the baseline machine
-  (64 × ~19 ms ≈ 1.2 s per displayed generation — inside the existing
-  0.6–5 s animation window).
-- **Effort:** M (2–3 days, mostly panel work). **Owner decision:** dial
-  presentation and default.
+- **Effort:** M (2–3 days, mostly panel work) — spent, then reverted.
 
 ---
 
@@ -887,8 +893,8 @@ future default change reports pack + battery together.
    level labelled solvable-by-plan that the planner cannot in fact route,
    across pack + battery + a fuzz set of generated levels.
 4. **No performance regression on the baseline machine:** watched runs still
-   animate inside the existing frame budget with the thinking dial at its
-   default; headless throughput within 20% of today's episodes/s at equal
+   animate inside the existing frame budget at one generation per request;
+   headless throughput within 20% of today's episodes/s at equal
    configuration, WP7's islands excepted (judged at equal episodes).
 5. Every claim above recorded in FINDINGS.md under the §2 protocol — or the
    package that promised it is retired, in writing, in the same place.

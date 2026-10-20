@@ -73,6 +73,7 @@ const WATCH_OPTS: &[&str] = &[
     "crossover",
     "fine-children",
     "jump-timing-share",
+    "repair-children",
     "commitment",
     "mastery",
     "no-mastery",
@@ -224,6 +225,12 @@ pub fn watch(a: &Args) -> Result<(), String> {
         jump_timing_share: usage(
             a.f32_opt("jump-timing-share", GaConfig::default().jump_timing_share),
         )?,
+        // Item 14: repair children bred from the best genome's own losing decisions. The default
+        // lives in the config, as for `train`, so a watched run and a trained one agree.
+        repair_children: usage(a.usize_opt(
+            "repair-children",
+            GaConfig::default().repair_children,
+        ))?,
         // The same default as `train` and the window: after the record solves, the second phase
         // ranks winners by the clock. `--no-mastery` is the plain run.
         mastery: !a.has_flag("no-mastery"),

@@ -209,24 +209,6 @@ pub struct Curriculum {
 /// so the plan's 1x–50x range (§10 Tier 1.4) is a handful of steps wide here too.
 pub const SPEEDS: [u32; 7] = [1, 2, 4, 8, 16, 32, 50];
 
-/// The **thinking ladder**: generations computed per generation displayed (WP3).
-///
-/// A generation is 15–19 ms at pop 200 on the baseline machine, so a watched run leaves most of
-/// its silicon idle: the worker computes one generation while the window animates the last one
-/// for 0.6–5 s. These rungs spend that idle time on *search* rather than on more pixels — 64x at
-/// 19 ms is 1.2 s per displayed generation, inside the animation's own window — so a viewer who
-/// wants to see the AI work hard turns one dial instead of restarting the run with a bigger
-/// population (which would spend the same compute on duplicates; the plan's §7 measurement).
-///
-/// **It changes nothing about the search.** Every skipped generation is still run, seeded and
-/// recorded in the trainer's history; the window simply shows the latest one rather than each in
-/// turn. A packet's `generation` is therefore the truth about how far the run has got, and the
-/// panel's chart is the history of every one of them.
-pub const THINKING: [u32; 4] = [1, 4, 16, 64];
-
-/// Generations computed per displayed generation at startup: the shipped one-at-a-time run.
-pub const DEFAULT_THINKING: u32 = 1;
-
 /// Physics ticks per rendered frame at startup. 8x is the compromise the fun gate
 /// needs: fast enough that a 5 000-tick episode is a ten-second generation, slow enough
 /// to see a jump happen.
@@ -353,6 +335,11 @@ pub struct Packet {
     /// Children bred out of the quality-diversity archive: perturbations of the best genome
     /// in a behavioural niche, rather than of anything in the generation's ranking.
     pub archive_children: usize,
+    /// Children bred from a **mistake** the generation's best genome made (Item 14): each is the
+    /// best genome with its output layer moved just far enough to take the better action at a
+    /// decision that lost. Zero when [`evo::GaConfig::repair_children`] is off, which is the
+    /// terminal default and not the window's.
+    pub repairs: usize,
     /// Behavioural niches the archive holds, of `evo::ARCHIVE_CELLS`. The run's *diversity*
     /// reading: a population that has collapsed onto one way of moving fills one or two
     /// niches and stays there, which no chart of its scores can show.
@@ -546,26 +533,6 @@ pub fn step_speed(current: u32, up: bool) -> u32 {
         nearest.saturating_sub(1)
     };
     SPEEDS[next]
-}
-
-/// The next rung of the thinking ladder, up or down, stopping at the ends.
-///
-/// Snapped to the ladder for the same reason as [`step_speed`]: a value from a build that
-/// changed the list must still land on a rung the buttons can describe, or one press would do
-/// nothing while the reading beside it claims otherwise.
-pub fn step_thinking(current: u32, up: bool) -> u32 {
-    let nearest = THINKING
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, rung)| rung.abs_diff(current))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let next = if up {
-        (nearest + 1).min(THINKING.len() - 1)
-    } else {
-        nearest.saturating_sub(1)
-    };
-    THINKING[next]
 }
 
 /// The next rung of the mutation ladder, up or down, stopping at the ends.
@@ -1344,6 +1311,7 @@ impl Generator {
             stagnation: self.trainer.stagnation(),
             immigrants: report.immigrants,
             archive_children: report.archive_children,
+            repairs: report.repairs,
             archive_bits: report.archive_bits,
             archive_time_bits: report.archive_time_bits,
             fastest: report.fastest,
@@ -1472,10 +1440,6 @@ struct State {
     /// one rather than start from nothing.
     restart: Option<Restart>,
     mutation_rate: Option<f32>,
-    /// Generations the worker computes per request (see [`THINKING`]). Live, like the mutation
-    /// rate: the dial is meant to be turned *while* watching, and it takes effect on the next
-    /// request rather than needing the run restarted.
-    thinking: u32,
     finished: bool,
     /// A worker thread died of a panic rather than of `quit`.
     ///
@@ -1539,7 +1503,7 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon:
     // *panic*, and the loop's own exits already say what they are.
     let _guard = WorkerGuard { hub: hub.clone() };
     loop {
-        let (restart, rate, thinking) = {
+        let (restart, rate) = {
             let mut state = hub.state.lock().unwrap();
             while !state.quit && !state.want_next && state.restart.is_none() {
                 state = hub.cv.wait(state).unwrap();
@@ -1548,11 +1512,7 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon:
                 return;
             }
             state.want_next = false;
-            (
-                state.restart.take(),
-                state.mutation_rate,
-                state.thinking.max(1),
-            )
+            (state.restart.take(), state.mutation_rate)
         };
 
         if let Some(restart) = restart {
@@ -1571,20 +1531,15 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon:
         // curriculum work — run on this pool rather than rayon's global one. Without it the
         // sizing above would be decoration: `evaluate_suite` is a `par_iter`, and a `par_iter`
         // outside a pool uses every core on the machine.
-        // **The thinking dial** (WP3): one request asks for one *displayed* generation, which at
-        // 4x/16x/64x is several computed generations. The intermediate packets are not shown
-        // but they are not skipped either — each one is a real step of the trainer, with its
-        // own selection, breeding and (on a stall) detour. Only the last is queued, so the
-        // window still holds exactly one packet and the worker still runs at most one request
-        // ahead of the screen: turning the dial up makes the run think harder between frames,
-        // it does not let it train unboundedly ahead of the viewer.
-        let mut packet = pool.install(|| generator.next_packet());
-        for _ in 1..thinking {
-            if packet.finished {
-                break;
-            }
-            packet = pool.install(|| generator.next_packet());
-        }
+        // **One generation per request, and no dial to multiply it.** The panel used to carry a
+        // 1x/4x/16x/64x "thinking" ladder: a request computed that many generations and queued
+        // only the last. It is gone because the trade is the wrong way round on the machine this
+        // ships on. A batched request holds the evaluation pool for the whole batch and yields no
+        // frame, so the window stutters for as long as the batch runs; and the generations it
+        // skips are still real trainer steps, none of which was ever shown, so the run *looks*
+        // stalled while it is working hardest. One generation per request is also the cadence
+        // every measurement in FINDINGS.md was taken at.
+        let packet = pool.install(|| generator.next_packet());
         let finished = packet.finished;
 
         let mut state = hub.state.lock().unwrap();
@@ -1724,7 +1679,6 @@ impl Lab {
                 // A fresh run should produce its first generation immediately: waiting
                 // for the first "next" would show an empty panel for no reason.
                 want_next: true,
-                thinking: DEFAULT_THINKING,
                 ..State::default()
             }),
             cv: Condvar::new(),
@@ -1886,23 +1840,6 @@ impl Lab {
         let mut state = self.hub.state.lock().unwrap();
         state.mutation_rate = Some(rate);
         self.hub.cv.notify_all();
-    }
-
-    /// The viewer's live **thinking** dial (WP3): generations computed per request.
-    ///
-    /// Applied to the next request rather than the one in flight, because the worker is already
-    /// inside a generation when the viewer presses the button. A turn of the dial is never lost,
-    /// though: the worker reads it again for the next request, so the run's rate follows the
-    /// control from the very next displayed generation.
-    pub fn set_thinking(&mut self, generations: u32) {
-        let mut state = self.hub.state.lock().unwrap();
-        state.thinking = generations.clamp(1, THINKING[THINKING.len() - 1]);
-        self.hub.cv.notify_all();
-    }
-
-    /// The thinking dial as the worker will read it, for tests and for the panel's reading.
-    pub fn thinking(&self) -> u32 {
-        self.hub.state.lock().unwrap().thinking.max(1)
     }
 
     /// Start a fresh run — a new population — on `level`.
@@ -2215,42 +2152,6 @@ mod tests {
             lab.take().is_none(),
             "the worker computed a generation nobody asked for"
         );
-        lab.stop();
-    }
-
-    /// **The thinking dial computes N generations per displayed one** (WP3), and the packet the
-    /// window takes is the *last* of them, so the generation number is the truth about how far the
-    /// run has got rather than the count of what was shown.
-    #[test]
-    fn the_thinking_dial_runs_several_generations_between_displays() {
-        let mut lab = Lab::start(
-            &shipped("l1-flat-run"),
-            tiny_config(),
-            DEFAULT_BEST_LANES,
-            DEFAULT_RANDOM_LANES,
-            RunPlan::default(),
-            scratch("thinking"),
-            "l1-flat-run",
-        )
-        .expect("the run starts");
-
-        // The first generation is requested at start, before the window has had a chance to turn
-        // the dial; take it so the worker is parked, then turn the dial for the next request.
-        let first = take_waiting(&mut lab).packet().generation;
-        lab.set_thinking(4);
-        lab.request_next();
-        let second = take_waiting(&mut lab).packet().generation;
-        assert_eq!(
-            second,
-            first + 4,
-            "a 4x dial computes four generations per packet, so the displayed generation jumps by four"
-        );
-
-        // Back to one at a time: the dial is live, not a restart-only setting.
-        lab.set_thinking(1);
-        lab.request_next();
-        let third = take_waiting(&mut lab).packet().generation;
-        assert_eq!(third, second + 1);
         lab.stop();
     }
 

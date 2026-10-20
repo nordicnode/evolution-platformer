@@ -235,6 +235,12 @@ TRAIN OPTIONS:
                           gets a child with the take-off moved rather than a redrawn input
                           weight. 0.5 is the plan's arm; 0 is the shipped search and the
                           default until the 24-seed measurement lands.        [default 0.0]
+    --repair-children <N> Item 14: children bred from the best genome's own losing decisions.
+                          The run replays its representative episode, finds the last
+                          decisions where another action would have survived or got further,
+                          and moves that action's output row by the smallest step that flips
+                          the choice at that state. The child is then judged on a full
+                          episode like any other. 0 disables; the window runs 3.  [default 0]
     --growth-units <N>    Item 13: hidden units added to the first layer each time the record has
                           not improved for `--stagnation` generations. The new units have zero
                           outgoing weights, so the policy is bit-identical at the moment of
@@ -489,7 +495,8 @@ WATCH OPTIONS:
     --headless            Plain text frames, no keyboard. Implied without a TTY.
     --out <DIR>           Where the best-ever champion is saved.      [default champions]
     --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --jump-timing-share,
-    --commitment, --growth-units, --growth-events, --lesson-every, --plateau-window,
+    --repair-children, --commitment, --growth-units, --growth-events, --lesson-every,
+    --plateau-window,
     --plateau-cem-generations, --plateau-cem-events, --generalist, --generalist-share,
     --mastery, --no-mastery, --stagnation,
     --immigrants, --archive-children, --reheat-factor, --elite,

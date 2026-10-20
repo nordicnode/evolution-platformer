@@ -101,6 +101,27 @@ pub struct GaConfig {
     /// `--jump-timing-share 0.5` is the arm, and the default stays the bit-identical pre-WP1 search
     /// until the arm says otherwise.
     pub jump_timing_share: f32,
+    /// **Repair children (Item 14): offspring bred from a mistake the run just made.**
+    ///
+    /// Each generation, when this is non-zero, the generation's best genome replays its own
+    /// representative episode. [`crate::mistakes`] finds the last decisions where an alternative
+    /// action beat the one it chose, and breeding turns each into a child whose output layer has
+    /// been moved by the smallest step that makes it choose the better action at that exact state.
+    /// The children are ordinary members of the next generation: they are **evaluated** like
+    /// everyone else, so a repair the objective does not like dies with its lineage.
+    ///
+    /// This is the one mechanism in the search that is not a blind perturbation. Everything else
+    /// here asks "what if this genome were slightly different"; this asks "which decision lost,
+    /// and what would have been better" — which is what turns a level with one lethal moment from
+    /// a lottery over the genes upstream of it into something the run can iterate on.
+    ///
+    /// **0 by default.** The arm is `--repair-children`; the window opts in, because a watched run
+    /// is exactly the case where the mistake is legible. Its cost is one extra episode per
+    /// generation plus eleven short rollouts at each of the last eight decisions, measured at
+    /// about 3 ms on a 15 ms generation at pop 200 (`FINDINGS.md`, "Item 14"); the arm that was
+    /// measured is 3 children on the custom level, where it took solves from 6 of 12 paired seeds
+    /// to 11 of 12 and did not speed up the seeds that solved either way.
+    pub repair_children: usize,
     /// **The mastery league** (WP11): once the run's record has solved the level, keep evolving
     /// and rank the winners by the clock instead of by the crowned fitness.
     ///
@@ -514,6 +535,7 @@ impl Default for GaConfig {
             crossover_rate: 0.75,
             fine_children: 8,
             jump_timing_share: 0.0,
+            repair_children: 0,
             mastery: false,
             plan_bonus: 0.0,
             plan_bonus_generations: 100,
@@ -671,6 +693,9 @@ impl GaConfig {
         self.immigrants = self.immigrants.min(extra_cap);
         self.archive_children = self.archive_children.min(extra_cap);
         self.technique_children = self.technique_children.min(extra_cap);
+        // Repair children are a directed step from the best genome, so they may not outnumber the
+        // slots a generation can spend on directed work.
+        self.repair_children = self.repair_children.min(extra_cap);
         // The rarity bonus is an addition to the selection score, so it is bounded by what it
         // could pay: at 512 a maximally rare genome (an extreme of the grid with a population of
         // one) would out-earn the goal bonus, which would turn a tie-break into the objective.
@@ -1022,6 +1047,8 @@ pub struct GenerationReport {
     pub immigrants: usize,
     /// Children bred from the archive into the generation that follows this one.
     pub archive_children: usize,
+    /// Children bred from a **mistake** into the generation that follows this one (Item 14).
+    pub repairs: usize,
     /// Behavioural niches occupied at the end of this generation (see [`GenRow`]).
     pub archive_bits: usize,
     /// Finish bands holding a winner at the end of this generation (see [`GenRow`]).
@@ -1806,6 +1833,12 @@ pub struct Trainer {
     cut_early: usize,
     /// Item 5, step 2's counter: genomes re-read on an extra trial with the ticks the cut saved.
     cut_refunds: usize,
+    /// **Item 14's latest mistakes**, found from the generation's best genome and consumed by
+    /// [`Trainer::breed`]. Empty when [`GaConfig::repair_children`] is 0, and cleared each
+    /// generation so a mistake is used once.
+    mistakes: Vec<crate::mistakes::Mistake>,
+    /// Children the last generation actually bred from a mistake.
+    repairs: usize,
 }
 
 impl Trainer {
@@ -1845,6 +1878,8 @@ impl Trainer {
             technique_bred: 0,
             cut_early: 0,
             cut_refunds: 0,
+            mistakes: Vec::new(),
+            repairs: 0,
         }
     }
 
@@ -1922,6 +1957,8 @@ impl Trainer {
             technique_bred: 0,
             cut_early: 0,
             cut_refunds: 0,
+            mistakes: Vec::new(),
+            repairs: 0,
         })
     }
 
@@ -2970,6 +3007,28 @@ impl Trainer {
             self.spend_cem_phase(&levels[0]);
         }
 
+        // ---- Item 14: learn from the mistake the generation's best genome just made ----------
+        //
+        // One replay of the best genome's **own** representative episode — the one it was scored
+        // on, so "the mistake it just made" is literally that episode — then the last decisions
+        // are judged against every action. `breed` turns each mistake into a child whose output
+        // layer has been moved until the better action wins at that state. No fitness is touched
+        // and nothing is recorded: the children are hypotheses, and the next generation's
+        // ordinary episode is what accepts or rejects them.
+        self.mistakes = if self.config.repair_children > 0 {
+            let best = &self.genomes[order[0]];
+            let seed = episode_seed_for(&self.config, self.generation, best.id, 0);
+            crate::mistakes::find_mistakes(
+                &levels[0],
+                best,
+                &self.config.eval_config(),
+                seed,
+                self.config.repair_children,
+            )
+        } else {
+            Vec::new()
+        };
+
         let (immigrants, archive_children) = self.breed(&order, &selection);
         // ---- Item 4, step 1: a mid-run lesson, injected through breeding ----------
         if self.config.lesson_every > 0 && self.generation % self.config.lesson_every == 0 {
@@ -3029,6 +3088,7 @@ impl Trainer {
                 mutation_sigma: row.mutation_sigma,
                 immigrants: row.immigrants,
                 archive_children: row.archive_children,
+                repairs: self.repairs,
                 archive_bits: row.archive_bits,
                 archive_time_bits: row.archive_time_bits,
                 fastest: self.fastest,
@@ -3247,6 +3307,32 @@ impl Trainer {
             }
         }
         budget -= fine;
+
+        // 2b. Repair children (Item 14): one per mistake the generation's best genome made, each
+        //     a one-sample output-layer update that flips the losing decision. They sit beside the
+        //     fine children because they are the same kind of step — local, and aimed at the best
+        //     genome — and before the immigrants because a directed step must not be crowded out
+        //     by a reheat when the budget is tight.
+        let mistakes = std::mem::take(&mut self.mistakes);
+        let mut repaired = 0usize;
+        if self.config.repair_children > 0 && !mistakes.is_empty() {
+            let parent = self.genomes[ranking[0]].clone();
+            let slots = self.config.repair_children.min(budget.saturating_sub(1));
+            for mistake in mistakes.iter().take(slots) {
+                let Some(mut child) = crate::mistakes::learn(&parent, mistake) else {
+                    continue;
+                };
+                child.id = self.next_id;
+                child.fitness = 0.0;
+                child.shape = shape.clone();
+                self.next_id += 1;
+                next.push(child);
+                parents.push(parent.fitness);
+                repaired += 1;
+            }
+        }
+        self.repairs = repaired;
+        budget -= repaired;
 
         // 3. Immigrants, only when the run has stopped moving — and reheated copies of the
         //    best genome the run has found, not fresh random ones.
@@ -5767,6 +5853,48 @@ mod tests {
             copies > 0,
             "a zero-rate coarse child must be a copy of a parent"
         );
+    }
+
+    /// **Item 14: the generation's best genome's own mistake becomes children.**
+    ///
+    /// Every member is the same runner on a two-tile pit, so the species really is "runs into the
+    /// pit": the best genome has a losing decision to learn from rather than a lucky escape. With
+    /// mutation and crossover off, the elite and the coarse children are exact copies, so any
+    /// genome that differs from the elite is a repair — and the report's count is the number the
+    /// window can show.
+    #[test]
+    fn repair_children_are_bred_from_the_best_genomes_own_mistake() {
+        let level = crate::fixture::gap_runway("ga-repair-fixture", 24, 22, &[(10, 2)]);
+        let cfg = GaConfig {
+            pop_size: 8,
+            elite: 2,
+            fine_children: 0,
+            mutation_rate: 0.0,
+            crossover_rate: 0.0,
+            adaptive_sigma: false,
+            stagnation_generations: 0,
+            immigrants: 0,
+            archive_children: 0,
+            technique_children: 0,
+            repair_children: 2,
+            master_seed: 4,
+            ..GaConfig::default()
+        };
+        let zeros = Genome::zeros(0, cfg.shape.clone());
+        let mut t = Trainer::resume(cfg.clone(), vec![zeros; cfg.pop_size], 0)
+            .expect("a uniform population resumes");
+        let report = t.step(&level);
+        assert_eq!(
+            report.repairs, 2,
+            "a pit is a mistake, so both repair slots must be filled"
+        );
+        let best = t.genomes[0].clone();
+        for slot in cfg.elite..cfg.elite + 2 {
+            assert!(
+                gene_distance(&best, &t.genomes[slot]) > 0,
+                "slot {slot} must be a repaired child, not a copy of the elite"
+            );
+        }
     }
 
     /// **The timing share spends its fine slots on the jump boundary and nothing else.**
