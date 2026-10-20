@@ -86,6 +86,7 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         "watch" => watch::watch(&args),
         "reach" => commands::reach(&args),
         "fuzz" => commands::fuzz(&args),
+        "routeplan" => commands::routeplan(&args),
         "battery" => commands::battery(&args),
         "codex" => commands::codex(&args),
         "break" => commands::break_my_level(&args),
@@ -144,6 +145,10 @@ COMMANDS:
               the oracle and the planner say about each, and with --out write the level files.
               Deterministic: level i is a pure function of i, so the committed suite is
               reproducible byte for byte.
+    routeplan Compile the Phase 1 route plan: certify the level (oracle + a planner route that
+              must win a replay), then cut the route into its legs, one per route crossing, with
+              each leg's margin in frames. --all compiles a directory; --out writes the plans.
+              Exits non-zero if any level has no certified plan, so it is the phase's gate too.
     battery   Run the §9 adversarial battery: every bat-* level must be both reachable and
               routable by the timed planner, reported together with its timings.
     codex     Detect what a champion's winning episode discovered and record it in the level's
@@ -595,6 +600,15 @@ FUZZ OPTIONS:
     --out <DIR>           Write the suite's level files here (e.g. levels/practice). Without
                           it the command only prints the certification table.
 
+ROUTEPLAN OPTIONS:
+    --level <PATH>        Level to compile.                                  [required, or --all]
+    --all                 Compile every *.json level in --levels-dir.
+    --levels-dir <DIR>    Directory --all reads.                            [default levels]
+    --seed <N>            Episode seed the plan is searched and replayed against. [default 1]
+    --plan-depth <N>      Planner expansions. The practice suite certifies at 48; 64 is the
+                          command's default because `l11-the-elements` needs it. [default 64]
+    --out <DIR>           Write <stem>.routeplan.json here. Without it the plans are printed.
+
 REPLAY OPTIONS:
     --champion <PATH>     Champion JSON to replay.                      [required]
     --level <PATH>        Level it was trained on; omitted = infer from name.
@@ -724,6 +738,7 @@ EXAMPLES:
     train-cli es --level levels/scratch-tower.json --generations 300 --stop-on-win
     train-cli reach --all
     train-cli fuzz --out levels/practice
+    train-cli routeplan --level levels/practice/p17-mover-t2.json
     train-cli watch --level levels/l2-first-gap.json
     train-cli watch --champion champions/l1-flat-run.json --speed 16
     train-cli replay --champion champions/l1-flat-run.json

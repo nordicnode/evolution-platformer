@@ -957,8 +957,8 @@ impl EvoApp {
             curriculum,
             // A fresh run on a level somebody has just drawn starts from a walk of it; a run
             // handed a population or a champion already has the better starting point. See
-            // `lab::RunPlan::warm_from_route`.
-            warm_from_route: self.options.resume.is_none() && self.options.from_champion.is_none(),
+            // `lab::RunPlan::warm_from_plan`.
+            warm_from_plan: self.options.resume.is_none() && self.options.from_champion.is_none(),
         })
     }
 

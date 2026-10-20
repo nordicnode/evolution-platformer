@@ -527,7 +527,26 @@ pub fn from_plan(
     let route = outcome
         .route
         .ok_or_else(|| format!("no timed route was found: {}", outcome.note))?;
-    let play = timed_play(level, &route, eval);
+    let (play, report) = from_certified_plan(level, &route, eval, shape, cfg)?;
+    Ok((play, report, route))
+}
+
+/// Clone a route the planner has **already** produced (and [`crate::route_plan::RoutePlan`] has
+/// already certified): replay it, refuse it if it does not win, fit a clone, then run the DAgger
+/// rounds.
+///
+/// Split out of [`from_plan`] so the route compiler is paid for once. A window's warm start has to
+/// decide *whether* there is a plan before it decides to clone one, and planning twice to answer
+/// two questions about the same search would double the startup cost for no extra information.
+/// The route is still replayed here — a certified plan is checked by the same rule a fresh one is.
+pub fn from_certified_plan(
+    level: &Level,
+    route: &sim::plan::TimedRoute,
+    eval: &EvalConfig,
+    shape: NetShape,
+    cfg: &ImitateConfig,
+) -> Result<(RoutePlay, ImitationReport), String> {
+    let play = timed_play(level, route, eval);
     if !play.won() {
         return Err(format!(
             "the planner's route did not replay to the flag: {}",
@@ -569,7 +588,7 @@ pub fn from_plan(
             }
         }
     }
-    Ok((play, report, route))
+    Ok((play, report))
 }
 
 /// The states a student actually visits while following a plan, labelled by the **nearest**

@@ -84,7 +84,10 @@ ghosted beside it.
   instead of stopping.
 - **A planner, as well as a learner:** the deliberate controller (`T` in the
   playtest) works out a route through the level with the game's own physics
-  and plays it, which answers levels whose trick is timing or waiting.
+  and plays it, which answers levels whose trick is timing or waiting. That
+  route can be compiled into a **route plan** — certified, cut into the same
+  legs the training telemetry counts, with each leg's timing margin — and a
+  fresh run starts a quarter of its first population from a clone of it.
 - **Headless training** with `train-cli`: train, watch, replay champions,
   check levels, and run seed benchmarks, all from the terminal. A run started
   in the window can be resumed in the terminal and the other way round.
@@ -124,6 +127,11 @@ oracle *and* the timed planner before it is written. `train-cli fuzz` prints tha
 certification table, and `train-cli fuzz --out levels/practice` regenerates the
 suite byte for byte from its own seed.
 
+`train-cli routeplan` compiles a level's certified route into plan legs with
+per-leg margins (`--all --levels-dir levels/practice --out plans` for the whole
+suite). A level the oracle certifies but the planner cannot route is reported
+as such; the window then starts that run's population random rather than warm.
+
 ## Quick start
 
 You need a Rust toolchain. From the top of the repo:
@@ -143,6 +151,7 @@ cargo run --release -p app -- --replay --generations 20 --level levels/l3-gauntl
 ./target/release/train-cli train --level levels/l3-gauntlet.json --generations 200 --pop 200 --stop-on-win
 ./target/release/train-cli train --level levels/practice/p17-mover-t2.json --telemetry out/p17.jsonl
 ./target/release/train-cli reach --level levels/l11-the-elements.json
+./target/release/train-cli routeplan --level levels/practice/p17-mover-t2.json
 ./target/release/train-cli fuzz --out levels/practice
 
 cargo test --workspace   # the test suite

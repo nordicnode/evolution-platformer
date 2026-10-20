@@ -2275,6 +2275,7 @@ mod tests {
             // has a number in it, so the fixture is a real census rather than a default.
             telemetry: evo::Telemetry {
                 generation: 4,
+                level: "l1-flat-run".to_string(),
                 pop: 200,
                 solved: if won { 3 } else { 0 },
                 wins: if won { 3 } else { 0 },

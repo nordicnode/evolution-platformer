@@ -37,9 +37,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use evo::{
-    curriculum_step, from_route, practice_level_for_stall, practice_step, save_practice_level,
-    warm_population, BestEver, ChampionFile, EpisodeResult, EpisodeRunner, EvalConfig, GaConfig,
-    Genome, ImitateConfig, LaneKind, PopulationFile, Trainer,
+    curriculum_step, from_certified_plan, practice_level_for_stall, practice_step,
+    save_practice_level, warm_population, BestEver, ChampionFile, EpisodeResult, EpisodeRunner,
+    EvalConfig, GaConfig, Genome, ImitateConfig, LaneKind, PopulationFile, Trainer,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use render::trace::{ChampionTrace, TraceLog, TracePoint, TRACE_SAMPLE_FRAMES};
@@ -91,36 +91,93 @@ pub fn slug(name: &str) -> String {
     }
 }
 
-/// A fresh population's worth of genomes warmed from the level's own route, or `None` when the
-/// level has no walk to clone.
+/// The planner budget the window's warm start compiles with.
 ///
-/// The whole of the window's route warm start: walk the level with the reachability oracle's plan
-/// ([`evo::route_play::replay`]), clone the walk into a genome ([`evo::imitate`]), and assemble a
-/// full population of `cfg.pop_size` from that clone plus random genomes — a quarter warm by
-/// default, which is the measured optimum (`FINDINGS.md`, "The route as a demonstration": a
-/// quarter of the population solves every level on every seed and reaches a first win two to four
-/// times sooner than random, while warming *every* slot is the worst arm there is).
+/// 64, not the planner's shipped default (32) and not the practice suite's certification depth
+/// (48): `l11-the-elements` — the level the plan's own diagnosis turns on — needs 64 expansions
+/// before its 11-leg route appears. A depth is a cap rather than a cost, so the levels that route
+/// sooner are unaffected; the ones that need the extra rungs stop being silently unwarmed.
+const WARM_PLAN_DEPTH: u32 = 64;
+
+/// A fresh population's worth of genomes warmed from the level's **timed plan**, or no population
+/// plus the reason when there is no certified plan.
 ///
-/// **Nothing here can fail a run.** A level whose route the replay cannot walk still clones
-/// *something* — a partial walk is a warm start worth what it demonstrated — and a level with no
-/// walk at all (no route to its flag, or a stand the graph cannot leave) returns `None`, which
-/// leaves the caller with the fresh random population it would have had anyway. The note is what
-/// the window shows, so a warm start is never silent.
+/// The whole of the window's warm start, and the Phase 1 replacement for the old route walk: the
+/// route compiler ([`sim::route_plan::compile`]) certifies the level twice (oracle, then a planner
+/// route that must win a replay) and cuts it into legs; [`evo::from_certified_plan`] clones the
+/// block-aligned demonstration and runs the DAgger rounds; a quarter of the population starts from
+/// that clone and the rest are random.
 ///
-/// The fit is the shipped default (300 gradient passes). It runs once, on the worker thread, before
-/// the first generation: a fraction of a second at the default pop size, against the generations it
-/// saves.
-fn warm_seed_from_route(level: &Level, cfg: &GaConfig) -> Option<(Vec<Genome>, String)> {
+/// **Why the plan and not the walk.** The oracle's route is indexed in ticks, while a policy decides
+/// once per four ticks, so a clone of the walk walks the route and steps into the first pit at the
+/// shipped cadence (`evo::imitate` documents the measurement). The planner's route is already
+/// written in decision blocks, so a clone that reproduces it is playing the control grid it has.
+///
+/// **Nothing here can fail a run, and nothing here fails silently.** A level the oracle says is
+/// unbeatable, or one the oracle certifies but this planner budget cannot route, returns no warm
+/// population **and a note naming which of the two happened** — the population then starts random.
+/// In particular this never falls back to the tick-indexed route walk: a clone of a route the
+/// planner could not certify is a warm start from a weaker demonstration, and the caller would have
+/// no way to tell which one it got.
+///
+/// The fit is the shipped default (300 gradient passes plus six DAgger rounds). It runs once, on the
+/// worker thread, before the first generation; the profile line says what it cost.
+fn warm_seed_from_plan(level: &Level, cfg: &GaConfig) -> (Option<Vec<Genome>>, String) {
+    warm_seed_from_plan_with(
+        level,
+        cfg,
+        sim::plan::PlanConfig {
+            depth: WARM_PLAN_DEPTH,
+            ..sim::plan::PlanConfig::default()
+        },
+        &ImitateConfig::default(),
+    )
+}
+
+/// [`warm_seed_from_plan`] with the planner budget and the fit under the caller's control. The
+/// no-route case is testable without a full-depth search, and a test that only needs to see the
+/// clone and the note does not have to pay for the shipped epoch budget.
+fn warm_seed_from_plan_with(
+    level: &Level,
+    cfg: &GaConfig,
+    plan_cfg: sim::plan::PlanConfig,
+    imit: &ImitateConfig,
+) -> (Option<Vec<Genome>>, String) {
     let started = Instant::now();
+    let plan = match sim::route_plan::compile(level, cfg.master_seed, plan_cfg) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return (
+                None,
+                format!(
+                    "no warm start: {}. The population starts random rather than from a weaker \
+                     route",
+                    err.line()
+                ),
+            )
+        }
+    };
     let eval = cfg.eval_config();
-    let imit = ImitateConfig::default();
-    let (play, report) =
-        from_route(level, cfg.master_seed, &eval, cfg.shape.clone(), &imit).ok()?;
+    let route = plan.timed_route();
+    let fit = match from_certified_plan(level, &route, &eval, cfg.shape.clone(), imit) {
+        Ok((play, report)) => (play, report),
+        Err(why) => {
+            return (
+                None,
+                format!(
+                    "no warm start: {why}. The population starts random rather than from a \
+                     weaker route"
+                ),
+            )
+        }
+    };
+    let (play, report) = fit;
     if profiling() {
         eprintln!(
-            "lab warm route+clone {:?} ({} decisions, {:.0}% agreement)",
+            "lab warm plan+clone {:?} ({} decisions, {} legs, {:.0}% agreement)",
             started.elapsed(),
             play.decisions.len(),
+            plan.legs.len(),
             report.agreement * 100.0
         );
     }
@@ -134,25 +191,29 @@ fn warm_seed_from_route(level: &Level, cfg: &GaConfig) -> Option<(Vec<Genome>, S
         cfg.mutation_rate,
         &mut rng,
     );
-    let walked = if play.won() {
-        format!("walked the whole route ({:?} hops)", play.route_hops)
+    let coverage = if plan.covered == plan.hops {
+        format!("{} legs / {} rungs", plan.legs.len(), plan.hops)
     } else {
         format!(
-            "walked part of the route ({} hops closed)",
-            play.hops_closed
+            "{} legs, but the flag is reached after {} of {} route rungs",
+            plan.legs.len(),
+            plan.covered,
+            plan.hops
         )
     };
-    Some((
-        pop,
+    (
+        Some(pop),
         format!(
-            "warmed from this level's own route: the replay {walked} in {} decisions and a genome \
-             was cloned from them ({:.0}% of the demonstrated actions reproduced); {warm} of {} \
-             genomes start from that clone, the rest are random",
-            play.decisions.len(),
+            "warmed from this level's timed plan: {coverage} in {} blocks and {}; a genome was \
+             cloned from the plan ({:.0}% of the demonstrated decisions reproduced) and {warm} of \
+             {} genomes start from that clone, the rest are random; {}",
+            plan.actions.len(),
+            sim::format_time(plan.frames),
             report.agreement * 100.0,
             cfg.pop_size,
+            plan.line()
         ),
-    ))
+    )
 }
 
 /// How a run was asked for: how long it may run, where it starts from, and what to do
@@ -183,17 +244,17 @@ pub struct RunPlan {
     pub seed_from_champion: Option<PathBuf>,
     /// The easier level to fall back to when the run stalls, and for how long.
     pub curriculum: Option<Curriculum>,
-    /// Warm a **fresh** population from the level's own route: walk it with the reachability
-    /// oracle's plan, clone the walk into a genome, and start a quarter of generation 0 from that
-    /// clone (`evo::imitate`, and `train-cli`'s `--from-route`).
+    /// Warm a **fresh** population from the level's certified **timed plan** (Phase 1): compile a
+    /// [`sim::route_plan::RoutePlan`], clone its block-aligned demonstration with DAgger, and start
+    /// a quarter of generation 0 from that clone.
     ///
     /// It is a *default* for the window rather than something to ask for, because the level the
-    /// window trains on is usually one somebody has just drawn: measured, the warm arm reaches a
-    /// first win two to four times sooner than a random population on the shipped pack's harder
-    /// levels, and its failure mode is bounded (a level with no route to its flag falls back to a
-    /// random population, and a partial walk is a warm start still). Ignored when the run resumes a
-    /// checkpoint, which already *has* a population.
-    pub warm_from_route: bool,
+    /// window trains on is usually one somebody has just drawn. It replaces the old tick-indexed
+    /// route walk, whose clone could not place a press on the policy's own cadence. A level the
+    /// planner cannot route starts **random** and says why in the run's origin note; it is never
+    /// warmed from the weaker route instead. Ignored when the run resumes a checkpoint, which
+    /// already *has* a population.
+    pub warm_from_plan: bool,
 }
 
 /// A run's fallback level: what a stalled population gets trained on instead (§12 M5).
@@ -777,16 +838,16 @@ impl Generator {
                     let trainer = train_from_champion(&cfg, &level, &seed)?;
                     (trainer, Some(seed.origin))
                 }
-                // A fresh run warms itself from the level's own route when it has one. See
-                // [`warm_seed_from_route`] and [`RunPlan::warm_from_route`].
-                None => match plan
-                    .warm_from_route
-                    .then(|| warm_seed_from_route(&level, &cfg))
-                    .flatten()
-                {
-                    Some((pop, note)) => (Trainer::resume(cfg.clone(), pop, 0)?, Some(note)),
-                    None => (Trainer::new(cfg.clone()), None),
-                },
+                // A fresh run warms itself from the level's certified timed plan when it has one.
+                // See [`warm_seed_from_plan`] and [`RunPlan::warm_from_plan`].
+                None if plan.warm_from_plan => {
+                    let (pop, note) = warm_seed_from_plan(&level, &cfg);
+                    match pop {
+                        Some(pop) => (Trainer::resume(cfg.clone(), pop, 0)?, Some(note)),
+                        None => (Trainer::new(cfg.clone()), Some(note)),
+                    }
+                }
+                None => (Trainer::new(cfg.clone()), None),
             },
         };
         let codex_path = evo::Codex::path_for(&out_dir, &stem);
@@ -898,19 +959,18 @@ impl Generator {
                     )),
                 ),
             },
-            None => match self
-                .plan
-                .warm_from_route
-                .then(|| warm_seed_from_route(&level, &cfg))
-                .flatten()
-            {
-                Some((pop, note)) => (
-                    Trainer::resume(cfg.clone(), pop, 0)
-                        .unwrap_or_else(|_| Trainer::new(cfg.clone())),
-                    Some(note),
-                ),
-                None => (Trainer::new(cfg.clone()), None),
-            },
+            None if self.plan.warm_from_plan => {
+                let (pop, note) = warm_seed_from_plan(&level, &cfg);
+                match pop {
+                    Some(pop) => (
+                        Trainer::resume(cfg.clone(), pop, 0)
+                            .unwrap_or_else(|_| Trainer::new(cfg.clone())),
+                        Some(note),
+                    ),
+                    None => (Trainer::new(cfg.clone()), Some(note)),
+                }
+            }
+            None => (Trainer::new(cfg.clone()), None),
         };
         self.trainer = trainer;
         self.cfg = cfg;
@@ -2932,11 +2992,10 @@ mod tests {
         // it. The note, the checkpoint and the practice level all appear, and the
         // note names the spot: "this run changed shape" is the viewer's to read.
         //
-        // The fixture needs a best genome that has *stood* somewhere, which a frozen
-        // population of random weights need not have done (`l5`'s did not, and the
-        // derived step correctly refused). So generation 0 is warmed from `l11`'s own
-        // route: the walker clone reaches the plateau before the movers and then, with
-        // the population frozen, stalls there — the exact shape this step exists for.
+        // The fixture needs a best genome that has *stood* somewhere. A frozen population on
+        // `l11` stands on the spawn stand and gets no further, which is a valid — if shallow —
+        // stall. Warming it from the plan would put it over the plateau instead, and this test is
+        // about the step back, not about how far the population got.
         let dir = scratch("practice");
         let mut generator = generator_with(
             "l11-the-elements",
@@ -2946,7 +3005,10 @@ mod tests {
             },
             RunPlan {
                 cap: Some(60),
-                warm_from_route: true,
+                // No warm start: the fixture is a population that cannot move, and a random
+                // population's own spawn stand is enough for the derived practice level. A plan
+                // clone would be a second thing this test is measuring.
+                warm_from_plan: false,
                 ..RunPlan::default()
             },
             "practice",
@@ -3079,31 +3141,24 @@ mod tests {
         );
     }
 
-    /// **A fresh run on a level with a route starts from a walk of it.**
+    /// **A fresh run on a routable level starts from a clone of its timed plan.**
     ///
-    /// The window's half of `train-cli --from-route`: the first generation's population is not
-    /// random, the level's own route walked it into existence, and the run *says so* — the origin
+    /// The window's Phase 1 warm start: the first generation's population is not random, the
+    /// certified plan's own block actions produced the clone, and the run *says so* — the origin
     /// note is what the panel shows, so a warm start is never something the operator has to infer
     /// from the first generation's scores.
     ///
-    /// **The whole route, and this time because the walk takes it.** An earlier version of this test
-    /// asserted the same thing and was green for the wrong reason: it read the shipped file and
-    /// adopted whatever route sidecar was beside it, so the claim it measured was `MOVE_SET_VERSION`
-    /// 3's graph on a developer's disk rather than the graph this code builds — green here, red in
-    /// CI, which rebuilds from the terrain. The copy below cannot be adopted that way, so the
-    /// assertion is about the replay. `l2-first-gap` is the pack's first earned level and its route
-    /// walks at the trainer's decision cadence (three hops, `evo::tests::route_play`'s table), and a
-    /// window that found a *partial* walk here would still warm the population — the partial case is
-    /// the one that always has to keep working — but it is not the case this level is.
+    /// The copy is written into this test's own directory rather than read from the shipped file:
+    /// a sidecar beside `levels/l1-flat-run.json` is a developer artifact, and adopting one would
+    /// mean measuring whatever graph this machine last wrote instead of what the code builds now.
+    /// The flat level is also the cheapest routable fixture: its clone reaches the flag in the
+    /// first DAgger round, so this test pays one fit rather than the six a pit level would.
     #[test]
-    fn a_fresh_run_warmed_from_the_route_says_so_and_is_not_random() {
-        let dir = scratch("route-warm");
-        // A copy in this test's own directory rather than the shipped file: a sidecar beside
-        // `levels/l2-first-gap.json` is a developer artifact, and adopting one would mean measuring
-        // whatever graph this machine last wrote instead of what the code builds now.
+    fn a_fresh_run_warmed_from_the_timed_plan_says_so_and_is_not_random() {
+        let dir = scratch("plan-warm");
         std::fs::create_dir_all(&dir).unwrap();
-        let level_path = dir.join("l2-first-gap.json");
-        shipped("l2-first-gap")
+        let level_path = dir.join("l1-flat-run.json");
+        shipped("l1-flat-run")
             .to_json_file(&level_path)
             .expect("a copy of the level");
         let level = Level::from_json_file(&level_path).expect("the copy loads");
@@ -3114,11 +3169,11 @@ mod tests {
             2,
             2,
             RunPlan {
-                warm_from_route: true,
+                warm_from_plan: true,
                 ..RunPlan::default()
             },
             dir.clone(),
-            "l2-first-gap",
+            "l1-flat-run",
         )
         .expect("a warmed run starts");
         let note = warm
@@ -3126,19 +3181,77 @@ mod tests {
             .expect("a warmed run says where its first generation came from")
             .to_string();
         assert!(
-            note.contains("walked the whole route")
-                && note.contains("warmed from this level's own route")
+            note.contains("warmed from this level's timed plan")
+                && note.contains("legs")
                 && note.contains("cloned"),
-            "the note names the walk and the clone: {note}"
+            "the note names the plan and the clone: {note}"
         );
         assert!(note.contains("2 of 8 genomes"), "{note}");
 
         // The same level, unwarmed, is the control: same seeds, same budget, a random population.
-        let cold = Generator::new(level, cfg, 2, 2, RunPlan::default(), dir, "l2-first-gap")
+        let cold = Generator::new(level, cfg, 2, 2, RunPlan::default(), dir, "l1-flat-run")
             .expect("a plain run starts");
         assert!(
             cold.origin().is_none(),
             "nothing to declare about a population nobody handed over"
+        );
+    }
+
+    /// **A plan warm start is a clone of the plan's own blocks, cut into its legs.** The fit is
+    /// cheap here, because the claim is about the note and the population rather than about how far
+    /// 300 gradient passes get; the shipped budget is exercised by a real run.
+    #[test]
+    fn a_plan_warm_start_names_the_legs_and_the_clone() {
+        let level = shipped("l2-first-gap");
+        let cfg = tiny_config();
+        let imit = ImitateConfig {
+            epochs: 20,
+            ..ImitateConfig::default()
+        };
+        let (pop, note) = warm_seed_from_plan_with(
+            &level,
+            &cfg,
+            sim::plan::PlanConfig {
+                depth: 48,
+                ..sim::plan::PlanConfig::default()
+            },
+            &imit,
+        );
+        let pop = pop.expect("a routable level warms");
+        assert_eq!(pop.len(), cfg.pop_size);
+        assert!(
+            note.starts_with("warmed from this level's timed plan")
+                && note.contains("legs /")
+                && note.contains("cloned"),
+            "the note names the plan's legs and the clone: {note}"
+        );
+    }
+
+    /// **The case Phase 1 must report rather than paper over.** The oracle certifies the level,
+    /// but this planner budget cannot find a line. The population starts random, and the origin
+    /// note names the planner's failure — it does not quietly fall back to the tick-indexed route
+    /// walk, which is the weaker demonstration the plan exists to replace.
+    #[test]
+    fn a_level_the_planner_cannot_route_starts_random_instead_of_from_a_weaker_route() {
+        let level = shipped("l2-first-gap");
+        let (pop, note) = warm_seed_from_plan_with(
+            &level,
+            &tiny_config(),
+            sim::plan::PlanConfig {
+                depth: 1,
+                ..sim::plan::PlanConfig::default()
+            },
+            &ImitateConfig::default(),
+        );
+        assert!(pop.is_none(), "no certified plan, no warm population");
+        assert!(note.starts_with("no warm start:"), "{note}");
+        assert!(
+            note.contains("beatable in principle"),
+            "the note must distinguish the planner's budget failure from an unbeatable level: {note}"
+        );
+        assert!(
+            !note.contains("walked") && !note.contains("route walk"),
+            "the fallback is random, not the older walk: {note}"
         );
     }
 
