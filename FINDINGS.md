@@ -6275,14 +6275,14 @@ Same gate, `--first-seed 9`, all four arms:
 
 | arm | legs (mean / min-max) | past leg 1 | deaths | plan+fit s |
 |---|---|---|---|---|
-| baseline | 1.38 / 1-2 | 3/8 | spike 5, turret 3 | 4.45 |
-| labels | **2.25 / 2-4** | **8/8** | spike 1, stuck 4, turret 3 | 4.99 |
-| fit (900) | 1.88 / 1-2 | 7/8 | spike 2, stuck 4, turret 2 | 9.59 |
-| phase3 | **2.25 / 2-4** | **8/8** | spike 1, stuck 4, turret 3 | 5.00 |
+| baseline | 1.38 / 1-2 | 3/8 | spike 5, turret 3 | 4.65 |
+| labels | **2.25 / 2-4** | **8/8** | spike 1, stuck 4, turret 3 | 5.16 |
+| fit (900) | 1.88 / 1-2 | 7/8 | spike 2, stuck 4, turret 2 | 9.90 |
+| phase3 | **2.25 / 2-4** | **8/8** | spike 1, stuck 4, turret 3 | 5.19 |
 
 **The 900-epoch gain reverses.** On seeds 1-8 it is +0.50 legs over the default teacher; on seeds 9-16
 it is -0.38. Over sixteen seeds the two are 2.31 against 2.25 — a wash inside the variance of eight
-seeds, bought for +70 % plan+fit time (6.73 s to 11.49 s on the first half). The turret deaths fall
+seeds, bought for +70 % plan+fit time (7.05 s to 12.03 s on the first half). The turret deaths fall
 from three to two on the held-out half, but one seed falls from leg 2 to leg 1 and another from leg 4
 to leg 2 doing it — the same trade in the other direction.
 
@@ -6300,6 +6300,17 @@ the **baseline** arm from 2.00 to 1.88 on seeds 1-8, so the gain is a redistribu
 teachers rather than an improvement, and a gate compared against a weakened baseline would flatter
 every later pass. Rejected and reverted; settling it needs both arms on sixteen seeds and a reason to
 believe the selection rule should differ per arm.
+
+### The harness, and a defect it was hiding
+
+Running the gate to record this section turned up a real bug rather than a result: **every arm of it
+exited 1** (32 of 32). `train --generations 0` printed the whole warm start — clone line, mastery,
+skill line, correction counts — and then failed on the champion lookup, because `best_ever()` is
+`None` when no generation ran. A gate that parses stdout had no way to tell a complete run from a
+broken one, so its status was unreadable by construction. `--generations 0` now returns success with
+`stop    --generations 0: warm start only, no champion written`, and the gate treats any non-zero arm
+as a failure instead of a data point. Both halves re-ran after the fix: **0 of 32 runs exited
+non-zero**, with the same legs, deaths and correction counts per seed as before it.
 
 ### Gates
 

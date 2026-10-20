@@ -829,6 +829,18 @@ pub fn train(a: &Args) -> Result<(), String> {
         }
     }
 
+    // **A warm start with no search is a supported run, not a failed one.** `--generations 0`
+    // exists so a gate can read the clone, its mastery and its skill line without training, and
+    // the run really did all of that; reaching the champion block below would turn it into exit 1
+    // with the whole report already on stdout. Every arm of `tools/phase3_gate.py` used to report
+    // failure for exactly this reason, which made the status of a 32-run gate unreadable.
+    if generations == 0 {
+        if !quiet {
+            println!("stop    --generations 0: warm start only, no champion written");
+        }
+        return Ok(());
+    }
+
     let elapsed = started.elapsed();
     let best = trainer
         .best_ever()
