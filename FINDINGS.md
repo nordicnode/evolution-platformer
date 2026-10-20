@@ -5673,3 +5673,147 @@ generation, `—` for a seed still unsolved at 200:
 - **Not the 24-seed gate.** One level, one machine, twelve seeds. `GaConfig::repair_children` is 0 by
   default and `--repair-children` is the arm; the window runs 3 because a watched run is where the
   mistake is legible. A 24-seed gate across the pack is still owed before this becomes a default.
+
+## Phase 0: learning telemetry and a certified practice suite
+
+The complaint this phase answers is not "the score is low". It is that a run can look identical
+whether it is learning or scouting: a maximum that will not move while every agent dies at the same
+ledge, a population that converges on one action and calls it a policy. Fitness is a whole-episode
+scalar and cannot distinguish those. So Phase 0 builds the two things every later phase gates on:
+a **reading of where the population actually got**, and a **fixed set of problems whose answer is
+already proved**.
+
+### What was added
+
+* **`evo::telemetry`** — one `Telemetry` record per generation, computed from the results the
+  trainer already has: `solved`/`wins`, the winning clock (best and median frames), where the best
+  genome ended (leg, frame, decision, and whether it died), the per-leg census of every episode
+  (`ended_legs`, `died_legs`, `reached_legs`), and the population's first-action histogram and
+  entropy at a fixed spawn probe. Reporting only: no fitness term, no hash, no RNG draw. The one
+  cost is 200 forward passes at spawn, far below a generation.
+* **A leg is a route crossing**, not a checkpoint: `route_hops_closed`, the sim's own geodesic
+  count. On a level with no route (`legs == 0`) every episode is in leg 0 and the record says so.
+  That is the unit Phase 1's route compiler will use, so the two cannot disagree about "leg 3".
+* **Surfaced three ways**: `train` prints `solved`, `clock` and the best genome's ending per
+  generation; `--telemetry <PATH>` writes one JSON object per generation (`watch` accepts it too);
+  and the window's Details panel has a "What it learned" section with the solved rate, clock, best
+  genome's leg/frame/decision and one row per leg anybody ended on.
+* **`sim::practice`** — a deterministic generator for twenty-four practice levels: six archetypes
+  (`gap`, `spike`, `step`, `crumble`, `mover`, `mixed`) at four tiers. Each candidate is certified
+  by the reachability oracle **and** the timed planner before it is kept; failing candidates fall
+  back to a gap chain, so a level is never written uncertified. The suite is committed under
+  `levels/practice/` and `train-cli fuzz --out levels/practice` regenerates it byte for byte.
+* **`train-cli fuzz`** — prints the certification table (oracle, plan, frames, blocks, and the
+  oracle and planner cost measured on a fresh parse of each file). All 24 pass: oracle 500 ms
+  total in release, timed planner 5.92 s total, worst level 1.32 s (`p23-mover-t3`).
+* **`tools/phase0_baseline.py`** — the gate below, re-runnable. It runs both arms on the pack, the
+  battery and the suite, reads each run's JSONL, and prints the table.
+
+### The gate, as run
+
+Protocol: pop 200, **one episode per genome** (`--no-auto-trials --trials 1`, so the episode cost
+is the same on a patrol level and a deterministic one), at most 100 generations, `--stop-on-win`,
+curriculum off, seeds 1 and 2. The **random** arm is the same population on the same level for one
+generation (200 episodes, seed 99) — the floor an unevolved population sets. Plan ms is today's
+timed planner on a fresh parse: depth 48 for the generated suite (its certification budget), the
+shipped default depth for the pack and battery. `D` = default, `R` = random. Clocks are
+seconds; legs are the share of the final generation that crossed each of the first three route
+legs; entropy is the first-action probe in bits (the maximum is 3.46).
+
+| level | D solved | D first win | D clock best/med | D legs 0/1/2 % | D entropy 0→end | R solved | R legs 0/1/2 % | R entropy | plan ms |
+|---|---|---|---|---|---|---|---|---|---|
+| **pack** (12 levels) | | | | | | | | | |
+| l1-flat-run | 2/2 | g0 / 200 ep | 6.15s / 8.40s | — | 3.43→3.43 | yes | — | 3.42 | 50 |
+| l10-the-hunt | 2/2 | g5 / 1200 ep | 7.00s / 7.00s | 10/0/0 | 3.43→3.34 | no | 2/0/0 | 3.43 | 290 |
+| l11-the-elements | 0/2 | — | — / — | 68/35/18 | 3.44→0.14 | no | 1/0/0 | 3.44 | 2530 |
+| l2-first-gap | 2/2 | g1 / 400 ep | 12.77s / 20.95s | 10/1/1 | 3.42→3.31 | no | 2/1/0 | 3.42 | 80 |
+| l3-gauntlet | 2/2 | g15 / 3200 ep | 11.07s / 12.98s | 24/8/1 | 3.42→2.09 | no | 5/0/0 | 3.42 | 170 |
+| l4-rhythm | 2/2 | g5 / 1200 ep | 7.35s / 8.33s | 42/22/16 | 3.43→2.03 | no | 2/0/0 | 3.41 | 120 |
+| l5-tightrope | 2/2 | g5 / 1200 ep | 7.48s / 25.78s | 10/7/6 | 3.43→2.61 | no | 0/0/0 | 3.42 | 250 |
+| l6-marathon | 2/2 | g7 / 1600 ep | 9.38s / 9.53s | 16/13/5 | 3.43→2.47 | no | 0/0/0 | 3.42 | 580 |
+| l7-ascent | 2/2 | g7 / 1600 ep | 7.22s / 14.25s | 8/6 | 3.45→2.76 | no | 0/0 | 3.39 | 430 |
+| l7-wall-school | 2/2 | g4 / 1000 ep | 3.50s / 4.18s | 0 | 3.44→2.88 | no | 0 | 3.41 | 440 |
+| l8-long-jump | 2/2 | g4 / 1000 ep | 6.27s / 6.32s | 12/0 | 3.43→2.66 | no | 0/0 | 3.42 | 100 |
+| l9-wait-and-climb | 1/2 | g29 / 6000 ep | 18.20s / 18.20s | 49/24/13 | 3.44→1.60 | no | 2/0/0 | 3.38 | 1870 |
+| **battery** (7 levels) | | | | | | | | | |
+| bat-backtrack | 2/2 | g0 / 200 ep | 3.97s / 4.10s | 3/0 | 3.43→3.43 | yes | 4/0 | 3.40 | 10 |
+| bat-crumble-bridge | 2/2 | g0 / 200 ep | 4.48s / 6.57s | — | 3.44→3.44 | yes | — | 3.45 | 30 |
+| bat-deck-phase | 2/2 | g16 / 3400 ep | 8.98s / 10.70s | 8/8/6 | 3.44→1.89 | no | 0/0/0 | 3.45 | 120 |
+| bat-double-threat | 2/2 | g2 / 600 ep | 4.85s / 4.98s | 0 | 3.43→3.34 | no | 0 | 3.42 | 50 |
+| bat-patrol-wait | 2/2 | g1 / 400 ep | 4.95s / 5.68s | 2 | 3.44→3.33 | yes | 1 | 3.41 | 40 |
+| bat-pit-bait | 0/2 | — | — / — | 17/6/6 | 3.41→2.23 | no | 2/0/0 | 3.41 | 970 |
+| bat-spring-chain | 2/2 | g0 / 200 ep | 6.15s / 7.12s | 2/1 | 3.44→3.44 | yes | 1/0 | 3.40 | 30 |
+| **generated** (24 levels) | | | | | | | | | |
+| p01-gap-t0 | 2/2 | g0 / 200 ep | 7.08s / 14.42s | 4/0 | 3.44→3.44 | yes | 7/0 | 3.40 | 105 |
+| p02-spike-t0 | 2/2 | g6 / 1400 ep | 8.13s / 8.40s | 7/4/4 | 3.44→2.20 | no | 0/0/0 | 3.41 | 118 |
+| p03-step-t0 | 2/2 | g0 / 200 ep | 7.02s / 13.33s | 8 | 3.44→3.44 | yes | 8 | 3.41 | 96 |
+| p04-crumble-t0 | 2/2 | g0 / 200 ep | 6.87s / 10.58s | 5 | 3.44→3.44 | yes | 6 | 3.45 | 87 |
+| p05-mover-t0 | 2/2 | g0 / 200 ep | 5.97s / 6.37s | 6/2/0 | 3.44→3.44 | no | 7/0/0 | 3.45 | 128 |
+| p06-mixed-t0 | 2/2 | g0 / 200 ep | 7.13s / 10.92s | 8/1/0 | 3.44→3.44 | yes | 10/3/2 | 3.45 | 153 |
+| p07-gap-t1 | 2/2 | g1 / 400 ep | 8.37s / 9.82s | 8/5/0 | 3.44→3.25 | yes | 2/1/0 | 3.40 | 163 |
+| p08-spike-t1 | 2/2 | g3 / 800 ep | 18.32s / 24.35s | 13/4 | 3.44→3.14 | no | 0/0 | 3.41 | 104 |
+| p09-step-t1 | 2/2 | g0 / 200 ep | 7.22s / 9.88s | 8/5 | 3.44→3.44 | yes | 8/6 | 3.42 | 93 |
+| p10-crumble-t1 | 2/2 | g0 / 200 ep | 9.78s / 9.90s | 5 | 3.44→3.36 | yes | 2 | 3.45 | 123 |
+| p11-mover-t1 | 2/2 | g4 / 1000 ep | 7.23s / 9.28s | 14/6/6 | 3.43→2.93 | no | 1/0/0 | 3.45 | 175 |
+| p12-mixed-t1 | 2/2 | g0 / 200 ep | 8.43s / 13.12s | 10/2/0 | 3.44→3.44 | yes | 14/4/2 | 3.45 | 207 |
+| p13-gap-t2 | 2/2 | g0 / 200 ep | 8.12s / 9.67s | 8/2 | 3.44→3.44 | yes | 8/2 | 3.41 | 149 |
+| p14-spike-t2 | 2/2 | g20 / 4200 ep | 8.48s / 9.95s | 18/8/1 | 3.44→1.57 | no | 0/0/0 | 3.41 | 150 |
+| p15-step-t2 | 2/2 | g0 / 200 ep | 8.55s / 13.27s | 8/6/4 | 3.44→3.44 | yes | 10/8/4 | 3.41 | 217 |
+| p16-crumble-t2 | 2/2 | g3 / 800 ep | 8.45s / 10.23s | 8/6/0 | 3.44→3.07 | no | 4/1/0 | 3.45 | 136 |
+| p17-mover-t2 | 2/2 | g64 / 13000 ep | 7.98s / 10.67s | 49/34/11 | 3.44→0.72 | no | 1/1/0 | 3.45 | 461 |
+| p18-mixed-t2 | 2/2 | g7 / 1600 ep | 11.62s / 18.57s | 20/12/5 | 3.44→3.25 | no | 4/2/0 | 3.45 | 326 |
+| p19-gap-t3 | 2/2 | g1 / 400 ep | 10.02s / 10.70s | 12/8/6 | 3.43→3.34 | no | 8/0/0 | 3.41 | 388 |
+| p20-spike-t3 | 0/2 | — | — / — | 44/23/14 | 3.44→1.84 | no | 0/0/0 | 3.40 | 328 |
+| p21-step-t3 | 2/2 | g0 / 200 ep | 9.43s / 13.30s | 8/6 | 3.44→3.44 | yes | 7/4 | 3.42 | 161 |
+| p22-crumble-t3 | 2/2 | g2 / 600 ep | 10.70s / 11.35s | 8/6/2 | 3.44→3.20 | no | 2/2/1 | 3.45 | 331 |
+| p23-mover-t3 | 0/2 | — | — / — | 60/42/6 | 3.44→1.43 | no | 2/1/0 | 3.45 | 1258 |
+| p24-mixed-t3 | 2/2 | g1 / 400 ep | 9.20s / 11.45s | 10/6/0 | 3.44→2.93 | no | 3/0/0 | 3.45 | 314 |
+
+Totals: **pack 21/24 seed-runs solved, battery 12/14, generated 44/48**; the random arm won at
+generation 0 on 1 pack level, 4 battery levels and 11 generated levels. The gate is a recording
+gate and it passes: every metric it names exists for all 43 levels and both arms. All 24 generated
+levels are certified beatable and routable (oracle 500 ms total, planner 5.92 s total in release).
+
+### What the table says
+
+* **The suite spans reflex to wall.** Eleven of the twenty-four generated levels are won by a
+  random population at generation 0 — tier 0 and 1 are mostly reflexes. At the other end,
+  `p20-spike-t3` and `p23-mover-t3` are unsolved at 100 generations on both seeds, and
+  `p17-mover-t2` needs 64 generations (13,000 episodes). That is what a practice suite is for:
+  a floor to check the telemetry's easy cases, and walls for the later phases to move.
+* **The per-leg census is the reading fitness cannot give.** `l11` has zero solves but 68/35/18 %
+  of the population crossing the first three legs: the run is not flailing at the spawn, it is
+  piling up deeper. `p23` is 60/42/6 % with zero solves: the wall is the last two legs, not the
+  first. `bat-pit-bait` is 17/6/6 %. Those are the sentences a level designer can act on, and
+  they are invisible in a max/avg/min row.
+* **Entropy is diversity, not progress.** Every generation-0 row is 3.40-3.45 bits of 3.46, so the
+  probe is doing its job as a "how spread out is the population" reading. The hard runs collapse
+  (`l11` 3.44→0.14, `p17` 3.44→0.72, `p23` 3.44→1.43) while the easy runs that stop at generation
+  0 stay at 3.44. A collapsed population is therefore not evidence of learning, and an unchanged
+  one is not evidence of failure — the later phases must gate on per-leg reach and solves, not on
+  entropy alone.
+* **The clock's two numbers are different questions.** `l5` has a 7.48 s best against a 25.78 s
+  median, and `l2` 12.77 s against 20.95 s: a few fast winners in a slow population, which is the
+  mastery league's cue rather than a level solved uniformly. On `p17` the best clock is 7.98 s but
+  the median 10.67 s at the generation the run finally solved — quick for the winner, not yet for
+  the population.
+* **The known walls are unchanged under this protocol.** `l11` and `bat-pit-bait` are 0/2, `l9` is
+  1/2, `p20`/`p23` are 0/2. One episode per genome and 100 generations is not the difficulty
+  ladder's protocol; it is the comparable baseline Phase 1 inherits. The suite's hardest rows are
+  the ones Phase 2's "≤ 1/3 the generations" gate should be measured against (e.g. `p17`: 64
+  generations today, target ≤ 21).
+
+### Limits
+
+Two seeds and a 100-generation cap: this is a recorded baseline, not a significance test, and no
+arm is being claimed as an improvement. The suite is deterministic by design (no patrols, flyers
+or turrets) so its per-leg curves are not phase noise; stochastic mechanics stay the battery's job.
+`plan ms` is today's timed planner, not Phase 1's route compiler — the suite's own certification
+uses depth 48, the pack and battery the shipped default. Nothing in this pass starts Phase 1: there
+is no `RoutePlan` artifact, no DAgger leg learner and no meta-controller yet. The two
+front-ends' existing numbers (max/avg/min, the archive, the chart) are untouched; telemetry is an
+addition, not a replacement.
+
+Files: `crates/evo/src/telemetry.rs`, `crates/sim/src/practice.rs`, `levels/practice/` (24 files),
+`tools/phase0_baseline.py`; wiring in `crates/evo/src/ga.rs`, `crates/train-cli/src/{commands,watch,main}.rs`,
+`crates/app/src/{lab,panel}.rs`.

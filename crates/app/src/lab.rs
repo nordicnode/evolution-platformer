@@ -407,6 +407,10 @@ pub struct Packet {
     /// How many finds the level's codex holds after this generation, so the panel can say
     /// "2 of 7" without reading a file per frame.
     pub codex_len: usize,
+    /// **Phase 0: what this generation learned**, in the terms a fitness scalar cannot show —
+    /// solved rate, the winning clock, and where on the level the population ended
+    /// ([`evo::Telemetry`]). Reporting only; it reaches no score and no RNG.
+    pub telemetry: evo::Telemetry,
 }
 
 /// A generation being animated: the packet, and one live episode per lane.
@@ -1329,6 +1333,7 @@ impl Generator {
             finished,
             discovery,
             codex_len: self.codex.len(),
+            telemetry: report.telemetry.clone(),
         }
     }
 }

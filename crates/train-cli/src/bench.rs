@@ -728,6 +728,7 @@ fn reject_train_shape_flags(a: &Args) -> Result<(), String> {
         "curriculum",
         "curriculum-generations",
         "csv",
+        "telemetry",
         "max-seconds",
     ];
     for name in REFUSED {

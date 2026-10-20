@@ -32,6 +32,7 @@ pub mod snapshots;
 pub mod style;
 pub mod tas;
 pub mod technique;
+pub mod telemetry;
 
 pub use autoshape::{apply as apply_auto_shape, scan as scan_level_shape, AutoShape};
 pub use champion::{
@@ -82,6 +83,7 @@ pub use tas::{
     TasRoute,
 };
 pub use technique::{TechniqueArchive, TechniqueEntry, TechniqueFirst, TechniqueSignature};
+pub use telemetry::Telemetry;
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///
