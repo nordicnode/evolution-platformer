@@ -15,6 +15,12 @@
 //!
 //! The l11 champion is the right fixture because it already carries feedback-16 memory, so the
 //! growth has to preserve the recurrent block as well as the feedforward rows.
+//!
+//! **The fixture is committed, on purpose.** This test originally read the author's own saved
+//! champion out of `champions/`, which is gitignored, so the proof passed on one machine and
+//! failed on every clean checkout, CI included. The artifact under `tests/fixtures/` is a real
+//! recorded episode on this level by a feedback-16 genome, wrapped by the ordinary champion
+//! code; regenerate it with `cargo run -p evo --example make_migration_fixture`.
 
 use evo::champion::ChampionFile;
 use evo::genome::ActScratch;
@@ -33,8 +39,10 @@ fn path(rel: &str) -> std::path::PathBuf {
 }
 
 fn saved_l11() -> ChampionFile {
-    let src = std::fs::read_to_string(path("champions/l11-the-elements.json"))
-        .expect("the saved l11 champion is in the tree");
+    let src = std::fs::read_to_string(path(
+        "crates/evo/tests/fixtures/l11-the-elements.champion.json",
+    ))
+    .expect("the committed fixture champion is in the tree");
     ChampionFile::from_json_str(&src).expect("it parses")
 }
 

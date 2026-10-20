@@ -96,7 +96,7 @@
 use sim::physics::AgentAction;
 use sim::rng::rng_from_seed;
 use sim::sensors::N_INPUTS;
-use sim::{Level, Sim};
+use sim::{Level, ObservationScratch, Sim};
 
 use crate::fitness::{run_episode, EvalConfig};
 use crate::genome::{ActScratch, Genome, NetShape, GENE_CLAMP};
@@ -590,12 +590,13 @@ fn rollout_states(
     let repeat = eval.action_repeat.max(1);
     let mut sim = Sim::new(level, expert.seed);
     let mut scratch = ActScratch::new();
+    let mut obs = ObservationScratch::new();
     let mut out = Vec::new();
     for _ in 0..expert.decisions.len() {
         if sim.outcome().is_finished() {
             break;
         }
-        let observation = sim.observation();
+        let observation = sim.observation_into(&mut obs);
         let action = genome.act(&observation, &mut scratch);
         // Nearest demonstrated state, by the observation the policy itself reads.
         let mut best = expert.decisions[0].action;

@@ -30,7 +30,7 @@
 
 use serde::{Deserialize, Serialize};
 use sim::physics::AgentAction;
-use sim::{Level, Outcome, Sim};
+use sim::{Level, ObservationScratch, Outcome, Sim};
 
 use crate::champion::NetworkSpec;
 use crate::fitness::{run_episode, EvalConfig};
@@ -372,10 +372,11 @@ impl Committee {
         for &seed in seeds {
             committee.reset_context();
             let mut sim = Sim::new(level, seed);
+            let mut obs = ObservationScratch::new();
             let mut action = AgentAction::Walk;
             while !sim.outcome().is_finished() {
                 if sim.stats().frames % repeat == 0 {
-                    action = committee.act(&sim.observation());
+                    action = committee.act(&sim.observation_into(&mut obs));
                 }
                 sim.step(action);
             }
@@ -477,11 +478,12 @@ pub fn showcase(
     let mut committee = Committee::from_ranked(members, k)?;
     let repeat = eval.action_repeat.max(1);
     let mut sim = Sim::new(level, seed);
+    let mut obs = ObservationScratch::new();
     let mut action = AgentAction::Walk;
     let mut actions = Vec::new();
     while !sim.outcome().is_finished() {
         if sim.stats().frames % repeat == 0 {
-            action = committee.act(&sim.observation());
+            action = committee.act(&sim.observation_into(&mut obs));
             actions.push(action);
         }
         sim.step(action);

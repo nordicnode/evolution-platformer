@@ -328,6 +328,14 @@ pub struct TrainingSummary {
     /// reheat at the sigma floor, which no old champion ever was.
     #[serde(default = "default_reheat_factor")]
     pub reheat_factor: f32,
+    /// **The early cut the run trained with** (Item 5), in no-progress ticks; 0 is off.
+    /// Provenance with teeth: a champion's recorded fitness is the run's own result, and a cut
+    /// run's results are scored on episodes that were ended early, while every replay evaluates
+    /// uncut. A file that recorded the fact but let the mismatch through would be worse than one
+    /// that refused, so [`ChampionFile::save`] refuses a summary with this set. Defaulted to 0:
+    /// a file written before the cut existed never trained with it.
+    #[serde(default)]
+    pub cut_stuck_frames: u32,
 }
 
 /// The value a champion file written before `reheat_factor` existed is read with.
@@ -352,6 +360,7 @@ impl From<&GaConfig> for TrainingSummary {
             stagnation_generations: c.stagnation_generations,
             immigrants: c.immigrants,
             reheat_factor: c.reheat_factor,
+            cut_stuck_frames: c.cut_stuck_frames,
         }
     }
 }
@@ -553,6 +562,19 @@ impl ChampionFile {
     }
 
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
+        // A champion is a claim that its recorded episode replays exactly, and replay always
+        // evaluates uncut. A run trained with the early cut scored its record on episodes that
+        // were ended early, so its numbers cannot keep that promise: refuse the file rather
+        // than write a record the replay screen would contradict. Training with the cut stays
+        // available for measurement (bench arms record themselves); it just cannot crown.
+        if self.metadata.training_config.cut_stuck_frames > 0 {
+            return Err(format!(
+                "refusing to write a champion trained with --cut-stuck {}: its recorded \
+                 fitness comes from cut episodes and would not reproduce on replay; \
+                 re-run without the cut to crown a champion",
+                self.metadata.training_config.cut_stuck_frames
+            ));
+        }
         let path = path.as_ref();
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
@@ -699,6 +721,33 @@ mod tests {
         let cfg = GaConfig::default();
         let r = crate::fitness::run_episode(level, &g, &cfg.eval_config(), 99);
         ChampionFile::new(&g, &r, level, 3, &cfg)
+    }
+
+    /// **A cut run cannot crown.** The champion's recorded fitness is the run's own result and
+    /// replay evaluates uncut, so a file written from a `--cut-stuck` run would promise an
+    /// episode its numbers did not play. `save` refuses, and the refusal names the knob.
+    #[test]
+    fn a_champion_trained_with_the_cut_refuses_to_be_written() {
+        let lv = level();
+        let mut rng = rng_from_seed(5);
+        let g = Genome::random(1, default_shape(), &mut rng);
+        let cfg = GaConfig {
+            cut_stuck_frames: 60,
+            ..GaConfig::default()
+        };
+        let r = crate::fitness::run_episode(&lv, &g, &cfg.eval_config(), 99);
+        let champ = ChampionFile::new(&g, &r, &lv, 3, &cfg);
+        assert_eq!(champ.metadata.training_config.cut_stuck_frames, 60);
+        let path =
+            std::env::temp_dir().join(format!("evo-cut-champion-{}.json", std::process::id()));
+        let err = champ.save(&path).expect_err("a cut run must not crown");
+        assert!(err.contains("--cut-stuck"), "{err}");
+        assert!(!path.exists(), "the refused champion must not reach disk");
+
+        // The same genome crowned by an uncut run writes fine.
+        let clean = champion_for(&lv, 5);
+        clean.save(&path).expect("an uncut champion writes");
+        std::fs::remove_file(&path).ok();
     }
 
     /// **Item 8's reading is arithmetic, and it round-trips through the file.** A champion written

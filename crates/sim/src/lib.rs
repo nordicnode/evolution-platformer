@@ -363,6 +363,23 @@ fn goal_approach(player: &PlayerState, level: &Level) -> f32 {
         .fold(f32::INFINITY, f32::min)
 }
 
+/// Caller-owned buffers for [`Sim::observation_into`]: the mover rectangles, velocities and
+/// phases a scene is built from. Kept outside the `Sim` so an evaluator running many episodes
+/// reuses one set of allocations across all of them; the contents are rebuilt on every call
+/// and mean nothing between calls.
+#[derive(Clone, Debug, Default)]
+pub struct ObservationScratch {
+    movers: Vec<Rect>,
+    mover_vel: Vec<(f32, f32)>,
+    mover_phase: Vec<f32>,
+}
+
+impl ObservationScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// One deterministically simulated episode.
 ///
 /// Construct with [`Sim::new`], then drive with [`Sim::step`]. The full state
@@ -1231,18 +1248,37 @@ impl Sim {
     /// Everything alive is handed over, because the enemy slots answer about the *nearest
     /// threat* and a flyer or a shot is one: an agent that could only see walkers would be
     /// blind to exactly the two enemies added to make height and distance dangerous.
+    ///
+    /// This allocating form is the convenience wrapper; the per-decision hot paths (episode
+    /// evaluation, committee play) call [`Sim::observation_into`] with a reused
+    /// [`ObservationScratch`] instead, because building the scene used to allocate three
+    /// vectors per decision and a training run makes millions of decisions.
     pub fn observation(&self) -> [f32; sensors::N_INPUTS] {
-        let movers = self.platforms();
-        let mover_vel: Vec<(f32, f32)> = self
+        self.observation_into(&mut ObservationScratch::default())
+    }
+
+    /// The same observation, with the scene's mover vectors built in caller-owned scratch
+    /// buffers whose capacity is reused across calls. Bit-for-bit the vector
+    /// [`Sim::observation`] returns: the scratch changes where the intermediate vectors
+    /// live, never what they contain (pinned by a test that compares the two over an
+    /// episode on a level with movers).
+    pub fn observation_into(
+        &self,
+        scratch: &mut ObservationScratch,
+    ) -> [f32; sensors::N_INPUTS] {
+        let frames = self.stats.frames;
+        scratch.movers.clear();
+        scratch
             .movers
-            .iter()
-            .map(|m| m.delta_at(self.stats.frames, &PHYSICS))
-            .collect();
-        let mover_phase: Vec<f32> = self
-            .movers
-            .iter()
-            .map(|m| m.phase_at(self.stats.frames, &PHYSICS))
-            .collect();
+            .extend(self.movers.iter().map(|m| m.rect_at(frames, &PHYSICS)));
+        scratch.mover_vel.clear();
+        scratch
+            .mover_vel
+            .extend(self.movers.iter().map(|m| m.delta_at(frames, &PHYSICS)));
+        scratch.mover_phase.clear();
+        scratch
+            .mover_phase
+            .extend(self.movers.iter().map(|m| m.phase_at(frames, &PHYSICS)));
         sensors::observe_scene(
             &self.level,
             &self.player,
@@ -1251,9 +1287,9 @@ impl Sim {
                 flyers: &self.flyers,
                 shots: &self.shots,
                 lava_balls: &self.lava_balls,
-                movers: &movers,
-                mover_vel: &mover_vel,
-                mover_phase: &mover_phase,
+                movers: &scratch.movers,
+                mover_vel: &scratch.mover_vel,
+                mover_phase: &scratch.mover_phase,
                 turrets: &self.turrets,
                 vents: &self.lava_vents,
                 air_ticks: self.air_ticks,
@@ -1443,6 +1479,49 @@ mod tests {
             sim.plan_progress().0 <= sim.plan_progress().1,
             "the cursor cannot pass the guide's end"
         );
+    }
+
+    /// **The scratch observation is the observation.** `observation_into` exists so a training
+    /// run stops allocating three vectors per decision; this pins that the saving changes
+    /// nothing else, over an episode on a level whose movers actually move (so the mover
+    /// rectangle, velocity and phase slots are live, not zeros agreeing with zeros).
+    #[test]
+    fn the_scratch_observation_is_bit_identical_to_the_allocating_one() {
+        let level = Level::from_json_str(include_str!("../../../levels/l11-the-elements.json"))
+            .expect("the shipped level parses");
+        assert!(
+            !Sim::new(&level, 7).movers.is_empty(),
+            "the fixture level must have movers for this test to say anything"
+        );
+        let mut sim = Sim::new(&level, 7);
+        let mut scratch = ObservationScratch::new();
+        // A reused scratch across a second episode too: stale capacity must never leak
+        // yesterday's movers into today's vector.
+        for episode in 0..2 {
+            if episode == 1 {
+                sim = Sim::new(&level, 8);
+            }
+            for frame in 0..900 {
+                if sim.outcome().is_finished() {
+                    break;
+                }
+                let plain = sim.observation();
+                let reused = sim.observation_into(&mut scratch);
+                for (i, (a, b)) in plain.iter().zip(reused.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "slot {i} differs at frame {frame} of episode {episode}"
+                    );
+                }
+                let action = if frame % 50 < 25 {
+                    AgentAction::Run
+                } else {
+                    AgentAction::RunJump
+                };
+                sim.step(action);
+            }
+        }
     }
 
     /// Frames a written time stands for, to the nearest frame. The inverse of [`format_time`] for

@@ -62,9 +62,7 @@ pub use ga::{
     ARCHIVE_BEHAVIOUR_CELLS, ARCHIVE_CELLS, ARCHIVE_CHECKPOINT_BINS, ARCHIVE_PROGRESS_BINS,
     ARCHIVE_TIME_BINS, ARCHIVE_TIME_SLOTS, MUTATION_RATES,
 };
-pub use genome::{
-    default_shape, ActScratch, BlockScratch, Genome, NetShape, BLOCK_LANES, N_INPUTS, N_OUTPUTS,
-};
+pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
 pub use imitate::{
     clone_from_play, from_plan, from_route, warm_population, warm_set, ImitateConfig,
     ImitationReport,

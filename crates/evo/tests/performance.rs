@@ -19,10 +19,15 @@
 //! The probe prints every reading it uses — episodes, decisions, microseconds per
 //! decision, generation seconds — so a later run can be compared without trusting this
 //! file's arithmetic.
+//!
+//! The batched-vs-scalar comparison that used to live here went with `Genome::forward_block`
+//! itself: Item 2 was killed by its own gate (0.96x on the feedback shape that matters), and
+//! the killed implementation was removed rather than kept as a measured artifact with no
+//! callers. The readings that condemned it are recorded in FINDINGS.md.
 
 use std::time::Instant;
 
-use evo::genome::{default_shape, ActScratch, BlockScratch, Genome, NetShape, BLOCK_LANES};
+use evo::genome::{default_shape, ActScratch, Genome, NetShape};
 use evo::{evaluate_population, GaConfig, Trainer};
 use sim::rng::rng_from_seed;
 use sim::sensors::N_INPUTS;
@@ -63,73 +68,6 @@ fn forward_ns_per_call(genomes: &[Genome], calls: usize) -> f64 {
         genomes[at].forward(&obs, &mut scratches[at]);
     }
     start.elapsed().as_nanos() as f64 / calls as f64
-}
-
-/// Time `calls` genome-decisions through the batched entry point, in blocks of
-/// [`BLOCK_LANES`], reusing one scratch per genome as an episode does. Returns nanoseconds
-/// per genome-decision.
-fn blocked_ns_per_call(genomes: &[Genome], calls: usize) -> f64 {
-    let obs = observation(7);
-    let mut scratches: Vec<ActScratch> = genomes.iter().map(|_| ActScratch::new()).collect();
-    let mut block = BlockScratch::new();
-    let mut i = 0usize;
-    while i < genomes.len() {
-        let end = (i + BLOCK_LANES).min(genomes.len());
-        Genome::forward_block(&genomes[i..end], &obs, &mut scratches[i..end], &mut block);
-        i = end;
-    }
-    let start = Instant::now();
-    let mut done = 0usize;
-    while done < calls {
-        for i in (0..genomes.len()).step_by(BLOCK_LANES) {
-            let end = (i + BLOCK_LANES).min(genomes.len());
-            Genome::forward_block(&genomes[i..end], &obs, &mut scratches[i..end], &mut block);
-            done += end - i;
-        }
-    }
-    start.elapsed().as_nanos() as f64 / done as f64
-}
-
-/// **Item 2's measurement.** The plan projected 4-6× from evaluating a block of genomes
-/// together, on the premise that one weight row could be loaded once and applied to every
-/// genome in the block. In this population it cannot: every genome owns its own weights. The
-/// batching therefore overlaps four independent accumulator chains per row — and the scalar
-/// pass already does exactly that *inside* one genome ([`DENSE_ROW_BLOCK`]). This probe prints
-/// both so the claim can be checked rather than assumed, and the verdict is written in
-/// FINDINGS.md.
-#[test]
-#[ignore = "a machine measurement, not an assertion; run with --release --ignored"]
-fn the_batched_forward_pass_against_the_scalar_one() {
-    let decisions = 20_000usize;
-    for (name, shape) in [
-        ("shipped 108-16-11, no memory", default_shape()),
-        (
-            "feedback 16 (a timed level)",
-            NetShape {
-                feedback: 16,
-                ..default_shape()
-            },
-        ),
-        (
-            "two hidden layers 108-32-16-11",
-            NetShape {
-                hidden: vec![32, 16],
-                ..default_shape()
-            },
-        ),
-    ] {
-        let mut rng = rng_from_seed(3);
-        let genomes: Vec<Genome> = (0..200)
-            .map(|i| Genome::random(i as u32, shape.clone(), &mut rng))
-            .collect();
-        let scalar = forward_ns_per_call(&genomes, decisions);
-        let blocked = blocked_ns_per_call(&genomes, decisions);
-        println!(
-            "{name}: scalar {scalar:.1} ns/genome-decision, batched {blocked:.1}, \
-             speedup {:.2}x",
-            scalar / blocked
-        );
-    }
 }
 
 /// **Item 5's baseline.** "Stop paying for episodes that have already failed" assumes failed

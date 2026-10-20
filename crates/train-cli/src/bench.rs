@@ -787,6 +787,24 @@ fn read_arm(path: &str) -> Result<BenchArm, String> {
 }
 
 fn write_arm(path: &Path, arm: &BenchArm) -> Result<(), String> {
+    // An arm file is evidence: its per-seed rows are what a gate is quoted from. Re-running
+    // the same arm on the same level legitimately replaces it (that is how a reading gets
+    // reproduced), but writing a *different level's* arm over an existing file destroys the
+    // first run's rows silently — which is exactly how the jump-timing arm lost its per-seed
+    // data when two levels were recorded under one name. Refuse that one case and name it.
+    if path.exists() {
+        if let Ok(existing) = read_arm(&path.to_string_lossy()) {
+            if existing.level_hash != arm.level_hash {
+                return Err(format!(
+                    "refusing to overwrite {}: it records {} but this arm ran {}; \
+                     give this arm a distinct --arm name so both readings survive",
+                    path.display(),
+                    existing.level_name,
+                    arm.level_name
+                ));
+            }
+        }
+    }
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             if let Err(e) = fs::create_dir_all(dir) {
@@ -1226,6 +1244,52 @@ mod tests {
                 "the arm's file is missing {key}: {text}"
             );
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **An arm name belongs to one level.** The jump-timing reading lost its per-seed rows
+    /// when two levels were recorded under one arm name and the second write replaced the
+    /// first; this pins that the second write is refused and the first file survives, while
+    /// a same-level re-run (the reproduce-a-reading workflow) still writes.
+    #[test]
+    fn an_arm_for_a_different_level_cannot_overwrite_an_existing_arm() {
+        let dir = tmpdir("guard");
+        let out = dir.to_string_lossy().to_string();
+        let tiny = |level: &str| {
+            bench(&a(&[
+                "bench",
+                "--protocol",
+                "chain",
+                "--level",
+                level,
+                "--seeds",
+                "2",
+                "--generations",
+                "2",
+                "--pop",
+                "16",
+                "--arm",
+                "guarded",
+                "--out",
+                &out,
+                "--quiet",
+            ]))
+        };
+        let l1 = wpath("levels/l1-flat-run.json");
+        let l2 = wpath("levels/l2-first-gap.json");
+        tiny(&l1).expect("the first arm runs");
+        let path = dir.join("chain-guarded.json");
+        let before = fs::read_to_string(&path).expect("the first arm is on disk");
+
+        let err = tiny(&l2).expect_err("a different level under the same arm name is refused");
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("the first arm survives"),
+            before,
+            "the refused write must leave the original rows untouched"
+        );
+
+        tiny(&l1).expect("the same arm on the same level re-runs and rewrites");
         let _ = fs::remove_dir_all(&dir);
     }
 

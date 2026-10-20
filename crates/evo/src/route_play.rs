@@ -75,7 +75,7 @@ use sim::reach::{
     swim_action, trajectory_action, vine_action, vine_run, GoalRoutes, JumpHold, LaunchSpeed,
     Platform, RouteMove, Takeoff,
 };
-use sim::{spawn_route_stand, Level, Outcome, Rect, Sim, PHYSICS};
+use sim::{spawn_route_stand, Level, ObservationScratch, Outcome, Rect, Sim, PHYSICS};
 
 use crate::fitness::EvalConfig;
 
@@ -553,13 +553,14 @@ pub fn timed_play_from(
     debug_assert_eq!(level.width, start.level().width, "a plan replays on its own geometry");
     let repeat = cfg.action_repeat.max(1);
     let mut sim = start.clone();
+    let mut obs = ObservationScratch::new();
     let mut decisions: Vec<Decision> = Vec::new();
     for action in &route.actions {
         if sim.outcome().is_finished() {
             break;
         }
         decisions.push(Decision {
-            observation: sim.observation(),
+            observation: sim.observation_into(&mut obs),
             action: *action,
         });
         for _ in 0..repeat {
@@ -608,6 +609,7 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
     let repeat = cfg.action_repeat.max(1);
     let ph = &PHYSICS;
     let mut sim = Sim::new(level, seed);
+    let mut obs = ObservationScratch::new();
     let routes = level.routes();
     let goal = level.goals.first().copied();
     let goal_x = goal.map(|g| g.center().0).unwrap_or(level.width as f32);
@@ -871,7 +873,7 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                 }
             }
             decisions.push(Decision {
-                observation: sim.observation(),
+                observation: sim.observation_into(&mut obs),
                 action: held,
             });
             if idle_blocks > STALL_BLOCKS {

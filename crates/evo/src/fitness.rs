@@ -170,7 +170,7 @@
 
 use sim::hash::StateHasher;
 use sim::physics::AgentAction;
-use sim::{EpisodeStats, Level, Outcome, Sim};
+use sim::{EpisodeStats, Level, ObservationScratch, Outcome, Sim};
 
 use crate::genome::{ActScratch, Genome};
 
@@ -538,6 +538,10 @@ pub struct EpisodeRunner {
     genome: Genome,
     sim: Sim,
     scratch: ActScratch,
+    /// The observation's scene buffers, reused across every decision this runner makes: a
+    /// training run makes millions of decisions, and building the scene used to allocate
+    /// three vectors for each one.
+    obs: ObservationScratch,
     action: AgentAction,
     repeat: u32,
     /// The next tick a decision is due. Constant `repeat` for a headless genome, and the head's
@@ -565,6 +569,7 @@ impl EpisodeRunner {
             genome,
             sim,
             scratch: ActScratch::new(),
+            obs: ObservationScratch::new(),
             action: AgentAction::Walk,
             repeat,
             next_decision: 0,
@@ -587,6 +592,7 @@ impl EpisodeRunner {
             genome,
             sim,
             scratch: ActScratch::new(),
+            obs: ObservationScratch::new(),
             action: AgentAction::Walk,
             repeat,
             next_decision: 0,
@@ -629,14 +635,15 @@ impl EpisodeRunner {
         }
         let frames = self.sim.stats().frames;
         if frames >= self.next_decision {
+            let observation = self.sim.observation_into(&mut self.obs);
             if self.genome.shape.commitment {
                 let (action, ticks) = self
                     .genome
-                    .act_with_commitment(&self.sim.observation(), &mut self.scratch);
+                    .act_with_commitment(&observation, &mut self.scratch);
                 self.action = action;
                 self.next_decision = frames + ticks.max(1);
             } else {
-                self.action = self.genome.act(&self.sim.observation(), &mut self.scratch);
+                self.action = self.genome.act(&observation, &mut self.scratch);
                 self.next_decision = frames + self.repeat;
             }
             self.trace.u32(frames);
