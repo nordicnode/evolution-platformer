@@ -7149,6 +7149,17 @@ the shape a person actually opens.
   the panel has a 300-point floor so it is the column it says it is rather than a box that fits its
   contents.
 
-The blocks-and-cast gallery was checked rather than re-shot: the atlas has changed one sprite since it
-was made (`rope`, which is a mechanic rather than a block, and has no cell in the grid), and every
-other cell is byte-identical, so the picture is still of the current art.
+**The blocks-and-cast sheet is generated, and it is the whole palette.** The old sheet was drawn once
+and then *checked* against the atlas; the check asked whether the cells it already had were still
+current, which they were, and missed that the palette had grown around them. The README went on
+showing eighteen cells — seventeen brushes and the runner — with six of the twenty-three placeable
+brushes simply absent: brittle sand, brick and timber, the spawn marker, the rope and the scenery.
+
+`tools/blocks_gallery.py` now draws the sheet from `assets/tileset.json` and `assets/tileset.png` at
+the atlas's own coordinates, and it reads the brush list out of `editor.rs` rather than keeping a
+second copy, so a brush added to the editor and forgotten here is a failure instead of a gap. The
+clearing tools are the only two it skips: they act on a cell rather than putting an object in it. The
+brittle cells are a material with its transparent crack over it, exactly as the view draws one; water
+and lava show their animated surface rather than the plain body; and the ledge and the mover are
+their middle variants, which are the shelf drawn whole. `python3 tools/blocks_gallery.py --check`
+compares the file against a fresh render.

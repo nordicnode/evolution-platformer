@@ -24,7 +24,8 @@ the terminal.
 
 ![The blocks and the cast](docs/images/blocks-gallery.png)
 
-*The blocks and enemies a level is built from.*
+*Everything a level is made of: the four materials and their brittle twins, the
+hazards and furniture, the cast and the scenery.*
 
 ![Editor, on the showcase level](docs/images/editor-showcase.png)
 
