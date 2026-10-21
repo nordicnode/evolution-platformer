@@ -4392,8 +4392,8 @@ same embedded pixel face (Press Start 2P) every other word on the screen is draw
 way the game's own objects are: cream letters with a hard brown edge standing on a shelf of the
 accent gold — cream on gold on brown, which is the hierarchy and the material at once. Nothing in
 the window reads `logo.png` any more, so the old art is gone from the tree; the README's header is
-now a crop of the rendered card (see below), which is the one copy of the mark that cannot drift
-from the screen it opens.
+the card's own drawing on a transparent window (see "The README's pictures"), which is the one copy
+of the mark that cannot drift from the screen it opens.
 
 Four decisions, and what forced each:
 
@@ -7097,13 +7097,36 @@ it yet, and that is its own step.
 ## The README's pictures are the window's own frames
 
 Every screenshot in the README is now a `--screenshot` frame of the current build at the window's own
-1360 × 800, and the header is no longer a separate drawing at all: it is the title card cropped out of
-one of those frames. That is the point of doing it that way. The old header — rainbow letters over a
-strip of baked ground — was an asset somebody had to remember to redraw when the title screen changed,
-and nobody did; the screen stopped drawing it a release ago and the README went on showing it. A crop
-of the real frame is a picture of what the game actually draws, so the next time the mark changes the
-picture is stale in exactly the way the rest of the screenshots are stale, and re-shooting the set
-fixes all of them together. The retired file (`crates/app/assets/logo.png`) was deleted with it.
+1360 × 800, and the header is the title card's own mark on nothing: `--logo` opens a transparent
+window, draws the title card with no world, vignette or menu behind it, and writes the ink to a PNG.
+The old header — rainbow letters over a strip of baked ground — was an asset somebody had to remember
+to redraw when the title screen changed, and nobody did; the screen stopped drawing it a release ago
+and the README went on showing it. A crop of a rendered frame was the first replacement, and it was a
+picture of the screen again: a rectangle of sky with the mark inside it, which is not what a header
+wants on a page, and which would still need re-cropping the next time the card moved. Drawing the
+card on transparency is the same code the front door runs, cropped to its own ink, so it sits on
+either of GitHub's themes and cannot drift from the screen. The retired file
+(`crates/app/assets/logo.png`) was deleted with it.
+
+Three format decisions, each of which is visible in the file:
+
+* **The framebuffer is premultiplied and a PNG is not.** egui draws with premultiplied alpha and
+  hands the frame back that way, so a half-covered edge saved straight comes out dark. Every pixel is
+  un-premultiplied on the way out (`to_srgba_unmultiplied`); the letters' antialiasing keeps its own
+  colour and only its coverage varies.
+* **The crop is the ink's bounding box, not the window.** The capture is a 2100 × 800 frame with the
+  mark in the top third; the export finds the ink's own edges and pads them by sixteen points, so the
+  header is the mark rather than however much sky the window happened to have.
+* **The tagline's chip is opaque in the export.** On the title screen it is 168/255 ink so the sky can
+  pass through it; with nothing behind it, translucent is a smudge of somebody else's page. `title`
+  takes an `alone` flag for the one caller that has no picture behind the card, and draws the chip
+  solid. Everything else the card draws was already opaque.
+
+A frame that comes back opaque is an error rather than a logo with a background baked into it: a
+compositor with no transparent windows has to say so, or the header quietly becomes a screenshot
+again. The export test writes a synthetic frame through the same path and reads it back — the margin
+still transparent, the half-covered pixel still half-covered and still the colour it was, and an
+opaque frame refused.
 
 Shooting the set at the window's real size turned up two layout bugs that only show when the window is
 the shape a person actually opens.

@@ -29,7 +29,7 @@
 //! module is where the two meet the keys. The one rule it inherits intact is that a run
 //! advances **when the viewer has finished watching, not when a timer fires**.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Context, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -298,6 +298,154 @@ pub fn run(
         }),
     )
     .map_err(|e| format!("cannot open a window: {e}"))
+}
+
+/// Write the title card's wordmark as a transparent PNG, and leave.
+///
+/// The README's header is this file. It used to be an asset of its own — a hand-drawn rainbow
+/// logo, and later a crop of a title frame — and both were pictures *of* the mark, which can go on
+/// describing a mark the window has stopped drawing. This asks the screen that draws it to draw it
+/// on nothing: a transparent window, the title card, no world behind it, and a crop to the ink’s
+/// own edge. What comes out is [`splash::wordmark`], so the header cannot disagree with the front
+/// door. A frame that comes back opaque is an error rather than a logo with a background painted
+/// into it: a silent background is exactly how the header would become a screenshot again.
+pub fn export_wordmark(path: PathBuf) -> Result<(), String> {
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([2100.0, 800.0])
+        // The one window in the project whose background is *nothing*. A compositor that refuses
+        // transparency gives `save_wordmark` an opaque frame to refuse, rather than a header with
+        // a dark rectangle around it.
+        .with_transparent(true)
+        .with_title("one two hundred — wordmark");
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "one two hundred — wordmark",
+        options,
+        Box::new(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(WordmarkShot {
+                path,
+                requested: false,
+                frames: 0,
+            }))
+        }),
+    )
+    .map_err(|e| format!("cannot open a window: {e}"))
+}
+
+/// The window [`export_wordmark`] opens: one frame of the wordmark, saved, closed.
+struct WordmarkShot {
+    path: PathBuf,
+    requested: bool,
+    frames: u32,
+}
+
+impl eframe::App for WordmarkShot {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        crate::splash::wordmark(&painter, ctx.screen_rect());
+        self.frames += 1;
+        if !self.requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            self.requested = true;
+        }
+        if let Some(image) = screenshot_image(ctx) {
+            match save_wordmark(&image, &self.path) {
+                Ok((width, height)) => {
+                    println!("wrote {} ({width}x{height})", self.path.display());
+                }
+                Err(err) => {
+                    // A scripted export has no viewer to report to, so a failure is the process's
+                    // exit status — the same rule `--screenshot` follows.
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if self.frames > 240 {
+            eprintln!("error: no screenshot arrived within 240 frames");
+            std::process::exit(1);
+        }
+        ctx.request_repaint();
+    }
+
+    /// Nothing behind the mark. The window is transparent, so the clear is too.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
+/// The frame egui captured this pass, if it has arrived.
+///
+/// One reader for both the window's `--screenshot` and the wordmark export, so the two cannot
+/// disagree about which event they are waiting for.
+fn screenshot_image(ctx: &Context) -> Option<std::sync::Arc<egui::ColorImage>> {
+    ctx.input(|i| {
+        i.events.iter().find_map(|event| match event {
+            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+            _ => None,
+        })
+    })
+}
+
+/// Save a captured wordmark as a PNG with a transparent background, cropped to its ink.
+///
+/// The framebuffer is read back **premultiplied**, which is what egui draws with; a PNG is not,
+/// so each pixel is un-premultiplied before it is written or the antialiased edges of the letters
+/// come out dark against a light background. The crop is the ink's own bounding box plus a small
+/// margin, so the header is the mark rather than the window it happened to be drawn in.
+fn save_wordmark(image: &egui::ColorImage, path: &Path) -> Result<(u32, u32), String> {
+    let (width, height) = (image.width() as u32, image.height() as u32);
+    let mut frame = image::RgbaImage::new(width, height);
+    for (index, pixel) in image.pixels.iter().enumerate() {
+        let [r, g, b, a] = pixel.to_srgba_unmultiplied();
+        frame.put_pixel(
+            index as u32 % width,
+            index as u32 / width,
+            image::Rgba([r, g, b, a]),
+        );
+    }
+    if frame.get_pixel(0, 0)[3] != 0 {
+        return Err(
+            "the window came back opaque — this display has no transparent window to shoot".into(),
+        );
+    }
+    let (x0, y0, x1, y1) = ink_bounds(&frame).ok_or("the frame had no ink in it")?;
+    let pad = 16;
+    let ink = image::imageops::crop_imm(&frame, x0, y0, x1 - x0 + 1, y1 - y0 + 1).to_image();
+    let mut out = image::RgbaImage::from_pixel(
+        ink.width() + pad * 2,
+        ink.height() + pad * 2,
+        image::Rgba([0, 0, 0, 0]),
+    );
+    image::imageops::overlay(&mut out, &ink, pad as i64, pad as i64);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    out.save(path)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(out.dimensions())
+}
+
+/// The bounding box of every pixel with any ink in it, inclusive.
+fn ink_bounds(frame: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (x, y, pixel) in frame.enumerate_pixels() {
+        if pixel[3] > 8 {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    (x0 != u32::MAX).then_some((x0, y0, x1, y1))
 }
 
 struct EvoApp {
@@ -4415,12 +4563,7 @@ impl EvoApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.shot_requested = true;
         }
-        if let Some(image) = ctx.input(|i| {
-            i.events.iter().find_map(|event| match event {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        }) {
+        if let Some(image) = screenshot_image(ctx) {
             let bytes: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
             let buffer =
                 image::RgbaImage::from_raw(image.width() as u32, image.height() as u32, bytes)
@@ -5381,6 +5524,53 @@ mod tests {
             app.palette_group.brushes().len(),
             6,
             "and the shelf on screen is the hazards, not the ground"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The wordmark export is a logo, not a screenshot: transparent, cropped to its ink, and
+    /// un-premultiplied so the edges of the letters do not go dark on a light page.
+    ///
+    /// A built frame of the window is opaque, and the framebuffer egui hands back is
+    /// premultiplied; the header has to be neither. The test is a synthetic frame rather than a
+    /// rendered one because what is being checked is the format — the frame's own shape is the
+    /// title card's business, and has its own tests.
+    #[test]
+    fn the_wordmark_export_crops_to_the_ink_and_writes_straight_alpha() {
+        let root = scratch("wordmark");
+        let path = root.join("wordmark.png");
+        let mut pixels = vec![Color32::TRANSPARENT; 20 * 12];
+        // A two-by-two block of ink at (6, 4), with one half-covered pixel, so both the crop and
+        // the un-premultiply are read back from the file.
+        pixels[4 * 20 + 6] = Color32::from_rgba_unmultiplied(200, 100, 50, 128);
+        for i in [(4, 7), (5, 6), (5, 7)] {
+            pixels[i.0 * 20 + i.1] = Color32::from_rgba_unmultiplied(10, 20, 30, 255);
+        }
+        let image = egui::ColorImage::new([20, 12], pixels);
+        let (width, height) = save_wordmark(&image, &path).expect("the logo writes");
+        assert_eq!(
+            (width, height),
+            (2 + 32, 2 + 32),
+            "two points of ink and the margin"
+        );
+
+        let written = image::open(&path).expect("the file reads").to_rgba8();
+        assert_eq!(written.get_pixel(0, 0)[3], 0, "the margin is transparent");
+        let half = *written.get_pixel(16, 16);
+        assert_eq!(half[3], 128, "the half-covered pixel is still half-covered");
+        for (got, want) in half.0[..3].iter().zip([200, 100, 50]) {
+            assert!(
+                (*got as i32 - want).abs() <= 2,
+                "the colour is straight, not premultiplied: {half:?}"
+            );
+        }
+
+        // A frame with no transparency in it is a window that could not open transparent: the
+        // export refuses rather than writing the header with a background baked into it.
+        let opaque = egui::ColorImage::new([2, 2], vec![Color32::WHITE; 4]);
+        assert!(
+            save_wordmark(&opaque, &path).is_err(),
+            "an opaque frame is not a logo"
         );
         let _ = std::fs::remove_dir_all(root);
     }

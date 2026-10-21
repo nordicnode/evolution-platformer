@@ -542,7 +542,7 @@ impl Splash {
         // menu stands on. The vignette goes down *before* the mark so the title is the
         // brightest thing on the screen rather than the thing the dark edges are cutting into.
         vignette(&painter, rect);
-        title(&painter, rect, self.clock);
+        title(&painter, rect, self.clock, false);
 
         let floor = sheet
             .camera
@@ -1143,6 +1143,18 @@ fn lockup(painter: &Painter, rect: Rect, clock: f32) -> Lockup {
     }
 }
 
+/// The wordmark on nothing, for the one caller that needs it as an asset.
+///
+/// The README's header has been two different pictures *of* this mark — a hand-drawn rainbow
+/// logo, then a crop of a title frame — and both could disagree with the screen they were
+/// supposed to show. This is the screen's own [`title`], laid out on whatever rectangle it is
+/// given, with no world, no vignette and no menu behind it; the caller hands it a transparent
+/// painter and crops to the ink. The clock is past every arrival, so the mark and its tagline
+/// are at full strength rather than half-faded.
+pub fn wordmark(painter: &Painter, rect: Rect) {
+    title(painter, rect, 2.0, true);
+}
+
 /// The title card: the two-line wordmark, its rules, and the line under it.
 ///
 /// The mark used to be a picture — the committed `logo.png`, rainbow letters on a strip of baked
@@ -1154,7 +1166,12 @@ fn lockup(painter: &Painter, rect: Rect, clock: f32) -> Lockup {
 /// accent gold, the small line ruled out to the big line's measure. Cream on gold on brown is the
 /// hierarchy and the material at once, which is what a title needs and the old picture, six
 /// colours of somebody else's logotype, did not have.
-fn title(painter: &Painter, rect: Rect, clock: f32) {
+///
+/// `alone` says there is no picture behind the card. The tagline normally sits on a translucent
+/// chip, because the sky behind it is full of clouds and hills rather than being a surface; with
+/// nothing behind it, translucent is a smudge of somebody else's background, so the chip is drawn
+/// solid. Everything else the card draws is already opaque.
+fn title(painter: &Painter, rect: Rect, clock: f32, alone: bool) {
     let arrived = title_in(clock);
     if arrived <= 0.0 {
         return;
@@ -1233,7 +1250,7 @@ fn title(painter: &Painter, rect: Rect, clock: f32) {
                 STAGE_INK.r(),
                 STAGE_INK.g(),
                 STAGE_INK.b(),
-                (tag * 168.0) as u8,
+                (tag * if alone { 255.0 } else { 168.0 }) as u8,
             ),
         );
         painter.text(

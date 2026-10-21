@@ -30,7 +30,7 @@
 //!         [--champions champions] [--resume champions/l5-tightrope.population.json]
 //!         [--from-champion champions/l5-tightrope.json]
 //!         [--curriculum levels/l3-gauntlet.json] [--curriculum-generations 40]
-//!         [--screenshot out.png]
+//!         [--screenshot out.png] [--logo out/wordmark.png]
 //! ```
 
 mod app;
@@ -104,6 +104,9 @@ OPTIONS:
     --screenshot <PATH>   Render one frame, write it as a PNG, and exit. Used to
                           verify the renderer without a human watching; with
                           --evolve it waits for a real generation first.
+    --logo <PATH>         Write the title card's wordmark as a transparent PNG and
+                          exit. This is the README's header, drawn by the title
+                          screen's own code, so it cannot drift from the game.
     --help, -h            Show this text.
 ";
 
@@ -111,6 +114,9 @@ struct Options {
     level: PathBuf,
     assets: PathBuf,
     screenshot: Option<PathBuf>,
+    /// The README's header, when the window was asked for a transparent wordmark instead of a
+    /// game.
+    logo: Option<PathBuf>,
     lab: LabOptions,
     /// Whether to open on the title screen. `None` is the default, which is "on for a person
     /// at a window, off for a scripted frame" — see [`app::run`].
@@ -121,6 +127,7 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
     let mut level = None;
     let mut assets = None;
     let mut screenshot = None;
+    let mut logo = None;
     let mut lab = LabOptions::default();
     // Unset is the common case, and it means "the default": on for an interactive launch,
     // off for a scripted one. The flags are for overriding that.
@@ -144,6 +151,7 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
             "--level" => level = Some(PathBuf::from(value("--level")?)),
             "--assets" => assets = Some(PathBuf::from(value("--assets")?)),
             "--screenshot" => screenshot = Some(PathBuf::from(value("--screenshot")?)),
+            "--logo" => logo = Some(PathBuf::from(value("--logo")?)),
             "--splash" => splash = Some(true),
             "--no-splash" => splash = Some(false),
             // A population of one has no selection pressure, and a zero-generation run
@@ -223,6 +231,7 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
         level,
         assets,
         screenshot,
+        logo,
         lab,
         splash,
     }))
@@ -241,6 +250,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // The wordmark export is its own window and its own job: no level, no atlas, no run. Asking
+    // for it alongside `--screenshot` or a mode would be two windows' worth of intent in one
+    // command, so the logo answers first and the rest of the options are not read.
+    if let Some(path) = options.logo {
+        return match app::export_wordmark(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     match app::run(
         options.level,
