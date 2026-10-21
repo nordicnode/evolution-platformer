@@ -116,9 +116,9 @@ fn the_vector_has_the_documented_named_layout() {
     // what makes the diff between the layouts reviewable.
     assert_eq!(
         sensors::N_INPUTS,
-        108,
+        111,
         "§7.2's 90 plus v2's three, v3's and v4's one each, v7's enemy_dir, v8's waypoint, \
-         v10's two phases and v13's eight time slots"
+         v10's two phases, v13's eight time slots and v14's three rope slots"
     );
     // v5 bounded the enemy slots and v6 widened that bound; both moved the reading without
     // moving a slot. v7 and v8 are appends, which is why this number moved: the whole
@@ -137,7 +137,9 @@ fn the_vector_has_the_documented_named_layout() {
     // v13 appends eight slots (the episode clock, the next dangerous event's eta and position, a
     // mover's velocity and cycle phase, and the body's ground/air ticks): a champion trained before
     // it is blind to every timed mechanic in the pack, which is the whole reason for the bump.
-    assert_eq!(sensors::VERSION, 13);
+    // v14 appends three (whether the body is on a rope, and the two offsets to the nearest line's
+    // end): the first *object* the observation can name that is not a tile or an enemy.
+    assert_eq!(sensors::VERSION, 14);
 
     let names = sensors::input_names();
     assert_eq!(names.len(), sensors::N_INPUTS);
@@ -187,7 +189,14 @@ fn the_vector_has_the_documented_named_layout() {
     assert_eq!(names[105], "mover_vy");
     assert_eq!(names[106], "mover_phase");
     assert_eq!(names[107], "ground_air");
-    assert_eq!(names.len(), 90 + 3 + sensors::N_ABILITY_INPUTS + 2 + 2 + 8);
+    // v14 appends the rope: whether the body is on one, and where the nearest line's end is.
+    assert_eq!(names[108], "on_rope");
+    assert_eq!(names[109], "rope_dx");
+    assert_eq!(names[110], "rope_dy");
+    assert_eq!(
+        names.len(),
+        90 + 3 + sensors::N_ABILITY_INPUTS + 2 + 2 + 8 + 3
+    );
 }
 
 /// **Where the goal vector is clamped, the phase slots are the only sub-tile position there is.**
@@ -819,9 +828,13 @@ fn the_ability_slots_report_the_wall_and_the_sprint() {
 /// so six of the eight read zero; the clock reads the settled frame count in its 64-frame buckets
 /// and `ground_air` reads the ticks the body has spent on its feet. Both are still drawn, so the
 /// hash pins them.
+///
+/// Re-pinned for **v14**, which appends slots 108-110. The fixture has no rope, so all three read
+/// zero here and only the stream grew — which is the append-only promise, and the reason a
+/// champion grown from v13 keeps every weight it had.
 #[test]
 fn golden_observation_hash_at_a_fixed_state() {
-    const GOLDEN_OBSERVATION_HASH: u64 = 12_842_302_117_604_028_991;
+    const GOLDEN_OBSERVATION_HASH: u64 = 11_791_287_316_338_203_092;
 
     let level = common::fixture(
         "ground",

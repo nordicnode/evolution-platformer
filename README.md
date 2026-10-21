@@ -20,7 +20,7 @@ the terminal.
 
 ![Title screen](docs/images/title-screen.png)
 
-*The title screen: the demo runner climbs the wordmark.*
+*The title screen: the demo run plays behind the wordmark.*
 
 ![The blocks and the cast](docs/images/blocks-gallery.png)
 
@@ -29,21 +29,27 @@ the terminal.
 ![Editor, on the showcase level](docs/images/editor-showcase.png)
 
 *The editor, on `levels/scratch-showcase.json`, a level that uses every block
-and enemy at once.*
+and enemy at once. The canvas is the game's own view; `G` adds the guides.*
 
 ![Evolve view: a run in progress on L3](docs/images/evolve.png)
 
-*Evolve view: 20 generations into a run on L3, with the fitness chart below.*
+*Evolve view: twenty generations into a run on L3, with the fitness chart
+below.*
 
-![Replay view: the best agent, with the population ghosted beside it](docs/images/replay.png)
+![Replay view: the run's quickest win, with the population ghosted beside it](docs/images/replay.png)
 
-*Replay view: the best agent's run, with the rest of its generation shown as ghosts.*
+*Replay view: the run's quickest win, with the rest of its generation ghosted
+beside it.*
 
 ## How it plays
 
 **Edit.** Draw a level with the mouse: drag blocks, spikes, springs, enemies
-and the flag out of the palette onto the canvas. A status line tells you
-whether the level can be beaten at all before you waste time on it.
+and the flag out of the palette onto the canvas. The palette shows one shelf at
+a time — ground, hazards, enemies, the level's own furniture, and the two
+clearers — so it stays a handful of cells rather than a box of parts. A lamp on
+the status line says whether the level can be beaten at all; `G` turns on the
+guides — the tile grid, the reachability tint and the full verdict — when you
+want to measure the level instead of look at it.
 
 **Play.** Run the level yourself, against the clock. Once the AI has a best
 time on the level, the playtest races you against it, and you can turn on a
@@ -57,15 +63,26 @@ ghosted beside it.
 
 ## Features
 
-- **Level editor** with a parts palette, undo/redo, eyedropper, line and
+- **Level editor** with a shelved parts palette, a game-view canvas (the
+guides are one key), undo/redo, eyedropper, line and
   rectangle tools, a browsable shelf of levels, and a mirror tool that flips
   the whole level in one step.
 - **Four building materials** (grass, sand, brick, timber), all solid, plus
   one-way platforms and moving platforms with a visible travel guide.
 - **Trap tiles:** cracked ground that crumbles shortly after something stands
-  on it, and spring pads that throw whatever lands on them.
+  on it — the piece breaks off, falls, and shatters on the floor — and spring
+  pads that throw whatever lands on them.
 - **Elements:** water you swim in, lava that kills and throws fireballs, and
   vines you climb.
+- **Ropes:** a line hanging from a ceiling that an airborne body catches with
+  its hands and swings on. The arc is real physics — a pendulum with inertia,
+  pumped by leaning and spent on release — so a rope turns a jump into a swing
+  and a swing into a launch the running jump cannot match.
+- **A physics engine of its own** (`crates/dynamics`): point masses, rigid
+  links, ropes, gravity and tile collision, stepped one deterministic tick at a
+  time. The rope you see is a world in it — a pinned tie, a chain of links and a
+  grip at your hands — and the same crate is what the next falling crate, plank
+  or boulder will be built from.
 - **Enemies:** patrolling walkers, chasers that hunt you and stop at ledges,
   flyers on a set flight path, and turrets that shoot along their row.
 - **A reachability check on every level**, so the editor can say "beatable"
@@ -119,7 +136,11 @@ Twelve levels ship with the game, each teaching one thing:
 
 There is also a set of small adversarial levels (`levels/bat-*.json`), one per
 skill the AI is meant to have, and working levels named `levels/scratch-*.json`,
-including the showcase level in the screenshot above.
+including the showcase level in the screenshot above and `levels/scratch-rope.json`,
+a pit crossed only by swinging. The editor's palette has a rope brush that paints a
+**cell** at a time, like every other part of a level: a click hangs one cell of line
+from the ceiling above it, and dragging down grows that line a cell per row (a cell
+inside a line is refused, because it is already rope).
 
 `levels/practice/` is a **generated, certified practice suite**: twenty-four
 levels, six mechanics at four tiers, every one checked by the reachability
@@ -173,8 +194,8 @@ playtest, `E` straight to a run.
 **Edit:** click paints, drag a palette item to place it, right-drag erases,
 wheel zooms, middle-drag (or alt-drag) pans, ctrl+click picks the tile under
 the pointer as your brush, shift-drag draws a line. `Ctrl+S` saves, `Ctrl+Z`
-and `Ctrl+Y` undo and redo, `G` toggles the grid, `F` fits the level, `P`
-plays.
+and `Ctrl+Y` undo and redo, `G` toggles the guides (grid, reachability tint,
+verdict), `F` fits the level, `P` plays.
 
 **Play:** arrows or WASD move and jump, `R` restarts, `G` toggles the
 record-holder ghost, `T` hands control to the planner, `P` or Esc goes back
@@ -193,6 +214,6 @@ findings and the version history of the physics, sensors and scoring are in
 [FINDINGS.md](FINDINGS.md), and the forward plan for the AI is in
 [AI_IMPROVEMENT_PLAN.md](AI_IMPROVEMENT_PLAN.md).
 
-The game is in active development (currently sim 0.16.0, level format v3).
+The game is in active development (currently sim 0.17.0, level format v3).
 Champion files record the exact physics and scoring they were trained under
 and are refused, rather than mis-replayed, if the game has moved on since.

@@ -71,9 +71,9 @@
 
 use sim::physics::AgentAction;
 use sim::reach::{
-    climb_action, extract_platforms, simulate_jump_at, simulate_swim, simulate_vine_climb,
-    swim_action, trajectory_action, vine_action, vine_run, GoalRoutes, JumpHold, LaunchSpeed,
-    Platform, RouteMove, Takeoff,
+    climb_action, extract_platforms, simulate_jump_at, simulate_rope_swing, simulate_swim,
+    simulate_vine_climb, swim_action, trajectory_action, vine_action, vine_run, GoalRoutes,
+    JumpHold, LaunchSpeed, Platform, RopeSwing, RouteMove, Takeoff,
 };
 use sim::{spawn_route_stand, Level, ObservationScratch, Outcome, Rect, Sim, PHYSICS};
 
@@ -220,6 +220,8 @@ impl Plan {
             // A vine's "hold" is its whole climb and a dive is a jump; the field only seeds
             // `Active::hovering`, which the swim and vine scripts do not read.
             RouteMove::Climb { .. } | RouteMove::Vine { .. } => true,
+            // A rope is gripped by a held jump from the approach to the release.
+            RouteMove::Rope { .. } => true,
             RouteMove::Swim { dive, .. } => dive,
         }
     }
@@ -235,6 +237,11 @@ impl Plan {
             // A swim and a vine are entered from the aim at whatever speed the approach built:
             // both scripts take the body over from there, and a pool's own drag is the cap.
             RouteMove::Swim { .. } | RouteMove::Vine { .. } => 0.0,
+            // A rope is different: the line is caught *in the air*, and the sweep launched the
+            // body with a run behind it. Arriving at a walk would put the hands under a line the
+            // swing was never swept from — so the aim asks for the run and the catch comes at the
+            // speed the oracle had.
+            RouteMove::Rope { dir, .. } => dir.sign() * PHYSICS.run_speed,
         }
     }
 
@@ -255,6 +262,9 @@ impl Plan {
             RouteMove::Climb { dir } => climb_action(dir, 0, ph),
             RouteMove::Swim { dir, dive } => swim_action(dir, dive, false, 0),
             RouteMove::Vine { .. } => AgentAction::JumpInPlace,
+            // The press that starts a swing is the jump the catch is made with; the swing's own
+            // clock starts on the tick the line is held.
+            RouteMove::Rope { dir, release } => RopeSwing::default().action(dir, false, release),
         }
     }
 }
@@ -270,13 +280,43 @@ struct Active {
     hovering: bool,
     /// The body has left the ground, so a later touchdown is a landing on this hop.
     airborne: bool,
-    /// `hops_closed` when the attempt started, so a landing can say whether it bought anything.
-    hops_at_start: u32,
     /// The vine's top row, for a vine climb's exit timing — a property of the level, read once
     /// when the plan is pressed.
     vine_top: Option<i32>,
     /// A vine climb has reached its exit and is pressing off it.
     exiting: bool,
+    /// A rope swing's own clock: ticks held since the grab, and whether it has let go.
+    rope: RopeSwing,
+}
+
+/// Whether `stand` is a route hop the walk has not had: the one rule that counts
+/// [`RoutePlay::hops_closed`].
+///
+/// Both places a body can *arrive* use it — the first idle block on a stand, and a landing at the
+/// end of a script — because the second one used to leave the counting to the next block, and a
+/// move that closed a hop then reported "closed no hop" and was remembered as failed. A swing is
+/// where that reads worst: it lands on the far bank and, for the twelve ticks until the next
+/// decision block, the trace says the swing that won the level failed to cross anything.
+/// `false` for a stand with no route to the flag, which the idle branch reports as a hard stop.
+fn close_hop(
+    hops_closed: &mut u32,
+    best_hops: &mut Option<u32>,
+    routes: &GoalRoutes,
+    stand: usize,
+) -> bool {
+    let Some(hops) = routes.hops_to_flag(stand) else {
+        return false;
+    };
+    if best_hops.is_some_and(|best| hops >= best) {
+        return false;
+    }
+    // The **first** stand is where the walk starts, not a hop it made: the spawn is already the
+    // best hop count the body has had, so only a strict improvement after it is a crossing.
+    if best_hops.is_some() {
+        *hops_closed += 1;
+    }
+    *best_hops = Some(hops);
+    true
 }
 
 /// Which stand the body is standing on, if it is standing on one.
@@ -380,6 +420,13 @@ fn press_lands(
             let traj = simulate_vine_climb(level, platforms, x, surface_row, exit);
             return traj.landed_at.and_then(|(c, r)| routes.zone_at(c, r)) == plan.to;
         }
+        RouteMove::Rope { dir, release } => {
+            let traj = simulate_rope_swing(level, platforms, x, surface_row, dir, release);
+            if plan.touches_flag && traj.touched_goal {
+                return true;
+            }
+            return traj.landed_at.and_then(|(c, r)| routes.zone_at(c, r)) == plan.to;
+        }
     };
     let traj = simulate_jump_at(level, platforms, x, surface_row as f32, &takeoff);
     if traj.hit_spike || traj.fell_out {
@@ -450,6 +497,15 @@ fn match_speed(vx: f32, desired: f32, plan: Plan) -> AgentAction {
                 }
             }
             RouteMove::Vine { .. } => AgentAction::Walk,
+            // A rope has to arrive at a run: the catch is a pass at the line, and the sweep's
+            // approach carried the run speed `desired_vx` asks for.
+            RouteMove::Rope { dir, .. } => {
+                if dir.sign() > 0.0 {
+                    AgentAction::Run
+                } else {
+                    AgentAction::Retreat
+                }
+            }
         }
     }
 }
@@ -677,7 +733,15 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
             }
             if a.airborne && grounded {
                 let landed = stand_under(level, &sim);
-                if hops_closed == a.hops_at_start {
+                // A landing is where a hop is *arrived at*, so it is where the hop is counted —
+                // see [`close_hop`]. The attempt's own verdict is this landing's, not the block
+                // after it.
+                let closed_here =
+                    landed.is_some_and(|s| close_hop(&mut hops_closed, &mut best_hops, routes, s));
+                if closed_here {
+                    idle_blocks = 0;
+                }
+                if !closed_here {
                     failed.push(a.plan.key());
                     trace.push(format!(
                         "  tried {:?} from stand {} at x {:.2}: landed on {:?} and closed no hop",
@@ -693,6 +757,7 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
             } else {
                 let on_vine = sim.player().on_vine;
                 let in_water = sim.player().in_water;
+                let on_rope = sim.player().on_rope();
                 let feet = sim.player().y + sim.player().h;
                 held = match a.plan.move_ {
                     RouteMove::Jump(t) => {
@@ -706,6 +771,10 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                     RouteMove::Vine { exit } => {
                         vine_action(exit, on_vine, feet, a.vine_top.unwrap_or(0), &mut a.exiting)
                     }
+                    // The swing's clock is the tick the *body* is on the line, not the tick
+                    // since the press: the same release number is the same moment of the arc on
+                    // every approach, which is what makes the swept plan a plan.
+                    RouteMove::Rope { dir, release } => a.rope.action(dir, on_rope, release),
                 };
                 a.ticks += 1;
             }
@@ -744,9 +813,9 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                         ticks: 0,
                         hovering: p.holds_jump(),
                         airborne: false,
-                        hops_at_start: hops_closed,
                         vine_top,
                         exiting: false,
+                        rope: RopeSwing::default(),
                     });
                     pending = None;
                     blocked_blocks = 0;
@@ -812,12 +881,8 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                 let stand = stand_under(level, &sim);
                 if let Some(s) = stand {
                     match routes.hops_to_flag(s) {
-                        Some(h) => {
-                            if best_hops.is_none_or(|b| h < b) {
-                                if best_hops.is_some() {
-                                    hops_closed += 1;
-                                }
-                                best_hops = Some(h);
+                        Some(_) => {
+                            if close_hop(&mut hops_closed, &mut best_hops, routes, s) {
                                 idle_blocks = 0;
                             }
                         }

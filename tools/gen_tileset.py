@@ -89,6 +89,12 @@ FAMILIES = (
     # the only family drawn *over* other families' art, and keeping them at the end means
     # a new one is an additive change to a generated file rather than a reshuffle.
     ("seams", terrain.blends),
+    # The rope's icon, and a family of one for a reason: a level's rope is drawn as a line by the
+    # view (its shape is its swing), so this sprite exists only to be the rope brush's palette
+    # picture. Appended *after* every other family so that adding it moved no cell anything else
+    # points at — the manifest is generated, but a reshuffle is a diff across the whole file for
+    # one picture that only the palette ever reads.
+    ("rope", terrain.rope_sprites),
 )
 
 

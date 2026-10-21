@@ -24,6 +24,15 @@
 //! player. Modelling it late is what `REVIEW.md` §1.12 is: a level whose only way across a gap was
 //! a pad at the lip was reported *unbeatable* while the population crossed it in a few generations,
 //! because the trajectories were stepped one layer below the rule that owns the pad.
+//!
+//! **The rope is the fourth, and the one that could only be a move of its own.** A swing is not a
+//! jump that goes further: the line is caught in the air, the body's motion *is* the arc while it is
+//! held, and where it lands is decided by the tick the button comes up. So it is a canonical script
+//! ([`RopeSwing`]) swept over its **release tick** from every stand within reach of a line, and the
+//! ballistic sweep gives up any landing that caught one — the rule vines forced, for the same
+//! reason. Before it, a level whose only crossing was a rope was answered "unbeatable" while a
+//! person swung across it in a second; `levels/scratch-rope.json` is that level, and its verdict is
+//! pinned by `the_oracle_crosses_the_scratch_pit_only_with_the_rope`.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +61,31 @@ pub const MAX_CLIMB_TICKS: u32 = 600;
 /// swim cap, which is longer than any shipped level, and it costs the sweep nothing on a
 /// level with no water in it: the script is only run from a platform beside a pool.
 pub const MAX_SWIM_TICKS: u32 = 1200;
+
+/// How long a canonical **rope** move may run: the approach jump, the swing and the flight after
+/// it. Eight seconds at 60 Hz.
+///
+/// A rope move is the jump's budget twice over and then some, because it is three moves in a
+/// coat: a jump to reach the line, a pendulum whose period grows with the line's length (a
+/// fifteen-tile rope takes about 220 ticks to come back round, so the swing cap below is its full
+/// period), and the flight after the release. The cap only ever costs anything on a level that
+/// has a rope in it, because the script is only run from a stand near one.
+pub const MAX_ROPE_TICKS: u32 = 480;
+
+/// Longest swing the sweep releases at, in ticks held.
+///
+/// One **full period** of a fifteen-tile pendulum (2π√(L/g) at the game's gravity), so a release
+/// anywhere the arc visits — the first pass, the far end, the return, the second pass — is in the
+/// sweep. It is a time budget rather than a count of passes for the same reason the climb's is:
+/// the arc's period is the level's business, not the oracle's.
+pub const MAX_SWING_TICKS: u32 = 240;
+
+/// How far along a stand a rope can be caught from, in tiles.
+///
+/// A run jump covers about four tiles of flight and a sprint jump six, so seven either way covers
+/// every approach to a line the sweep could reach at all. It is the move's whole cost: at most
+/// `2 * 7` starts a stand, each run once per release tick.
+const ROPE_START_REACH: i32 = 7;
 
 /// Ticks one swim stroke is held, and how many of them release the jump.
 ///
@@ -101,6 +135,17 @@ pub struct ReachOptions {
     /// only way up is a hanging vine is unreachable — which is what the oracle used to answer
     /// about every one of them, and why no route graph could point a population at a vine.
     pub vine: bool,
+    /// Whether a body may catch a rope and swing on it.
+    ///
+    /// The fourth route, and the one whose *outcome* is momentum rather than position: a rope is
+    /// caught in the air, the body rides an arc, and the move ends when the button is let go. The
+    /// oracle had no model of one at all — a level whose only crossing was a rope read
+    /// **unbeatable** while a player swung it in a second — because a ballistic jump can only ever
+    /// fall past the line, and a jump that holds the button through one used to be recorded as a
+    /// jump that happened to land far away (the same defect vines had, and for the same reason).
+    /// With the move switched off, that level is unreachable again — which is how a crossing is
+    /// pinned as a swing rather than as a jump that got lucky.
+    pub rope: bool,
 }
 
 impl Default for ReachOptions {
@@ -111,6 +156,7 @@ impl Default for ReachOptions {
             spring: true,
             swim: true,
             vine: true,
+            rope: true,
         }
     }
 }
@@ -189,7 +235,13 @@ impl Default for ReachOptions {
 /// changed, which is exactly what a cached answer is keyed on — and the reason is not cosmetic: a
 /// stall at a shuttle's ledge used to answer "the flag cannot be reached from here", so the stall
 /// curriculum refused to derive a practice level and the run was left with nothing.
-pub const MOVE_SET_VERSION: u32 = 10;
+/// v11: **the rope is a move.** A canonical swing — jump at the line holding the button, pump the
+/// arc with the direction, let go at a swept tick — is swept from every stand within reach of a
+/// line, and the jump sweep gives up any landing that caught one (a jump that grabs is a swing, the
+/// same way a jump that grabs a vine is a climb). No terrain rule changed; what changed is that a
+/// level whose only crossing is a rope is no longer answered "unbeatable", so every cached verdict
+/// and route graph from v10 is a miss.
+pub const MOVE_SET_VERSION: u32 = 11;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -449,6 +501,8 @@ pub struct MoveEdge {
     pub swim: Option<(TakeoffDir, bool)>,
     /// The exit side, when this move is a vine climb.
     pub vine: Option<TakeoffDir>,
+    /// The jump's side and the tick the swing lets go at, when this move is a rope swing.
+    pub rope: Option<(TakeoffDir, u32)>,
 }
 
 /// A single canonical jump at a single spot: enough to name the culprit in the
@@ -839,6 +893,21 @@ fn simulate_jump_with(
         // replay can only stumble into. The vine script ([`simulate_vine_climb`]) owns that move,
         // so the ballistic sweep gives its landing up to it.
         if player.on_vine {
+            return Trajectory {
+                landed_on: None,
+                landed_at: None,
+                touched_goal: false,
+                hit_spike: false,
+                fell_out: false,
+                ticks: t + 1,
+            };
+        }
+        // **A jump that catches a rope is not a jump either.** One line, one reason: the ballistic
+        // sweep holds its button through the flight, and a rope in the flight path turns that into
+        // a swing whose landing is the arc's, not the jump's. The rope move owns that landing
+        // ([`simulate_rope_swing`]), and a plan that says "jump" at a take-off that happens to
+        // swing cannot be replayed by standing there and pressing once.
+        if player.on_rope() {
             return Trajectory {
                 landed_on: None,
                 landed_at: None,
@@ -1452,6 +1521,210 @@ fn simulate_vine_climb_with(
     }
 }
 
+/// The tick-by-tick script of a canonical **rope swing**: jump at the line, hold to keep it, lean
+/// into the arc, and let go at a chosen tick.
+///
+/// It is a struct rather than a free function because a swing has a memory — the *release* is a
+/// moment, not a state — and both callers that execute it (the sweep and the replay) have to agree
+/// on that memory to the tick. Four lines of state:
+///
+/// * before the catch the jump is **held**, which is what makes the grip: a rope is caught by a
+///   body that is asking to hold it, and a press that arrived after the hands left the line would
+///   be a jump that fell past a rope;
+/// * on the line the jump is held and the direction is pressed — the pump. Pumping the way the
+///   body jumped is the swing that builds: it leans into the arc it already has;
+/// * at `release` ticks the button comes up, and the body is a projectile again carrying the arc's
+///   velocity. That velocity is the whole point of the object;
+/// * after the release the button stays up. A script that went back to holding would catch the
+///   line on the return pass, which is a different swing and would land somewhere the sweep never
+///   measured.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RopeSwing {
+    /// Ticks the line has been held, counted from the grab.
+    pub ticks: u32,
+    /// The body has let go: the rest of the move is a flight.
+    pub released: bool,
+}
+
+impl RopeSwing {
+    /// One tick of the script. `on_rope` is the sim's own reading of the medium **at the start of
+    /// the tick**, because that is the state a player acts on.
+    pub fn action(&mut self, dir: TakeoffDir, on_rope: bool, release: u32) -> AgentAction {
+        if self.released {
+            return arm(dir, false);
+        }
+        if !on_rope {
+            return arm(dir, true);
+        }
+        if self.ticks >= release {
+            self.released = true;
+            return arm(dir, false);
+        }
+        self.ticks += 1;
+        arm(dir, true)
+    }
+}
+
+/// Where a body standing on `p` can **catch a rope**: a take-off position and the side to jump
+/// toward.
+///
+/// The test is geometric rather than simulated, because a catch is contact: the line has to pass
+/// through the band the hands sweep on a jump from that stand (from hand height up to a jump's
+/// height), and the jump has to come at the line from the side the body is on. Anything further
+/// than [`ROPE_START_REACH`] away is a line this move cannot reach at all, and a line that ends
+/// above the body's hands is one it would have to fall to rather than jump at — a different move,
+/// and not one the sweep claims.
+fn rope_starts(level: &Level, p: &Platform) -> Vec<(f32, TakeoffDir)> {
+    let ph = &PHYSICS;
+    let hands = p.surface_y - ph.player_h;
+    let rise = ph.discrete_max_jump_height();
+    let mut out = Vec::new();
+    for rope in &level.ropes {
+        let (ax, ay) = rope.anchor();
+        if ay > hands + ph.rope_grab || ay + rope.length < hands - rise - ph.rope_grab {
+            continue;
+        }
+        for col in (rope.col - ROPE_START_REACH)..=(rope.col + ROPE_START_REACH) {
+            if col < p.x0 || col > p.x1 {
+                continue;
+            }
+            for dir in [TakeoffDir::Left, TakeoffDir::Right] {
+                // The jump comes at the line, not away from it: a body on the far side of the rope
+                // that presses outward is doing a jump the ballistic sweep already has.
+                if dir.sign() > 0.0 && col as f32 + 0.5 > ax {
+                    continue;
+                }
+                if dir.sign() < 0.0 && col as f32 + 0.5 < ax {
+                    continue;
+                }
+                let x = col as f32 + (1.0 - ph.player_w) * 0.5;
+                if !takeoff_fits(level, x, p.surface_y, ph) {
+                    continue;
+                }
+                out.push((x, dir));
+            }
+        }
+    }
+    out
+}
+
+/// Simulate one canonical rope swing with the real physics stepper.
+///
+/// `release` is the tick the swing lets go at, counted from the grab; the sweep tries every one.
+pub fn simulate_rope_swing(
+    level: &Level,
+    platforms: &[Platform],
+    start_x: f32,
+    surface_row: i32,
+    dir: TakeoffDir,
+    release: u32,
+) -> Trajectory {
+    simulate_rope_swing_with(
+        level,
+        platforms,
+        start_x,
+        surface_row as f32,
+        dir,
+        release,
+        ReachOptions::default(),
+    )
+}
+
+/// [`simulate_rope_swing`] with the oracle's abilities in the caller's hands.
+///
+/// The body starts standing at the take-off carrying a run — a rope is caught in the air, so the
+/// jump has to *reach* the line, and a swing whose approach is a standing jump at a line six tiles
+/// away never gets wet. From there the script is [`RopeSwing`]'s and every tick is the sim's own:
+/// the catch is `Level::rope_grab`, the arc is the tension constraint, the pump and the drag are
+/// the physics' pendulum, and the release is simply the tick the button comes up. The trajectory
+/// ends where any other does, plus one ending of its own: a swing that touches down before it is
+/// released is a move that lands where the arc met the ground.
+fn simulate_rope_swing_with(
+    level: &Level,
+    platforms: &[Platform],
+    start_x: f32,
+    surface_y: f32,
+    dir: TakeoffDir,
+    release: u32,
+    options: ReachOptions,
+) -> Trajectory {
+    let ph = &PHYSICS;
+    let mut player = PlayerState::spawn(level, ph);
+    player.w = ph.player_w;
+    player.h = ph.player_h;
+    player.x = start_x;
+    player.y = surface_y - ph.player_h;
+    player.vx = dir.sign() * LaunchSpeed::Run.achievable(ph, 4.0);
+    player.set_speed_cap(player.vx.abs().max(ph.run_speed));
+    player.vy = 0.0;
+    player.grounded = true;
+    if let Some(death) = hazard_start(level, &player) {
+        return death;
+    }
+
+    let mut script = RopeSwing::default();
+    let mut caught = false;
+    let mut airborne = false;
+    let mut prev_feet = player.y + player.h;
+    for t in 0..MAX_ROPE_TICKS {
+        let on_rope = player.on_rope();
+        let action = script.action(dir, on_rope, release);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        if player.on_rope() {
+            caught = true;
+        }
+        let feet = player.y + player.h;
+        if !player.grounded {
+            airborne = true;
+        }
+        if let Some(end) = trajectory_terminal(level, &player, &contact, t + 1) {
+            return end;
+        }
+        if caught && airborne && !launched {
+            if let Some(deck) = deck_landing(platforms, prev_feet, &player, t + 1) {
+                return deck;
+            }
+        }
+        prev_feet = feet;
+        if contact.landed && airborne && !launched {
+            // A body that came back to the ground without ever meeting the line is not a rope
+            // move at all: it is the approach jump failing, and reporting its landing as a swing
+            // would credit the rope with a crossing no rope took part in.
+            if !caught {
+                return Trajectory {
+                    landed_on: None,
+                    landed_at: None,
+                    touched_goal: false,
+                    hit_spike: false,
+                    fell_out: false,
+                    ticks: 0,
+                };
+            }
+            return landed_trajectory(level, platforms, &player, t + 1);
+        }
+        // The jump has been and gone and the line was never met: give up on this start rather
+        // than spending the rest of the budget bouncing under it.
+        if !caught && t > 2 && player.grounded {
+            return Trajectory {
+                landed_on: None,
+                landed_at: None,
+                touched_goal: false,
+                hit_spike: false,
+                fell_out: false,
+                ticks: 0,
+            };
+        }
+    }
+    Trajectory {
+        landed_on: None,
+        landed_at: None,
+        touched_goal: false,
+        hit_spike: false,
+        fell_out: false,
+        ticks: MAX_ROPE_TICKS,
+    }
+}
+
 /// Whether a body standing with its left edge at `x` and its feet on `surface_row` fits in the
 /// level's open space.
 ///
@@ -1661,6 +1934,7 @@ fn edges_from_all_with(
                     climb: Some(dir),
                     swim: None,
                     vine: None,
+                    rope: None,
                 });
             }
         }
@@ -1693,6 +1967,7 @@ fn edges_from_all_with(
                         climb: None,
                         swim: Some((dir, dive)),
                         vine: None,
+                        rope: None,
                     });
                 }
             }
@@ -1722,6 +1997,7 @@ fn edges_from_all_with(
                         climb: None,
                         swim: None,
                         vine: Some(exit),
+                        rope: None,
                     });
                 }
                 // The third way out of a vine: **over the block it hangs from.** A vine beside a
@@ -1757,6 +2033,50 @@ fn edges_from_all_with(
                         climb: None,
                         swim: None,
                         vine: Some(TakeoffDir::Still),
+                        rope: None,
+                    });
+                }
+            }
+        }
+        // The rope. One script per start and **release tick**, because the tick is the move: the
+        // same catch let go ten ticks apart lands tiles apart, and a sweep that only tried one
+        // moment of the arc would report a pit unreachable that a swing crosses on its far side.
+        // The starts are geometric ([`rope_starts`]), so the cost is a stand's columns around the
+        // line rather than the sweep's whole grid.
+        if options.rope {
+            for (start_x, dir) in rope_starts(level, p) {
+                for release in 0..=MAX_SWING_TICKS {
+                    let traj = simulate_rope_swing_with(
+                        level,
+                        landing,
+                        start_x,
+                        p.surface_y,
+                        dir,
+                        release,
+                        *options,
+                    );
+                    // A start that never met the line is not a move: the script reports an empty
+                    // trajectory rather than the landing of its failed approach jump.
+                    if traj.ticks == 0 {
+                        continue;
+                    }
+                    edges.push(MoveEdge {
+                        traj,
+                        jump: CulpritJump {
+                            from: p.id,
+                            takeoff_x: start_x.floor() as i32,
+                            takeoff_offset: start_x.fract(),
+                            dir,
+                            // The swing is one press held: the take-off is a full jump, and the
+                            // approach carries a run.
+                            hold: JumpHold::Full,
+                            speed: LaunchSpeed::Run,
+                            to: traj.landed_on.filter(|q| *q != p.id),
+                        },
+                        climb: None,
+                        swim: None,
+                        vine: None,
+                        rope: Some((dir, release)),
                     });
                 }
             }
@@ -1823,6 +2143,7 @@ fn edges_at_column(
                         climb: None,
                         swim: None,
                         vine: None,
+                        rope: None,
                     });
                 }
             }
@@ -1846,6 +2167,7 @@ fn edges_at_column(
                     climb: None,
                     swim: None,
                     vine: None,
+                    rope: None,
                 });
             }
         }
@@ -2196,6 +2518,15 @@ pub enum RouteMove {
     /// [`TakeoffDir::Still`] is the third exit: a vine that hangs from a **block** with air above it is
     /// climbed straight up and pulled over, and the body ends on the block rather than beside it.
     Vine { exit: TakeoffDir },
+    /// Jump at this rope holding the button, pump the arc toward `dir`, and let go after
+    /// `release` ticks on the line.
+    ///
+    /// A swing is a *timing* move, which is why the plan carries the tick rather than only a
+    /// direction: the same catch released ten ticks apart lands five tiles apart, and a replay that
+    /// improvised the moment would be describing a move the graph never proved. `dir` is both the
+    /// side the body jumps from and the way it leans, because a swing that is pumped against its
+    /// own approach is a different plan (and the sweep has it as one).
+    Rope { dir: TakeoffDir, release: u32 },
 }
 
 impl RouteEdge {
@@ -2211,6 +2542,9 @@ impl RouteEdge {
             // A vine is a climb: many presses, and only worth taking when nothing simpler
             // reaches the same ledge.
             RouteMove::Vine { .. } => (3, 2),
+            // A rope is one press held and one let go — cheaper than a climb, dearer than a
+            // jump, and a swing that lands where a jump could have is a swing not worth replaying.
+            RouteMove::Rope { .. } => (2, 2),
             // A swim is a walk that happens to be wet: it asks for no jump (a dive asks for one
             // and is still a single press), and its price is time rather than demand.
             RouteMove::Swim { dive, .. } => (0, u8::from(dive)),
@@ -2247,6 +2581,7 @@ impl RouteEdge {
             RouteMove::Jump(Takeoff { dir, .. }) => dir,
             RouteMove::Swim { dir, .. } => dir,
             RouteMove::Vine { exit } => exit,
+            RouteMove::Rope { dir, .. } => dir,
             RouteMove::Climb { .. } => TakeoffDir::Still,
         };
         match dir {
@@ -2621,10 +2956,16 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
                 touches_flag: traj.touched_goal,
                 takeoff_x: jump.takeoff_x as f32 + jump.takeoff_offset,
                 surface_row: stands[i].row,
-                plan: match (edge_move.climb, edge_move.swim, edge_move.vine) {
-                    (Some(dir), _, _) => RouteMove::Climb { dir },
-                    (_, Some((dir, dive)), _) => RouteMove::Swim { dir, dive },
-                    (_, _, Some(exit)) => RouteMove::Vine { exit },
+                plan: match (
+                    edge_move.climb,
+                    edge_move.swim,
+                    edge_move.vine,
+                    edge_move.rope,
+                ) {
+                    (Some(dir), _, _, _) => RouteMove::Climb { dir },
+                    (_, Some((dir, dive)), _, _) => RouteMove::Swim { dir, dive },
+                    (_, _, Some(exit), _) => RouteMove::Vine { exit },
+                    (_, _, _, Some((dir, release))) => RouteMove::Rope { dir, release },
                     _ => RouteMove::Jump(Takeoff::with_runway(
                         jump.dir,
                         jump.hold,
@@ -3248,6 +3589,14 @@ mod tests {
                             edge.takeoff_x,
                             edge.surface_row,
                             exit,
+                        ),
+                        RouteMove::Rope { dir, release } => simulate_rope_swing(
+                            &lv,
+                            &platforms,
+                            edge.takeoff_x,
+                            edge.surface_row,
+                            dir,
+                            release,
                         ),
                     };
                     let landed = traj.landed_at.and_then(|(c, row)| routes.zone_at(c, row));

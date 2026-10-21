@@ -34,10 +34,11 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, Context, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use evo::GaConfig;
+use sim::reach::ReachReport;
 use sim::{Level, Tile};
 
 use crate::atlas::{self, Atlas};
-use crate::editor::{free_level_name, Brush, Editor, Shape};
+use crate::editor::{free_level_name, Brush, BrushGroup, Editor, Shape};
 use crate::help;
 use crate::lab::{self, Lab, Lanes, Packet};
 use crate::panel::{self, BestLine, Command, RunSummary, ViewState};
@@ -52,6 +53,22 @@ use render::chart::HistoryPoint;
 
 /// Height of the fitness chart's strip at the bottom of the window.
 const CHART_PANEL_HEIGHT: f32 = 150.0;
+
+/// A rule between two groups of dock controls.
+///
+/// The bar carries a dozen and more plates, and a row of equals is a row with no order: which of
+/// them act on the document, which on the view of it, and which change what the window *is* are
+/// three different questions. A two-pixel rule answers that without spending a word on it, and it
+/// is the same warm outline the panels and the plates are drawn with, so it reads as a seam in one
+/// object rather than as a divider between two toolbars.
+fn dock_rule(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(11.0, 30.0), Sense::hover());
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        Stroke::new(2.0_f32, theme::EDGE),
+    );
+}
 
 /// How long the shutter between two of the window's four views stays closed.
 ///
@@ -299,7 +316,26 @@ struct EvoApp {
     levels_dir: PathBuf,
     /// Pending grid size, applied by the Resize button.
     pending_size: (i32, i32),
-    grid: bool,
+    /// **The guides: the drawing board under the game.**
+    ///
+    /// One switch rather than four, because the four things it turns on are one idea. A grid, a
+    /// tint over the platforms the spawn cannot reach, a sentence about beatability and a tile
+    /// coordinate under the pointer are all *measurements of a level as a drawing* — and a window
+    /// that shows them while a person is arranging a bush is a window that has stopped being a
+    /// game. Off is the game: the level's own sky, the level's own art, and one lamp that says
+    /// whether it can be beaten.
+    ///
+    /// The pieces are still one key away (`G`), and the details window still opens on the
+    /// numbers, so nothing is lost — what is gone is the assumption that everyone wants graph
+    /// paper all the time.
+    guides: bool,
+    /// Which shelf of the palette is on screen ([`BrushGroup`]).
+    ///
+    /// The palette shows one shelf at a time: eight cells that are the job in hand rather than
+    /// twenty-five that are every job at once. Held here rather than in the editor because it is
+    /// a fact about the *window* — which tab a person is looking at — and the document it edits
+    /// must not carry it into a file.
+    palette_group: BrushGroup,
     /// Whether the inspector is showing the level's *numbers* — its size, what it is made of,
     /// the physics it may ask for — or just its verdict.
     ///
@@ -551,7 +587,8 @@ impl EvoApp {
             thinking: false,
             levels_dir,
             pending_size,
-            grid: true,
+            guides: false,
+            palette_group: BrushGroup::Ground,
             details_open: false,
             dragging: None,
             last_pointer: None,
@@ -613,11 +650,35 @@ impl EvoApp {
     fn opts(&self) -> RenderOpts {
         match self.mode {
             Mode::Edit => RenderOpts {
-                grid: self.grid,
+                grid: self.guides,
                 ..RenderOpts::editing()
             },
             Mode::Play | Mode::Evolve | Mode::Replay => RenderOpts::playing(),
         }
+    }
+
+    /// The editor's backdrop: the game's own sky, or the drawing board's graph paper.
+    ///
+    /// **The default is the game.** A window that opens on a blue grid is a tool looking at a
+    /// document, and the thing being edited is a level in a game — the sky is the one backdrop that
+    /// says so, and it is the same renderer the playtest uses, so what a person draws is what they
+    /// will see. The graph paper is still there, behind [`Self::guides`], for the person checking a
+    /// two-tile gap against something ruled.
+    fn edit_backdrop(&self) -> view::Backdrop {
+        if self.guides {
+            view::Backdrop::Checker
+        } else {
+            view::Backdrop::Sky
+        }
+    }
+
+    /// The reachability tint, when the guides are on.
+    ///
+    /// One place, read by the canvas and by nothing else, so "the overlay is off" is a fact about
+    /// the window rather than a condition repeated wherever a level happens to be drawn — the same
+    /// reason [`Self::edit_backdrop`] is a method instead of an `if` at the call site.
+    fn reach_overlay(&self) -> Option<&ReachReport> {
+        self.guides.then_some(&self.editor.report)
     }
 
     /// The terrain the canvas is actually drawing.
@@ -632,7 +693,7 @@ impl EvoApp {
             Mode::Replay => self
                 .replay
                 .as_ref()
-                .map(|replay| replay.level())
+                .map(|replay| replay.drawn_level())
                 .unwrap_or(&self.editor.level),
             Mode::Evolve => self
                 .lab
@@ -851,7 +912,10 @@ impl EvoApp {
         let p = replay.star_sim().player();
         self.camera.centre = Vec2::new(p.x + p.w * 0.5, p.y + p.h * 0.5);
         self.camera.zoom = self.camera.zoom.max(FOLLOW_ZOOM);
-        self.camera.clamp_to(replay.level(), 2.0);
+        // The terrain the canvas is drawing, not the document the episode was scored against:
+        // the two differ by the holes this run has broken, and a camera clamped to the wrong one
+        // is how a follow-cam and a painter start to disagree about where the level is.
+        self.camera.clamp_to(replay.drawn_level(), 2.0);
     }
 
     // -----------------------------------------------------------------------
@@ -1325,8 +1389,11 @@ impl EvoApp {
         // the key belongs to that view alone. Toggling it everywhere made `G` do two things
         // at once in the evolution view, where it also means "ghosts": the ghosts flipped on
         // screen and the editor's grid silently flipped behind them.
+        // **`G` is the guides, not a bare grid.** The grid is one of the four things the switch
+        // turns on, and a key that flipped one of them while the others stayed would be a window
+        // that could be half a drawing board — which is the state this replaced.
         if grid && self.mode == Mode::Edit {
-            self.grid = !self.grid;
+            self.guides = !self.guides;
         }
         // `f` is one key with two meanings, split by mode rather than by modifier: in the
         // editor it fits the level in the window, and in the views that watch an agent
@@ -1537,13 +1604,33 @@ impl EvoApp {
     /// scored on the run's terrain, and drawing it on an edit made since would be showing
     /// a different game from the one being replayed.
     ///
+    /// And it is the star's terrain as it stands *now* ([`Replay::drawn_level`]), not the
+    /// document it started from: a brittle tile the star has stood through is gone from its
+    /// own copy of the level, and the canvas has to show the hole the debris fell into.
+    ///
     /// `clock` is the replay's own (see the caller), so the level's scenery belongs to the
     /// episode being watched rather than to the window.
     fn canvas_replay(&self, sheet: Sheet<'_>, clock: f32) {
         let Some(replay) = &self.replay else {
             return;
         };
-        view::draw_level(sheet, replay.level(), self.opts(), None, clock);
+        // The ropes are drawn *before* the bodies and from **the star's own chains** — never from
+        // a ghost's. A ghost is a phantom of another run: its grip is a coincidence of where that
+        // body happens to be, and drawing the level's one line from whichever body held it made
+        // the rope snap from the star's arc to a ghost's and back on the ticks the two overlapped.
+        // A viewer watching a replay is watching the star, so the line it hangs from is the star's
+        // — held while it holds, and still moving from the swing it just let go of.
+        let rope_anim = replay.star_anim();
+        view::draw_level_held(
+            sheet,
+            replay.drawn_level(),
+            self.opts(),
+            None,
+            clock,
+            Some(rope_anim.motion()),
+        );
+        // The pieces of the floor this episode broke, between the terrain and the bodies.
+        view::draw_debris(sheet, rope_anim.debris());
         view::draw_replay(sheet, replay);
     }
 
@@ -2120,9 +2207,9 @@ impl EvoApp {
                 ));
                 ui.add_space(2.0);
                 self.dock_tools(ui);
-                ui.add_space(2.0);
+                dock_rule(ui);
                 self.dock_modes(ui);
-                ui.add_space(2.0);
+                dock_rule(ui);
                 self.dock_sound(ui);
                 ui.add_space(2.0);
                 self.dock_readout(ui);
@@ -2159,14 +2246,14 @@ impl EvoApp {
         (self.editor.level.name.clone(), subtitle)
     }
 
-    /// The seven tools down the left of the dock, in the order a person reaches for them.
+    /// The eight tools down the left of the dock, in the order a person reaches for them.
     ///
     /// Every response is collected before any of them is acted on. Acting is what mutates the
     /// editor, and the buttons have to be laid out from one frame's state: a *Save* that moved the
     /// levels directory out from under *Levels…* mid-row would be a bar that disagreed with itself
     /// for a frame, which is exactly the kind of flicker a prototype has and a game does not.
     ///
-    /// **Each is a picture and its own name.** Two of the six show the thing they act on out of the
+    /// **Each is a picture and its own name.** Two of them show the thing they act on out of the
     /// game's own art — the signpost for the pack of levels, the crate a save writes — and the four
     /// the world has no picture of carry a glyph drawn for this row alone (`tools/art/ui.py`): a turn
     /// arrow each way for the stroke history, a bracket frame for *Fit*'s cousin *Details*, a
@@ -2252,6 +2339,26 @@ impl EvoApp {
             "what this level is made of: its size, its materials, and the physics it may ask for",
         )
         .clicked();
+        // **The switch between the game and the drawing board.** A text plate rather than a glyph,
+        // because there is no picture of "the measurements" — and because the word is the whole
+        // explanation a person needs when the grid and the tint appear (see [`Self::guides`]).
+        //
+        // It exists only in the editor: the grid, the tint and the verdict are facts about a
+        // *drawing*, and a view that is running a level has nothing for them to measure. A plate
+        // that cannot do what it says is worse than a plate that is not there — the same rule that
+        // keeps the palette out of the run views.
+        let guides = self.mode == Mode::Edit
+            && ui::icon_button(
+                ui,
+                Some(&self.atlas),
+                None,
+                "Guides",
+                ui::TOOL_SIZE,
+                self.guides,
+                true,
+            )
+            .on_hover_text("the grid, the reachability tint and the verdict — G")
+            .clicked();
         // The one tool in the row that acts on the *document* rather than on a tile: mirroring.
         // It sits after the history because that is where its undo step lands — flip, look, and
         // Ctrl+Z puts it back — and it is a tool rather than a palette cell because it is not
@@ -2295,6 +2402,9 @@ impl EvoApp {
         }
         if details {
             self.details_open = !self.details_open;
+        }
+        if guides {
+            self.guides = !self.guides;
         }
     }
 
@@ -2589,89 +2699,154 @@ impl EvoApp {
         }
     }
 
-    /// The palette: what to paint with, in a wrapped grid of tiles, and the shape the stroke is.
+    /// The line at the foot of the palette: which brush is in hand, and what it does.
     ///
-    /// A wrapped *grid* rather than one brush per row (which is what this was): sixteen
-    /// brushes laid out one to a line is a column the height of the panel that says nothing
-    /// about which of them go together. Wrapped, one material and its brittle self sit side by
-    /// side, the hazard and the pad follow them, and the entities come after — and the panel
-    /// scrolls for the frames where the window is too short to show all of it, which is the
-    /// bargain a grid of this many cells makes rather than a claim that it always fits.
-    ///
-    /// **The panel has one line of type in it, and it names the brush that is on.** The title used
-    /// to be a bare *Parts*, with the selected brush named under the grid and a sentence about
-    /// dragging between them: three separate lines saying what the gold cell and its hover already
-    /// said, in the one panel a person looks at the level beside. What is left is a heading that
-    /// carries the answer to "what am I holding" for the two seconds a person wonders it.
-    ///
-    /// Every cell is a [`ui::icon_button`]'s plate, drawn through the same [`ui::bevel`] as the
-    /// dock's tools: a resting cell is a card, the one under the pointer lifts, the one being
-    /// pressed sinks into its socket, and the selected brush is the palette's gold with its picture
-    /// still legible on it. That is the whole point of having the vocabulary in one place — the
-    /// thing a person paints with and the thing a person opens a level with answer the pointer the
-    /// same way, so the window reads as one object rather than as a panel beside a tool bar.
-    fn palette(&mut self, ui: &mut egui::Ui) {
-        // The one line of type in the panel, and it answers the one question a person asks of a
-        // palette: which brush is in hand. The instruction the window needs — that a brush is
-        // dragged onto the level — is on every cell's own hover, where a person asking "what is
-        // this cell" is already looking, and that is the difference between a game that teaches and
-        // a tutorial that never ends.
-        let heading = match self.editor.brush {
-            Some(brush) => format!("PARTS · {}", brush.label().to_uppercase()),
-            None => "PARTS".to_string(),
+    /// One sentence, in the space the shortest shelf leaves. The alternative was nothing, and a
+    /// panel whose content stops a third of the way down reads as a panel still being built; this
+    /// spends the room on the one fact a person painting needs that a grid of pictures cannot say —
+    /// what the picture *does*.
+    fn brush_note(&self, ui: &mut egui::Ui) {
+        let Some(brush) = self.editor.brush else {
+            return;
         };
-        panel::section(ui, &heading);
-        // Forty-eight rather than forty: a cell drawn as a plate spends [`theme::PRESS_SINK`] and
-        // its lip on the picture, and a sixteen-pixel tile at twenty-six points is the smallest an eye
-        // can still tell a plank from a brick at.
-        let cell = 48.0;
+        ui.add_space(8.0);
+        let (rule, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().hline(
+            rule.x_range(),
+            rule.center().y,
+            Stroke::new(1.0_f32, theme::EDGE),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(brush.label().to_uppercase())
+                .font(FontId::monospace(11.0))
+                .color(theme::TEXT),
+        );
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(brush.about())
+                    .small()
+                    .color(theme::TEXT_DIM),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+    }
+
+    /// The palette: which shelf of parts is on screen, the parts on it, and the shape of the
+    /// stroke.
+    ///
+    /// **One shelf at a time.** Twenty-five cells in one wrapped grid was a wall of tiny pictures:
+    /// the eight materials that build the floor, the six ways a floor can hurt and the four things
+    /// that patrol it are three different jobs, and a person does one of them at a time (see
+    /// [`BrushGroup`]). The tabs say which shelf is up, and the widest shelf is eight cells — so the
+    /// panel is a small ordered thing to look at rather than a box of parts emptied onto a table.
+    ///
+    /// **A shelf is a place to look, not a tool.** Pressing a tab leaves the brush in hand alone,
+    /// which is what makes browsing safe: the gold cell is the answer to "what am I holding", and it
+    /// is on whichever shelf that brush lives on.
+    ///
+    /// **The grid keeps its height whatever the shelf holds.** Ground has eight cells and Clear has
+    /// two, and a stroke switch that jumped up and down as a person changed shelves would be a
+    /// control that moves out from under the pointer that just used it. Three rows are reserved for
+    /// every shelf, so everything below the grid stays put.
+    ///
+    /// Every cell is a plate drawn through the same [`ui::bevel`] as the dock's tools: a resting
+    /// cell is a card, the one under the pointer lifts, the one being pressed sinks into its socket,
+    /// and the selected brush is the window's gold with its picture still legible on it. The tabs
+    /// are the same plate at a smaller size, so "one of these is chosen" reads the same in the
+    /// palette as it does on the bar above it.
+    fn palette(&mut self, ui: &mut egui::Ui) {
+        panel::section(ui, "PARTS");
+        let shown = self.palette_group;
+        // The tabs, wrapped: five words at their plates' own widths do not fit 190 points on one
+        // line, and a clipped tab is a tab nobody can read. The row takes two lines rather than
+        // shrinking a word to where it is a smudge.
         ui.horizontal_wrapped(|ui| {
-            for brush in Brush::ALL {
-                let selected = self.editor.brush == Some(brush);
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(cell, cell), Sense::click_and_drag());
-                let state = ui::PlateState::of(&response, selected, true);
-                let plate = ui::bevel(state, rect);
-                let painter = ui.painter_at(rect);
-                ui::paint(&painter, &plate);
-                // Two layers, when a brush has two. A cracked brush's own icon is a *transparent
-                // crack* — what it paints is a material plus a crack — so its cell draws the
-                // material the crack breaks underneath it, in the same socket and at the same
-                // size. That is the pair the level draws for a brittle tile, and it is what makes
-                // a cracked cell read as "the floor above this one, about to go" rather than as a
-                // scratch on the palette. Every other brush has no base layer and is unchanged.
-                let (icon, flip) = self.brush_icon(brush);
-                for (name, flip) in [
-                    Self::brush_base(brush).map(|n| (n, false)),
-                    Some((icon, flip)),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    if let Ok(uv) = self.atlas.uv(name) {
-                        painter.image(
-                            self.atlas.texture_id(),
-                            plate.content.shrink(2.0),
-                            crate::view::facing(uv, flip),
-                            Color32::WHITE,
-                        );
-                    }
-                }
-                let response = response.on_hover_text(format!(
-                    "{}: {}\nDrag onto the level to place it.",
-                    brush.label(),
-                    brush.about()
-                ));
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+            for group in BrushGroup::ALL {
+                let response = ui::icon_button(
+                    ui,
+                    None,
+                    None,
+                    group.label(),
+                    Vec2::new(8.0, 26.0),
+                    group == shown,
+                    true,
+                )
+                .on_hover_text(group.about());
+                self.remember_tool(group.label(), response.rect);
                 if response.clicked() {
-                    self.editor.brush = Some(brush);
-                    self.editor.message = format!("{} brush", brush.label());
-                }
-                if response.drag_started() {
-                    self.dragging = Some(brush);
-                    self.editor.brush = Some(brush);
+                    self.palette_group = group;
+                    self.editor.message = format!("{} parts", group.label());
                 }
             }
         });
+        ui.add_space(8.0);
+        // Forty-eight rather than forty: a cell drawn as a plate spends [`theme::PRESS_SINK`] and
+        // its lip on the picture, and a sixteen-pixel tile at twenty-six points is the smallest an eye
+        // can still tell a plank from a brick at. Three columns at this size are what a 190-point
+        // panel holds, which is what caps the shelf at a glanceable eight.
+        const CELL: f32 = 48.0;
+        const GAP: f32 = 4.0;
+        const COLUMNS: f32 = 3.0;
+        let rows = ((shown.brushes().len() as f32) / COLUMNS).ceil().max(1.0);
+        let height = rows * CELL + (rows - 1.0) * GAP;
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), height),
+            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+            |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(GAP, GAP);
+                for &brush in shown.brushes() {
+                    let selected = self.editor.brush == Some(brush);
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(CELL, CELL), Sense::click_and_drag());
+                    let state = ui::PlateState::of(&response, selected, true);
+                    let plate = ui::bevel(state, rect);
+                    let painter = ui.painter_at(rect);
+                    ui::paint(&painter, &plate);
+                    // Two layers, when a brush has two. A cracked brush's own icon is a
+                    // *transparent crack* — what it paints is a material plus a crack — so its
+                    // cell draws the material the crack breaks underneath it, in the same socket
+                    // and at the same size. That is the pair the level draws for a brittle tile,
+                    // and it is what makes a cracked cell read as "the floor above this one, about
+                    // to go" rather than as a scratch on the palette. Every other brush has no
+                    // base layer and is unchanged.
+                    let (icon, flip) = self.brush_icon(brush);
+                    for (name, flip) in [
+                        Self::brush_base(brush).map(|n| (n, false)),
+                        Some((icon, flip)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if let Ok(uv) = self.atlas.uv(name) {
+                            painter.image(
+                                self.atlas.texture_id(),
+                                plate.content.shrink(2.0),
+                                crate::view::facing(uv, flip),
+                                Color32::WHITE,
+                            );
+                        }
+                    }
+                    let response = response.on_hover_text(format!(
+                        "{}: {}\nDrag onto the level to place it.",
+                        brush.label(),
+                        brush.about()
+                    ));
+                    if response.clicked() {
+                        self.editor.brush = Some(brush);
+                        self.editor.message = format!("{} brush", brush.label());
+                    }
+                    if response.drag_started() {
+                        self.dragging = Some(brush);
+                        self.editor.brush = Some(brush);
+                    }
+                }
+            },
+        );
         // The shape of the stroke: one tile at a time, or a box, or a line. A switch rather than
         // a menu, because it is changed as often as the brush itself — and the same switch the
         // dock uses for the modes, so the window has one way of saying "one of these three".
@@ -2708,7 +2883,7 @@ impl EvoApp {
         // is in hand: a flyer's beat and a platform's travel are the same knob (how far it
         // goes), a platform also has a width, and a turret has a direction instead. The row is
         // conditional for the scenery picker's own reason — a control that belongs to one brush
-        // is noise in front of the other twenty.
+        // is noise in front of the other twenty-one.
         if matches!(
             self.editor.brush,
             Some(Brush::Flyer | Brush::Turret | Brush::Platform)
@@ -3081,6 +3256,34 @@ impl EvoApp {
         if let Some(plan) = self.editor.plan_verdict() {
             label.on_hover_text(format!("{}\n{}", plan.label(), plan.detail()));
         }
+    }
+
+    /// The verdict as a lamp alone: the same reading, at the size a game owes somebody.
+    ///
+    /// The same colour as [`Self::verdict_lamp`] and the same hover, so the two halves cannot say
+    /// different things about one level — the text is hidden while the guides are off, not the
+    /// fact. A light reads from across the room, which is why this can be the whole of the
+    /// editor's chrome at the bottom of a window that is otherwise just a level.
+    fn verdict_light(&self, ui: &mut egui::Ui) {
+        let colour = if self.editor.beatable() {
+            theme::GOOD_INK
+        } else {
+            theme::BAD_INK
+        };
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        let centre = rect.center();
+        painter.circle_filled(centre, 5.0, colour);
+        painter.circle_stroke(
+            centre,
+            5.0,
+            Stroke::new(1.0_f32, colour.gamma_multiply(0.6)),
+        );
+        let mut response = response.on_hover_text(self.editor.verdict());
+        if let Some(plan) = self.editor.plan_verdict() {
+            response = response.on_hover_text(format!("{}\n{}", plan.label(), plan.detail()));
+        }
+        let _ = response;
     }
 
     /// What the details window holds, which depends on what the window is showing.
@@ -3508,11 +3711,12 @@ impl EvoApp {
             Mode::Edit | Mode::Play | Mode::Evolve => ui.ctx().input(|i| i.time) as f32,
         };
 
-        // The editor draws a document — graph paper behind the level — while watching a
-        // run draws a game: sky, hills and clouds, parallaxed against the camera. The two
-        // are the same renderer, and which one is up is the only difference.
+        // Watching a run draws a game: sky, hills and clouds, parallaxed against the camera. The
+        // editor draws the *same* game by default — its level is a level, not a spreadsheet — and
+        // swaps to graph paper only while the guides are on. The two are the same renderer, and
+        // which one is up is the only difference.
         let (backdrop, level) = match self.mode {
-            Mode::Edit => (view::Backdrop::Checker, &self.editor.level),
+            Mode::Edit => (self.edit_backdrop(), &self.editor.level),
             Mode::Play | Mode::Evolve | Mode::Replay => (
                 view::Backdrop::Sky,
                 self.lab
@@ -3524,24 +3728,38 @@ impl EvoApp {
         view::draw_background(sheet, level, backdrop, clock);
 
         match self.mode {
-            Mode::Edit => view::draw_level(
-                sheet,
-                &self.editor.level,
-                opts,
-                Some(&self.editor.report),
-                clock,
-            ),
+            Mode::Edit => {
+                view::draw_level(sheet, &self.editor.level, opts, self.reach_overlay(), clock)
+            }
             Mode::Play => {
                 if let Some(session) = &self.session {
+                    // The level first, once, with the rope drawn from **the player's** chains. The
+                    // ghost is a recording of another run: it cannot pull the level's line, and a
+                    // rope that switched to the ghost's arc on the ticks it passed the pit read as
+                    // the rope itself twitching. When the player is not holding, its own chains are
+                    // still moving from the swing it just let go of.
+                    let rope_anim = session.anim();
+                    view::draw_level_held(
+                        sheet,
+                        session.sim().level(),
+                        opts,
+                        None,
+                        session.clock,
+                        Some(rope_anim.motion()),
+                    );
+                    // Whatever the player has broken: the piece falls over the hole it left,
+                    // between the level and the body.
+                    view::draw_debris(sheet, session.anim().debris());
                     // The body is drawn *between* the simulator's ticks (`Session::body_at`):
                     // the sim runs at 60 Hz whatever the display does, and drawing the last
                     // tick's position is what made the playtest stutter on a fast screen.
-                    view::draw_sim_at(
+                    view::draw_agents_at(
                         sheet,
                         session.sim(),
-                        opts,
                         session.clock,
+                        Color32::WHITE,
                         session.anim(),
+                        true,
                         Some(session.body_at()),
                     );
                     // The champion beside the player, translucent so it never hides them:
@@ -3741,7 +3959,23 @@ impl EvoApp {
         } else {
             self.opts()
         };
-        view::draw_level(sheet, lab.level(), opts, None, clock);
+        // The drawn rope belongs to the agent on it, and this view draws a field of them: the
+        // champion's line while it hangs, otherwise the best-ranked lane that is holding one. Every
+        // lane steps its own chains (they live in its [`view::AgentAnim`]), so whichever is picked
+        // the line is the one that body is actually swinging.
+        let rope_anim = self.lanes.as_ref().and_then(|lanes| {
+            let bodies =
+                (0..lanes.len()).map(|i| (lanes.lanes()[i].rank, lanes.sim(i).player().on_rope()));
+            Some(lanes.anim(view::rope_owner(bodies)?))
+        });
+        view::draw_level_held(
+            sheet,
+            lab.level(),
+            opts,
+            None,
+            clock,
+            rope_anim.map(view::AgentAnim::motion),
+        );
 
         if let Some(generation) = self.view.scrub {
             // A recorded route replaces the live lanes rather than joining them: the two
@@ -3874,6 +4108,12 @@ impl EvoApp {
         // exists to prevent. A plain right-click has no modifier and still erases.
         if picking && (primary || secondary) {
             self.editor.pick_at(tx, ty);
+            // The palette follows the tool it just took. An eyedropper can pick up a brush that
+            // lives on a shelf the person is not looking at, and a gold cell nobody can see is a
+            // palette that disagrees with what is in hand.
+            if let Some(brush) = self.editor.brush {
+                self.palette_group = brush.group();
+            }
         } else if secondary {
             // Right-click erases whatever is under the cursor, regardless of the brush.
             self.editor.erase_at(tx, ty);
@@ -4112,7 +4352,17 @@ impl EvoApp {
                     // The editor's line: the verdict, then only what just happened. Its message is
                     // empty while nothing is happening on purpose — a bar that talks to itself is
                     // chatter — which leaves the lamp and the word, and those never stop mattering.
-                    self.verdict_lamp(ui);
+                    //
+                    // **The word is a guide too.** "beatable: flag reachable over 1 platform(s)" is
+                    // a measurement of a drawing, and it belongs with the grid and the tint rather
+                    // than under a level a person is arranging bushes in. What stays is the lamp:
+                    // one light that says whether the thing can be finished, with the sentence on
+                    // its hover, which is the amount of that fact a game owes somebody.
+                    if self.guides {
+                        self.verdict_lamp(ui);
+                    } else {
+                        self.verdict_light(ui);
+                    }
                     ui.label(
                         egui::RichText::new(self.editor.message.clone()).color(theme::TEXT_DIM),
                     );
@@ -4126,12 +4376,17 @@ impl EvoApp {
                 // the tertiary ink is not cleared for: readouts on the well take `TEXT_DIM`.
                 ui.label(egui::RichText::new("? keys").small().color(theme::TEXT_DIM))
                     .on_hover_text("the keys for this view — F1 does the same");
-                if let Some((tx, ty)) = self.hover_tile {
-                    ui.label(
-                        egui::RichText::new(format!("tile ({tx}, {ty})"))
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
+                // A coordinate is a measurement, and it is one of the guides: the level is a
+                // picture while a person places a bush, and a readout of which cell the pointer is
+                // on is the drawing board talking. On its hover the guides say where to find it.
+                if self.guides {
+                    if let Some((tx, ty)) = self.hover_tile {
+                        ui.label(
+                            egui::RichText::new(format!("tile ({tx}, {ty})"))
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
                 }
                 if let Some(warning) = &self.warning {
                     // The warning's *ink*, not its fill: `WARN` is 1.5:1 on this surface and is a
@@ -4348,6 +4603,13 @@ impl EvoApp {
                 // chart — are another, which is the whole of what stops this reading as a tool.
                 .frame(theme::panel_frame())
                 .show(ctx, |ui| {
+                    // The shelf's own line, pinned to the panel's foot. It is the one place in the
+                    // window that can say what the held brush *is* without taking room from
+                    // anything else, and the space under a short shelf is otherwise a panel that
+                    // has finished — which reads as an unfinished one.
+                    egui::TopBottomPanel::bottom("palette-foot")
+                        .frame(egui::Frame::new())
+                        .show_inside(ui, |ui| self.brush_note(ui));
                     egui::ScrollArea::vertical().show(ui, |ui| self.palette(ui))
                 });
         }
@@ -4365,6 +4627,12 @@ impl EvoApp {
             egui::SidePanel::right("run")
                 .frame(theme::panel_frame())
                 .default_width(310.0)
+                // A run's column is a *column*, not a box that fits whatever is in it. egui sizes
+                // a side panel to its content, and a panel with a ScrollArea shrinks to the widest
+                // row, so this one used to come out about 230 points wide — narrow enough that the
+                // pace row ran off the edge, and narrow enough that the level was laid out against
+                // a width it did not have. The floor is what makes it the width it says it is.
+                .min_width(300.0)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| match self.mode {
                         Mode::Evolve => self.evolve_panel(ui),
@@ -5029,5 +5297,91 @@ mod tests {
         assert!(titles[1].contains("playtest"), "{}", titles[1]);
         assert!(titles[2].contains("evolve"), "{}", titles[2]);
         assert!(titles[3].contains("replay"), "{}", titles[3]);
+    }
+
+    /// **The editor opens on the game, not on the drawing board.**
+    ///
+    /// The window used to open on blue graph paper with a tile grid over it and a reachability
+    /// tint on top — three measurements of a drawing, before a person had drawn anything. What
+    /// opens now is the level under the same sky the playtest runs it under, with one lamp that
+    /// says whether it can be finished; the measurements are one key away.
+    #[test]
+    fn the_editor_opens_with_the_guides_off_and_that_is_the_game() {
+        let (_ctx, root, app) = window("guides-off");
+        assert!(!app.guides, "the guides are something a person asks for");
+        assert!(!app.opts().grid, "so no tile grid is drawn");
+        assert_eq!(
+            app.edit_backdrop(),
+            view::Backdrop::Sky,
+            "the canvas is the game's own sky, not an editor's graph paper"
+        );
+        assert!(
+            app.reach_overlay().is_none(),
+            "and no platform wears a reachability tint"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `G` is **the whole drawing board**: the grid, the tint, the verdict's sentence and the tile
+    /// coordinate, on and off together.
+    ///
+    /// Four switches would be four states a person can be half-way into, and "half a drawing
+    /// board" is exactly the window this replaced. The key is a switch, not a one-way door: one
+    /// press back is the game again.
+    #[test]
+    fn g_turns_the_whole_drawing_board_on_and_off() {
+        let (ctx, root, mut app) = window("guides-key");
+        let g = || egui::Event::Key {
+            key: egui::Key::G,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame(&ctx, &mut app, vec![g()]);
+        assert!(app.guides, "G turns the guides on");
+        assert!(app.opts().grid);
+        assert_eq!(app.edit_backdrop(), view::Backdrop::Checker);
+        assert!(app.reach_overlay().is_some());
+
+        frame(&ctx, &mut app, vec![g()]);
+        assert!(!app.guides, "and G turns them off again");
+        assert!(!app.opts().grid);
+        assert_eq!(app.edit_backdrop(), view::Backdrop::Sky);
+        assert!(app.reach_overlay().is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **A palette tab is a place to look, not a tool.** Pressing one changes the shelf on screen
+    /// and leaves the brush in hand alone — the gold cell is the answer to "what am I holding", and
+    /// it is wherever that brush lives.
+    #[test]
+    fn a_palette_tab_changes_the_shelf_and_not_the_brush() {
+        let (ctx, root, mut app) = window("palette-shelves");
+        assert_eq!(
+            app.palette_group,
+            BrushGroup::Ground,
+            "the floor comes first"
+        );
+        let held = app.editor.brush;
+        assert_eq!(
+            app.palette_group.brushes().len(),
+            8,
+            "the ground shelf is the four materials and their brittle twins"
+        );
+
+        let hazards = centre_of(&app, "Hazards");
+        click(&ctx, &mut app, hazards);
+        assert_eq!(app.palette_group, BrushGroup::Hazard);
+        assert_eq!(
+            app.editor.brush, held,
+            "browsing a shelf picked up a brush nobody asked for"
+        );
+        assert_eq!(
+            app.palette_group.brushes().len(),
+            6,
+            "and the shelf on screen is the hazards, not the ground"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

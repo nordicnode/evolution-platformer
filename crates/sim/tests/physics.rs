@@ -1670,6 +1670,19 @@ fn a_cracked_tile_holds_a_body_up_and_then_takes_itself_out_of_the_level() {
         "a broken tile must not redraw the route table: the flag it points at has not moved"
     );
 
+    // **The hole and the piece that fell out of it are one event.** `Sim::broken` is the list the
+    // state hash folds in, and it now says *what* left as well as where: a view draws the piece in
+    // its own material, and by the time it hears about the break the cell is already empty.
+    assert_eq!(
+        sim.broken(),
+        &[sim::BrokenTile {
+            col: 1,
+            row: 7,
+            tile: Tile::Cracked,
+        }],
+        "a broken tile is recorded with the material it was made of"
+    );
+
     // A tile the body never stood on never lights: brittleness is a trap for the body that *chooses*
     // to cross it, not a floor with a countdown on it.
     assert_eq!(

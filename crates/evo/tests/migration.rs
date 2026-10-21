@@ -6,12 +6,12 @@
 //! If the growth is what it claims, the two runs agree on every frame, the outcome and the
 //! frontier — not approximately, exactly.
 //!
-//! **Why the growth is hypothetical here.** Sensors v14 was built and measured, and it does not
-//! land in this pass: the plan's rule 1 puts Item 3 behind Item 2, whose batched forward pass came
-//! in below its gate, and the battery levels it exists for have not moved. The machinery is the
-//! part that survives, so the proof grows the current layout by eight columns instead of reading a
-//! v13 file into a v14 build. When a real bump lands, `ChampionFile::migrate_sensors` is the same
-//! call this test exercises by hand.
+//! **Why the growth is still hypothetical here.** Sensors v14 (the rope's three slots) has landed,
+//! and the committed fixture is a v14 champion — `the_saved_l11_champion_survives_growth...`
+//! asserts that, because a fixture left one layout behind would be testing the migration instead of
+//! the invariance. The proof therefore grows *this* layout by the eight columns a next append-only
+//! bump would add, which is the machine every future bump reuses: `ChampionFile::migrate_sensors`
+//! is the same call this test exercises by hand.
 //!
 //! The l11 champion is the right fixture because it already carries feedback-16 memory, so the
 //! growth has to preserve the recurrent block as well as the feedforward rows.

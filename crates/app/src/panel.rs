@@ -703,7 +703,11 @@ fn pace_row(ui: &mut egui::Ui, atlas: Option<&Atlas>, current: u32, unit: &str) 
         {
             step = down;
         }
-        reading(ui, format!("{}x", SPEEDS[rung]), unit);
+        ui.label(
+            egui::RichText::new(format!("{}x", SPEEDS[rung]))
+                .monospace()
+                .color(theme::TEXT),
+        );
         let up = pace_step(rung, true);
         if ui::icon_button(ui, atlas, None, "+", SPEED_STEP, false, up != 0)
             .on_hover_text("one rung faster — the plus key")
@@ -712,6 +716,13 @@ fn pace_row(ui: &mut egui::Ui, atlas: Option<&Atlas>, current: u32, unit: &str) 
             step = up;
         }
     });
+    // The description goes *under* the stepper rather than beside it. Beside it, the replay's
+    // "the pace it plays at, in real time" made the row wider than the panel, and a panel that is
+    // sized to its content grows to fit the row; the canvas is then laid out against the width the
+    // panel reserved a frame earlier and the two disagree. Under it, the phrase wraps in the column
+    // like every other sentence in the panel, and the two buttons stay a stepper instead of being
+    // pushed apart by the words between them.
+    small_dim(ui, unit);
     step
 }
 
@@ -825,7 +836,14 @@ pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
 
 /// One reading, drawn: the number big, its unit small and dim after it.
 fn reading_line(ui: &mut egui::Ui, reading: &Reading) {
-    ui.horizontal(|ui| {
+    // Wrapped, not a plain row: a reading with a long qualifier — "4 / 200 reached the flag — 1 on
+    // every trial" is the one that does it — was wider than the panel, and a row that cannot wrap
+    // makes the *panel* wider instead. egui sizes a side panel to its content, so the panel grew
+    // past the window, the canvas was laid out against the width it had reserved a frame earlier,
+    // and the two disagreed: the level painted over the panel's left edge while the panel's text
+    // ran off the screen. Letting the qualifier fall under the number keeps both inside the width
+    // the panel asked for.
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             egui::RichText::new(reading.value.clone())
                 .font(FontId::new(HERO_FONT, egui::FontFamily::Monospace))
@@ -3172,5 +3190,76 @@ mod tests {
         let idle = draw_panel(&summary, &mut view);
         assert_eq!(idle.speed, 0);
         assert_eq!(view.speed, SPEEDS[speed_rung(view.speed)]);
+    }
+
+    /// Draw one panel headlessly at a stated content width, and report the rectangle it used.
+    ///
+    /// The rectangle is the *content's* own idea of how wide it is, before any clipping — which is
+    /// exactly what egui uses to size a side panel. A row that cannot wrap therefore shows up here
+    /// as a frame wider than the column it was given.
+    fn used_rect(width: f32, mut draw: impl FnMut(&mut egui::Ui)) -> Rect {
+        let ctx = egui::Context::default();
+        let mut used = Rect::NOTHING;
+        let size = Vec2::new(width, 700.0);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::default())
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            draw(ui);
+                            used = ui.min_rect();
+                        });
+                    });
+            },
+        );
+        used
+    }
+
+    /// Neither panel is wider than the column it is drawn in.
+    ///
+    /// This is the bug the README's screenshots caught: a row that cannot wrap does not get clipped
+    /// by a side panel, it *sizes* the panel. The run's panel came out about 230 points wide while
+    /// the level beside it was laid out against the width it had reserved a frame earlier, so the
+    /// canvas painted over the panel's left edge and the panel's text ran off the window. Both the
+    /// reading rows and the pace description wrap now; 280 is the panel's content width at its
+    /// 300-point floor.
+    #[test]
+    fn neither_panel_grows_past_the_column_it_is_drawn_in() {
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
+        let mut won = packet(points.clone(), Vec::new(), true);
+        // The strict reading — "reached the flag — 1 on every trial" — is the longest qualifier the
+        // panel can carry, and the one that used to make it grow.
+        won.solved = 1;
+        let summary = RunSummary::new(&won, &points);
+        let mut view = ViewState::default();
+        let used = used_rect(280.0, |ui| {
+            lab_panel(ui, None, &summary, &mut view, false);
+        });
+        assert!(
+            used.width() <= 280.5,
+            "the run's panel is {:.1} points wide: {used:?}",
+            used.width()
+        );
+
+        // The replay's own long row is its pace description — "the pace it plays at, in real time"
+        // — which sat beside the stepper and widened the panel the same way.
+        let level = sim::Level::starter("panel-width", 40, 8);
+        let scored = crate::lab::scored_packet(&level, "panel-width");
+        let mut replay = crate::replay::Replay::new(&scored, &level, &evo::EvalConfig::default())
+            .expect("a scored generation holds an agent to replay");
+        let view = ViewState::default();
+        let used = used_rect(280.0, |ui| {
+            replay_panel(ui, None, &mut replay, &view);
+        });
+        assert!(
+            used.width() <= 280.5,
+            "the replay's panel is {:.1} points wide: {used:?}",
+            used.width()
+        );
     }
 }

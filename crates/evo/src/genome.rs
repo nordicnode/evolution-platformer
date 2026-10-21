@@ -1214,19 +1214,19 @@ mod tests {
     #[test]
     fn default_shape_matches_the_plan() {
         let s = default_shape();
-        // v13: 108 inputs (the plan's 90, plus wall side/wall slide/sprint charge from v2,
+        // v14: 111 inputs (the plan's 90, plus wall side/wall slide/sprint charge from v2,
         // plus the goal's vertical component and the leftward gap probe, plus the nearest
         // walker's heading, plus the route's next waypoint, plus the body's sub-tile phase,
-        // plus v13's clock, next-event eta/position, mover velocity/phase and press timing)
-        // and eleven
+        // plus v13's clock, next-event eta/position, mover velocity/phase and press timing,
+        // plus v14's on-rope flag and the two offsets to the nearest line) and eleven
         // outputs
         // (the plan's six, plus sprint, sprint_jump, retreat_jump and the two leftward
         // sprinting arms). The pin is the *recipe* — one hidden layer of sixteen,
         // argument-max output — with the two ends read from the sim so this test cannot
         // disagree with the action table or the sensor layout.
         assert_eq!(s.inputs, N_INPUTS);
-        // The recipe's own width, written down: 81 patch cells plus twenty-seven scalars.
-        assert_eq!(s.inputs, 108);
+        // The recipe's own width, written down: 81 patch cells plus thirty scalars.
+        assert_eq!(s.inputs, 111);
         assert_eq!(s.hidden, vec![16]);
         assert_eq!(s.outputs, N_OUTPUTS);
         assert_eq!(s.outputs, 11);
@@ -1239,7 +1239,7 @@ mod tests {
         assert_eq!(s.n_genes(), N_INPUTS * 16 + 16 * 11 + 16 + 11);
         assert_eq!(
             s.n_genes(),
-            1931,
+            1979,
             "the recipe's own gene count, written down"
         );
         s.validate().expect("shape is valid");

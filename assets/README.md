@@ -67,6 +67,7 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `lava_wall_l`, `lava_wall_r` | the rim of a lava pool against open air: the crust that forms where the melt meets nothing. Another mirrored pair |
 | `lava_ball` | one ball of lava in flight, drawn to fill its cell because the cell *is* its hitbox: the thing that kills a body is the thing the player can see |
 | `vine` | one cell of climbable vine (`Tile::Vine`, `V`): a stem continuous from row 0 to row 15 so a shaft of them reads as one vine, with leaves alternating down it. Not solid; jump climbs it and releasing slides down it |
+| `rope` | the rope brush's palette picture: a twisted cord tied under a tile, a knot half way down and a loop at the free end, in the three shades (`ROPE_CORD`, `ROPE_LIGHT`, `ROPE_KNOT`) the view draws a rope with. A rope in a level is **drawn**, not tiled (`crate::view::draw_ropes`) — its shape is its swing — so this cell exists for the palette alone |
 | `cracked_ground`, `cracked_sand`, `cracked_brick`, `cracked_wood` | one material's crack, on an otherwise transparent cell, drawn **over** that material's own tile by `crate::view`. The tile it marks is ordinary solid ground until a body stands on it, and then it leaves the level (`sim::physics::CRUMBLE_TICKS`) |
 | `player_idle_a`, `player_idle_b` | the runner at rest, breathing |
 | `player_run_1`, `player_run_2`, `player_run_3`, `player_run_4`, `player_run_5`, `player_run_6` | the six-frame run cycle |

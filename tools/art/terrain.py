@@ -1479,6 +1479,68 @@ def vine() -> Image.Image:
     return img
 
 
+def rope() -> Image.Image:
+    """A rope hanging from the tile above: a twisted cord, a knot and a loop at its end.
+
+    The palette's picture of the rope brush, and the only *picture* of a rope in the game: in a
+    level the view draws the line itself ([`crate::view::draw_ropes`]), because a rope's shape is
+    the shape of its swing and a sprite is one pose. So this has to say "rope" at palette size and
+    nothing else has to — which is why it is a twist, a knot and a loop rather than a straight
+    strand. A plain vertical line reads as a wire, and the vine beside it in the palette is the
+    other thing a hanging line in this tileset can be, with leaves this deliberately has none of.
+
+    The three shades are the view's own (`ROPE_CORD`, `ROPE_LIGHT` and `ROPE_KNOT` are these wood
+    tones): a brush whose icon is a different brown from the line it paints is two ropes.
+    """
+    img = cell()
+    px = img.load()
+
+    def put(x: int, y: int, colour) -> None:
+        px[x, y] = colour
+
+    # Tied under a ceiling: a bar of a knot across the top, and the strand leaving its underside.
+    for x in range(5, 11):
+        put(x, 0, WOOD_DARK)
+    put(6, 0, WOOD_TOP)
+    for x in range(6, 10):
+        put(x, 1, WOOD_MID)
+    # The twist: three pixels wide, with the highlight stepping from one side of the cord to the
+    # other every three rows. That step is the whole of the rope's texture — a column of one shade
+    # is a cable, and a two-row checker is noise at this size.
+    step = [(8, 2), (8, 3), (7, 4), (7, 5), (8, 7), (8, 8), (7, 9), (7, 10)]
+    for y in range(2, 11):
+        for x in (7, 8):
+            put(x, y, WOOD_MID)
+        put(9, y, WOOD_DARK)
+    for x, y in step:
+        put(x, y, WOOD_LIGHT)
+    # A knot half way down, then the loop its free end is turned into: the two things the view's
+    # own drawing uses to stop a line reading as a wire, said again here at eight pixels wide.
+    for x in range(6, 11):
+        put(x, 6, WOOD_DARK)
+    put(6, 6, WOOD_TOP)
+    put(10, 6, WOOD_TOP)
+    put(7, 6, WOOD_MID)
+    for x in range(6, 10):
+        put(x, 11, WOOD_DARK)
+    put(6, 11, WOOD_LIGHT)
+    for y in (12, 13, 14):
+        put(6, y, WOOD_LIGHT)
+        put(9, y, WOOD_DARK)
+    for x in range(6, 10):
+        put(x, 15, WOOD_DARK)
+    put(7, 15, WOOD_MID)
+    put(8, 15, WOOD_MID)
+    put(7, 12, WOOD_DARK)
+    put(8, 12, WOOD_DARK)
+    return img
+
+
+def rope_sprites() -> list[tuple[str, Image.Image]]:
+    """The rope's own picture, as a family of one (see [`rope`] and `gen_tileset.FAMILIES`)."""
+    return [("rope", rope())]
+
+
 def sprites() -> list[tuple[str, Image.Image]]:
     """Every terrain sprite, in the order the manifest lists them."""
     out: list[tuple[str, Image.Image]] = []

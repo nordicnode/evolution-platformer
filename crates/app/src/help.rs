@@ -78,7 +78,7 @@ const EDIT: &[Key] = &[
     },
     Key {
         keys: "G",
-        what: "the tile grid",
+        what: "the guides — grid, reachability and the verdict",
     },
     Key {
         keys: "F",

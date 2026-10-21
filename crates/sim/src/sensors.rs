@@ -168,7 +168,18 @@ use crate::physics::{AgentAction, Flyer, LavaBall, Physics, PlayerState, Shot, W
 ///
 /// v11 read the twin triple and the patch's one-way value for the new kinds; v12 is the same
 /// shape of change for the tiles themselves.
-pub const VERSION: u32 = 13;
+///
+/// **v14 appends the rope** at indices 108 to 110: whether the body is holding one, where the
+/// nearest line hangs (`rope_dx` to the line, `rope_dy` to its end) and nothing else. It is a
+/// new *slot* rather than a new reading of an old one, because a rope is not a tile: the patch
+/// has no cell to put it in, and the one thing a policy has to know about a rope is *where the
+/// line is relative to the hands*, which is what the pair of offsets says.
+///
+/// The three slots are appended, so a champion grown from the previous layout keeps every
+/// weight where it was and reads zeros where the rope would be — see `Genome::grown_to_inputs`.
+/// That is the whole reason growth is append-only: the levels that have no rope observe exactly
+/// the same vector they observed at v13, and a champion trained on one still plays it.
+pub const VERSION: u32 = 14;
 
 /// Tiles per side of the local patch (`9×9 = 81` inputs).
 pub const PATCH_RADIUS: i32 = 4;
@@ -189,7 +200,7 @@ pub const PATCH_RADIUS: i32 = 4;
 /// **v10 appends the body's sub-tile phase (`phase_x, phase_y`)** at indices 98 and 99: the part of
 /// the body's position inside its own tile, which is the one positional quantity no other slot
 /// carries once the goal vector is clamped. See [`VERSION`] for the measurement.
-pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1 + 1 + 2 + 2 + 8;
+pub const N_INPUTS: usize = 81 + 2 + 1 + 1 + 2 + 1 + 2 + 1 + 3 + 1 + 1 + 2 + 2 + 8 + 3;
 
 /// Inputs appended in v2: wall side, wall slide, sprint charge.
 pub const N_ABILITY_INPUTS: usize = 3;
@@ -207,6 +218,13 @@ pub const ENEMY_VIEW_DISTANCE: f32 = 8.0;
 /// fourth tile is visible in the 9×9 grid but not worth a dedicated scalar, which is the
 /// division of labour between the patch and the feature slots.
 pub const GAP_LOOKAHEAD: i32 = 3;
+
+/// Normalizer for the nearest rope's offsets (tiles).
+///
+/// Eight, like [`ENEMY_VIEW_DISTANCE`] and for the same kind of reason: a rope is only useful
+/// within a jump of the body, and an offset that saturated over the whole level would tell a
+/// policy "a rope exists somewhere" rather than "a rope is a jump to my right".
+pub const ROPE_VIEW_DISTANCE: f32 = 8.0;
 
 /// Normalizer for the goal vector (tiles).
 ///
@@ -604,6 +622,30 @@ pub fn observe_scene(
         (scene.air_ticks as f32 / 120.0).clamp(0.0, 1.0)
     };
 
+    // ---- the rope -------------------------------------------------------
+    //
+    // `on_rope` is a state, and the pair after it is the **aim**: the horizontal offset to the
+    // nearest line and the vertical offset to that line's end. Both are relative to the body's
+    // centre, so a policy can answer "is the line in front of me and is its end still below my
+    // hands" without a second sense — which is the question a grab is made of. The nearest line
+    // is the one whose segment passes nearest the body, measured to the line itself rather than
+    // to its anchor, because the anchor may be ten tiles up and out of sight.
+    out[108] = if player.on_rope() { 1.0 } else { 0.0 };
+    let mut nearest_rope: Option<(f32, f32, f32)> = None;
+    for rope in &level.ropes {
+        let (ax, ay) = rope.anchor();
+        let end = ay + rope.length;
+        let (bx, by) = (cx, cy.clamp(ay, end));
+        let d2 = (ax - bx) * (ax - bx) + (by - cy) * (by - cy);
+        if nearest_rope.is_none_or(|(_, _, best)| d2 < best) {
+            nearest_rope = Some((ax - cx, end - cy, d2));
+        }
+    }
+    if let Some((dx, dy, _)) = nearest_rope {
+        out[109] = (dx / ROPE_VIEW_DISTANCE).clamp(-1.0, 1.0);
+        out[110] = (dy / ROPE_VIEW_DISTANCE).clamp(-1.0, 1.0);
+    }
+
     debug_assert!(out.iter().all(|v| v.is_finite()));
     out
 }
@@ -682,6 +724,9 @@ pub fn input_names() -> Vec<String> {
     names.push("mover_vy".into());
     names.push("mover_phase".into());
     names.push("ground_air".into());
+    names.push("on_rope".into());
+    names.push("rope_dx".into());
+    names.push("rope_dy".into());
     debug_assert_eq!(names.len(), N_INPUTS);
     names
 }

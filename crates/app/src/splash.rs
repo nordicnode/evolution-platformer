@@ -1259,12 +1259,29 @@ fn title(painter: &Painter, rect: Rect, clock: f32) {
 /// cutting into it would hide the thing the screen is showing.
 fn vignette(painter: &Painter, rect: Rect) {
     let clear = Color32::from_rgba_unmultiplied(STAGE_INK.r(), STAGE_INK.g(), STAGE_INK.b(), 0);
+    // Two quad helpers, because a band fades along one axis and it matters which. A band with a
+    // `top` and a `bottom` colour fades *down* the window, which is what the two horizontal
+    // bands want; the side bands want to fade *across* their own width, and were first built
+    // with the same helper. That painted a fixed-width strip whose ink started strong at the top
+    // of the window and thinned to nothing at the bottom, with a hard vertical edge where the
+    // strip ended — a visible seam down a skylight, which is the one thing a vignette must not
+    // have. The corners come out darker than either band alone, which is the point of them.
     let band = |x0: f32, x1: f32, y0: f32, y1: f32, top: Color32, bottom: Color32| {
         let mut mesh = egui::Mesh::default();
         mesh.colored_vertex(Pos2::new(x0, y0), top);
         mesh.colored_vertex(Pos2::new(x1, y0), top);
         mesh.colored_vertex(Pos2::new(x1, y1), bottom);
         mesh.colored_vertex(Pos2::new(x0, y1), bottom);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(mesh);
+    };
+    let side = |x0: f32, x1: f32, y0: f32, y1: f32, left: Color32, right: Color32| {
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(Pos2::new(x0, y0), left);
+        mesh.colored_vertex(Pos2::new(x1, y0), right);
+        mesh.colored_vertex(Pos2::new(x1, y1), right);
+        mesh.colored_vertex(Pos2::new(x0, y1), left);
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(0, 2, 3);
         painter.add(mesh);
@@ -1287,7 +1304,7 @@ fn vignette(painter: &Painter, rect: Rect) {
         clear,
         ink(70),
     );
-    band(
+    side(
         rect.left(),
         rect.left() + rect.width() * 0.10,
         rect.top(),
@@ -1295,7 +1312,7 @@ fn vignette(painter: &Painter, rect: Rect) {
         ink(48),
         clear,
     );
-    band(
+    side(
         rect.right() - rect.width() * 0.10,
         rect.right(),
         rect.top(),

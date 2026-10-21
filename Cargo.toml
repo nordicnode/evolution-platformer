@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/dynamics",
     "crates/sim",
     "crates/evo",
     "crates/render",
@@ -124,13 +125,23 @@ members = [
 # whenever it presses into a vine — so the trio moves to sim 0.15.0. Sensors and fitness are
 # unchanged: the patch already said where the vine is, and what changed is what the body does on
 # it.
+# 0.17.0: **the rope.** A line hanging from a ceiling that an airborne body catches with its
+# hands and swings on: `rope_pump` when a direction is pressed, gravity, and then one position
+# constraint against the line's length — anything past the radius is pulled back onto the circle
+# and the radial part of the velocity is spent against it. That is a body whose *momentum* the
+# action set can steer, which nothing before this could. The grip's length is the one the catch
+# found and never changes — holding on is holding the line, not hauling on it — and letting go
+# releases the body with the speed the arc built. A rope is a new kind of state (the grip), a new
+# entity and three new observation slots, so the trio moves:
+# sim 0.17.0, sensors v14 (`on_rope`, `rope_dx`, `rope_dy` appended) and level format 4.
 [workspace.package]
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
+dynamics = { path = "crates/dynamics" }
 sim = { path = "crates/sim" }
 evo = { path = "crates/evo" }
 render = { path = "crates/render" }

@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use dynamics::{Vec2 as DVec2, World as DWorld};
 use egui::{Color32, CornerRadius, Mesh, Painter, Pos2, Rect, Stroke, TextureId, Vec2};
 use sim::reach::ReachReport;
 use sim::{Level, Outcome, Sim, Tile, Walker};
@@ -2309,14 +2310,804 @@ const FLAG_FRAMES: [&str; 4] = ["goal_flag_1", "goal_flag_2", "goal_flag_3", "go
 /// eye from across the frame.
 const FLAG_HZ: f32 = 3.0;
 
-/// Draw the level: its scenery, its tiles, its goal flag, and (optionally) its grid and
-/// bounds.
+/// The rope's own two shades: the twisted cord, and the strand that catches the light.
+const ROPE_CORD: Color32 = Color32::from_rgb(104, 74, 44);
+const ROPE_LIGHT: Color32 = Color32::from_rgb(168, 128, 78);
+/// The knots down the line, and the loop at its end: the two things that make a line a *rope*
+/// rather than a wire.
+const ROPE_KNOT: Color32 = Color32::from_rgb(206, 168, 104);
+
+/// A body's grip on a rope, as the rope's own motion needs it.
 ///
-/// `clock` is what animates the things the level itself owns — the waving flag, the
-/// swaying grass — and it is an argument rather than a reading of egui's own time because
-/// the view is a pure function of it: two draws at the same clock draw the same picture,
-/// which is what makes this testable at all. `reach` is the validation overlay; pass
-/// `None` for a plain view.
+/// Two points and nothing else: which line the body is on (the anchor), and where its hands are.
+/// The pendulum's radius is the distance between them, and the slack below the hands is what the
+/// rope's own length leaves over.
+#[derive(Clone, Copy, Debug)]
+pub struct HeldRope {
+    /// Where the line is tied: the ceiling's underside.
+    pub anchor: (f32, f32),
+    /// The body's hands, which are what carry the line.
+    pub hands: (f32, f32),
+    /// How much line is out, in tiles: the arc length from the tie to the hands. This is the sim's
+    /// own number ([`sim::physics::RopeGrip::length`]) — where the grip sits along the rope, and so
+    /// which material point of the chain the hands hold.
+    pub length: f32,
+}
+
+/// Points per tile of rope. Four is a curve at a couple of pixels of sag per tile — as fine as a
+/// sixteen-pixel tile can show — and cheap enough for a level's handful of lines.
+const ROPE_SEGMENTS_PER_TILE: f32 = 4.0;
+/// Fraction of a tick's velocity the line keeps: air drag on a braided rope, and nothing else.
+/// This is the only place a drawn line loses energy, so it is what brings a swinging or falling
+/// rope to rest: at 0.96 a swing has lost half its speed in seventeen ticks, which is what stops a
+/// line that has just been let go of from swinging for seconds the way a frictionless chain would.
+const ROPE_DRAG: f32 = 0.96;
+/// Most constraint passes per tick.
+const ROPE_PASSES: usize = 48;
+/// How close the constraints have to be satisfied for the solve to stop, in tiles: a twentieth of
+/// a pixel at the default zoom, below the width of the drawn cord.
+const ROPE_TOLERANCE: f32 = 1.0e-3;
+/// Fraction of a rope point's slide the ground takes each tick it is in contact. A line that lands
+/// should stay where it landed rather than skating along the floor for a second.
+const ROPE_FRICTION: f32 = 0.4;
+/// How far outside the terrain a rope point is held, in tiles: enough that the next solve pass does
+/// not put it back inside, small enough to be a pixel of the cord's own width.
+const ROPE_SKIN: f32 = 0.02;
+/// The sim's own tick rate, so the drawn rope falls at the speed the body does.
+const ROPE_TICKS_PER_SECOND: f32 = 60.0;
+/// Most ticks of rope one advance may catch up. A frame of a 4x replay steps four, and a stall of a
+/// quarter second at 1x steps fifteen; the cap only exists so a debugger pause cannot make the rope
+/// integrate for a minute at once.
+const ROPE_CATCH_UP_TICKS: f32 = 16.0;
+
+/// One rope's drawn line: a **rope**, simulated as a rope.
+///
+/// It is a world in the game's physics engine ([`dynamics::World`]): point masses joined by
+/// inextensible links, the tie pinned to the anchor, and — while a body hangs on it — a grip at the
+/// hands, which is a target at an **arc length** along the line rather than a body of its own.
+/// Gravity is the sim's own, the only loss is air drag and the ground's friction, and nothing is
+/// posed or keyframed: let go and the line falls, swings, lies on the terrain and comes to rest
+/// because the engine says so.
+///
+/// Two things fall out of that description rather than being written down beside it.
+///
+/// The grip **slides continuously**, because it is a point *between* two chain bodies rather than
+/// the nearest body: a grip snapped to whole segments would move the attached material point a
+/// quarter tile at a time, and every snap would be an impulse into the line.
+///
+/// And the part between the tie and the grip is **straight**, because the sim swings the body on a
+/// fixed radius and the grip sits at exactly the arc length of that chord. A chain of exact length
+/// whose point at that arc length is held where the hands are has only one shape left to take. The
+/// solve is started from that chord (a warm start, not a pose: it is the exact solution of the
+/// constraints that then run), because an iterated solver at this segment count otherwise leaves a
+/// visible sag in the part that is under load — a rope hanging from two pins, which is the one
+/// thing a taut rope is not.
+///
+/// It is **outside the sim** on purpose. Nothing here touches the body, the level or the episode:
+/// the rope a policy swings on is the constraint in `sim::physics`, and this is the drawing of it.
+/// A cosmetic integration that fed back into play would be a second physics — more expensive and
+/// impossible to replay. It is *in the engine* rather than in this file, though, so the crate that
+/// swings a rope is the crate that will drop a crate.
+/// One number for a level's ropes: how many, where each is tied, and how long each is.
+///
+/// The drawing's key for "these chains are still the ropes of this level". It is deliberately not
+/// the level's content hash: a level is edited in more ways than a rope cares about, and an
+/// episode under way changes the terrain beneath a rope — a tile burning away must not rebuild a
+/// chain a body is swinging on. What a chain is built from is an anchor and a length, so that is
+/// what is compared, and an edit that moves a tie or resizes a line still rebuilds it.
+fn rope_signature(level: &Level) -> u64 {
+    let mut hash = level.ropes.len() as u64;
+    for rope in &level.ropes {
+        for word in [rope.col as u32, rope.row as u32, rope.length.to_bits()] {
+            hash = hash
+                .wrapping_mul(0x0000_0100_0000_01b3)
+                .wrapping_add(u64::from(word));
+        }
+    }
+    hash
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RopeMotion {
+    /// The level's ropes as the chains were built from them ([`rope_signature`]): an edit
+    /// rebuilds them.
+    level: u64,
+    /// One chain per rope, in the level's own order.
+    chains: Vec<Chain>,
+    /// The rope index a body is holding, so the drawing can thicken it.
+    held: Option<usize>,
+    /// Display seconds not yet stepped. A step is a whole sim tick, so the drawing runs at the
+    /// sim's rate whatever the screen does, and two advances of the same total time agree.
+    carry: f32,
+    /// Ticks this line has actually been stepped for. A view that draws an agent is supposed to
+    /// give it one per simulated tick rather than one per frame, and this is how a test says so.
+    steps: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Chain {
+    /// Rest length of one segment, in tiles.
+    segment: f32,
+    /// The line as the engine sees it: a pinned tie, a chain of masses, and — while a body hangs
+    /// from it — a grip at the hands.
+    world: DWorld,
+    /// The grip constraint's index in the world, while a body holds the line.
+    grip: Option<usize>,
+    /// The sampled line, top first, refreshed after every tick for the painter.
+    points: Vec<(f32, f32)>,
+}
+
+impl Chain {
+    /// A line hanging straight down from `anchor`, at rest.
+    fn new(anchor: (f32, f32), length: f32) -> Chain {
+        let length = length.max(0.25);
+        let n = ((length * ROPE_SEGMENTS_PER_TILE).ceil() as usize + 1).max(2);
+        let segment = length / (n - 1) as f32;
+        let anchor = DVec2::new(anchor.0, anchor.1);
+        let mut world = DWorld::new(DVec2::new(0.0, sim::physics::PHYSICS.gravity));
+        world.iterations = ROPE_PASSES;
+        world.tolerance = ROPE_TOLERANCE;
+        world.relaxation = 1.0;
+        let bodies: Vec<usize> = (0..n)
+            .map(|i| {
+                let pos = anchor + DVec2::new(0.0, i as f32 * segment);
+                let body = world.add_body(pos, if i == 0 { 0.0 } else { 1.0 });
+                let b = world.body_mut(body);
+                b.damping = ROPE_DRAG;
+                b.skin = ROPE_SKIN;
+                b.friction = ROPE_FRICTION;
+                body
+            })
+            .collect();
+        for pair in bodies.windows(2) {
+            world.connect(pair[0], pair[1], segment);
+        }
+        let points = bodies
+            .iter()
+            .map(|i| {
+                let p = world.body(*i).pos;
+                (p.x, p.y)
+            })
+            .collect();
+        Chain {
+            segment,
+            world,
+            grip: None,
+            points,
+        }
+    }
+
+    /// One tick of the line: the tie stays where it is, the hands take hold if a body is hanging
+    /// from it, and the engine does the rest.
+    ///
+    /// The loaded part comes out straight because the sim swings the body on a fixed radius: the
+    /// arc length out to the hands is exactly the chord they span, and a chain whose length is
+    /// exact and whose point at that arc length is held there has only one shape it can take. The
+    /// solve starts from that chord each tick — the warm start documented on [`RopeMotion`] — and
+    /// then runs on the whole line, so what is drawn is what the constraints leave, not the start.
+    fn step(&mut self, anchor: (f32, f32), attach: Option<((f32, f32), f32)>, level: &Level) {
+        let anchor = DVec2::new(anchor.0, anchor.1);
+        {
+            let pin = self.world.body_mut(0);
+            pin.pos = anchor;
+            pin.vel = DVec2::ZERO;
+        }
+        // The grip is rebuilt rather than moved: its two bodies change as the hands slide along
+        // the line, and a grip that named yesterday's pair would be holding a different piece of
+        // rope than the one the body is on.
+        if let Some(index) = self.grip.take() {
+            self.world.release_grip(index);
+        }
+        if let Some((hands, length)) = attach {
+            let hands = DVec2::new(hands.0, hands.1);
+            let (i, a) = self.grip_span(length);
+            // The loaded section is the straight chord from the tie to the hands: the sim swings
+            // the body on a fixed radius, so the arc length out to the grip is exactly the chord
+            // it spans, and a chain of that length held at that point has no other shape it can
+            // take. Starting the solve there is not posing the line — it is the exact solution of
+            // the constraints that are about to run — and it is what keeps the answer to one
+            // pass's worth of drift instead of a spiral toward the chord. A released line is not
+            // seeded at all.
+            self.seed_taut(anchor, hands, length);
+            self.grip = Some(self.world.grip(i, i + 1, a, hands));
+        }
+
+        self.world.step(&Tiles(level));
+
+        for (i, point) in self.points.iter_mut().enumerate() {
+            let p = self.world.body(i).pos;
+            *point = (p.x, p.y);
+        }
+    }
+
+    /// Lay the section from the tie to the grip on the straight chord between them, at rest.
+    ///
+    /// The arc length of the section is `length` and so is the distance between its ends, which
+    /// makes the chord an exact solution of the links along it. Seeding does not skip the solve —
+    /// it tells the solve where the answer is, which is what a hundred-link-per-second game needs
+    /// and what a physics engine normally does with the previous frame's answer.
+    fn seed_taut(&mut self, anchor: DVec2, hands: DVec2, length: f32) {
+        if length <= 0.0 {
+            return;
+        }
+        let (i, _) = self.grip_span(length);
+        for k in 0..=i {
+            let t = (k as f32 * self.segment / length).min(1.0);
+            let body = self.world.body_mut(k);
+            body.pos = anchor.lerp(hands, t);
+            body.vel = DVec2::ZERO;
+        }
+    }
+
+    /// Where along the chain a grip `length` tiles out sits: body `i`, a fraction `a` of the way
+    /// to body `i + 1`.
+    fn grip_span(&self, length: f32) -> (usize, f32) {
+        let n = self.points.len();
+        let t = (length / self.segment).clamp(0.0, (n - 1) as f32);
+        let i = (t.floor() as usize).min(n - 2);
+        (i, (t - i as f32).clamp(0.0, 1.0))
+    }
+
+    /// Sampled positions, top first.
+    fn points(&self) -> &[(f32, f32)] {
+        &self.points
+    }
+}
+
+/// The level's tiles, asked the one question the engine has for the ground.
+///
+/// The adapter lives here rather than in `dynamics` because the engine does not depend on `sim`
+/// and never should: it is the crate the sim will use for its own objects next, and an arrow back
+/// that way would be a cycle.
+struct Tiles<'a>(&'a Level);
+
+impl dynamics::Terrain for Tiles<'_> {
+    fn solid(&self, tx: i32, ty: i32) -> bool {
+        self.0.is_solid(tx, ty)
+    }
+}
+
+impl RopeMotion {
+    /// Build the chains `level`'s ropes need, all hanging at rest.
+    ///
+    /// Only [`Self::advance`] calls this, lazily: a fresh animation has no level yet, and the first
+    /// advance it sees is the one that knows which. A rope motion is therefore never out of step
+    /// with the level it is drawn over, even when a lane's episode moves to another one.
+    fn rebuild(&mut self, level: &Level) {
+        self.level = rope_signature(level);
+        self.chains = level
+            .ropes
+            .iter()
+            .map(|r| Chain::new(r.anchor(), r.length))
+            .collect();
+        self.held = None;
+        self.carry = 0.0;
+    }
+
+    /// Advance the drawn lines by `dt` display seconds, with `held` the grip a body has on one of
+    /// the level's ropes.
+    ///
+    /// The level's **ropes** are what a chain is bound to, and they are compared as such
+    /// ([`rope_signature`]): an edit that moves a tie or changes a length rebuilds the chains,
+    /// which is the rule that keeps a drawn rope attached to the level it is drawn over.
+    ///
+    /// Not the level's content hash, deliberately. A brittle tile that burns away under an
+    /// episode changes that hash, and a chain rebuilt on the tick the floor went out from under
+    /// the body would drop the rope a body is still swinging on — a visible reset of a line that
+    /// nothing about a burnt tile has anything to do with.
+    pub fn advance(&mut self, level: &Level, held: Option<HeldRope>, dt: f32) {
+        if self.level != rope_signature(level) || self.chains.len() != level.ropes.len() {
+            self.rebuild(level);
+        }
+        // Which chain the body is on: matched by anchor, because the sim hands the view a point
+        // and the level's rope order is not something the view should have to agree with.
+        self.held = held.and_then(|h| {
+            level.ropes.iter().position(|r| {
+                let (ax, ay) = r.anchor();
+                (ax - h.anchor.0).abs() < 1.0e-3 && (ay - h.anchor.1).abs() < 1.0e-3
+            })
+        });
+        // The cap is a stall guard, not a speed limit: a replay at eight times real time steps eight
+        // ticks in one frame, and a rope that only took four of them would fall behind the body
+        // hanging on it. A quarter second of catch-up is the most a hitch can buy.
+        self.carry = (self.carry + dt * ROPE_TICKS_PER_SECOND).min(ROPE_CATCH_UP_TICKS);
+        while self.carry >= 1.0 {
+            self.carry -= 1.0;
+            self.steps += 1;
+            for (i, chain) in self.chains.iter_mut().enumerate() {
+                let anchor = level.ropes[i].anchor();
+                let pin = if self.held == Some(i) {
+                    let h = held.expect("the held index names the held grip");
+                    Some((h.hands, h.length))
+                } else {
+                    None
+                };
+                chain.step(anchor, pin, level);
+            }
+        }
+    }
+
+    /// The drawn line of rope `index`, top first.
+    pub fn curve(&self, index: usize) -> Option<&[(f32, f32)]> {
+        self.chains.get(index).map(Chain::points)
+    }
+
+    /// Ticks of line simulated so far — the cadence a view gives it, for the test that pins it.
+    #[cfg(test)]
+    pub fn steps(&self) -> u64 {
+        self.steps
+    }
+
+    /// Whether rope `index` is the one a body is holding.
+    pub fn is_held(&self, index: usize) -> bool {
+        self.held == Some(index)
+    }
+}
+
+/// A rope with nobody on it and no motion to draw: straight down from its anchor.
+///
+/// The editor and the title screen draw levels without a player in them, so they ask for this
+/// rather than carrying a [`RopeMotion`] whose chains would never be touched.
+fn hanging_curve(anchor: (f32, f32), length: f32) -> Vec<(f32, f32)> {
+    vec![anchor, (anchor.0, anchor.1 + length.max(0.0))]
+}
+
+// ---- the pieces of a broken tile -------------------------------------------------
+
+/// Chunks a view keeps on screen at once.
+///
+/// A cracked bridge is eight tiles, and a level with more brittle ground than this is a level
+/// nobody is watching every frame of. The oldest fall is retired when the limit is reached, which
+/// is the same bargain the particle bursts make: the effect is feedback, and feedback that piles
+/// up is noise.
+const DEBRIS_LIMIT: usize = 16;
+/// Fragments one chunk breaks into.
+///
+/// Seven because a one-tile chunk cut into a two-by-two grid is four pieces and that reads as
+/// four *tiles*, not as rubble; three-by-three with the centre missing is a shatter.
+const SHARD_COUNT: usize = 7;
+/// Ticks a chunk's pieces stay on screen after the smash, fading over the last third.
+const SHARD_LIFE: u32 = 120;
+/// Ticks a chunk may fall before a view gives up on it — one that fell out of the level.
+const CHUNK_LIFE: u32 = 240;
+/// Solver passes for a chunk's box: eight particles and six links, not a rope.
+const DEBRIS_PASSES: usize = 8;
+/// A chunk's mass, in the engine's units. One tile of ground.
+const CHUNK_MASS: f32 = 1.0;
+/// Fraction of its speed a fragment keeps per tick: a little air, so a burst settles.
+const SHARD_DAMPING: f32 = 0.995;
+/// Fraction of the tangential speed a fragment loses against the ground each tick.
+const SHARD_FRICTION: f32 = 0.6;
+/// Fraction of its impact speed a fragment gives back: a small bounce, not a rubber ball.
+const SHARD_RESTITUTION: f32 = 0.1;
+
+/// The pieces of a level's brittle ground: a broken tile **falls**, and it **smashes**.
+///
+/// This is the same engine the rope is drawn with ([`dynamics::World`]), and for the same reason:
+/// the game's own solver can drop a crate, so a level does not need a second one. A brittle tile
+/// that burns leaves a hole in the level and a chunk in this world — a rigid box of four corner
+/// particles, joined by its edges and cross-braced, which is the engine's crate — and gravity is
+/// the sim's own. When the box meets the terrain the chunk **shatters**: the box is thrown away and
+/// the same engine gets seven small bodies at the impact point, carrying the speed the box had, so
+/// the pieces scatter, bounce once, slide and come to rest because the ground says so.
+///
+/// It is **outside the sim**. Nothing here touches the body, the level or the episode: the hole is
+/// the sim's (`Sim::broken` is the list it hashes), and this is the drawing of the piece that fell
+/// out of it. A cosmetic body that fed back into play would be a second physics — unreplayable,
+/// and it would make a level's difficulty depend on where the rubble rolled.
+///
+/// The state is stepped **once per simulated tick** by the views that show a run's own terrain
+/// ([`crate::play::Session`] and [`crate::replay::Replay`]), so a chunk falls at the speed a body
+/// does at any playback speed. The evolution view does not step one: it draws the *authored*
+/// level, in which the tile has not broken, and a block falling out of a tile that is still drawn
+/// would be a worse lie than no block at all.
+#[derive(Clone, Debug, Default)]
+pub struct Debris {
+    /// The size of the level the pieces were broken out of: another level clears the field.
+    ///
+    /// **Not the content hash**, and the reason is the event this struct exists for: a hash of the
+    /// terrain changes the tick a tile burns, so keying on it would throw the chunk away on the
+    /// very tick it should start falling. The size is the cheap half of the same question — a
+    /// document of another shape is another level — and the sim's own broken list settles the
+    /// rest: it goes back to empty when an episode restarts, which is a reset.
+    level: (i32, i32),
+    /// The chunks in the air and the rubble on the floor, oldest first.
+    falls: Vec<Fall>,
+    /// How many of the sim's broken tiles have already been dropped.
+    spawned: usize,
+    /// Ticks of debris simulated so far — the cadence, for the test that pins it.
+    steps: u64,
+}
+
+/// One broken tile: a chunk that falls, and the pieces it becomes.
+#[derive(Clone, Debug)]
+struct Fall {
+    col: i32,
+    row: i32,
+    material: Tile,
+    world: DWorld,
+    /// The chunk's four corners while it is still one piece, and `None` once it has smashed.
+    corners: Option<[usize; 4]>,
+    /// The fragments, once there are any: their body in `world`, and their half-size in tiles.
+    shards: Vec<Shard>,
+    /// Ticks since it spawned, for the give-up cap.
+    age: u32,
+    /// Ticks since it smashed, for the fade.
+    settled: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Shard {
+    body: usize,
+    /// Half the piece's width in tiles: the corner of a chunk, roughly.
+    half: f32,
+}
+
+impl Debris {
+    /// Advance the debris by exactly one **simulated tick**, from what `sim` reports now.
+    ///
+    /// Called right after [`Sim::step`] by the views that draw the run's own terrain, so a tile
+    /// that broke on this tick is a chunk that starts falling on this one. The sim's own list of
+    /// broken tiles is the trigger: nothing here listens to a fuse, because the sim is the only
+    /// thing that knows when a fuse expired, and a second countdown would be a second answer.
+    pub fn advance(&mut self, sim: &Sim) {
+        let level = sim.level();
+        let broken = sim.broken();
+        let shape = (level.width, level.height);
+        // A different level, or a new episode on this one (the list went back to empty): the
+        // pieces of the old run are not the pieces of this one.
+        if self.level != shape || broken.len() < self.spawned {
+            self.level = shape;
+            self.falls.clear();
+            self.spawned = 0;
+        }
+        for tile in broken.iter().skip(self.spawned) {
+            self.spawn(*tile);
+        }
+        self.spawned = broken.len();
+        if self.falls.is_empty() {
+            return;
+        }
+        self.steps += 1;
+        for fall in &mut self.falls {
+            fall.step(level);
+        }
+        self.falls.retain(Fall::alive);
+    }
+
+    /// Drop one tile: a chunk at the cell it broke out of, at rest for an instant before gravity
+    /// takes it.
+    fn spawn(&mut self, tile: sim::BrokenTile) {
+        if self.falls.len() >= DEBRIS_LIMIT {
+            self.falls.remove(0);
+        }
+        let mut world = DWorld::new(DVec2::new(0.0, sim::physics::PHYSICS.gravity));
+        world.iterations = DEBRIS_PASSES;
+        let corners = world.add_box(
+            DVec2::new(tile.col as f32, tile.row as f32),
+            DVec2::new(1.0, 1.0),
+            CHUNK_MASS,
+        );
+        for &corner in &corners {
+            let body = world.body_mut(corner);
+            body.damping = 1.0;
+            body.friction = 0.5;
+            body.restitution = 0.05;
+            body.skin = 0.02;
+        }
+        self.falls.push(Fall {
+            col: tile.col,
+            row: tile.row,
+            material: tile.tile,
+            world,
+            corners: Some(corners),
+            shards: Vec::new(),
+            age: 0,
+            settled: 0,
+        });
+    }
+
+    /// The chunks and rubble on screen, oldest first.
+    fn falls(&self) -> &[Fall] {
+        &self.falls
+    }
+
+    #[cfg(test)]
+    pub fn steps(&self) -> u64 {
+        self.steps
+    }
+}
+
+impl Fall {
+    /// One tick: the engine's, and then the question the engine cannot answer — did it land?
+    fn step(&mut self, level: &Level) {
+        self.world.step(&Tiles(level));
+        self.age += 1;
+        if let Some(corners) = self.corners {
+            // A face pushing **up** on one of the four corners is the floor: the chunk has hit
+            // something, and a chunk of ground does not bounce — it breaks. The normal is the
+            // engine's own (it points out of the terrain), so this is not a second collision test.
+            let landed = self
+                .world
+                .contacts()
+                .iter()
+                .any(|c| corners.contains(&c.body) && c.normal.y < -0.25);
+            if landed {
+                self.shatter();
+            }
+        } else {
+            self.settled += 1;
+        }
+    }
+
+    /// Whether the fall still has something to draw.
+    fn alive(&self) -> bool {
+        if self.corners.is_some() {
+            return self.age < CHUNK_LIFE;
+        }
+        self.settled < SHARD_LIFE
+    }
+
+    /// Break the chunk into pieces, in a world of their own.
+    ///
+    /// A new world rather than the same one: the engine has no way to remove a body, and a chunk's
+    /// four corners left lying in the world would be stepped forever and drawn never. The cost is
+    /// an allocation per smash, which is the right trade for an engine whose whole design is "no
+    /// indices move".
+    ///
+    /// The pieces carry the chunk's own velocity, damped hard, plus an outward kick scaled by how
+    /// far each one was from the centre — so a chunk that fell six tiles bursts, and one that
+    /// dropped a hand's width crumbles in place. The kick's numbers come from the impact speed
+    /// rather than from a constant, which is what makes the effect read as a *consequence*.
+    fn shatter(&mut self) {
+        let Some(corners) = self.corners.take() else {
+            return;
+        };
+        let mut centre = DVec2::ZERO;
+        let mut carried = DVec2::ZERO;
+        for &corner in &corners {
+            let body = self.world.body(corner);
+            centre += body.pos;
+            carried += body.vel;
+        }
+        let centre = centre * 0.25;
+        let carried = carried * 0.25;
+        let impact = carried.length();
+
+        let mut world = DWorld::new(DVec2::new(0.0, sim::physics::PHYSICS.gravity));
+        world.iterations = DEBRIS_PASSES;
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        for i in 0..SHARD_COUNT {
+            // A pure function of the cell and the piece's index: the same smash is the same
+            // scatter in two replays of one episode, and two neighbouring tiles break apart
+            // differently without anything drawing from an RNG.
+            let hash = tile_hash(self.col * 7 + i as i32, self.row, 0x5EED);
+            let u = ((hash & 0xFFFF) as f32 / 65_535.0) - 0.5;
+            let v = (((hash >> 16) & 0xFFFF) as f32 / 65_535.0) - 0.5;
+            let half = 0.07 + 0.06 * (((hash >> 8) & 0xFF) as f32 / 255.0);
+            let pos = centre + DVec2::new(u * 0.62, v * 0.62);
+            let body = world.add_body(pos, 1.0);
+            let shard = world.body_mut(body);
+            shard.damping = SHARD_DAMPING;
+            shard.friction = SHARD_FRICTION;
+            shard.restitution = SHARD_RESTITUTION;
+            shard.skin = 0.02;
+            shard.vel = DVec2::new(
+                u * (0.012 + impact * 0.10),
+                v * (0.008 + impact * 0.06) - 0.02,
+            ) + carried * 0.25;
+            shards.push(Shard { body, half });
+        }
+        self.world = world;
+        self.shards = shards;
+        self.settled = 0;
+    }
+}
+
+/// The sprite a falling chunk is drawn with: its material's **buried** autotile.
+///
+/// Mask fifteen is the tile with ground on every side, which is what a tile in the middle of a
+/// floor or a bridge is, and what a chunk of one looks like from outside. The chunk is drawn as
+/// the tile it was so that a break reads as a piece of *this* level falling — a grey square would
+/// be a different game's rubble.
+fn chunk_sprite(material: Tile) -> &'static str {
+    match material.base_material() {
+        Tile::Sand => SAND[15],
+        Tile::Brick => BRICK[15],
+        Tile::Plank => WOOD[15],
+        _ => soil_name(15, false),
+    }
+}
+
+/// The two shades a fragment is drawn in: the material's body and its shadow.
+fn shard_colours(material: Tile) -> (Color32, Color32) {
+    match material.base_material() {
+        Tile::Sand => (
+            Color32::from_rgb(214, 190, 128),
+            Color32::from_rgb(168, 142, 88),
+        ),
+        Tile::Brick => (
+            Color32::from_rgb(176, 96, 74),
+            Color32::from_rgb(124, 62, 48),
+        ),
+        Tile::Plank => (
+            Color32::from_rgb(150, 112, 66),
+            Color32::from_rgb(104, 76, 44),
+        ),
+        _ => (
+            Color32::from_rgb(126, 92, 62),
+            Color32::from_rgb(86, 60, 40),
+        ),
+    }
+}
+
+/// Draw the debris of a run's broken tiles: the chunk while it falls, then its pieces.
+///
+/// Above the terrain and under every agent, which is where a piece of the floor belongs. The
+/// chunk is the tile's own sprite at the box's bounding rectangle — a box that is still square, so
+/// the picture is exact; the pieces are four-pixel quads in the material's own two shades, which
+/// at that size is all a fragment can be.
+pub fn draw_debris(sheet: Sheet<'_>, debris: &Debris) {
+    let painter = sheet.painter;
+    for fall in debris.falls() {
+        if let Some(corners) = fall.corners {
+            let (mut x0, mut y0) = (f32::MAX, f32::MAX);
+            let (mut x1, mut y1) = (f32::MIN, f32::MIN);
+            for &corner in &corners {
+                let p = fall.world.body(corner).pos;
+                x0 = x0.min(p.x);
+                y0 = y0.min(p.y);
+                x1 = x1.max(p.x);
+                y1 = y1.max(p.y);
+            }
+            let rect = sheet.world(x0, y0, x1 - x0, y1 - y0);
+            let uv = sheet
+                .sprites
+                .first_of(&[chunk_sprite(fall.material), GROUND[15]]);
+            sheet.image(rect, uv);
+        } else {
+            let (light, dark) = shard_colours(fall.material);
+            // The last third of the pieces' life is a fade, so rubble does not vanish between two
+            // frames: it settles and then goes.
+            let left = SHARD_LIFE.saturating_sub(fall.settled);
+            let alpha = (left as f32 / (SHARD_LIFE as f32 / 3.0)).clamp(0.0, 1.0);
+            let tint = |c: Color32| {
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (255.0 * alpha) as u8)
+            };
+            for (i, shard) in fall.shards.iter().enumerate() {
+                let p = fall.world.body(shard.body).pos;
+                let side = shard.half * 2.0;
+                let rect = sheet.world(p.x - shard.half, p.y - shard.half, side, side);
+                painter.rect_filled(
+                    rect,
+                    CornerRadius::ZERO,
+                    tint(if i % 2 == 0 { light } else { dark }),
+                );
+            }
+        }
+    }
+}
+
+/// Draw every rope in the level along the line its motion says it is on.
+///
+/// It is **drawn**, not a sprite, for the same reason the moving platform is: a rope's shape is
+/// the shape of its swing, and a sprite is one pose. Everything else in the level is a cell of an
+/// atlas because everything else is a cell of the terrain; a rope is a line whose lower end a
+/// body carries.
+///
+/// Three elements and no fourth: the cord, a lighter strand a pixel to its right so the line has a
+/// side the light comes from, and a knot every half tile — spaced in **tiles of line**, not
+/// pixels, so a long rope and a short one are made of the same knots and a bent line is knotted at
+/// the same spacing as a straight one. The loop is at the rope's own end, which while a body holds
+/// it part-way down is the tail's tip rather than the hands: a hand holds the line, not its end.
+fn draw_ropes(sheet: Sheet<'_>, level: &Level, motion: Option<&RopeMotion>) {
+    let painter = sheet.painter;
+    let scale = sheet.camera.scale();
+    let knot = (scale * 0.11).max(1.0);
+    for (i, rope) in level.ropes.iter().enumerate() {
+        let (ax, ay) = rope.anchor();
+        let hanging;
+        let curve: &[(f32, f32)] = match motion.and_then(|m| m.curve(i)) {
+            Some(points) if points.len() >= 2 => points,
+            _ => {
+                hanging = hanging_curve((ax, ay), rope.length);
+                &hanging
+            }
+        };
+        // Loaded line, heavier line: the only tension a column of two shades can say.
+        let cord = (scale * 0.13).max(1.0)
+            * if motion.is_some_and(|m| m.is_held(i)) {
+                1.18
+            } else {
+                1.0
+            };
+        let pts: Vec<egui::Pos2> = curve
+            .iter()
+            .map(|(x, y)| sheet.camera.to_screen(*x, *y, sheet.viewport))
+            .collect();
+
+        // The cord, then the strand beside it. The offset is along the screen's x, which is why
+        // it is a *cheap* light: a pixel-art rope is a column of two shades, and a torch-lit side
+        // is all the lighting the rest of the tileset has.
+        for w in pts.windows(2) {
+            painter.line_segment([w[0], w[1]], egui::Stroke::new(cord, ROPE_CORD));
+            painter.line_segment(
+                [
+                    w[0] + egui::vec2(cord * 0.5, 0.0),
+                    w[1] + egui::vec2(cord * 0.5, 0.0),
+                ],
+                egui::Stroke::new((cord * 0.45).max(1.0), ROPE_LIGHT),
+            );
+        }
+
+        // The knots, walked along the drawn line so a bent one keeps the spacing a straight one
+        // has: a tile is sixteen art pixels and a knot every eight is a rope you can count the
+        // length of.
+        let mut walked = 0.0;
+        let mut next = 0.5;
+        for w in curve.windows(2) {
+            let seg = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+            if seg < 1.0e-6 {
+                continue;
+            }
+            while next <= walked + seg {
+                let t = (next - walked) / seg;
+                let p = sheet.camera.to_screen(
+                    w[0].0 + (w[1].0 - w[0].0) * t,
+                    w[0].1 + (w[1].1 - w[0].1) * t,
+                    sheet.viewport,
+                );
+                painter.rect_filled(
+                    Rect::from_center_size(p, egui::vec2(knot, knot)),
+                    CornerRadius::ZERO,
+                    ROPE_KNOT,
+                );
+                next += 0.5;
+            }
+            walked += seg;
+        }
+
+        // The loop at the end, and the knot at the anchor: a rope is tied at both ends.
+        let end = pts[pts.len() - 1];
+        painter.rect_stroke(
+            Rect::from_center_size(end, egui::vec2(cord * 2.4, cord * 2.4)),
+            CornerRadius::same(1),
+            egui::Stroke::new((cord * 0.5).max(1.0), ROPE_KNOT),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(
+            Rect::from_center_size(pts[0], egui::vec2(cord * 1.8, cord * 1.2)),
+            CornerRadius::ZERO,
+            ROPE_CORD,
+        );
+    }
+}
+
+/// Which body a frame's ropes are drawn from, given each body's `(rank, on_a_rope)`.
+///
+/// A level has one set of ropes and a view can have a dozen bodies on them, so the line has to be
+/// somebody's: the best-ranked body that is **holding** one wins, because that line is the one
+/// being pulled and the one somebody is watching. When nobody is on a rope the best-ranked body is
+/// used anyway — its chains are still moving from the swing it just let go of, and a rope that
+/// snapped back to a column the moment it was released is the pose bug this whole thing replaced.
+///
+/// The ranks are the view's own ordering (a lane's `rank`, a replay's star before its ghosts), and
+/// the answer is an index into the iteration order, so the caller can find the animation it came
+/// from without a second lookup by rank.
+pub fn rope_owner(bodies: impl IntoIterator<Item = (usize, bool)>) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut any: Option<(usize, usize)> = None;
+    for (index, (rank, holding)) in bodies.into_iter().enumerate() {
+        if any.is_none_or(|(r, _)| rank < r) {
+            any = Some((rank, index));
+        }
+        if holding && best.is_none_or(|(r, _)| rank < r) {
+            best = Some((rank, index));
+        }
+    }
+    best.or(any).map(|(_, index)| index)
+}
+
 /// The level's own chasers, flyers, turrets and movers — what a document says is *there*,
 /// rather than where anything has walked to.
 ///
@@ -2364,12 +3155,38 @@ fn draw_level_entities(sheet: Sheet<'_>, level: &Level, clock: f32) {
     }
 }
 
+/// Draw the level: its scenery, its tiles, its goal flag, and (optionally) its grid and
+/// bounds.
+///
+/// `clock` is what animates the things the level itself owns — the waving flag, the
+/// swaying grass — and it is an argument rather than a reading of egui's own time because
+/// the view is a pure function of it: two draws at the same clock draw the same picture,
+/// which is what makes this testable at all. `reach` is the validation overlay; pass
+/// `None` for a plain view.
 pub fn draw_level(
     sheet: Sheet<'_>,
     level: &Level,
     opts: RenderOpts,
     reach: Option<&ReachReport>,
     clock: f32,
+) {
+    draw_level_held(sheet, level, opts, reach, clock, None);
+}
+
+/// [`draw_level`] with the ropes' **motion** in it, if the caller has been stepping one.
+///
+/// A rope is the one entity whose drawing depends on a body: hanging, it is a column; held, it is
+/// the line the hands carry with whatever the chain has made of the rest. The state lives in the
+/// [`AgentAnim`] of the body in front of it (see [`AgentAnim::motion`]) — so every view with an
+/// agent passes `Some(anim.motion())`, and the callers with nobody to draw, the editor and a
+/// scrubbed route, pass `None` and get the ropes hanging straight.
+pub fn draw_level_held(
+    sheet: Sheet<'_>,
+    level: &Level,
+    opts: RenderOpts,
+    reach: Option<&ReachReport>,
+    clock: f32,
+    motion: Option<&RopeMotion>,
 ) {
     let painter = sheet.painter;
     let (tx0, tx1, ty0, ty1) = sheet.camera.visible_tiles(level, sheet.viewport);
@@ -2536,6 +3353,13 @@ pub fn draw_level(
     // though the moment the level is played it starts marching away from this tile. The
     // frame comes from the same `walker_sprite` the live lanes use, so the creature on the
     // editor's canvas and the creature patrolling a run are the same one.
+    // Ropes are drawn whether or not the *authored entities* are: a rope is not a marker of
+    // intent like a walker's authored tile, it is a thing in the level a body swings from, and a
+    // play view that left it out would hide the only object on the screen that moves because of
+    // the body on it. A held rope is drawn from its anchor to the hands, so this has to run after
+    // the terrain and before the body.
+    draw_ropes(sheet, level, motion);
+
     if opts.entities {
         draw_level_entities(sheet, level, clock);
         for walker in &level.walkers {
@@ -3043,7 +3867,12 @@ pub fn draw_sim_at(
     anim: &AgentAnim,
     at: Option<(f32, f32)>,
 ) {
-    draw_level(sheet, sim.level(), opts, None, clock);
+    // The ropes come from the animation, which stepped them with this body: the drawn line is the
+    // one the agent in front of it is hanging on, whichever view is drawing.
+    draw_level_held(sheet, sim.level(), opts, None, clock, Some(anim.motion()));
+    // And the rubble of the tiles this run has broken, between the terrain it came out of and the
+    // bodies that broke it.
+    draw_debris(sheet, anim.debris());
     draw_agents_at(sheet, sim, clock, Color32::WHITE, anim, true, at);
 }
 
@@ -3109,7 +3938,7 @@ pub struct BurstParticle {
     pub colour: [u8; 3],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct AgentAnim {
     /// Distance run so far, in seconds-at-full-speed, wrapped to one run cycle.
     stride: f32,
@@ -3141,6 +3970,20 @@ pub struct AgentAnim {
     particle_len: usize,
     prev_outcome: Option<Outcome>,
     prev_stomps: u32,
+    /// **The ropes, as this body has moved them.**
+    ///
+    /// The same kind of state as the dust and the trail — a drawing of the episode, remembered
+    /// between frames — and it lives *here* rather than in the window because the ropes belong to
+    /// the body in front of them. Every live episode has its own animation ([`crate::play::Session`],
+    /// each lane of [`crate::lab::Lanes`], every runner of a [`crate::replay::Replay`]), and every
+    /// one of those steps it in the same place, right after the sim: one shared chain set in the
+    /// window meant only the playtest's own grip ever reached it, and an agent swinging on a rope
+    /// in the replay or the generation drew a rope hanging straight down.
+    rope: RopeMotion,
+    /// **The pieces of the floor this body has broken.** The same kind of state as the rope and
+    /// for the same reason — it is a drawing of the episode — and it lives beside it so a view
+    /// that owns an animation owns the whole of what has been played.
+    debris: Debris,
 }
 
 impl Default for AgentAnim {
@@ -3175,6 +4018,8 @@ impl Default for AgentAnim {
             particle_len: 0,
             prev_outcome: None,
             prev_stomps: 0,
+            rope: RopeMotion::default(),
+            debris: Debris::default(),
         }
     }
 }
@@ -3311,6 +4156,66 @@ impl AgentAnim {
             self.dust = Some(DUST_LIFE);
             self.dust_timer = DUST_PERIOD;
         }
+
+        // The ropes last, from the hands this frame reports: the line is stepped with the body, so
+        // every view that draws an agent — a playtest, a lane of a generation, a ghost in a replay
+        // — animates the rope that agent is on for free, and letting go leaves the line swinging
+        // because the chains keep their own velocity.
+    }
+
+    /// One tick of the line this body is drawing, from the grip the sim reports **now**.
+    ///
+    /// Separate from [`AgentAnim::advance`] because a frame is not a tick. The lanes and the
+    /// replay step several ticks per drawn frame at speed, and the rope has to see the hands on
+    /// every one of them: advanced once for a four-tick frame, it is pulled from where the hands
+    /// were to where they ended up in one step and the line snaps — measured at 0.78 tiles of
+    /// divergence from the tick-by-tick line, on a frame whose hands move a tenth of a tile. The
+    /// playtest advances it inside its own tick loop for the same reason.
+    pub fn advance_rope(&mut self, sim: &Sim, dt: f32) {
+        self.rope.advance(sim.level(), AgentAnim::grip(sim), dt);
+    }
+
+    /// Step the chunks and rubble of the tiles this run has broken, by one sim tick.
+    ///
+    /// **Called by the views that draw the run's own terrain**, next to [`Self::advance_rope`] and
+    /// on the same tick: the playtest, the title screen's demo and the replay of a champion. The
+    /// evolution view does not call it, and that is a decision rather than an omission — the lab
+    /// draws the *authored* level, in which a broken tile is still drawn where it was, so a chunk
+    /// falling out of it would put the effect in front of terrain that contradicts it.
+    pub fn advance_debris(&mut self, sim: &Sim) {
+        self.debris.advance(sim);
+    }
+
+    /// The level's debris as this body has left it.
+    pub fn debris(&self) -> &Debris {
+        &self.debris
+    }
+
+    /// Advance everything by one whole sim tick: what a view that steps its own episode does.
+    pub fn advance_tick(&mut self, sim: &Sim) {
+        self.advance(sim, sim::DT);
+        self.advance_rope(sim, sim::DT);
+    }
+
+    /// The grip `sim`'s body has on one of its level's ropes, or `None` in the air.
+    ///
+    /// The hands are the top centre of the body rather than its feet: a body on a rope hangs from
+    /// its hands, and the hand is where the line leaves it. `length` is the sim's own amount of
+    /// line out, which is what decides *where along the rope* the hands are attached — the drawing
+    /// does not guess it from how far apart the two points happen to be, because a slack rope's
+    /// grip sits at an arc length, not at a distance.
+    pub fn grip(sim: &Sim) -> Option<HeldRope> {
+        let p = sim.player();
+        p.rope.map(|grip| HeldRope {
+            anchor: (grip.anchor_x, grip.anchor_y),
+            hands: (p.x + p.w * 0.5, p.y),
+            length: grip.length,
+        })
+    }
+
+    /// The ropes this agent has moved, for the level drawn behind it.
+    pub fn motion(&self) -> &RopeMotion {
+        &self.rope
     }
 
     /// Which of the six run frames is up.
@@ -3902,6 +4807,357 @@ mod tests {
     use egui::{Pos2, Rect, Vec2};
     use render::trace::{ChampionTrace, TracePoint};
     use sim::AgentAction;
+
+    /// One rope's drawn length, in tiles.
+    fn curve_length(points: &[(f32, f32)]) -> f32 {
+        points
+            .windows(2)
+            .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+            .sum()
+    }
+
+    /// A tick of display time, which is one solver step.
+    const TICK: f32 = 1.0 / 60.0;
+
+    /// The level the rope tests swing on: a pit crossed by one seven-tile line.
+    fn scratch_rope() -> sim::Level {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("levels/scratch-rope.json");
+        sim::Level::from_json_file(&path).expect("the scratch rope level loads")
+    }
+
+    /// The action a body takes to cross `scratch-rope`: run at the pit, jump for the line, hold it
+    /// while it beats right, and let go at the far end of the arc.
+    fn rope_script(player: &sim::physics::PlayerState) -> sim::physics::AgentAction {
+        if player.on_rope() {
+            if player.vx <= 0.0 {
+                sim::physics::AgentAction::Walk
+            } else {
+                sim::physics::AgentAction::RunJump
+            }
+        } else if player.x + player.w < 6.9 {
+            sim::physics::AgentAction::Run
+        } else {
+            sim::physics::AgentAction::RunJump
+        }
+    }
+
+    /// Swing a real body across `scratch-rope` and stop on the tick it lets go of the line.
+    ///
+    /// Everything is stepped the way a view steps it — the sim first, then [`AgentAnim::advance`]
+    /// on that same tick — because the animation only ever sees the grip the sim reports.
+    fn swing_until_release() -> (sim::Level, sim::Sim, AgentAnim) {
+        let level = scratch_rope();
+        let mut sim = sim::Sim::new(&level, 3);
+        let mut anim = AgentAnim::new();
+        let mut held = false;
+        for _ in 0..400 {
+            let action = rope_script(sim.player());
+            sim.step(action);
+            anim.advance_tick(&sim);
+            if sim.player().on_rope() {
+                held = true;
+            } else if held {
+                return (level, sim, anim);
+            }
+        }
+        panic!("the body never caught the line, so it never let go of it");
+    }
+
+    /// A hall with a ceiling at columns 9..13, a seven-tile rope hanging from it, and a floor.
+    fn rope_hall() -> sim::Level {
+        let rows = [
+            ".............",
+            ".............",
+            ".............",
+            ".........####",
+            ".............",
+            ".............",
+            ".............",
+            ".............",
+            ".............",
+            ".............",
+            ".............",
+            "#############",
+            "#############",
+        ];
+        let tiles = rows
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let src = format!(
+            r#"{{"format":"evo-platformer-level","level_format_version":4,"name":"rope-hall","width":13,"height":13,"spawn":{{"x":1,"y":10}},"tiles":[{tiles}],"entities":[{{"type":"rope","x":9,"y":4,"tiles":7}},{{"type":"goal","x":11,"y":10}}]}}"#
+        );
+        sim::Level::from_json_str(&src).expect("the rope hall parses")
+    }
+
+    /// **A real swing moves the drawn line, driven by the sim's own grip.**
+    ///
+    /// The synthetic hand path above proves the solver; this proves the *wiring* — that the grip
+    /// `sim::PlayerState` reports is the one the drawing is stepped with, that the loaded part of
+    /// the line stays taut over a whole real swing and its slack trails the hands, and that the
+    /// line is still off its column after the body has let go. It is the test for the complaint
+    /// that a swing looked static: the rope a body catches in the game, drawn the way the game
+    /// draws it.
+    ///
+    /// Stepped through [`AgentAnim::advance`] rather than through a hand-built [`HeldRope`], because
+    /// that is the only path any view takes: the playtest, every lane of a generation and every
+    /// replay runner advance an animation right after their sim. A rope that moves only when the
+    /// caller assembles a grip itself is a rope that hangs straight for every agent in the game,
+    /// which is exactly what it did.
+    #[test]
+    fn a_real_swing_moves_the_drawn_line() {
+        let level = scratch_rope();
+        let mut sim = sim::Sim::new(&level, 3);
+        // Through the *animation*, not a hand-built grip: this is the path every view takes — the
+        // playtest, a lane, a replay runner all call `AgentAnim::advance` right after the sim — so
+        // a rope that only animates when somebody constructs a `HeldRope` by hand is exactly the bug
+        // this test exists to catch.
+        let mut anim = AgentAnim::new();
+        let mut held_seen = false;
+        // How far the free end hangs behind the column under the hands, in tiles.
+        let mut trail = 0.0_f32;
+        // How far the taut part is from the straight chord from the anchor to the hands.
+        let mut bend = 0.0_f32;
+        for _ in 0..400 {
+            let action = rope_script(sim.player());
+            sim.step(action);
+            anim.advance_tick(&sim);
+            let Some(g) = sim.player().rope else { continue };
+            held_seen |= anim.motion().is_held(0);
+            let curve = anim.motion().curve(0).expect("one rope");
+            let hands = (sim.player().x + sim.player().w * 0.5, sim.player().y);
+            let anchor = (g.anchor_x, g.anchor_y);
+            let span = ((hands.0 - anchor.0).powi(2) + (hands.1 - anchor.1).powi(2)).sqrt();
+            let seg = g.max_length / (curve.len() - 1) as f32;
+            let k = ((span / seg).round() as usize).clamp(1, curve.len() - 1);
+            // A line under load is a chord: the part between the tie and the hands is straight.
+            for (i, p) in curve.iter().enumerate().take(k) {
+                let t = i as f32 / k as f32;
+                let chord = (
+                    anchor.0 + (hands.0 - anchor.0) * t,
+                    anchor.1 + (hands.1 - anchor.1) * t,
+                );
+                bend = bend.max(((p.0 - chord.0).powi(2) + (p.1 - chord.1).powi(2)).sqrt());
+            }
+            // The slack below the hands trails them through the arc.
+            trail = trail.max((curve[curve.len() - 1].0 - hands.0).abs());
+        }
+
+        assert!(
+            held_seen,
+            "the animation never learned which rope the body was on"
+        );
+        // The part above the grip has no slack to speak of, so it may only bend by the width of
+        // the solver's own residual — a quarter of a tile is a rope hanging from two pins, not a
+        // rope with a sag in it.
+        assert!(
+            bend < 0.35,
+            "the loaded part of the line left the straight chord (by {bend:.3} tiles)"
+        );
+        assert!(
+            trail > 0.3,
+            "the slack tail never swung out from under the hands (max {trail:.3} tiles)"
+        );
+    }
+
+    /// **A frame of agents draws the rope of the one that is on it.**
+    ///
+    /// The rule the evolution view and the replay use to pick which body's line to draw. It is a
+    /// rule and not a call because both views have a field of agents and one set of ropes: the
+    /// champion's line while it swings, a ghost's while the champion is not on one, and the best-
+    /// ranked body's own chains when nobody is holding anything (they are still moving from the
+    /// swing that was just let go of).
+    #[test]
+    fn the_ropes_are_drawn_from_the_agent_that_is_on_them() {
+        // Nobody on a rope: the best-ranked body, whichever order the field came in.
+        assert_eq!(rope_owner([(2, false), (0, false), (1, false)]), Some(1));
+        // The champion swinging: its line, even though lower ranks are not on one.
+        assert_eq!(rope_owner([(2, false), (0, true), (1, false)]), Some(1));
+        // A ghost swinging while the champion is in the air: the ghost's line, not a hanging one.
+        assert_eq!(rope_owner([(0, false), (3, true), (1, false)]), Some(1));
+        // Two of them on ropes: the better rank of the two.
+        assert_eq!(rope_owner([(0, false), (3, true), (1, true)]), Some(2));
+        assert_eq!(rope_owner(std::iter::empty()), None);
+    }
+
+    /// **The drawn rope is a chain of the right length, and an idle one hangs straight.**
+    ///
+    /// The solver's whole job is to keep the line's length while letting its shape answer to
+    /// forces, so the length is the first thing to pin: a chain that stretches is a rope made of
+    /// elastic, and every knot down it would be in the wrong place.
+    #[test]
+    fn an_idle_rope_hangs_straight_and_keeps_its_length() {
+        let level = rope_hall();
+        let mut motion = RopeMotion::default();
+        for _ in 0..120 {
+            motion.advance(&level, None, TICK);
+        }
+        let curve = motion.curve(0).expect("one rope").to_vec();
+        // Within a couple of percent: a real line stretches under its own weight, and the solve is
+        // iterative, so the drawn length is the rope's length to the width of a knot.
+        assert!(
+            (curve_length(&curve) - 7.0).abs() < 0.1,
+            "drawn {:.3} tiles of a seven-tile rope",
+            curve_length(&curve)
+        );
+        for p in &curve {
+            assert!(
+                (p.0 - 9.5).abs() < 1.0e-3,
+                "an idle rope hangs in its column, got {p:?}"
+            );
+        }
+        assert!(
+            (curve[curve.len() - 1].1 - 11.0).abs() < 0.1,
+            "its end is the anchor plus its length"
+        );
+    }
+
+    /// **A held line is taut above the hands and slack below them.**
+    ///
+    /// Nothing is posed: one chain, one solver. The part above the grip comes out nearly straight
+    /// because the body is pulling on it, and the part below hangs because nothing is — and both
+    /// of those fall out of the same constraints, which is the point of simulating the line rather
+    /// than drawing a shape from the grip.
+    #[test]
+    fn a_held_line_is_taut_above_the_hands_and_slack_below_them() {
+        let level = rope_hall();
+        let mut motion = RopeMotion::default();
+        let anchor = (9.5, 4.0);
+        // Hang four tiles of line out, then swing the hands along that arc, as a body does.
+        let length = 4.0;
+        let hold = HeldRope {
+            anchor,
+            hands: (9.5, 8.0),
+            length,
+        };
+        for _ in 0..30 {
+            motion.advance(&level, Some(hold), TICK);
+        }
+        let mut hands = hold.hands;
+        for step in 1..=40 {
+            let phi = step as f32 * 0.03;
+            hands = (anchor.0 + length * phi.sin(), anchor.1 + length * phi.cos());
+            motion.advance(
+                &level,
+                Some(HeldRope {
+                    anchor,
+                    hands,
+                    length,
+                }),
+                TICK,
+            );
+        }
+
+        let curve = motion.curve(0).expect("one rope").to_vec();
+        assert!(
+            (curve_length(&curve) - 7.0).abs() < 0.25,
+            "the line stretched or lost length: {:.3}",
+            curve_length(&curve)
+        );
+        assert!(motion.is_held(0), "the drawing knows the line is loaded");
+
+        // Every point between the tie and the hands is on the chord — the line is loaded there.
+        let span = ((hands.0 - anchor.0).powi(2) + (hands.1 - anchor.1).powi(2)).sqrt();
+        let k = (span / (7.0 / (curve.len() - 1) as f32)).round() as usize;
+        for (i, p) in curve.iter().enumerate().take(k + 1) {
+            let t = i as f32 / k as f32;
+            let chord = (
+                anchor.0 + (hands.0 - anchor.0) * t,
+                anchor.1 + (hands.1 - anchor.1) * t,
+            );
+            assert!(
+                ((p.0 - chord.0).powi(2) + (p.1 - chord.1).powi(2)).sqrt() < 0.3,
+                "point {i} of the loaded part is off the chord: {p:?} against {chord:?}"
+            );
+        }
+
+        // And the slack below hangs: it is under the hands, and it trails *behind* the direction
+        // they are travelling rather than stretching out ahead of them.
+        let end = curve[curve.len() - 1];
+        assert!(
+            end.1 > hands.1 + 0.4,
+            "the slack did not hang below the hands: end {end:?}, hands {hands:?}"
+        );
+        assert!(
+            end.0 < hands.0,
+            "the slack was flung ahead of the swing: end {end:?}, hands {hands:?}"
+        );
+
+        // Let go: the line is still off its column a few ticks later, because it is still moving.
+        for _ in 0..6 {
+            motion.advance(&level, None, TICK);
+        }
+        assert!(!motion.is_held(0));
+        let swung = motion.curve(0).expect("one rope");
+        assert!(
+            swung.iter().any(|p| (p.0 - anchor.0).abs() > 0.2),
+            "the line snapped back to a hanging column the moment it was let go"
+        );
+    }
+
+    /// **A released line falls, drags on the terrain, and settles.**
+    ///
+    /// The complaint this pins: once the player or an agent jumped off, the line "moved strangely,
+    /// didn't settle, and jutted off at strange angles". It now has to do three things a rope does
+    /// and a chain of pure constraints did not. It lets go with its slack *hanging* under the grip.
+    /// Nothing in it moves faster than a heavy line falling can — no whip. And it comes back to its
+    /// column, on its own, inside a couple of seconds.
+    #[test]
+    fn a_released_line_hangs_instead_of_cracking() {
+        let (level, sim, mut anim) = swing_until_release();
+        let hands = (sim.player().x + sim.player().w * 0.5, sim.player().y);
+        let rope = level.ropes[0].length;
+        let curve = anim.motion().curve(0).expect("one rope").to_vec();
+        // The slack hangs below the grip: its end is under the hands rather than ahead of them.
+        let end = curve[curve.len() - 1];
+        assert!(
+            end.1 > hands.1 + 0.5,
+            "the free end was not hanging below the grip at release: {end:?}, hands {hands:?}"
+        );
+
+        // Then let it fall, with the body frozen where it let go: no point may travel faster than a
+        // heavy rope dropping under this gravity can. The body itself never moved faster than
+        // about 0.2 tiles a tick; a released line that beats that by three times is the crack.
+        let mut prev = curve;
+        let mut fastest = 0.0_f32;
+        for _ in 0..120 {
+            anim.advance_tick(&sim);
+            let c = anim.motion().curve(0).expect("one rope");
+            let step = c
+                .iter()
+                .zip(prev.iter())
+                .map(|(a, b)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt())
+                .fold(0.0_f32, f32::max);
+            fastest = fastest.max(step);
+            assert!(
+                curve_length(c) <= rope + 0.2,
+                "the released line stretched past its own length: {:.2} tiles",
+                curve_length(c)
+            );
+            prev = c.to_vec();
+        }
+        assert!(
+            fastest < 0.6,
+            "the released line moved {fastest:.2} tiles in one tick, which is a whip, not a rope"
+        );
+
+        // And it settles: a freed line has to come back to hanging under its tie, in a time a
+        // person reads as "the rope dropped", not as a rope that never stops moving. Two and a
+        // half seconds of drag is generous against the arithmetic — a seven-tile line of this
+        // length falls back to its column in about one and a half.
+        let settled = anim.motion().curve(0).expect("one rope");
+        let worst = settled
+            .iter()
+            .map(|p| (p.0 - level.ropes[0].anchor().0).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst < 0.4,
+            "the released line is still {worst:.2} tiles off its column two seconds later"
+        );
+    }
 
     /// **A moving shelf is drawn as one rigid object.**
     ///
@@ -5637,7 +6893,7 @@ mod tests {
         let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
         let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
         let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
-        let camera = Camera::fit(replay.level(), viewport, 24.0);
+        let camera = Camera::fit(replay.drawn_level(), viewport, 24.0);
 
         let output = ctx.run(
             egui::RawInput {
@@ -5651,7 +6907,13 @@ mod tests {
                         let rect = ui.available_rect_before_wrap();
                         let painter = ui.painter_at(rect);
                         let sheet = Sheet::new(&painter, &atlas, &sprites, &camera, rect);
-                        draw_level(sheet, replay.level(), RenderOpts::playing(), None, 0.0);
+                        draw_level(
+                            sheet,
+                            replay.drawn_level(),
+                            RenderOpts::playing(),
+                            None,
+                            0.0,
+                        );
                         draw_replay(sheet, replay);
                     });
             },
@@ -7992,5 +9254,318 @@ mod tests {
                  {family} and the level never sees one. Dressed families: {seen:?}"
             );
         }
+    }
+
+    /// A hall with a brittle brick bridge across it, six tiles above the floor.
+    ///
+    /// The bridge is the geometry the effect needs: a tile that breaks with nothing between it and
+    /// the floor, so the chunk has a fall to make and an impact to smash on.
+    fn cracked_bridge() -> sim::Level {
+        let rows = [
+            "................",
+            "................",
+            "................",
+            "................",
+            "................",
+            "................",
+            "................",
+            "................",
+            "..bbbbbb........",
+            "................",
+            "................",
+            "................",
+            "................",
+            "................",
+            "################",
+            "################",
+        ];
+        let tiles = rows
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let src = format!(
+            r#"{{"format":"evo-platformer-level","level_format_version":4,"name":"cracked-bridge","width":16,"height":16,"spawn":{{"x":3,"y":7}},"tiles":[{tiles}],"entities":[{{"type":"goal","x":14,"y":13}}]}}"#
+        );
+        sim::Level::from_json_str(&src).expect("the cracked bridge parses")
+    }
+
+    /// The chunk's bounding box in tiles: `(x0, y0, x1, y1)`.
+    fn chunk_box(fall: &Fall) -> Option<(f32, f32, f32, f32)> {
+        let corners = fall.corners?;
+        let mut box_ = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &corner in &corners {
+            let p = fall.world.body(corner).pos;
+            box_ = (
+                box_.0.min(p.x),
+                box_.1.min(p.y),
+                box_.2.max(p.x),
+                box_.3.max(p.y),
+            );
+        }
+        Some(box_)
+    }
+
+    /// The fastest fragment, in tiles per tick.
+    fn shard_speed(fall: &Fall) -> f32 {
+        fall.shards
+            .iter()
+            .map(|s| fall.world.body(s.body).vel.length())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// **A broken tile falls, and it smashes.**
+    ///
+    /// The whole of the request, measured: the tile that burns out of the bridge becomes a chunk
+    /// at its own cell; the chunk accelerates under the sim's own gravity; it hits the floor six
+    /// tiles down at the speed a fall that far gives it; it breaks into seven pieces that scatter
+    /// and come to rest; and the rubble is retired rather than left on the floor forever. Every
+    /// step is the engine's — this test never writes a position, only reads what the solver did.
+    #[test]
+    fn a_broken_tile_falls_and_smashes_into_pieces() {
+        let level = cracked_bridge();
+        let mut sim = sim::Sim::new(&level, 7);
+        let mut anim = AgentAnim::new();
+
+        // Stand on the bridge until the fuse under the body burns out. The animation is stepped
+        // with the sim on each tick, which is the order every living view uses.
+        let mut ticks = 0;
+        while sim.broken().is_empty() && ticks < 4 * sim::physics::CRUMBLE_TICKS {
+            sim.step(sim::physics::AgentAction::Walk);
+            anim.advance_debris(&sim);
+            ticks += 1;
+        }
+        assert!(!sim.broken().is_empty(), "the fuse never burned");
+
+        // A chunk at the cell it broke out of, in the material the tile was.
+        let chunk = anim
+            .debris()
+            .falls()
+            .first()
+            .expect("the break should have dropped a chunk");
+        assert_eq!(chunk.material, sim::level::Tile::CrackedBrick);
+        let start = chunk_box(chunk).expect("the chunk starts as one piece");
+        assert!(
+            (start.1 - 8.0).abs() < 0.2 && (start.3 - 9.0).abs() < 0.2,
+            "the chunk should start in row 8, not at {start:?}"
+        );
+
+        // The fall: the chunk's floor goes down, and by the time it lands it is doing a fall's
+        // speed — `v = sqrt(2 * g * h)` for the five tiles under it, so about 0.35 tiles a tick.
+        let mut fastest = 0.0_f32;
+        let mut bottom = start.3;
+        let mut smashed = None;
+        for tick in 0..90 {
+            anim.advance_debris(&sim);
+            let Some(fall) = anim.debris().falls().first() else {
+                break;
+            };
+            if let Some(box_) = chunk_box(fall) {
+                bottom = bottom.max(box_.3);
+                fastest = fastest.max(
+                    fall.corners
+                        .expect("a box")
+                        .iter()
+                        .map(|c| fall.world.body(*c).vel.length())
+                        .fold(0.0, f32::max),
+                );
+            } else {
+                smashed = Some(tick);
+                break;
+            }
+        }
+        assert!(
+            bottom > 11.0,
+            "the chunk did not fall: its bottom is at {bottom}"
+        );
+        assert!(
+            fastest > 0.25,
+            "a five-tile fall should be doing a fall's speed, not {fastest:.3} tiles a tick"
+        );
+        assert!(
+            smashed.is_some(),
+            "the chunk never shattered: it is not enough to fall over, it has to smash"
+        );
+
+        // The smash: seven pieces, thrown outward and carrying the fall, then at rest.
+        let fall = anim.debris().falls().first().expect("the pieces");
+        assert_eq!(fall.shards.len(), SHARD_COUNT);
+        let spread = fall.shards.iter().fold((f32::MAX, f32::MIN), |acc, s| {
+            let x = fall.world.body(s.body).pos.x;
+            (acc.0.min(x), acc.1.max(x))
+        });
+        let born = shard_speed(fall);
+        assert!(
+            born > 0.01,
+            "the pieces were not thrown: their fastest is {born:.4} tiles a tick"
+        );
+
+        let mut rest = 0.0;
+        let mut widest = 0.0_f32;
+        for _ in 0..(SHARD_LIFE + 20) {
+            anim.advance_debris(&sim);
+            let Some(fall) = anim.debris().falls().first() else {
+                break;
+            };
+            widest = widest.max(spread.1 - spread.0);
+            rest = shard_speed(fall);
+        }
+        assert!(
+            widest > 0.2,
+            "the pieces should scatter across the floor, not land in a heap ({widest:.2} tiles)"
+        );
+        assert!(
+            rest < 0.02,
+            "rubble should come to rest, not keep sliding for two seconds: {rest:.3} tiles a tick"
+        );
+        assert!(
+            anim.debris().falls().is_empty(),
+            "the rubble is retired rather than left on the floor forever"
+        );
+        assert!(
+            anim.debris().steps() > SHARD_LIFE as u64,
+            "the pieces should have been stepped for their whole life"
+        );
+    }
+
+    /// One headless frame of [`draw_debris`]: how many quads of the chunk's own sprite it painted,
+    /// and how many of its fragments.
+    ///
+    /// The quads are counted by their uv corners — the trick the shot test uses — because a chunk
+    /// is a *sprite* and a sprite that is allocated but never tessellated is the failure this is
+    /// looking for. The fragments are counted as filled rectangles in the material's two shades,
+    /// which is all a four-pixel piece of rubble can be.
+    fn debris_frame(
+        ctx: &egui::Context,
+        atlas: &Atlas,
+        sprites: &Sprites,
+        camera: &Camera,
+        viewport: Rect,
+        debris: &Debris,
+    ) -> (usize, usize, Option<Rect>) {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::default())
+                    .show(ctx, |ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let painter = ui.painter_at(rect);
+                        let sheet = Sheet::new(&painter, atlas, sprites, camera, rect);
+                        draw_debris(sheet, debris);
+                    });
+            },
+        );
+
+        let (light, dark) = shard_colours(Tile::CrackedBrick);
+        let mut pieces = 0;
+        for clipped in &output.shapes {
+            if let egui::Shape::Rect(rect) = &clipped.shape {
+                if rect.fill == light || rect.fill == dark {
+                    pieces += 1;
+                }
+            }
+        }
+
+        let wanted = atlas
+            .uv(chunk_sprite(Tile::CrackedBrick))
+            .expect("the chunk's sprite is in the atlas");
+        let corners = [
+            wanted.min,
+            Pos2::new(wanted.max.x, wanted.min.y),
+            wanted.max,
+            Pos2::new(wanted.min.x, wanted.max.y),
+        ];
+        let texture = atlas.texture_id();
+        let mut chunks = 0;
+        let mut where_ = None;
+        for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+            let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
+                continue;
+            };
+            if mesh.texture_id != texture {
+                continue;
+            }
+            for quad in mesh.vertices.chunks(4) {
+                if quad.len() == 4 && corners.iter().all(|c| quad.iter().any(|v| v.uv == *c)) {
+                    chunks += 1;
+                    let mut bounds = Rect::NOTHING;
+                    for v in quad {
+                        bounds = bounds.union(Rect::from_min_size(v.pos, Vec2::ZERO));
+                    }
+                    where_ = Some(where_.map_or(bounds, |w: Rect| w.union(bounds)));
+                }
+            }
+        }
+        (chunks, pieces, where_)
+    }
+
+    /// **The fall and the smash reach the frame**, as the tile that fell and then as rubble.
+    ///
+    /// The physics test above says the solver drops a chunk; this says the picture of it is
+    /// actually painted — the chunk with the sprite of the tile it broke out of, the pieces as
+    /// rubble in that material's own two shades — because an effect that exists only in a struct is
+    /// the one kind of bug a `cargo test` can otherwise miss completely.
+    #[test]
+    fn the_debris_is_drawn_in_the_material_it_broke_from() {
+        let level = cracked_bridge();
+        let mut sim = sim::Sim::new(&level, 7);
+        let mut anim = AgentAnim::new();
+        let mut guard = 0;
+        while sim.broken().is_empty() && guard < 4 * sim::physics::CRUMBLE_TICKS {
+            sim.step(sim::physics::AgentAction::Walk);
+            anim.advance_debris(&sim);
+            guard += 1;
+        }
+        assert!(!sim.broken().is_empty(), "the fuse never burned");
+        // A few ticks of fall, so the chunk is unambiguously in the air.
+        for _ in 0..6 {
+            anim.advance_debris(&sim);
+        }
+
+        let ctx = egui::Context::default();
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        let sprites = Sprites::load(&atlas).expect("the shipped tileset has every sprite");
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        let camera = Camera::fit(&level, viewport, 24.0);
+        let (chunks, pieces, at) =
+            debris_frame(&ctx, &atlas, &sprites, &camera, viewport, anim.debris());
+        assert_eq!(
+            chunks, 1,
+            "the falling chunk is one picture: the tile that fell"
+        );
+        assert_eq!(pieces, 0, "a chunk is not rubble yet");
+
+        // **Where the fall is drawn** is the box the solver is moving, not a tile it used to be:
+        // the chunk's picture has to travel with it, and the screen rectangle it lands in is the
+        // camera's answer for the physics box.
+        let fall = anim.debris().falls().first().expect("the chunk");
+        let (x0, y0, x1, y1) = chunk_box(fall).expect("a box");
+        let wanted = camera.world_rect(x0, y0, x1 - x0, y1 - y0, viewport);
+        let at = at.expect("the chunk's quad");
+        assert!(
+            (at.min - wanted.min).length() < 1.5 && (at.max - wanted.max).length() < 1.5,
+            "the chunk is drawn at {at:?}, not over its box at {wanted:?}"
+        );
+
+        // Let it land and break up.
+        let mut guard = 0;
+        while anim
+            .debris()
+            .falls()
+            .first()
+            .is_some_and(|fall| fall.corners.is_some())
+            && guard < 120
+        {
+            anim.advance_debris(&sim);
+            guard += 1;
+        }
+        let (chunks, pieces, _) =
+            debris_frame(&ctx, &atlas, &sprites, &camera, viewport, anim.debris());
+        assert_eq!(chunks, 0, "the chunk is gone once it has smashed");
+        assert_eq!(pieces, SHARD_COUNT, "every piece of it is painted");
     }
 }

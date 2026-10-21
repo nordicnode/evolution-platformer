@@ -318,6 +318,37 @@ pub struct Physics {
     pub lava_h: f32,
     /// Ticks a lava ball lives for at most, after which it burns out wherever it is.
     pub lava_ticks: u32,
+
+    // ---- the rope -----------------------------------------------------
+    /// Tangential push a direction press gives a body on a rope, tiles/tick².
+    ///
+    /// The body pumps the swing the way a person does: not by walking (there is no ground, and
+    /// a direction on a rope moves no body) but by leaning into the arc. It is smaller than
+    /// [`Physics::run_accel`] — 0.008 against 0.010 — because a pendulum has time: the force is
+    /// applied over a whole arc, so a gentler push is still enough to build a swing of several
+    /// tiles, and a runner's acceleration would make the rope a slingshot.
+    pub rope_pump: f32,
+    /// How close the body's hands have to pass to a rope's line to catch it, in tiles.
+    ///
+    /// Measured on the rope's own axis (a vertical line at the anchor's column) against the top
+    /// centre of the body, so the grab is a reach rather than a box: a body can jump past a rope
+    /// without touching it, which is what makes catching one a decision. 0.55 is a little under
+    /// the body's own width, so a jump that puts the hands over the line catches it and one that
+    /// clears it by half a tile does not.
+    pub rope_grab: f32,
+    /// Share of a swing's speed that survives each tick: the air and the grip taking their cut.
+    ///
+    /// 0.999 is a fraction of a percent per tick, which is 6% a second — enough that a swing
+    /// decays when nobody pumps it (a body hangs still in a few seconds, as a body does) and
+    /// little enough that a pumped arc keeps its energy for several passes.
+    pub rope_drag: f32,
+    /// Shortest a catch can be, in tiles: a body's reach is not a point.
+    ///
+    /// The grip is the distance from the anchor to the hands at the moment of the catch, so a
+    /// body that catches the line right under the anchor would be on a zero-length pendulum.
+    /// Three quarters of a tile is close to the body's own height and keeps the constraint's
+    /// arithmetic away from a degenerate radius.
+    pub rope_min_length: f32,
 }
 
 pub const PHYSICS: Physics = Physics {
@@ -396,6 +427,13 @@ pub const PHYSICS: Physics = Physics {
     // A ball's arc is ~40 ticks; 150 is the backstop for a vent that has been buried by a
     // bridge since it fired.
     lava_ticks: 150,
+    // Under `run_accel` on purpose: a pendulum has a whole arc to be pushed along.
+    rope_pump: 0.008,
+    // A hand's reach, not a box: a jump that misses the line by half a tile misses it.
+    rope_grab: 0.55,
+    // 6% a second: a swing nobody pumps comes to rest, a pumped one keeps its energy.
+    rope_drag: 0.999,
+    rope_min_length: 0.75,
 };
 
 impl Default for Physics {
@@ -725,6 +763,13 @@ pub struct TickContact {
     /// because the two hazards answer different boxes and a reader of this report should not
     /// have to know which one killed it.
     pub touched_lava: bool,
+    /// The body caught a rope this tick, or let one go.
+    ///
+    /// Reported separately from the jump because they are different events with different
+    /// consequences: a grab spends no jump and a release is not a jump, and the replay, the
+    /// sound and the pose all want to tell them apart. Nothing scores them.
+    pub grabbed_rope: bool,
+    pub released_rope: bool,
 }
 
 /// Bottom edge of an entity occupying tile row `ty`, in world units.
@@ -882,6 +927,40 @@ pub fn spring_launch(level: &Level, player: &mut PlayerState, ph: &Physics) -> b
     false
 }
 
+/// A body's grip on a rope: the pivot it swings about, and how much line is out.
+///
+/// The rope is modelled as an **inextensible line with a point mass on the end** — the body —
+/// rather than as a chain of linked segments. That is a deliberate choice and it is what the
+/// swinging *game* is: a body on a rope is a pendulum, and what a player learns is the period of
+/// the arc and the moment to let go. A segmented rope would simulate the line's own whip, which
+/// nothing in the level can see and no policy can use, at the cost of a state per segment per
+/// tick and a grab that has to decide which segment it caught.
+///
+/// **The constraint is a projection, not a spring.** Each tick the hands are integrated as a free
+/// point under gravity and the pump; anything past `length` from the anchor is then moved back
+/// onto the circle and the radial part of the velocity is taken away. That is what an
+/// inextensible line does — it can pull but never push — and doing it as a projection rather than
+/// a force is why the swing cannot explode: the body is put back on the circle every tick, so the
+/// error is one tick deep no matter how fast the arc is.
+///
+/// The alternative, a spring with a stiffness, was not tried and does not need to be: a spring
+/// stretches with speed, which would make a fast swing longer than a slow one, and the length of
+/// the rope is the one number a level author chooses.
+///
+/// No trig anywhere. The position is carried in Cartesian coordinates and constrained by
+/// normalising the offset, which is two multiplies and a square root — deterministic on every
+/// build, unlike `sin`/`cos`, which is the same rule the rest of this crate's physics follows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeGrip {
+    /// The pivot: the middle of the underside of the tile the line is tied to.
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+    /// How much line is out right now, in tiles: the radius of the arc.
+    pub length: f32,
+    /// The rope's own length: the longest this grip may extend to.
+    pub max_length: f32,
+}
+
 /// The player's body and movement state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerState {
@@ -915,6 +994,13 @@ pub struct PlayerState {
     pub in_water: bool,
     /// The body was airborne and overlapping a vine this tick, so it is climbing.
     pub on_vine: bool,
+    /// The rope this body is hanging from, when it is holding one.
+    ///
+    /// `Some` for as long as the grip is held, which is exactly as long as jump is held: the
+    /// rope answers the same button the vine does — *use the thing you are on* — and letting go
+    /// of it is how a swing ends. The body keeps whatever speed the arc had built, which is the
+    /// whole reason the object exists.
+    pub rope: Option<RopeGrip>,
     /// A pull-up in progress: the body has climbed a vine to the block it hangs from and is
     /// hauling itself over that block's lip.
     mantle: Option<Mantle>,
@@ -1040,8 +1126,14 @@ impl PlayerState {
             wall_lock: 0,
             in_water: false,
             on_vine: false,
+            rope: None,
             mantle: None,
         }
+    }
+
+    /// True while the body is hanging from a rope.
+    pub fn on_rope(&self) -> bool {
+        self.rope.is_some()
     }
 
     /// True while a pull-up is in progress. The window draws it as a climb — the rising pose, since
@@ -1094,6 +1186,108 @@ impl PlayerState {
             landed: finished,
             ..TickContact::default()
         })
+    }
+
+    /// One tick of a swing: the grip owns the body's motion.
+    ///
+    /// The order is the physics, and it is the whole implementation: a pump (a direction press),
+    /// gravity, then **the line**. The line is the object's entire contribution and it is one
+    /// projection — anything past the radius is put back on the circle and the radial part of the
+    /// velocity is spent against it — which is why the swing keeps its energy instead of leaking
+    /// it, and why the arc cannot run away: the body is on the circle every tick, so the error is
+    /// a tick deep however fast it is moving.
+    ///
+    /// **The grip does not change length.** Holding the button is holding the line, not hauling
+    /// on it: the first version shortened the grip while jump was held, and a policy that simply
+    /// held the button — which is what holding on *is* — reeled itself up to the anchor in two
+    /// seconds and then hung from a three-quarter-tile pendulum with no swing left in it. A rope
+    /// is a swing; the length is the one the catch found.
+    ///
+    /// Collisions are resolved after the constraint and **the constraint is not re-applied**: a
+    /// swing that meets a wall stops at the wall, and the next tick's gravity carries it back
+    /// along the arc. Re-projecting after a wall would push the body through the wall to stay on
+    /// the circle, which is the one thing a swing must not do.
+    fn tick_rope(
+        &mut self,
+        level: &Level,
+        ph: &Physics,
+        action: AgentAction,
+        contact: &mut TickContact,
+    ) {
+        let Some(grip) = self.rope else { return };
+        let anchor = (grip.anchor_x, grip.anchor_y);
+
+        // The hands are the point the whole model hangs from: the body is carried by them.
+        let mut hx = self.x + self.w * 0.5;
+        let mut hy = self.y;
+
+        // Pump. Horizontal on purpose — that is what leaning does — and the constraint is what
+        // turns it into an arc: at the bottom of a swing a sideways push is almost all
+        // tangential and the arc speeds up; at the ends of the arc it is almost all radial and
+        // nothing happens. That asymmetry is the mechanic.
+        self.vx += action.input_x() * ph.rope_pump;
+        // Gravity, uncapped: a swing is faster than a fall, which is the point of one.
+        self.vy += ph.gravity;
+        // Drag — the only place the arc loses energy.
+        self.vx *= ph.rope_drag;
+        self.vy *= ph.rope_drag;
+
+        hx += self.vx;
+        hy += self.vy;
+
+        // The line: pull, never push.
+        let (dx, dy) = (hx - anchor.0, hy - anchor.1);
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist > grip.length && dist > 1.0e-6 {
+            let (ux, uy) = (dx / dist, dy / dist);
+            hx = anchor.0 + ux * grip.length;
+            hy = anchor.1 + uy * grip.length;
+            let radial = self.vx * ux + self.vy * uy;
+            if radial > 0.0 {
+                self.vx -= ux * radial;
+                self.vy -= uy * radial;
+            }
+        }
+
+        // Place the body with its hands at the end of the line, then let the terrain answer:
+        // a swing into a wall stops at it, and a swing onto a floor lets go and lands.
+        let old_x = self.x;
+        self.x = hx - self.w * 0.5;
+        if rect_hits_opaque(level, self.aabb()) {
+            self.x = old_x;
+            self.vx = 0.0;
+            contact.hit_wall = true;
+        }
+        self.y = hy;
+        self.grounded = false;
+        let mut holding = true;
+        let (tx0, tx1) = tile_span(self.x, self.w);
+        if self.vy > 0.0 {
+            let row = row_span(self.y, self.h).1;
+            for tx in tx0..=tx1 {
+                if level.is_solid(tx, row) {
+                    self.y = row as f32 - self.h;
+                    self.vy = 0.0;
+                    self.grounded = true;
+                    self.jump_cut_applied = false;
+                    holding = false;
+                    contact.landed = true;
+                    contact.released_rope = true;
+                    break;
+                }
+            }
+        } else if self.vy < 0.0 {
+            let row = tile_span(self.y, self.h).0;
+            for tx in tx0..=tx1 {
+                if level.is_opaque(tx, row) {
+                    self.y = (row + 1) as f32;
+                    self.vy = 0.0;
+                    contact.hit_ceiling = true;
+                    break;
+                }
+            }
+        }
+        self.rope = if holding { Some(grip) } else { None };
     }
 
     pub fn aabb(&self) -> Rect {
@@ -1175,6 +1369,35 @@ impl PlayerState {
         }
         let clinging = self.clinging();
 
+        // ---- the rope: gripped while the button is held --------------------
+        //
+        // The same button the vine answers, and for the same reason: jump is "use the thing you
+        // are on". On a vine that means climb; on a rope it means **hold on**, and letting the
+        // button go is how a swing ends. The grip is therefore not a press but a *state*, which
+        // is what makes a rope different from a jump: the body is attached for as long as it
+        // asks to be, and everything that happens in between is the arc.
+        //
+        // Catching one is contact, not a press: an airborne body whose **hands** (the top centre
+        // of its box) pass within [`Physics::rope_grab`] of the line catches it, and one that
+        // passes half a tile wide misses. That is the decision the object adds — the jump has to
+        // be aimed at the rope, not merely made near it.
+        if self.rope.is_some() && (!want_jump || in_water) {
+            self.rope = None;
+            contact.released_rope = true;
+        }
+        if self.rope.is_none() && !self.grounded && !in_water && want_jump {
+            if let Some(grip) = level.rope_grab(self.aabb(), ph) {
+                self.rope = Some(grip);
+                contact.grabbed_rope = true;
+            }
+        }
+        let swinging = self.rope.is_some();
+        if swinging {
+            // Nothing buffered survives a grab: a press that would have been a jump is the
+            // press that took hold of the rope.
+            self.jump_buffer = 0;
+        }
+
         // ---- the vine's own block -----------------------------------------
         //
         // A vine that hangs from a *ledge* is left sideways (the climb's exit), but a vine that
@@ -1233,7 +1456,7 @@ impl PlayerState {
             Medium::Vine => self.jump_buffer = 0,
             Medium::Air => {}
         }
-        if in_air_medium && self.jump_buffer > 0 {
+        if in_air_medium && !swinging && self.jump_buffer > 0 {
             if self.can_jump() {
                 self.vy = -ph.jump_v0;
                 self.grounded = false;
@@ -1260,7 +1483,7 @@ impl PlayerState {
             }
         }
         let holding = want_jump || self.jump_hold_ticks > 0;
-        if !holding && self.vy < 0.0 && !self.jump_cut_applied {
+        if !swinging && !holding && self.vy < 0.0 && !self.jump_cut_applied {
             self.vy *= ph.jump_cut;
             self.jump_cut_applied = true;
         }
@@ -1308,7 +1531,11 @@ impl PlayerState {
 
         // ---- horizontal intent ------------------------------------------
         let input = action.input_x();
-        if held {
+        if swinging {
+            // The swing owns the body's motion: its x, its y, its gravity and its collisions
+            // are `PlayerState::tick_rope`, and a direction on a rope is a pump rather than a
+            // walk (there is no ground under the body to walk on).
+        } else if held {
             // The vine has the body: a direction is not a walk while the climb is held below
             // the exit window.
         } else if self.wall_lock > 0 {
@@ -1360,104 +1587,112 @@ impl PlayerState {
         }
 
         // ---- move x, resolve x ------------------------------------------
-        self.x += self.vx;
-        let (ty0, ty1) = row_span(self.y, self.h);
-        if self.vx > 0.0 {
-            let col = tile_span(self.x, self.w).1;
-            for ty in ty0..=ty1 {
-                // `is_opaque`, not `is_solid`: a one-way shelf is ground from above and air
-                // from the side, so a body walking into its edge walks past it.
-                if level.is_opaque(col, ty) {
-                    self.x = col as f32 - self.w;
-                    self.vx = 0.0;
-                    contact.hit_wall = true;
-                    break;
-                }
-            }
-        } else if self.vx < 0.0 {
-            let col = tile_span(self.x, self.w).0;
-            for ty in ty0..=ty1 {
-                if level.is_opaque(col, ty) {
-                    self.x = (col + 1) as f32;
-                    self.vx = 0.0;
-                    contact.hit_wall = true;
-                    break;
-                }
-            }
-        }
-
-        // ---- vertical: gravity, or the medium's own pull, then move y -----
         //
-        // One match rather than three ifs, because the media are exclusive and a body that is
-        // in water must not also be wall-sliding: a swimmer pressing into a pool wall would
-        // otherwise be held at the wall slide's 0.06 by a rule about walls it is not on.
-        match medium {
-            Medium::Water => {
-                // A body already rising faster than a stroke is **ballistic**: that is the
-                // breach jump, and letting gravity have it is what makes the leap out of a
-                // pool the height `water_breach_height` promises instead of a stroke. Inside
-                // the water, the body's vertical speed drifts to the water's own rate — the
-                // sink when the button is up, the swim when it is down.
-                if self.vy < -ph.water_swim {
-                    self.vy = (self.vy + ph.gravity).min(ph.max_fall);
-                } else {
-                    // The fall the body arrived with is taken out of it at the surface line,
-                    // in one tick, and `water_accel` does the rest. A body that has just
-                    // splashed in is caught here, not by the sink rate alone.
-                    self.vy = self.vy.min(ph.water_entry);
-                    let target = if want_jump {
-                        -ph.water_swim
+        // A body on a rope moves as the swing moves it, so the walk is the *other* branch. The
+        // two are exclusive by construction: `swinging` is `rope.is_some()`, and the rope is
+        // only held while jump is down and the body is off the ground.
+        if swinging {
+            self.tick_rope(level, ph, action, &mut contact);
+        } else {
+            self.x += self.vx;
+            let (ty0, ty1) = row_span(self.y, self.h);
+            if self.vx > 0.0 {
+                let col = tile_span(self.x, self.w).1;
+                for ty in ty0..=ty1 {
+                    // `is_opaque`, not `is_solid`: a one-way shelf is ground from above and air
+                    // from the side, so a body walking into its edge walks past it.
+                    if level.is_opaque(col, ty) {
+                        self.x = col as f32 - self.w;
+                        self.vx = 0.0;
+                        contact.hit_wall = true;
+                        break;
+                    }
+                }
+            } else if self.vx < 0.0 {
+                let col = tile_span(self.x, self.w).0;
+                for ty in ty0..=ty1 {
+                    if level.is_opaque(col, ty) {
+                        self.x = (col + 1) as f32;
+                        self.vx = 0.0;
+                        contact.hit_wall = true;
+                        break;
+                    }
+                }
+            }
+
+            // ---- vertical: gravity, or the medium's own pull, then move y -----
+            //
+            // One match rather than three ifs, because the media are exclusive and a body that is
+            // in water must not also be wall-sliding: a swimmer pressing into a pool wall would
+            // otherwise be held at the wall slide's 0.06 by a rule about walls it is not on.
+            match medium {
+                Medium::Water => {
+                    // A body already rising faster than a stroke is **ballistic**: that is the
+                    // breach jump, and letting gravity have it is what makes the leap out of a
+                    // pool the height `water_breach_height` promises instead of a stroke. Inside
+                    // the water, the body's vertical speed drifts to the water's own rate — the
+                    // sink when the button is up, the swim when it is down.
+                    if self.vy < -ph.water_swim {
+                        self.vy = (self.vy + ph.gravity).min(ph.max_fall);
                     } else {
-                        ph.water_sink
+                        // The fall the body arrived with is taken out of it at the surface line,
+                        // in one tick, and `water_accel` does the rest. A body that has just
+                        // splashed in is caught here, not by the sink rate alone.
+                        self.vy = self.vy.min(ph.water_entry);
+                        let target = if want_jump {
+                            -ph.water_swim
+                        } else {
+                            ph.water_sink
+                        };
+                        self.vy += (target - self.vy).clamp(-ph.water_accel, ph.water_accel);
+                    }
+                }
+                // A vine replaces gravity outright: the body hangs where it is when the button is
+                // up, and rises when it is held. Snapping rather than accelerating is the grab —
+                // arriving at a vine at speed catches the body on the first tick, which is the
+                // difference between a vine and a ladder-shaped suggestion.
+                Medium::Vine => {
+                    self.vy = if want_jump {
+                        -ph.vine_climb
+                    } else {
+                        ph.vine_slide
                     };
-                    self.vy += (target - self.vy).clamp(-ph.water_accel, ph.water_accel);
+                }
+                Medium::Air => {
+                    self.vy = (self.vy + ph.gravity).min(ph.max_fall);
+                    // Pressing into a wall turns a fall into a slow slide. `wall_dir != 0` after the
+                    // jump block means this tick did *not* launch off the wall (a wall jump clears
+                    // it), so a jump out of a slide is never slowed by the slide it just left.
+                    if clinging && self.wall_dir != 0 && self.vy > ph.wall_slide_fall {
+                        self.vy = ph.wall_slide_fall;
+                    }
                 }
             }
-            // A vine replaces gravity outright: the body hangs where it is when the button is
-            // up, and rises when it is held. Snapping rather than accelerating is the grab —
-            // arriving at a vine at speed catches the body on the first tick, which is the
-            // difference between a vine and a ladder-shaped suggestion.
-            Medium::Vine => {
-                self.vy = if want_jump {
-                    -ph.vine_climb
-                } else {
-                    ph.vine_slide
-                };
-            }
-            Medium::Air => {
-                self.vy = (self.vy + ph.gravity).min(ph.max_fall);
-                // Pressing into a wall turns a fall into a slow slide. `wall_dir != 0` after the
-                // jump block means this tick did *not* launch off the wall (a wall jump clears
-                // it), so a jump out of a slide is never slowed by the slide it just left.
-                if clinging && self.wall_dir != 0 && self.vy > ph.wall_slide_fall {
-                    self.vy = ph.wall_slide_fall;
+            self.y += self.vy;
+            let (tx0, tx1) = tile_span(self.x, self.w);
+            self.grounded = false;
+            if self.vy > 0.0 {
+                let row = row_span(self.y, self.h).1;
+                for tx in tx0..=tx1 {
+                    if level.is_solid(tx, row) {
+                        self.y = row as f32 - self.h;
+                        self.vy = 0.0;
+                        self.grounded = true;
+                        self.jump_cut_applied = false;
+                        contact.landed = true;
+                        break;
+                    }
                 }
-            }
-        }
-        self.y += self.vy;
-        let (tx0, tx1) = tile_span(self.x, self.w);
-        self.grounded = false;
-        if self.vy > 0.0 {
-            let row = row_span(self.y, self.h).1;
-            for tx in tx0..=tx1 {
-                if level.is_solid(tx, row) {
-                    self.y = row as f32 - self.h;
-                    self.vy = 0.0;
-                    self.grounded = true;
-                    self.jump_cut_applied = false;
-                    contact.landed = true;
-                    break;
-                }
-            }
-        } else if self.vy < 0.0 {
-            let row = tile_span(self.y, self.h).0;
-            for tx in tx0..=tx1 {
-                // Rising through a one-way shelf is the move the tile exists for.
-                if level.is_opaque(tx, row) {
-                    self.y = (row + 1) as f32;
-                    self.vy = 0.0;
-                    contact.hit_ceiling = true;
-                    break;
+            } else if self.vy < 0.0 {
+                let row = tile_span(self.y, self.h).0;
+                for tx in tx0..=tx1 {
+                    // Rising through a one-way shelf is the move the tile exists for.
+                    if level.is_opaque(tx, row) {
+                        self.y = (row + 1) as f32;
+                        self.vy = 0.0;
+                        contact.hit_ceiling = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1703,6 +1938,19 @@ impl PlayerState {
         h.u32(self.wall_lock);
         h.u8(self.in_water as u8);
         h.u8(self.on_vine as u8);
+        // The swing is state in the strongest sense: two frames that differ only in how much
+        // line is out are two different arcs from here on, so the pivot and the radius are
+        // part of what this state *is*.
+        match &self.rope {
+            None => h.u8(0),
+            Some(r) => {
+                h.u8(1);
+                h.f32(r.anchor_x);
+                h.f32(r.anchor_y);
+                h.f32(r.length);
+                h.f32(r.max_length);
+            }
+        }
     }
 }
 

@@ -156,12 +156,114 @@ pub enum Brush {
     Turret,
     /// Places a moving platform: a shelf that slides on a fixed cycle and carries a body.
     Platform,
+    /// Hangs a rope: a line a body catches in the air and swings on.
+    ///
+    /// Painted a **cell at a time**, like every other part of a level: a click hangs one cell of
+    /// line, and a drag down from it grows that line a cell per row (`Level::add_rope_cell`). The
+    /// first cell needs something solid above it — a rope is tied to a ceiling — and the rest
+    /// follow the line already hanging there.
+    Rope,
     /// Places a piece of scenery (a bush, tree, rock, flower...): decoration the physics
     /// never sees. Which sprite is decided by [`Editor::scene_sprite`], because there are
     /// two dozen of them and two dozen palette buttons would be two dozen brushes.
     Scenery,
     /// Removes whatever is under the cursor: entity first, then terrain.
     Erase,
+}
+
+/// The palette's shelves: which brushes are shown together, and so which cells are on screen.
+///
+/// Twenty-five cells in one wrapped grid is a wall. The eight materials that build the floor, the
+/// six ways a floor can hurt and the four things that patrol it are three different jobs, and a
+/// person holds one of them at a time — so the palette shows one shelf at a time and the tabs say
+/// which. That is the whole difference between a palette and a box of parts emptied onto a table.
+///
+/// The shelves are grouped by **what a person is doing**, not by the simulator's taxonomy. Water
+/// sits with the traps because it kills by being fallen into; a rope sits with the platform and the
+/// flag because it is a way through the level; and the two cells that act on a cell rather than
+/// fill one keep a shelf of their own, because they are what a person reaches for while *fixing* a
+/// level rather than while building one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushGroup {
+    /// The floor and its materials, each with its brittle twin beside it.
+    Ground,
+    /// The spikes, pads, liquids, climbables and one-ways: what a floor can be made of that hurts.
+    Hazard,
+    /// The four things that move and want the body dead.
+    Enemy,
+    /// Where the level starts, where it ends, and what carries you between the two.
+    World,
+    /// The two brushes that act on a cell rather than fill it.
+    Clear,
+}
+
+impl BrushGroup {
+    /// Every shelf, in the order the palette's tabs draw them: the canvas is built from the ground
+    /// up, then made dangerous, then inhabited, then given a route and finally tidied.
+    pub const ALL: [BrushGroup; 5] = [
+        BrushGroup::Ground,
+        BrushGroup::Hazard,
+        BrushGroup::Enemy,
+        BrushGroup::World,
+        BrushGroup::Clear,
+    ];
+
+    /// What the tab says. One word, because the tab is as wide as the word and five of them have
+    /// to fit a panel that is 190 points wide ([`crate::ui::icon_button`] widens a plate to its
+    /// caption, so a longer name is a wrapped row rather than a clipped one).
+    pub fn label(self) -> &'static str {
+        match self {
+            BrushGroup::Ground => "Ground",
+            BrushGroup::Hazard => "Hazards",
+            BrushGroup::Enemy => "Enemies",
+            BrushGroup::World => "World",
+            BrushGroup::Clear => "Clear",
+        }
+    }
+
+    /// What is on this shelf, for the tab's hover: the sentence a one-word tab cannot hold.
+    pub fn about(self) -> &'static str {
+        match self {
+            BrushGroup::Ground => "the floor: four materials, each with its brittle twin",
+            BrushGroup::Hazard => "spikes, pads, water, lava, vines and one-way ledges",
+            BrushGroup::Enemy => "walkers, chasers, flyers and turrets",
+            BrushGroup::World => "spawn, flag, moving platform, rope and scenery",
+            BrushGroup::Clear => "clear a cell, or erase what is on it",
+        }
+    }
+
+    /// The brushes on this shelf, in palette order.
+    pub fn brushes(self) -> &'static [Brush] {
+        match self {
+            BrushGroup::Ground => &[
+                Brush::Solid,
+                Brush::Cracked,
+                Brush::Sand,
+                Brush::CrackedSand,
+                Brush::Brick,
+                Brush::CrackedBrick,
+                Brush::Plank,
+                Brush::CrackedPlank,
+            ],
+            BrushGroup::Hazard => &[
+                Brush::Spike,
+                Brush::Spring,
+                Brush::OneWay,
+                Brush::Water,
+                Brush::Lava,
+                Brush::Vine,
+            ],
+            BrushGroup::Enemy => &[Brush::Walker, Brush::Chaser, Brush::Flyer, Brush::Turret],
+            BrushGroup::World => &[
+                Brush::Spawn,
+                Brush::Goal,
+                Brush::Platform,
+                Brush::Rope,
+                Brush::Scenery,
+            ],
+            BrushGroup::Clear => &[Brush::Empty, Brush::Erase],
+        }
+    }
 }
 
 /// The scenery a person can place, curated from the shipped art.
@@ -229,15 +331,19 @@ impl Shape {
 }
 
 impl Brush {
-    /// Every brush, in the order the palette draws them: the six materials (four sound, four
-    /// brittle — soil's brittle twin sits beside the ground it breaks, and so on down the row),
-    /// then the spike and the pad, then the entities, then the two that act on a cell rather than
-    /// fill it.
+    /// Every brush, in the order the shelves were cut from them.
     ///
-    /// Material, then *what that material's brittle self is*, all the way down: a person painting a
-    /// bridge reaches for `cracked` in the same glance they found `ground` in, which a row that
-    /// grouped all four brittle cells together would not give them.
-    pub const ALL: [Brush; 24] = [
+    /// **Test-only, and deliberately so.** The palette draws one [`BrushGroup`] at a time now, so
+    /// the shelves are the only ordering a running window has; this list is the *whole set*, which
+    /// is a question only the checks ask — that every brush has an icon, and that the shelves
+    /// partition them. A production constant nothing in production reads is a list that quietly
+    /// stops agreeing with the thing it claims to describe.
+    ///
+    /// The order is the old palette's: material, then *what that material's brittle self is*, all
+    /// the way down, because that is how a person reaches for `cracked` in the same glance they
+    /// found `ground` — which is why the shelves keep the pairs side by side.
+    #[cfg(test)]
+    pub const ALL: [Brush; 25] = [
         Brush::Solid,
         Brush::Cracked,
         Brush::Sand,
@@ -261,8 +367,38 @@ impl Brush {
         Brush::Flyer,
         Brush::Turret,
         Brush::Platform,
+        Brush::Rope,
         Brush::Erase,
     ];
+
+    /// Which shelf of the palette this brush lives on.
+    ///
+    /// The inverse of [`BrushGroup::brushes`], and deliberately written as a match rather than
+    /// searched out of the shelves: a brush that belongs to no shelf is then a compile error, and
+    /// one that belongs to two is impossible rather than merely untested.
+    pub fn group(self) -> BrushGroup {
+        match self {
+            Brush::Solid
+            | Brush::Cracked
+            | Brush::Sand
+            | Brush::CrackedSand
+            | Brush::Brick
+            | Brush::CrackedBrick
+            | Brush::Plank
+            | Brush::CrackedPlank => BrushGroup::Ground,
+            Brush::Spike
+            | Brush::Spring
+            | Brush::OneWay
+            | Brush::Water
+            | Brush::Lava
+            | Brush::Vine => BrushGroup::Hazard,
+            Brush::Walker | Brush::Chaser | Brush::Flyer | Brush::Turret => BrushGroup::Enemy,
+            Brush::Spawn | Brush::Goal | Brush::Platform | Brush::Rope | Brush::Scenery => {
+                BrushGroup::World
+            }
+            Brush::Empty | Brush::Erase => BrushGroup::Clear,
+        }
+    }
 
     /// Does this brush paint brittle ground?
     pub fn is_cracked(self) -> bool {
@@ -321,6 +457,13 @@ impl Brush {
             Brush::Flyer => "flyer_a",
             Brush::Turret => "turret_r",
             Brush::Platform => "mover_m",
+            // A rope is drawn by the view rather than from a sprite (see `view::draw_ropes`), but
+            // the brush still needs a *picture*, and it used to borrow the vine's hanging strand —
+            // which is a picture of a vine: green, leafed, and the climb brush's own subject. The
+            // tileset has a `rope` cell of its own now (`terrain.rope`: a twisted cord, a knot and
+            // the loop at its end, in the view's three shades), and a family of one in the atlas
+            // for exactly this button.
+            Brush::Rope => "rope",
             Brush::Erase => "walker_dead",
         }
     }
@@ -350,6 +493,7 @@ impl Brush {
             Brush::Flyer => "flyer",
             Brush::Turret => "turret",
             Brush::Platform => "move platform",
+            Brush::Rope => "rope",
             Brush::Erase => "erase",
         }
     }
@@ -419,6 +563,12 @@ impl Brush {
                 on a fixed cycle, in the direction it is placed facing, and carries whatever \
                 stands on it."
             }
+            Brush::Rope => {
+                "A rope: painted a cell at a time. The first cell needs something solid above it \
+                — a rope is tied to a ceiling — and dragging down from there grows the same line \
+                a cell per row. Jump at it to catch the line, hold jump to hang on, and press a \
+                direction to pump the swing. Let go to fly off it with the arc's own speed."
+            }
             Brush::Erase => "Removes the entity under the cursor, then the tile.",
         }
     }
@@ -461,6 +611,7 @@ pub struct Editor {
     /// from the right is a different course from one that leaves. Kept across placements so a
     /// pair of shelves going the same way is one decision.
     pub platform_dir: i8,
+
     /// How a drag lays tiles down: freehand, a rectangle or a line.
     pub shape: Shape,
     /// Whether the *next* stroke is forced to a straight line whatever [`Self::shape`] says.
@@ -606,6 +757,7 @@ impl Editor {
             Brush::Flyer => self.level.flyer_placeable(tx, ty),
             Brush::Turret => self.level.turret_placeable(tx, ty),
             Brush::Platform => self.level.platform_placeable(tx, ty, self.platform_tiles),
+            Brush::Rope => self.level.rope_cell_placeable(tx, ty),
             Brush::Scenery => self.level.scenery_placeable(self.scene_sprite, tx, ty),
             Brush::Goal => self.level.goal_placeable(tx, ty),
             _ => true,
@@ -842,6 +994,19 @@ impl Editor {
                     self.platform_dir,
                 )
             }
+            Brush::Rope => {
+                if !self.can_place(Brush::Rope, tx, ty) {
+                    // Two refusals worth telling apart: a line's first cell needs a ceiling, and
+                    // a cell *inside* a line is already rope.
+                    self.message = if self.level.rope_at(tx, ty).is_some() {
+                        "this cell is already part of a rope".to_string()
+                    } else {
+                        "a rope cell needs air, and the first one needs a ceiling".to_string()
+                    };
+                    return false;
+                }
+                self.level.add_rope_cell(tx, ty)
+            }
             Brush::Scenery => {
                 if !self.can_place(Brush::Scenery, tx, ty) {
                     self.message =
@@ -950,6 +1115,7 @@ impl Editor {
                 }
                 self.brush = Some(Brush::Platform);
             }
+            Some("rope") => self.brush = Some(Brush::Rope),
             Some("chaser") => self.brush = Some(Brush::Chaser),
             Some("walker") => self.brush = Some(Brush::Walker),
             _ => {}
@@ -2292,5 +2458,112 @@ mod tests {
         assert_eq!(ed.platform_span, 6, "and the travel");
         assert!(ed.platform_vertical, "and the axis");
         assert_eq!(ed.platform_dir, -1, "and the direction it travels");
+    }
+
+    /// **A rope is painted a cell at a time, and a drag down grows one line.**
+    ///
+    /// This is the brush every other part of a level uses: the click is a *cell*, not a length
+    /// setting. The first cell needs something solid above it; each row below it is the next cell
+    /// of the **same** line, so a drag leaves one rope rather than a comb of one-tile ones, and a
+    /// cell inside a line is refused rather than silently splitting it.
+    #[test]
+    fn the_rope_brush_paints_one_cell_at_a_time() {
+        let mut ed = doc();
+        // A ceiling across the level, with room under it for a long line.
+        for tx in 0..40 {
+            ed.level.set_tile(tx, 2, Tile::Solid);
+        }
+        ed.brush = Some(Brush::Rope);
+
+        // One click, one cell of rope.
+        ed.begin_stroke();
+        assert!(ed.paint(8, 3));
+        ed.end_stroke();
+        assert_eq!(ed.level.ropes.len(), 1);
+        assert_eq!(ed.level.ropes[0].length, 1.0, "one cell");
+        assert_eq!(
+            ed.level.ropes[0].anchor(),
+            (8.5, 3.0),
+            "tied to the ceiling"
+        );
+
+        // Painting the next cell down grows the same line, so a drag is one rope.
+        ed.begin_stroke();
+        assert!(ed.paint(10, 3));
+        assert!(ed.paint(10, 6));
+        ed.end_stroke();
+        assert_eq!(ed.level.ropes.len(), 2, "one new line, not four");
+        assert_eq!((ed.level.ropes[1].col, ed.level.ropes[1].row), (10, 3));
+        assert_eq!(ed.level.ropes[1].length, 4.0, "rows 3 through 6");
+
+        // One gesture is one undo step, however many cells it painted.
+        assert!(ed.undo());
+        assert_eq!(ed.level.ropes.len(), 1, "the dragged line came back whole");
+        assert!(ed.redo());
+
+        // A cell in the middle of a line is already rope: refused, and said so.
+        assert!(!ed.can_place(Brush::Rope, 10, 5));
+        ed.begin_stroke();
+        assert!(!ed.paint(10, 5));
+        ed.end_stroke();
+        assert_eq!(ed.level.ropes[1].length, 4.0, "unchanged");
+        assert!(ed.message.contains("already"), "{:?}", ed.message);
+
+        // Without a ceiling the first cell has nothing to tie to.
+        assert!(!ed.can_place(Brush::Rope, 30, 6));
+        ed.begin_stroke();
+        assert!(!ed.paint(30, 6));
+        ed.end_stroke();
+        assert!(ed.message.contains("ceiling"), "{:?}", ed.message);
+
+        // And a click on any cell of a line picks the rope brush back up.
+        ed.brush = Some(Brush::Erase);
+        assert!(ed.pick_at(10, 5));
+        assert_eq!(ed.brush, Some(Brush::Rope));
+    }
+
+    /// **Every brush is on exactly one shelf, and the shelves are the whole palette.**
+    ///
+    /// A brush missing from every shelf is a tool nobody can pick up; one on two shelves is the
+    /// same cell drawn twice; and a shelf whose contents disagree with [`Brush::group`] is a
+    /// palette that puts a click somewhere other than where the tab says. The three are one
+    /// assertion because they are one fact: the shelves partition the brushes.
+    #[test]
+    fn every_brush_is_on_exactly_one_shelf() {
+        let mut seen: Vec<Brush> = Vec::new();
+        for group in BrushGroup::ALL {
+            assert!(
+                !group.brushes().is_empty(),
+                "{group:?} is a tab with nothing behind it"
+            );
+            for brush in group.brushes() {
+                assert_eq!(
+                    brush.group(),
+                    group,
+                    "{} is filed under {group:?} but says it belongs elsewhere",
+                    brush.label()
+                );
+                assert!(
+                    !seen.contains(brush),
+                    "{} is on two shelves, so one of them draws a cell that is not its own",
+                    brush.label()
+                );
+                seen.push(*brush);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            Brush::ALL.len(),
+            "the shelves hold {} of the {} brushes",
+            seen.len(),
+            Brush::ALL.len()
+        );
+        for brush in Brush::ALL {
+            assert!(
+                seen.contains(&brush),
+                "{} cannot be picked up",
+                brush.label()
+            );
+        }
     }
 }

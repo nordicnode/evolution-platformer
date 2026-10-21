@@ -203,6 +203,11 @@ pub struct Population {
 /// not a flag kept somewhere that could disagree with what is drawn: it is the head of the
 /// roster.
 pub struct Replay {
+    /// The **document**: the level every runner's episode was built from.
+    ///
+    /// Never handed to a painter. `Sim::new` takes a copy of it and destroys *that* when a body
+    /// stands on a brittle tile long enough, so a view that drew this would keep the floor a run
+    /// has already broken — see [`Replay::drawn_level`], which is what a canvas wants.
     level: Level,
     eval: EvalConfig,
     level_name: String,
@@ -366,7 +371,6 @@ impl Replay {
             .zip(self.anims.iter_mut())
             .enumerate()
         {
-            let mut stepped = 0u32;
             for _ in 0..ticks {
                 // A finished episode holds its last frame while the agents still running
                 // carry on: that is the whole point of running them in parallel.
@@ -374,18 +378,20 @@ impl Replay {
                     break;
                 }
                 runner.step();
-                stepped += 1;
+                // The animation is advanced per tick, not per frame: at 8x a frame is eight
+                // ticks, and the rope a body is swinging on has to see the hands on each of
+                // them or it jerks from pose to pose.
+                anim.advance_tick(runner.sim());
                 if index == 0 {
+                    // The star's rubble is the only rubble drawn: the level in front of the
+                    // viewer is the star's run, and a ghost's broken floor would be a second
+                    // episode's terrain.
+                    anim.advance_debris(runner.sim());
                     // The star is heard at the replay's own speed: at 8x its
                     // jumps are 8x as frequent, which is the honest sound of
                     // watching at 8x.
                     self.star_ear.observe(runner.sim(), 0.9);
                 }
-            }
-            // Simulated time, not wall clock: a dead ghost's dust settles instead of
-            // drifting for as long as the slowest agent in the field keeps going.
-            if stepped > 0 {
-                anim.advance(runner.sim(), stepped as f32 * sim::DT);
             }
         }
         self.ticks += ticks;
@@ -410,14 +416,23 @@ impl Replay {
         self.population
     }
 
-    /// The level the episode is on: the run's, not the editor's — a replay is a claim
-    /// about the terrain it was scored on.
-    pub fn level(&self) -> &Level {
-        &self.level
-    }
-
     pub fn level_name(&self) -> &str {
         &self.level_name
+    }
+
+    /// The terrain the canvas draws: the level **as this episode has left it**.
+    ///
+    /// Not the document the episodes were built from, which never changes — the sim took a copy
+    /// and destroys *that* when a body stands on a brittle tile long enough. A view that keeps
+    /// drawing the document shows the hole the body fell through as floor, so a tile the run has
+    /// broken looks **duplicated**: the piece that falls, and the piece that was never taken away.
+    /// The whole point of the debris is that the floor is gone, and only the sim's own copy knows
+    /// it is.
+    ///
+    /// Nor is it a ghost's terrain: every runner has its own episode and its own copy, and
+    /// `runners[0]` is the one the viewer is watching.
+    pub fn drawn_level(&self) -> &Level {
+        self.star_sim().level()
     }
 
     /// The star's live episode.
@@ -697,6 +712,81 @@ mod tests {
             ticks += 1;
         }
         assert!(ticks < cap, "the champion's episode did not end");
+    }
+
+    /// **A replay frame is not a tick either.** At 8x a frame steps eight ticks, and every
+    /// runner's line is advanced once per tick — the same cadence the lanes keep, and the reason a
+    /// swung rope is a swing rather than eight poses. Advanced once for the frame, the line is
+    /// pulled from the hands' old place to their new one in a single step and snaps.
+    #[test]
+    fn a_replay_advances_every_rope_on_every_tick_of_a_frame() {
+        let level = runway();
+        let mut replay = replay_on(&level, "rope-cadence");
+        replay.speed = 8;
+        replay.advance(1.0 / 60.0);
+        assert_eq!(replay.star_anim().motion().steps(), 8);
+        for i in 0..replay.ghost_count() {
+            assert_eq!(
+                replay.ghost_anim(i).motion().steps(),
+                8,
+                "ghost {i} advanced its line once for a frame that stepped eight ticks"
+            );
+        }
+    }
+
+    /// **The canvas draws the star's terrain, not the document's.** A brittle tile the star has
+    /// stood through is a hole in the sim's own copy of the level while the document stays
+    /// deliberately untouched — so a view that draws the document keeps drawing the floor the body
+    /// fell through while the debris drops out of it: one tile, twice.
+    ///
+    /// Asserted on content rather than on which field the pointer came from, because the content is
+    /// what the viewer sees: empty where the run broke it, still cracked in the document.
+    #[test]
+    fn a_broken_tile_is_a_hole_in_the_replayed_level_and_not_in_the_document() {
+        // A pen: the spawn's ground is brittle on both sides and a wall stops the star walking
+        // off it. A body that keeps walking across fresh floor never lights one — a fuse needs
+        // the tile stood on, not stepped over — so the trap is what makes the break happen on a
+        // level the test owns rather than on a policy's goodwill.
+        let mut level = runway();
+        for col in 0..=1 {
+            assert!(
+                level.set_tile(col, 7, sim::Tile::Cracked),
+                "the floor under the spawn is a tile a level may hold"
+            );
+        }
+        for row in 3..=6 {
+            assert!(level.set_tile(2, row, sim::Tile::Solid), "the pen's wall");
+        }
+        let mut replay = replay_on(&level, "drawn-terrain");
+
+        for _ in 0..30 {
+            replay.advance(1.0 / 10.0);
+            if !replay.star_sim().broken().is_empty() {
+                break;
+            }
+        }
+        let broken = replay.star_sim().broken();
+        assert!(
+            !broken.is_empty(),
+            "the star stood in the pen on brittle ground and no tile broke"
+        );
+        let (col, row) = (broken[0].col, broken[0].row);
+        assert_eq!(
+            replay.drawn_level().tile(col, row),
+            Some(sim::Tile::Empty),
+            "the canvas is drawing the floor the star fell through"
+        );
+        assert_eq!(
+            level.tile(col, row),
+            Some(sim::Tile::Cracked),
+            "and the document is untouched: a replay is not an edit"
+        );
+        // The extents the camera and the painter both read never move, so the two cannot disagree
+        // about where the level sits on the screen.
+        assert_eq!(
+            (replay.drawn_level().width, replay.drawn_level().height),
+            (level.width, level.height)
+        );
     }
 
     #[test]

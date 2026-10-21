@@ -463,7 +463,22 @@ pub struct Sim {
     /// the terrain a body has changed: the tiles that are gone cannot be recovered from a level
     /// that was already missing them when the episode started, and two runs can only agree on
     /// this list if they agreed on every fuse that lit.
-    broken: Vec<(i32, i32)>,
+    broken: Vec<BrokenTile>,
+}
+
+/// One brittle tile that has left the level this episode.
+///
+/// The **material** is here because the grid cannot answer for a hole: a view that wants to drop
+/// the piece that fell needs to know what the piece was made of, and by the time it hears about
+/// the break the cell is empty. It is carried rather than hashed — the tile a cell was made of is
+/// fixed by the level, so the coordinates in [`Sim::state_hash`] already say everything about the
+/// run's terrain that this does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrokenTile {
+    pub col: i32,
+    pub row: i32,
+    /// What the tile was, brittleness and all: a `CrackedBrick` is a brick that fell.
+    pub tile: crate::level::Tile,
 }
 
 impl Sim {
@@ -561,6 +576,16 @@ impl Sim {
 
     pub fn level(&self) -> &Level {
         &self.level
+    }
+
+    /// The brittle tiles that have left the level this episode, oldest first.
+    ///
+    /// The one place the outside learns that terrain changed, and so what a view watches to drop
+    /// the piece that broke off. It is the list [`Sim::state_hash`] folds in, not a second record
+    /// kept for the drawing: a renderer and the hash can never disagree about which tiles are
+    /// gone.
+    pub fn broken(&self) -> &[BrokenTile] {
+        &self.broken
     }
 
     pub fn player(&self) -> &PlayerState {
@@ -1010,8 +1035,15 @@ impl Sim {
                 let (tile, left) = self.crumbles[i];
                 if left <= 1 {
                     self.crumbles.swap_remove(i);
+                    // The material is read **before** the tile leaves: `burn_tile` empties the
+                    // cell, and a hole cannot say what was in it.
+                    let material = self.level.get(tile.0, tile.1);
                     self.level.burn_tile(tile.0, tile.1);
-                    self.broken.push(tile);
+                    self.broken.push(BrokenTile {
+                        col: tile.0,
+                        row: tile.1,
+                        tile: material,
+                    });
                     // WP13: did the body ride this tile until it burned? A fuse that expired
                     // underfoot is the technique a crumble-surf is made of; a fuse the body
                     // outran is not credited.
@@ -1338,9 +1370,11 @@ impl Sim {
         // episode as a document and is now two different things in two runs that stood on
         // different tiles, so a hash that left this out would call those two runs the same state.
         h.u32(self.broken.len() as u32);
-        for (tx, ty) in &self.broken {
-            h.i32(*tx);
-            h.i32(*ty);
+        for tile in &self.broken {
+            // Coordinates only, the bytes this hash has always folded in: the material is fixed
+            // by the level, so hashing it would change every golden without saying anything new.
+            h.i32(tile.col);
+            h.i32(tile.row);
         }
         h.u32(self.crumbles.len() as u32);
         for ((tx, ty), left) in &self.crumbles {

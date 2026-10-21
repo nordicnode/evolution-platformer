@@ -1,0 +1,13 @@
+[package]
+name = "dynamics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The game's own deterministic 2-D physics engine: particles, links, gravity and tile collision."
+
+# BOUNDARY RULE: the engine is arithmetic and nothing else. No clock, no threads, no
+# allocation in `step`, no dependencies. The same world stepped twice gives the same
+# numbers — that is what lets a replay of a physics object be a replay and not a new
+# performance.
+[dependencies]

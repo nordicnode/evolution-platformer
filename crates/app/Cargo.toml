@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 sim.workspace = true
+dynamics.workspace = true
 evo.workspace = true
 render.workspace = true
 # The trainer's own thread pool, sized to leave the window a core to draw with

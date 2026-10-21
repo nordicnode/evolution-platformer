@@ -544,6 +544,11 @@ impl Session {
                 });
             }
             self.sim.step(action);
+            // The line this body is on, one tick of it: a frame can carry more than one tick, and
+            // the hands move on every one.
+            self.anim.advance_rope(&self.sim, sim::DT);
+            // A tile that burned on this tick is a chunk that starts falling on this one.
+            self.anim.advance_debris(&self.sim);
             if audible {
                 self.ear.observe(&self.sim, 1.0);
             }
@@ -554,6 +559,7 @@ impl Session {
             if let Some(ghost) = &mut self.ghost {
                 if !ghost.runner.is_finished() {
                     ghost.runner.step();
+                    ghost.anim.advance_rope(ghost.runner.sim(), sim::DT);
                     if audible {
                         ghost.ear.observe(ghost.runner.sim(), 0.35);
                     }

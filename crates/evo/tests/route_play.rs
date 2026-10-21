@@ -226,3 +226,30 @@ fn the_replay_pulls_up_over_the_block_a_vine_hangs_from() {
     let play = replay(&vine_block(), 3, &EvalConfig::default());
     assert!(play.won(), "{}", play.trace.join("\n"));
 }
+
+/// **The route walk swings.** A rope crossing is the one move whose outcome is decided by *when*
+/// the button comes up, so it is the strongest check the replay has: the plan carries a release
+/// tick, the replay's swing clock counts the ticks the body is actually on the line, and a spin of
+/// either by one is a landing in the pit. The scratch level's gap is wider than a sprint jump, so a
+/// win here is a swing and cannot be anything else.
+#[test]
+fn the_replay_swings_across_the_pit() {
+    let level = level("scratch-rope");
+    let cfg = EvalConfig::default();
+    for seed in 1..=5 {
+        let play = replay(&level, seed, &cfg);
+        assert!(
+            play.won(),
+            "seed {seed}: the rope crossing did not replay:\n{}",
+            play.trace.join("\n")
+        );
+    }
+    let play = replay(&level, 3, &cfg);
+    assert!(
+        play.trace
+            .iter()
+            .any(|line| line.contains("Rope") && line.contains("(1 hops closed)")),
+        "the win has to be the swing's:\n{}",
+        play.trace.join("\n")
+    );
+}

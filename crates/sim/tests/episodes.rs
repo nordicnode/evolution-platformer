@@ -144,7 +144,13 @@ fn golden_state_hash_after_ten_thousand_frames() {
     // (`EpisodeStats::decks`, fitness v9), and that count is folded in even when it is zero. This
     // runway has no mover, so no deck is ever stood on and the episode is bit-identical — only the
     // hash stream grew.
-    const GOLDEN_LONG_RUNWAY_HASH: u64 = 13_720_823_320_593_112_504;
+    //
+    // Re-recorded for 0.17.0: the body carries its rope grip (`PlayerState::rope`) and that is
+    // folded in, because two frames that differ in how much line is out are two different arcs
+    // from there on. This runway has no rope, so no grip is ever taken and the trajectory is
+    // bit-identical — only the hash stream grew, by the absence marker and the four floats it
+    // would have carried.
+    const GOLDEN_LONG_RUNWAY_HASH: u64 = 7_025_955_010_476_754_342;
 
     let level = common::long_runway();
     let mut sim = sim::Sim::new(&level, SEED);

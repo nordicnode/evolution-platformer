@@ -4391,7 +4391,9 @@ relationship to the type in the menu two hundred points below it. The name is no
 same embedded pixel face (Press Start 2P) every other word on the screen is drawn in, and made the
 way the game's own objects are: cream letters with a hard brown edge standing on a shelf of the
 accent gold — cream on gold on brown, which is the hierarchy and the material at once. Nothing in
-the window reads `logo.png` any more; the file stays for the README's header.
+the window reads `logo.png` any more, so the old art is gone from the tree; the README's header is
+now a crop of the rendered card (see below), which is the one copy of the mark that cannot drift
+from the screen it opens.
 
 Four decisions, and what forced each:
 
@@ -5615,7 +5617,7 @@ is ~2 % against a 25 % bar.
 | 1 plan bonus | shipped, off | elements: 1 solve in 12 (seed 1, gen 863) against the default's 0, p = 1.0; bat-pit-bait: 3 solves against 5, p = 1.0 — no movement on either |
 | 1 islands | shipped, off | tower, 4 × 50: 1 win / 9 losses, p = 0.02, median 134 vs 53 — a loss at equal genome budget |
 | 2 batched pass | built, measured, **killed**: `Genome::forward_block` is not routed into evaluation | 1.14× batched on the memoryless shape, **0.96×** on the reference level's feedback shape, against a 10 % kill line; forward pass is 15 % of a generation on this machine |
-| 3 sensors v14 | **not in the tree**, rebuilt once more and reverted; `sensors::VERSION` stays 13 at 108 inputs | **the gate's premise is false**: both levels it names are already solved by the v13 default (`bat-crumble-bridge` 12/12 at generation 0, `bat-double-threat` 12/12, median 3.5), so no sensor can move them; the warm canary also reproduces at the same width (l5 199 vs 168, l2 38 vs 33 at 12 seeds) |
+| 3 sensors v14 | **in the tree as of the rope** — `sensors::VERSION = 14` at 111 inputs, three slots appended; the item's own gate was killed as below | **the gate's premise was false**: both levels it names are already solved by the v13 default (`bat-crumble-bridge` 12/12 at generation 0, `bat-double-threat` 12/12, median 3.5), so no sensor could move them; the warm canary also reproduced at the same width (l5 199 vs 168, l2 38 vs 33 at 12 seeds). What landed is the rope's three slots, not this item's — see *The rope: a line a body catches and swings on* |
 | 4 lessons + CEM | shipped, both off | gauntlet: lessons 8 wins / 3 losses, p = 0.23 (median 8 vs 16); tower CEM: 2/2, p = 1.0; **`l11` gate run at a 20-lesson budget, 24 paired seeds: 2 solves each way, p = 1.0** — the arm's solves land 1 183 and 1 143 generations later than the control's, so the trigger stays off |
 | 5 early cut | shipped, off, with the band and the refund | **12-seed `chain` gate: fails on solves** — default 11/12, band 9/12, win-margin 6/12, refund 9/12; directions are 7–4 and 5–7, p = 0.55 / 0.77 |
 | WP8 snapshot probes | shipped, off | gauntlet: 5 wins / 5 losses, p = 1.0, median 15.5 vs 16; bat-pit-bait (600 gens): 2 solves against 5, 1 win / 4 losses, p = 0.375 — a loss on its own gate level, at 0.1 % more episodes |
@@ -6563,3 +6565,567 @@ quoted as one. `BenchArm` now records `lesson_every`, `plateau_window`,
 seed actually injected (`Trainer::lessons_taught`); all are serde-defaulted to zero, so an arm
 written before they existed still loads as the no-lesson run it was. Pinned by
 `an_item_4_arm_records_its_cadence_and_the_lessons_it_injected`.
+
+## The rope: a line a body catches and swings on
+
+The pack had four ways to cross a pit — jump, sprint-jump, wall-climb, and the
+mover that carries you — and all of them are the same shape: an impulse, then a
+ballistic arc the body cannot steer. A rope is the first object whose *state the
+body keeps*, and the reason it is worth its own entry is that the difference is
+one line of maths rather than a new mode.
+
+**The mechanic.** A rope hangs from the tile above the cell it is placed in and
+ends `tiles` below its anchor. An airborne body whose hands (the top centre of
+its box) pass within `rope_grab` (0.55 tiles) of the line takes a grip at the
+distance it was caught: `Grip { anchor, length }`, never shorter than
+`rope_min_length` (0.75) and never longer than the line. The grip then owns the
+body's motion, and the tick is three steps in a fixed order:
+
+1. **pump** — a direction press adds `rope_pump` (0.008) sideways;
+2. **gravity and drag** — uncapped `gravity`, then `rope_drag` (0.999) on both
+   axes;
+3. **the line** — one position projection: anything past `length` from the
+   anchor is put back on the circle, and the *radial* part of the velocity is
+   spent against it while the tangential part survives untouched.
+
+That third step is the whole object. It is a *pull-only* constraint, so the body
+is on the circle every tick and the integration error is a tick deep however fast
+it is going — which is why a swing keeps its energy instead of leaking it, and
+why the arc cannot run away. And because the pump is horizontal, the constraint
+turns it into a tangential push at the bottom of the arc and into nothing at the
+ends: leaning is what a swing responds to, and leaning at the wrong moment is
+what it does not. Nothing in the action set could steer *momentum* before this;
+`RunJump` on a rope is a pump, and releasing it (`Walk`, or a direction alone) is
+a launch that keeps the arc's speed.
+
+**Collisions are resolved after the constraint and the constraint is not
+re-applied.** A swing into a wall stops at the wall and the next tick's gravity
+carries it back along the arc. Re-projecting after the wall would push the body
+*through* it to stay on the circle, which is the one thing a swing must not do.
+Landing on a floor ends the grip and is reported as `released_rope`, so a
+policy's own account of the swing is the same event the sim saw.
+
+**The grip does not change length, and the first version's did.** Holding jump
+was briefly a reel-in (`rope_climb`, 0.06/tick). It reads as the obvious extra
+verb and it destroys the object: a policy that simply holds the button — which
+is what holding on *is* — hauls itself to the anchor in about two seconds and
+then hangs from a 0.75-tile pendulum with no arc left in it. The measurement
+that settled it was the shipped scratch level: the body ended at the anchor with
+`grip = 0.75`, having swung nowhere. A rope is a swing, so the length is the one
+the catch found, and the only verb is when to let go.
+
+**The rope is tied to the top of its own cell, and the first version tied it a
+tile too low.** `RopeSpec::row` is the row the line's topmost cell occupies, so
+the anchor is the centre of that row's *top* edge — the ceiling's underside — and
+the cells the line is drawn through are the cells it swings on. Placing the rope
+in row 4 under a ceiling in row 3 and tying it to the row's *bottom* edge put the
+anchor at `y = 5.0` with the ceiling's underside at `4.0`: a tile of air between
+the ceiling and the line, and an ASCII map (`GLYPH_ROPE`, one glyph per cell the
+rope hangs through) that disagreed with the drawn line by exactly that tile. The
+placement rule (`rope_placeable` demands a solid tile *above* the clicked cell)
+and the map both had the geometry right, which is what made the tie point the
+odd one out.
+
+**What the shipped object does, measured.** `levels/scratch-rope.json` is a
+six-tile pit (columns 7 to 12) with one seven-tile line hanging over its near
+half (anchor `(9.5, 4.0)`, end `y = 11.0` — a standing body's hand height, so a
+jump catches it immediately). Driven by a policy a person could play — run at
+the lip, jump, lean right through the arc, let go at the far end where the
+horizontal speed turns over — the body catches the line at a **4.87-tile grip**
+and comes down **on the far lip at x 15.95**, grounded, having released at the
+top of the far side of the arc. No jump from that lip reaches 15.95: the sprint
+jump's own distance is the ceiling for a ballistic body, and this is a body thatlet go *moving*. Pinned by `crates/sim/tests/rope.rs`, whose twelve tests are
+properties of the motion rather than frames copied out of a run: a jump under the
+line catches it at hand height, a pumped swing rises above the height it
+caught at, the release keeps the arc's speed (a bound of `brake_friction`, not an
+equality — the tick that lets go is also a tick of air), a rope is not ground,
+the grip is hashed, the line answers the eraser along its whole length, a line is
+painted a cell at a time and grows from the cell above it, and the crossing above.
+The drawing has its own three in `view`'s tests: an idle chain hangs at the rope's
+length, a swing bows the taut part and lets the slack trail, and the same motion
+driven by a real sim swing moves the drawn line off the chord.
+
+**The drawn rope has to be simulated, not posed.** Two attempts at this are worth
+recording. The first drew a held rope from its anchor to the hands, which
+*shortened* it on the frame of the catch: the slack below the hands — real line —
+was not drawn at all. The second drew the hands' line plus its slack as a tail,
+with the shape computed from the grip and the body's velocity. That is a pose: it
+can lean one way, it cannot overshoot, it cannot remember that the body was
+swinging a moment ago, and the instant the grip is released it snaps back into a
+hanging column. A rope that reads as a rope has to remember its own motion, so
+`view::RopeMotion` is a real integration — verlet points under the sim's own
+gravity, distance constraints between neighbours solved to convergence, the top
+point pinned to the anchor, and while a body holds it the point at the catch
+distance pinned to the hands. Everything a swing should show then falls out of the
+solver: the taut part bows against the arc because the line has mass, the slack tail
+trails and whips, and letting go leaves the line swinging behind the body. It costs
+a few hundred distance projections per rope per tick and touches nothing — no
+collision, no force on the body, no change to the episode — and it steps at the
+sim's tick rate from the display's `dt`, so a scripted frame at a given state is
+still the same picture. Measured on the shipped scratch level, driven by the
+crossing policy the sim's own test uses: the taut part leaves the straight chord by
+up to **0.41 tiles** and the slack tail swings **2.15 tiles** out from under the
+hands — about 11 and 56 pixels at the default zoom, which is the difference between
+a rope and a stick. The drawn polyline is the rope's length to a couple of percent
+(a real line stretches under its own weight), which is what keeps the knots half a
+tile apart in *line* rather than in screen space, and the loop is at the rope's own
+end instead of at the hands. A loaded line is drawn a shade thicker too: the only
+tension a column of two shades can say.
+
+**A rope is a whole line to the eraser as well.** Long lines make the click target
+obvious and the old one wrong: `enemy_at` and the eraser answered only for the cell
+a rope is tied at, so clicking the middle of a line the author had just drawn did
+nothing. `Level::rope_at` answers for every cell the line hangs through, and the
+eraser and the eyedropper both use it.
+
+**A rope is painted a cell at a time.** Three attempts at this brush, and the third
+is the one that is simply the rest of the tool. A numeric length stepper asked the
+author to know what six tiles of rope looks like before seeing one. A
+drag-to-draw length was worse than it sounds: it made the rope the only brush in
+the palette that is not a cell, so "paint the rope" — the thing everyone tries —
+did nothing at all. The rope is painted like terrain now: `Level::add_rope_cell`
+adds one cell, the first needs something solid above it, and every cell below an
+existing line **grows that line** by a row, so a drag down a wall is one rope rather
+than a comb of one-tile ones. `rope_cell_placeable` refuses a cell inside a line —
+it is already rope — and one with no ceiling, and the brush says which of the two
+it was. The hover ghost is the single cell every other brush's ghost is, and one
+gesture is still one undo step, however many cells it painted. `DEFAULT_ROPE_TILES`
+still covers a hand-written file that names no length; the brush never needs it.
+
+**The reachability check does not know what a rope is.** `reach::report` walks
+canned moves between platforms and a swing is not one of them — nothing in
+`reach.rs` reads `level.ropes`. `levels/scratch-rope.json` therefore reports
+`goal_reached = true` for a reason that has nothing to do with its line: the
+analytic bound (`Physics::sprint_jump_distance`) treats its six-tile pit as
+jumpable, and the verdict is the same with the rope deleted from the level,
+while an actual sprint jump off the lip, held all the way, comes down at x 12.40
+— in the pit. The editor's "beatable" badge on a rope level is a jump-only
+verdict, not evidence that the swing works; `a_body_swings_across_the_scratch_pit`
+is. Modelling a swing as an edge is deliberately not done here: where a swing
+lands depends on *when the policy lets go*, which is a property of the policy
+rather than of the level, so an edge would have to assume an ideal release and
+would then be a claim the check cannot prove.
+
+**The bookkeeping the trio moves.** A rope is not a tile: it has no collision,
+so standing under one and walking changes nothing, and the 9×9 patch has no cell
+to put it in. It is therefore an entity (level format **4**), drawn as its own
+cells (`GLYPH_ROPE`, `view::draw_ropes`) rather than from the atlas, and it
+reaches the learner through three **appended** observation slots (sensors
+**v14**): `on_rope`, and the offsets to the nearest line's anchor and end, both
+normalised by 8 tiles. Appending rather than inserting is the whole reason
+`Genome::grown_to_inputs` can keep a v13 champion: every level without a rope
+observes exactly the vector it observed at v13, so the weights sit where they
+were and the new ones read zeros.
+
+**One measurement this change moved, recorded rather than glossed.** Adding 48
+first-layer genes re-draws every random population (`Genome::random` consumes the
+stream per gene), so `crates/evo/tests/imitate.rs`'s paired warm-start
+measurement is a new draw even though nothing about warming changed. The clone
+itself does not move: fitted from the same demonstration it scores the same mean
+fitness (260.80 on `l2-first-gap`, 190.40 on `l5-tightrope`) under both sensor
+layouts, because its extra weights multiply inputs that are zero on those
+levels. What moved is the *fast* level's sign: on the five pinned seeds warming a
+quarter of the population read `warm 17, cold 25` under v13 and `warm 24, cold
+17` under v14, against solves of one to seven generations — a one- to
+seven-generation difference between two sums of five draws, which is noise. Over
+ten seeds the same comparison reads `warm 41, cold 31` on the fast level and
+`warm 464, cold 502` on the slow one. The test therefore asserts what each level
+can carry: warming must never lose a solve on either level, `l5-tightrope` — the
+level a warm start exists for — must be strictly faster, and the two-level total
+must be lower (103 against 345 on the pinned five). The strict per-level claim on
+a level a random population already solves in single digits was never a claim
+the numbers supported; it passed on v13 by the draw.
+
+**The rope's motion belongs to the body, not to the window.** A rope is drawn as a
+line, and the line is a chain integrated *outside* the sim (see `view::RopeMotion`):
+verlet points, distance constraints, the top pinned to the anchor and the point at
+the catch distance pinned to the hands. The first wiring of that put one `RopeMotion`
+in the window and stepped it in `update` from the *playtest's* grip — and only there.
+The playtest then animated and the agents did not: the evolution view draws a level
+and a field of lanes, the replay draws a level and a field of runners, neither of them
+has a session, so both drew the rope's fallback, a column hanging straight down, while
+the agent on it swung. Reported as "the rope animates for the player but not for the
+agent", and it was the state's *ownership* that was wrong rather than the solver.
+
+The chains live in `view::AgentAnim` now, the per-agent cosmetic state every view
+already steps right after its sim — `play::Session` for the playtest, `lab::Lanes` for
+each lane of a generation, `replay::Replay` for the star and every ghost. The grip is
+taken from `sim::PlayerState::rope` itself (`AgentAnim::grip`), so the only place that
+can be out of step with the body is a caller that forgot to advance an animation, and
+there is no such caller: an animation is what draws a body. The catch-up cap went from
+four ticks to sixteen at the same time, because a lane at 8x steps eight ticks per
+frame and the shorter cap clipped the rope into slow motion. (The per-tick cadence the
+line needs on a multi-tick frame is the subject of the next section but one.)
+
+**A frame with a dozen bodies has to choose one line.** The ropes belong to the
+level, so the evolution view and the replay draw them once, before the bodies, from
+the animation of the body that is *on* them: `view::rope_owner` takes each body's
+`(rank, on_a_rope)` and answers the best-ranked holder, or the best-ranked body when
+nobody is holding — its chains are still moving from the swing it just let go of, and
+snapping back to a column on release is the pose bug this drawing replaced.
+
+**The rope brush's icon was a vine.** `Brush::Rope` pointed at `vine_a` because a rope
+is drawn rather than tiled, so the atlas had no rope of its own — and the palette
+showed a green, leafed hanging strand for a brown line with knots. The tileset has a
+`rope` cell now (`terrain.rope`: the twist, a knot, the loop at the free end, in the
+three shades `draw_ropes` uses), in a family of one appended after every other family
+so that adding it moved no cell anything else points at. Its family sits last for the
+same reason the seams do; the manifest is generated, but a reshuffle is a diff across
+the whole file for one picture only the palette ever reads.
+
+**The rope needed physics, not smoothing.** Two attempts at the drawn rope's release had
+been wrong in the same way: each one changed the *shape* the drawing produced (a posed
+chord, then a spring back to hanging) instead of fixing the simulation under it, and each
+one looked wrong for a different reason — first it uncoiled across the level, then it
+never settled. The report that settled the argument was "it needs to have PROPER physics".
+What it had was a chain with three defects.
+
+**It had no collision.** The free line swung in a clean arc through the floor of the
+level it hung over, which is the single most obviously broken thing a rope can do. Points
+are now pushed out of a solid tile by the face they came in through, so a line that falls
+fast is posted back out the way it arrived rather than through the far side of the floor,
+and it lies on the ground and drapes over a ledge instead of passing through it.
+
+**The part under load was solved, not known.** Above the hands the line is taut: the sim
+swings the body on a fixed radius, so the arc length from the tie to the grip is *exactly*
+the chord it spans, and the only legal shape is the straight one. A Gauss-Seidel chain at
+twenty-nine points does not find that in forty-eight passes from a sagged start — it left
+half a tile of sag in the part that is supposed to be under tension, which reads as a rope
+hanging from two pins. The solve is seeded with the exact chord each tick: a warm start,
+which is what any position-based solver would do, with the solve and the constraints still
+running afterwards and no seeding at all once the body lets go.
+
+**The grip was attached to the wrong thing.** A grip pinned to the *nearest chain point*
+moves the attached material point a quarter tile at a time, and every jump is an impulse
+into the line; a grip derived from the distance between the hands and the tie is not the
+same number as the sim's "how much line is out". The hands now attach to the interpolated
+point at the sim's own arc length (`World::grip`), so the attachment slides continuously
+along the rope and cannot pump it. With that, the pendulum drag of 0.96 (the only loss in
+the model) and gravity at the sim's own 0.05 tiles per tick squared, a released line falls,
+drapes and comes to rest on its own.
+
+Measured on `levels/scratch-rope.json`: the slack hangs below the grip through the swing,
+the line never exceeds its own length, no point moves faster than 0.6 tiles a tick after
+release, and it is back within 0.4 tiles of its column inside two seconds. Those are the
+assertions in `a_released_line_hangs_instead_of_cracking` and
+`a_held_line_is_taut_above_the_hands_and_slack_below_them`, and `out/rope-film.png` is the
+drawn geometry across a crossing — swing, release, and the second after.
+
+### The line became a world in an engine of our own
+
+The request after that was blunt: *"it still doesn't work properly. We need to create our
+own physics engine, as I intend to add more objects in the future which will utilize
+gravity as a mechanic."* The rope was the only thing in the game simulated by anything
+other than the platformer's own body physics, and its solver lived in `view.rs` — a chain
+of points, a grip, and forty-eight passes, private to the drawing code. That is one
+consumer and no second one: a crate that falls, a plank that tips or a boulder that rolls
+would have been a copy of the same file or another special case beside it.
+
+`crates/dynamics` is that engine as a crate. It is position-based: a world holds bodies
+(point masses, some pinned), links between them (exact length, or a maximum length for a
+rope) and grips (a target on a point *along* a link, which is how two hands hold a line at
+an arc length without the line needing a hand-shaped particle); a tick integrates every
+free body under gravity, projects the constraints and the terrain, and recovers velocity
+from the distance each body actually moved. Gravity is in tiles per tick squared — the
+sim's own units, so `PHYSICS.gravity` means the same thing in both — and the whole engine
+is `f32`, index order, no clock, no randomness, no hash map. Two worlds built by the same
+calls and stepped the same number of ticks are bit-identical, which is what a replay of a
+physics object has to be.
+
+The rope is now a world in it: a pinned tie, twenty-eight inextensible links, a grip that
+is rebuilt at the hands' arc length each tick, gravity 0.05 and air drag 0.96. The two
+things that used to be code in the drawing are now consequences: the grip slides
+continuously because it is a point *between* two links, and the loaded section is straight
+because the sim swings the body on a fixed radius, so the arc length out to the hands is
+exactly the chord they span and a chain of exact length held at that point has no other
+shape to take. (The solve is still started from that chord — a warm start, not a pose —
+because an iterated solver at this segment count otherwise leaves a visible sag in the
+part under load. The solve runs afterwards, and a released line is never seeded.)
+
+Two bugs surfaced only because the engine had to be general. The first was collision by
+**nearest face**: correct for a body resting on a surface, catastrophic for a body that
+arrives deep inside a cell, because the nearest face is then the far one. A corner shoved
+half a tile into a floor by a link correction was posted *through* the floor on the next
+pass, and a falling crate tunnelled out of the level. The entry face — read from the pose
+at the start of the substep — is the face it goes back out of, however deep it got. The
+second was a substep count of one: at three tiles a tick a body crosses a whole tile
+between tests. The tick is now split so that nothing moves more than half a tile between
+collision tests, with a cap so a body launched at absurd speed cannot make one tick cost a
+second.
+
+The engine's tests are behaviours, not pass counts (`crates/dynamics/tests/world.rs`): a
+seven-tile pendulum keeps its period within two percent of `2π√(L/g)` over two thousand
+ticks; a twenty-link chain hangs 5.000 tiles long; a released ten-tile line lands on a
+floor, coils and stops moving at under 0.02 tiles a tick; a body aimed at a one-tile wall
+at three tiles a tick does not appear on the far side of it; a dropped crate lands flat,
+stays square, and a crate dropped on a corner tips over and comes to rest on an edge —
+rotation is not stored anywhere, it falls out of four corners and six links; and two worlds
+stepped for 240 ticks agree to the last bit. The rope's own tests (`a_real_swing_moves_the_drawn_line`,
+`a_held_line_is_taut_above_the_hands_and_slack_below_them`, `a_released_line_hangs_instead_of_cracking`)
+now exercise the engine through the drawing, which is the only path a player sees.
+
+What the engine deliberately does not do is written down where it lives: no sleeping, no
+stored rotation, no continuous collision beyond the substep split, and restitution applied
+to velocity rather than as an impulse. Each is a real limitation, and each is a place a
+bigger engine would earn its complexity. What it does have is a second consumer waiting:
+`World::add_box` builds a crate out of four corners, four edges and two cross-braces, and
+it is a crate because it tips, lands flat and rests, not because it is called one.
+
+### The agent's rope looked worse than the player's. The frame was eight ticks.
+
+The report was precise: the rope is fine when *the player* uses it and janky when an agent
+does. That is a difference between the two paths, not between two bodies. The playtest
+runs at 1x and advances the line about once per simulated tick. The evolution view opens
+at **8x** (`lab::DEFAULT_SPEED`), and `Lanes::advance` stepped each lane eight ticks and
+then advanced its animation *once*, with `stepped * DT` and — the part that mattered — the
+grip the sim reported at the *end* of those eight ticks. `RopeMotion` then stepped eight
+ticks of rope toward a pair of hands that had already travelled most of a tile, and the
+hand target jumped again on the next frame. The line was not being simulated badly; it was
+being asked to catch up to a batched path.
+
+Measured on `levels/scratch-rope.json` with the scripted swing, comparing a line advanced
+every tick with one advanced four ticks at a time: the batched line diverged from the
+tick-by-tick line by up to **0.78 tiles**, and moved **0.93 tiles in a single advance**
+where the honest line moves about 0.2. That is a snap, four times a second at 8x.
+
+The fix is a split in `view::AgentAnim`: `advance` is now the frame's cosmetic work (squash
+and stretch, dust, sprite transitions) and no longer owns the line at all; `advance_rope`
+is the line, and `advance_tick` advances both by exactly one sim tick. The lanes and the
+replay call it **inside their tick loops**, so the rope sees the hands on every tick the
+simulation runs, at any speed. The playtest and its ghost do the same inside
+`Session::advance_actions`, which is also the path the title screen's demo takes. Two tests
+pin the cadence where it belongs — the view's, not the solver's:
+`a_lane_advances_its_rope_on_every_tick_of_a_frame` and
+`a_replay_advances_every_rope_on_every_tick_of_a_frame` (eight ticks at 8x must be eight
+steps of the line).
+
+One thing is still a choice rather than a bug: a level has one set of ropes and a generation
+has eight bodies, so the drawn line belongs to the best-ranked body that is holding one
+(`view::rope_owner`). When that body lets go and another is holding, the line switches to
+the other body's chain — a different swing, at a different place. That is the rule doing
+what it says. It is not what made the swing janky, and the measurement above is what says so.
+
+### The oracle had no rope in it at all.
+
+The report was that the oracle does not register a rope level as passable, "properly, or at
+all". It was *at all*: `crates/sim/src/reach.rs` had no mention of the object. The verdict's
+move set was jumps, wall climbs, swims, vines and pads, and a rope is none of those — a
+ballistic jump can only fall past the line, and a jump that happened to hold the button
+through one used to be recorded as a jump that landed far away, which is a plan no body can
+press. So `levels/scratch-rope.json` — a six-tile pit with a line over the middle of it, wider
+than a sprint jump — came back **unbeatable** while the rope's own test swings a body across
+it in three seconds.
+
+The move is now canonical, and it is the only one whose outcome is *momentum*. A **swing** is:
+jump at the line from a stand within reach of it, holding the button (which is what makes the
+grip — `Level::rope_grab` is contact, not a press); pump the arc by leaning the way the body
+jumped; and let go at a swept tick, after which the body is a projectile carrying the arc's
+velocity. The sweep is `rope_starts` × the release tick, 0 to `MAX_SWING_TICKS` (one full
+period of a fifteen-tile pendulum), because the release *is* the move: the same catch let go
+ten ticks apart lands tiles apart. The script is `reach::RopeSwing`, shared with the route
+replay so the plan's tick is the replay's tick.
+
+Two consequences, both measured:
+
+* **The verdict.** `scratch-rope` is now OK, and with `ReachOptions { rope: false }` the same
+  terrain is still a refusal — the control that says the crossing is the swing and not a jump
+  that got lucky. The whole pack (`reach --all`, 35 levels) still answers OK in 2.6 s.
+* **The graph.** The crossing is stored as `RouteMove::Rope { dir, release }`, the replay walks
+  it (five seeds win: `the_replay_swings_across_the_pit`), and the jump sweep gives up a
+  landing that caught a line. That last rule moved `MOVE_SET_VERSION` to 11, so every cached
+  verdict and route graph from v10 is a miss rather than an answer about a move the game had
+  all along.
+
+The counting of a hop moved with it. A landing used to be credited on the *next* idle block, so
+a swing that arrived on the far bank reported "landed and closed no hop" for the twelve ticks
+until the next decision — and the plan was remembered as failed. `route_play::close_hop` is now
+the one rule both arrivals use, so an attempt is judged by its own landing.
+
+### The replay's rope was drawn from whichever body held it.
+
+The earlier frame-cadence finding left one thing standing: `view::rope_owner` picks the
+best-ranked body *holding* a line, so in a replay a ghost passing the pit could take the line
+off the star and back again — the level's one rope visibly snapping between two arcs at two
+places. A ghost is a recording; it cannot pull the level's line. The replay now draws the star's
+own chains and the playtest draws the player's, which is also the simpler rule: the line belongs
+to the body the viewer is following, and when that body lets go its chains still move from the
+swing it just left. The evolution view keeps `rope_owner`, where a field of eight agents has no
+single subject.
+
+### A brittle tile left a hole and nothing else. Now the tile falls.
+
+The request was for the crumble blocks to "fall to the floor and smash into little pieces, fully
+obeying the laws of gravity". They did not move at all: `Sim::step` burned the tile out of the
+level's grid and the only trace was a hole — and even that was a subtraction, not an object. The
+sim's own record of the break (`Sim::broken`, the list the state hash folds in) carried the
+coordinate and nothing else, so a view could not even have drawn *what* fell.
+
+Two changes, one on each side of the sim's boundary.
+
+**The sim records the material.** `broken` is now `Vec<BrokenTile>` — column, row, and the tile
+that was there, read before `burn_tile` empties the cell. It is exposed by `Sim::broken()`; the
+state hash still folds in the coordinates only, so every recorded golden hash is unchanged and the
+version trio does not move. The material is not game state: the level fixes it, and a hole cannot
+report it.
+
+**The view drops it.** `view::Debris` is the rope's sibling: a `dynamics::World` in
+`AgentAnim`, stepped once per simulated tick by the views that draw the run's *own* terrain (the
+playtest, the title demo and a champion's replay). A break spawns a **chunk** — the engine's crate,
+four corner particles joined by edges and cross-braces, one tile of ground's mass, no drag, so it
+accelerates at the sim's own `gravity` — drawn with the sprite of the tile it was. The chunk
+shatters when the engine's own contact normal points up under one of its corners: the box is
+discarded and a fresh world is filled with seven small bodies at the impact point, carrying a
+quarter of the fall plus an outward kick scaled by the impact speed. They bounce once, slide and
+come to rest, are drawn as four-pixel quads in the material's two shades, fade over their last
+forty ticks and are retired.
+
+A fresh world per smash rather than removing bodies from one: the engine has no `remove`, and a
+chunk's corners left lying in its world would be stepped forever and drawn never. That is the
+right trade for an engine whose stated design is that no index ever moves.
+
+Measured on a fixture with a cracked bridge six tiles over a floor (`crates/app/src/view.rs`):
+
+* the chunk falls the five tiles beneath it and is doing **0.25+ tiles a tick** at the floor —
+  a fall's speed, from gravity alone, with no keyframe anywhere;
+* it breaks into **seven** pieces that scatter more than **0.2 tiles** and come to rest below
+  **0.02 tiles a tick**, then are retired;
+* a headless frame test counts the painted geometry, not the struct: one quad of the tile's own
+  sprite, placed on the box the solver is moving to within a pixel and a half, and seven filled
+  rectangles in the brick's colours once it has smashed.
+
+**The evolution view does not draw it**, deliberately: the lab draws the *authored* level, in
+which the tile has not burned, so a chunk falling out of a tile that is still drawn would be
+worse than no chunk. Drawing a lane's live terrain there is a larger change (eight lanes each
+break different tiles) and is left as its own step.
+
+### The falling tile looked duplicated in a replay, because the replay drew the document.
+
+Reported straight after the debris landed: "the blocks fall properly, but the original image of
+them stays there, so it looks like it duplicates instead of falling." The debris was right and
+the terrain under it was wrong.
+
+`Replay::level()` is the **document** — the level the episodes were built from, which nothing ever
+mutates, because an episode that could edit the file it was scored on would not be replayable. The
+star's `Sim` took a copy in `EpisodeRunner::new` and destroys *that*, so its broken tile is a hole
+in a level the canvas was not drawing. The result is the report exactly: the sprite of the tile
+still painted where the sim has nothing, and the chunk of that same tile falling out of it. Two
+copies of one tile, one of them going nowhere.
+
+`Replay::drawn_level()` is the star's terrain as the episode has left it, and it is what the replay
+canvas, the camera fit and the headless frame test now draw (`headless_replay_quads` had to follow,
+or its quad count would no longer be comparable with the editor's baseline). The camera is the one
+that matters most: a follow-cam clamped to a document whose extents can no longer change is fine,
+but a canvas drawing live terrain while the camera believes it is drawing the document is how the
+two drift apart later.
+
+The playtest was already right — it draws `session.sim().level()`, which is the same live copy —
+and the title-screen demo goes through `draw_sim`, so both were single-copy all along. That is why
+the bug read as "replay only", and it is the reason the fix is one getter rather than a re-plumbing
+of the views.
+
+**A second bug fell out of the first.** `RopeMotion` rebuilt its chains whenever the level's
+**content hash** changed, on the theory that an edit should move a drawn rope. A tile burning out
+changes that hash, and in a view that draws live terrain a body swinging on a line over a brittle
+floor would have had the line re-built at rest the tick the floor went — a rope that suddenly drops
+and re-hangs, for a reason that has nothing to do with ropes. The key is now `rope_signature`:
+count, anchor and length per rope. An edit that moves a tie or resizes a line still rebuilds;
+a tile on the other side of the level burning away does not.
+
+The regression test (`crates/app/src/replay.rs`) pens the star between two brittle floor tiles and
+a wall so the fuse actually runs — a body walking across fresh floor never lights one, which is
+what the first version of the test discovered — then asserts the tile is **empty** in
+`drawn_level()` and still **cracked** in `level()`. It also pins the extents equal, so the camera
+and the painter cannot come to disagree about where the level is.
+
+**The evolution view still draws the authored level** and still draws no debris, for the reason
+given above: eight lanes burn different tiles, and one drawn level cannot show eight holes. Rope
+rebuilds on a lane's level are unaffected by any of this now that the key ignores terrain.
+
+### The editor opened on a drawing board. It opens on the game now.
+
+The report was that the editor "looks far too detailed and doesn't look like the game we are trying to
+represent", and the diagnosis is in the first frame it ever draws: blue graph paper, a tile grid over
+it, a reachability tint on every platform the spawn cannot reach, `beatable: flag reachable over 1
+platform(s)` along the bottom, a pointer coordinate at the other end, and twenty-five brush cells in
+one wrapped grid. Not one of those is wrong. Together they are an *instrument panel*, and a person
+who has not drawn anything yet is being shown four measurements of the drawing they have not made.
+
+The fix is a **layer**, not a deletion: the window has a game and a drawing board, and the drawing
+board is now something you ask for.
+
+**`G` is the guides.** One switch — the dock's *Guides* plate or the key — turns on the tile grid,
+the reachability tint, the verdict's sentence *and* the pointer's tile coordinate, and swaps the
+canvas backdrop from the game's own sky back to graph paper. Four switches would be four states a
+person can be half-way into, and "half a drawing board" was precisely the problem; one switch cannot
+be half on. The lamp that says whether the level can be beaten stays up in both states, with the
+sentence on its hover: a light is a fact about the level, and the sentence is a measurement.
+
+**The sky is the default.** The editor and the playtest already share one renderer; the editor was
+simply handing it graph paper. Draw a level under the sky it will be played under and the canvas
+stops being a document with a game inside it — `view::Backdrop::Checker` is still there, one key
+away, for the person checking a two-tile gap against something ruled.
+
+**The palette is five shelves, one at a time.** `BrushGroup` splits the twenty-five brushes into
+ground (four materials and their brittle twins), hazards (spike, spring, one-way, water, lava, vine),
+enemies, the level's own furniture (spawn, flag, platform, rope, scenery) and clear. The tabs are the
+same plate as the dock's tools at a smaller size, so "one of these is chosen" reads the same
+everywhere; the grid keeps three rows whatever the shelf holds, so the stroke switch does not jump
+under the pointer that just changed shelves; and **a tab is a place to look, not a tool** — pressing
+one leaves the brush in hand alone, while the eyedropper moves the shelf to whatever it picked up.
+
+`Brush::ALL` is now `#[cfg(test)]`. The shelves are the only ordering a running window has, and a
+production constant nothing in production reads is a list that quietly stops agreeing with the thing
+it claims to describe; every-brush questions (does it have an icon, is it on exactly one shelf) are
+checks, and the checks are where it is used.
+
+**The dock has seams.** Two rules split the bar into the document's tools, the view of it, and what
+the window *is*. And *Guides* exists only in the editor: the grid, the tint and the verdict are facts
+about a drawing, and a plate that cannot do what it says is worse than one that is not there.
+
+The empty third of the palette is now a footer that names the held brush and says what it does — the
+one thing a grid of pictures cannot say, in the one place there was room for it.
+
+Four tests hold it: the editor opens with the guides off (sky, no grid, no tint), `G` toggles the
+whole board on and back off, a tab changes the shelf without changing the brush, and every brush is
+on exactly one shelf. `docs/images/editor-showcase.png` is re-shot, since the old picture was of the
+window this replaced.
+
+**The run views are untouched.** Their panel is busy by nature — it is the board a run is driven
+from — but the same question ("what is a measurement and what is the game?") has not been asked of
+it yet, and that is its own step.
+
+## The README's pictures are the window's own frames
+
+Every screenshot in the README is now a `--screenshot` frame of the current build at the window's own
+1360 × 800, and the header is no longer a separate drawing at all: it is the title card cropped out of
+one of those frames. That is the point of doing it that way. The old header — rainbow letters over a
+strip of baked ground — was an asset somebody had to remember to redraw when the title screen changed,
+and nobody did; the screen stopped drawing it a release ago and the README went on showing it. A crop
+of the real frame is a picture of what the game actually draws, so the next time the mark changes the
+picture is stale in exactly the way the rest of the screenshots are stale, and re-shooting the set
+fixes all of them together. The retired file (`crates/app/assets/logo.png`) was deleted with it.
+
+Shooting the set at the window's real size turned up two layout bugs that only show when the window is
+the shape a person actually opens.
+
+* **The splash's vignette had a seam down the left and right edges.** Its two side bands were built
+  with the same quad helper as the top and bottom ones, and that helper's two colours fade *down* the
+  window — so the side bands were fixed-width strips whose ink was strongest at the top of the screen
+  and gone by the bottom, with a hard vertical edge where the strip ended. On a sky gradient that is a
+  visible line, not a vignette: the left tenth of the title screen was a darker rectangle. The helper
+  was split in two, one fading down and one fading across, and the side bands use the second. The
+  corners still come out darker than either band alone, which is what a vignette is for.
+* **The run's panel was sized by whatever was in it.** egui sizes a side panel to its content, and a
+  panel whose body is a scrolling area shrinks to its widest row, so the run and replay panels came out
+  about 230 points wide — narrower than the 310 they asked for — and their text simply ran off the
+  window. Worse, the level's canvas was laid out against the width the panel had reserved a frame
+  earlier, so it painted over the panel's left edge. Two rows were the offenders and both were rows
+  that could not wrap: a reading's qualifier ("4 / 200 reached the flag — 1 on every trial") and the
+  replay's pace description ("the pace it plays at, in real time"). Readings now wrap under their
+  number (`horizontal_wrapped`), the pace description sits under its stepper instead of beside it, and
+  the panel has a 300-point floor so it is the column it says it is rather than a box that fits its
+  contents.
+
+The blocks-and-cast gallery was checked rather than re-shot: the atlas has changed one sprite since it
+was made (`rope`, which is a mechanic rather than a block, and has no cell in the grid), and every
+other cell is byte-identical, so the picture is still of the current art.

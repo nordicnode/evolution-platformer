@@ -85,6 +85,12 @@ pub const GLYPH_TURRET: char = 'T';
 pub const GLYPH_SHOT: char = 'o';
 /// A moving platform.
 pub const GLYPH_MOVER: char = 'M';
+/// A rope's line, one glyph per cell it hangs through.
+///
+/// A vertical bar rather than a letter: every other object in this view is a body with a name,
+/// and a rope is the one thing in a level that is a *line* — the drawing that says "a cell you can
+/// hang in" is the one a person would draw.
+pub const GLYPH_ROPE: char = '|';
 /// A ball of lava in flight.
 ///
 /// A star rather than a letter, for the same reason a shot is `o`: it is the one body in the
@@ -101,7 +107,7 @@ pub const GLYPH_UNKNOWN: char = '?';
 ///
 /// A legend, not a whitelist — see the module docs. Watch mode draws each agent
 /// with its own letter and those letters are not listed here.
-pub const GLYPHS: [(char, &str); 26] = [
+pub const GLYPHS: [(char, &str); 27] = [
     (GLYPH_SOLID, "solid tile"),
     (GLYPH_SAND, "sand tile (solid, a beach)"),
     (GLYPH_BRICK, "stone brick tile (solid masonry)"),
@@ -154,6 +160,7 @@ pub const GLYPHS: [(char, &str); 26] = [
     (GLYPH_SHOT, "a turret's shot in flight"),
     (GLYPH_LAVA_BALL, "a lava ball in flight"),
     (GLYPH_MOVER, "a moving platform"),
+    (GLYPH_ROPE, "a rope (grab it in the air and swing)"),
     (GLYPH_PLAYER, "the player"),
 ];
 
@@ -354,6 +361,21 @@ impl<'a> Scene<'a> {
                 GLYPH_MOVER,
                 true,
             ));
+        }
+        // A rope is drawn as the cells it hangs through, one glyph each, because that is what a
+        // terminal can say about a line. It is not a body (nothing collides with it) but it takes
+        // cells, and a scene that left it out would show a swing the reader could not explain.
+        for rope in &sim.level().ropes {
+            for i in 0..rope.length.max(1.0) as i32 {
+                bodies.push(Body::new(
+                    rope.col as f32,
+                    (rope.row + i) as f32,
+                    1.0,
+                    1.0,
+                    GLYPH_ROPE,
+                    true,
+                ));
+            }
         }
         Scene::new(sim.level(), bodies)
     }
@@ -985,6 +1007,56 @@ mod tests {
                 "mismatch at view {view:?}"
             );
         }
+    }
+
+    /// **The map and the swing agree about where the line is.** The `|` glyphs must occupy
+    /// exactly the cells between the rope's anchor and its end, or a reader is shown a line one
+    /// tile away from the line a body actually grabs — which is what the first cut did, when the
+    /// anchor was tied to the bottom of its own cell.
+    #[test]
+    fn a_rope_draws_every_cell_of_the_line_it_hangs_on() {
+        let rows = [
+            "............",
+            "............",
+            "####........",
+            "............",
+            "............",
+            "............",
+            "############",
+        ];
+        let tiles = rows
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let src = format!(
+            "{{\"format\":\"evo-platformer-level\",\"level_format_version\":4,\"name\":\"rope\",\
+             \"width\":12,\"height\":7,\"spawn\":{{\"x\":1,\"y\":5}},\"tiles\":[{tiles}],\
+             \"entities\":[{{\"type\":\"rope\",\"x\":2,\"y\":3,\"tiles\":3}},\
+             {{\"type\":\"goal\",\"x\":10,\"y\":5}}]}}"
+        );
+        let level = Level::from_json_str(&src).expect("the rope level parses");
+        let rope = level.ropes[0];
+        assert_eq!(rope.anchor(), (2.5, 3.0), "tied to the underside of row 2");
+        assert_eq!(
+            rope.end_y(),
+            6.0,
+            "three tiles of line, ending on the floor"
+        );
+
+        let frame = render_scene(
+            &Scene::from_sim(&Sim::new(&level, 1)),
+            Viewport::whole(&level),
+        );
+        let rows = rows_of(&frame);
+        let drawn: Vec<i32> = (0..level.height)
+            .filter(|row| rows[*row as usize].chars().nth(2) == Some(GLYPH_ROPE))
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![3, 4, 5],
+            "one glyph per cell of the line, from the ceiling down:\n{frame}"
+        );
     }
 
     #[test]

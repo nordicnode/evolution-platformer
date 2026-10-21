@@ -5,9 +5,11 @@
 # Tool-local metadata for the coding agent, not part of the project
 /.freebuff/
 
-# Human demonstrations (Item 7) are written beside the app's working directory, which is the
-# crate directory under `cargo test`; they are recordings, not sources.
+# Human demonstrations (Item 7) are written beside the app's working directory: the crate
+# directory under `cargo test`, and the top of the repo when the game is launched from there.
+# They are recordings, not sources.
 /crates/app/demos/
+/demos/
 
 # Champion + export artifacts are generated, but the curated starter pack is not.
 /champions/*.json

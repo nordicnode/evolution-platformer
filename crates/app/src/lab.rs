@@ -581,18 +581,17 @@ impl Lanes {
         self.carry -= whole;
         let ticks = whole.max(0.0) as u32;
         for (runner, anim) in self.runners.iter_mut().zip(self.anims.iter_mut()) {
-            let mut stepped = 0u32;
             for _ in 0..ticks {
                 if runner.is_finished() {
                     break;
                 }
                 runner.step();
-                stepped += 1;
-            }
-            // Simulated time, not wall clock: a finished lane's dust settles instead of
-            // drifting on for as long as the slowest lane in the generation keeps running.
-            if stepped > 0 {
-                anim.advance(runner.sim(), stepped as f32 * sim::DT);
+                // One drawn frame is not one tick. At speed a lane steps several ticks per
+                // frame, and the animation — the run cycle, the dust and the rope — is advanced
+                // on the tick rather than once for the frame: a rope advanced once for four
+                // ticks is pulled from the hands' old place to their new one in a single step,
+                // and the line snaps instead of swinging.
+                anim.advance_tick(runner.sim());
             }
         }
         self.ticks += ticks;
@@ -2449,6 +2448,28 @@ mod tests {
             0.10,
             "0.07 snaps to 0.08, then steps up"
         );
+    }
+
+    /// **A frame is not a tick.** At speed a lane steps several ticks per drawn frame, and the
+    /// line is advanced once for each of them. Advanced once for the whole frame — which is what
+    /// this used to do — the rope is pulled from where the hands were to where they ended up in a
+    /// single step, and the swing reads as a series of snaps. The cadence is the view's to keep,
+    /// so it is pinned here rather than in the solver.
+    #[test]
+    fn a_lane_advances_its_rope_on_every_tick_of_a_frame() {
+        let mut generator = new_generator("l2-first-gap", None);
+        let packet = generator.next_packet();
+        let level = generator.level().clone();
+        let eval = tiny_config().eval_config();
+        let mut lanes = Lanes::new(packet, &level, &eval);
+        lanes.advance(1.0 / 60.0, 8);
+        for i in 0..lanes.len() {
+            assert_eq!(
+                lanes.anim(i).motion().steps(),
+                8,
+                "lane {i} advanced its line once for a frame that stepped eight ticks"
+            );
+        }
     }
 
     #[test]

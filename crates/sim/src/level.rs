@@ -46,7 +46,14 @@ pub const LEVEL_FORMAT: &str = "evo-platformer-level";
 /// meanings for a cell, so version 3. **A v3 build reads v1 and v2**, because this pass only
 /// *added*: every earlier glyph, entity and rule means exactly what it meant. The writer
 /// always emits 3.
-pub const LEVEL_FORMAT_VERSION: u32 = 3;
+///
+/// **Bumped to 4 when the rope arrived** — one new entity and no new glyph. The same rule
+/// applies to entities as to tiles: a v3 build meeting `"type": "rope"` refuses the file with
+/// "unknown entity type", which is the right *behaviour* from a build that has no rope, and the
+/// wrong *promise* from a file that says version 3. So the writer emits 4, a v4 build still reads
+/// 1 through 3 (every earlier meaning is unchanged), and a champion trained on a rope level
+/// carries 4 in its provenance like every other version this format has had.
+pub const LEVEL_FORMAT_VERSION: u32 = 4;
 
 /// Smallest grid the editor will build. Not a loader rule — a level is legal from
 /// 1x1 — but a painter with less room than this has nothing to paint with.
@@ -678,6 +685,73 @@ impl PlatformSpec {
     }
 }
 
+/// A **rope**: a length of line hanging from the underside of a tile that a body can grab in
+/// the air and swing on.
+///
+/// The pack's third way across a gap, and the first that is neither a timed move nor a climb.
+/// A vine is a vertical route the body *holds*: the brain decides to climb and the body goes up at
+/// a constant rate. A rope is a route the body *rides*: once it is gripped, the body's motion is
+/// the rope's, and the only way to change it is to pump the arc with a direction and to decide
+/// when to let go. That is why it is worth the state — it is the one object in the pack whose
+/// outcome is decided by momentum rather than by where the body is.
+///
+/// **Hangs from the bottom of row `row`, and its own cells are the rows below.** The anchor is a
+/// point — the middle of the underside of the tile above `(col, row)` — rather than a box, because
+/// a rope has no thickness: it is a line, its length is the entity's, and a body grabs it wherever
+/// its hands happen to meet it. Those cells are not solid, not hazards and not tiles; they are
+/// only where the rope is drawn and where the grip is looked for.
+///
+/// `length` is in tiles and is the full length of the line. A body that grabs near the anchor is
+/// on a short pendulum and a body that grabs near the end is on a long one, which is the whole of
+/// the skill the object asks for: the same rope is a different swing depending on where you catch
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeSpec {
+    /// Column the line hangs in.
+    pub col: i32,
+    /// Row the line's **topmost** cell occupies. The line is tied to the underside of the row
+    /// above it — which is what [`Level::rope_placeable`] demands — and hangs `length` tiles down
+    /// from there, so a rope's drawn cells and the segment it swings on are the same cells.
+    pub row: i32,
+    /// The line's full length, in tiles. Never less than one.
+    pub length: f32,
+}
+
+/// A rope's length when the file does not say one: five tiles.
+///
+/// Shared with the editor for the reason every other default in this module is — a rope placed
+/// in the window and a rope written by hand have to be the same rope. Five tiles is a little over
+/// one full jump's height (2.5), so a body can grab it from a jump and still have an arc left
+/// underneath: a one-jump rope is a vine with extra steps, and a fifteen-tile rope is a lift.
+pub const DEFAULT_ROPE_TILES: i32 = 5;
+
+impl RopeSpec {
+    /// A rope hung at tile `(tx, ty)` with `length` tiles of line.
+    ///
+    /// The one place the geometry is stated: the anchor is the centre of the **top** edge of row
+    /// `ty`, so a rope placed in the air under a ceiling is tied to that ceiling's underside and
+    /// its first drawn cell is the first cell of the line. The alternative — tying it to the
+    /// bottom of the row it is placed in — leaves a tile of air between the ceiling and the rope,
+    /// which is a rope that looks like it is floating.
+    pub fn at(tx: i32, ty: i32, length: i32) -> RopeSpec {
+        RopeSpec {
+            col: tx,
+            row: ty,
+            length: length.max(1) as f32,
+        }
+    }
+
+    /// Where the line is tied: the centre of the row's top edge, in world tiles.
+    pub fn anchor(&self) -> (f32, f32) {
+        (self.col as f32 + 0.5, self.row as f32)
+    }
+
+    /// The lowest point of the line, where its end hangs at rest.
+    pub fn end_y(&self) -> f32 {
+        self.anchor().1 + self.length
+    }
+}
+
 /// The on-disk shape, in write order. Serializing this rather than hand-building
 /// JSON is what keeps the writer and the loader from ever disagreeing about keys:
 /// they are the same struct.
@@ -757,6 +831,8 @@ pub struct Level {
     pub turrets: Vec<TurretSpec>,
     /// Moving platforms, with the travel each one slides over.
     pub platforms: Vec<PlatformSpec>,
+    /// Ropes, with the length each one hangs: a swing a body can grab in the air.
+    pub ropes: Vec<RopeSpec>,
     /// Lazily computed move-graph route table for this level.
     ///
     /// **The slot is shared between clones, not copied by them.** The graph is a pure
@@ -852,6 +928,7 @@ impl Level {
             flyers: Vec::new(),
             turrets: Vec::new(),
             platforms: Vec::new(),
+            ropes: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -929,6 +1006,23 @@ impl Level {
                         vertical,
                         dir,
                     ));
+                }
+                // A rope hangs from the **bottom of its own row**: the cell it is authored in
+                // is the line's first cell, and the tile it is tied to is the one above it, so
+                // the anchor is the underside of the ceiling an author would have clicked on.
+                // The line's cells have to be inside the map — a rope that ends below the world
+                // is a rope whose swing could carry a body out of the level without falling —
+                // and that is refused here rather than clamped, because a file that asks for it
+                // is a file whose author meant something else.
+                "rope" => {
+                    let length = e.tiles.unwrap_or(DEFAULT_ROPE_TILES).max(1);
+                    if e.x < 0 || e.x >= level.width || e.y < 1 || e.y + length > level.height {
+                        return Err(format!(
+                            "rope at ({}, {}) of length {} does not hang inside a {}x{} level",
+                            e.x, e.y, length, level.width, level.height
+                        ));
+                    }
+                    level.ropes.push(RopeSpec::at(e.x, e.y, length));
                 }
                 "goal" => {
                     // One flag per level, refused here as well as in the editor: the oracle,
@@ -1503,6 +1597,7 @@ impl Level {
             flyers: Vec::new(),
             turrets: Vec::new(),
             platforms: Vec::new(),
+            ropes: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1612,6 +1707,16 @@ impl Level {
             .chasers
             .iter()
             .map(|r| Rect::new(w - (r.x + r.w), r.y, r.w, r.h))
+            .collect();
+        // A rope is one column and one length, so the mirror is its column: the line stays
+        // where it hangs and the anchor stays under the same ceiling.
+        out.ropes = self
+            .ropes
+            .iter()
+            .map(|r| RopeSpec {
+                col: self.width - 1 - r.col,
+                ..*r
+            })
             .collect();
         out.flyers = self
             .flyers
@@ -1747,6 +1852,12 @@ impl Level {
             )
         });
         report.dropped_platforms = before - self.platforms.len();
+
+        // A rope is dropped when its anchor column leaves the map *or* when the line would no
+        // longer fit under the new bottom edge: half a rope is not a shorter rope, it is a
+        // swing that lets go of a body over the void.
+        self.ropes
+            .retain(|r| r.col < width && r.row >= 1 && (r.row as f32 + r.length) <= height as f32);
 
         let before = self.scenery.len();
         self.scenery.retain(|s| !tx_out(s.x, s.y, width, height));
@@ -2025,6 +2136,146 @@ impl Level {
         true
     }
 
+    // ---- the rope ----------------------------------------------------------------------
+
+    /// Tile positions of every rope: the cell its line hangs from (its first cell).
+    pub fn rope_tiles(&self) -> Vec<(i32, i32)> {
+        self.ropes.iter().map(|r| (r.col, r.row)).collect()
+    }
+
+    /// Whether a rope may be hung at `(tx, ty)`: on the map, tied to something solid above it,
+    /// with a cell of open air to hang through.
+    ///
+    /// **Tied to something**, unlike a flyer, because a rope that hangs from nothing is not a
+    /// rope. The anchor is the underside of the tile above, so an author paints a ceiling and
+    /// then hangs the line from it — the same click the vine tile's own art already teaches.
+    /// The rest of the line is allowed to pass in front of a ledge: a rope is not solid, and a
+    /// swing that brushes a wall is handled by the body's own collision.
+    pub fn rope_placeable(&self, tx: i32, ty: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height)
+            && ty >= 1
+            && self.is_opaque(tx, ty - 1)
+            && self.tile(tx, ty) == Some(Tile::Empty)
+    }
+
+    /// Hang a rope at `(tx, ty)` with `length` tiles of line, shortened to the room under the
+    /// new row so a brush stroke at the bottom of the map still hangs a whole rope.
+    pub fn add_rope_tile(&mut self, tx: i32, ty: i32, length: i32) -> bool {
+        if !self.rope_placeable(tx, ty) {
+            return false;
+        }
+        let room = self.height - ty;
+        self.ropes
+            .push(RopeSpec::at(tx, ty, length.max(1).min(room.max(1))));
+        true
+    }
+
+    /// The rope whose line passes through `(tx, ty)`, if any.
+    ///
+    /// A rope *occupies* the cells it hangs through, not just the one it is tied at. A person
+    /// picks and erases the line where they can see it, which for anything longer than a couple
+    /// of tiles is its middle — so the eyedropper and the eraser ask this rather than
+    /// [`Self::rope_tiles`], which reports only the anchors.
+    pub fn rope_at(&self, tx: i32, ty: i32) -> Option<&RopeSpec> {
+        self.ropes.iter().find(|r| {
+            let last = r.row + r.length.max(1.0).ceil() as i32 - 1;
+            r.col == tx && (r.row..=last).contains(&ty)
+        })
+    }
+
+    /// Whether a **cell** of rope may be painted at `(tx, ty)`.
+    ///
+    /// A rope is painted the way every other part of a level is: one cell at a time, so the brush
+    /// asks this per tile rather than per line. A cell is legal when it is a line's first cell —
+    /// empty, with something solid above to tie it to — or when it is the next cell below a line
+    /// already hanging in that column, which is how a drag downwards grows one rope instead of
+    /// starting a new one every row.
+    pub fn rope_cell_placeable(&self, tx: i32, ty: i32) -> bool {
+        if tx_out(tx, ty, self.width, self.height) || self.tile(tx, ty) != Some(Tile::Empty) {
+            return false;
+        }
+        if ty >= 1 && self.is_opaque(tx, ty - 1) {
+            return true;
+        }
+        self.ropes.iter().any(|r| {
+            let end = r.row + r.length.max(1.0).ceil() as i32 - 1;
+            r.col == tx && ty == end + 1
+        })
+    }
+
+    /// Paint one cell of rope at `(tx, ty)`: start a line there, or grow the one above it by a cell.
+    ///
+    /// Returns whether the document changed. Growing rather than stacking one-tile ropes is what
+    /// makes a drag down a ceiling's edge *one rope*: every row the pointer passes is the next cell
+    /// of the line it started.
+    pub fn add_rope_cell(&mut self, tx: i32, ty: i32) -> bool {
+        if !self.rope_cell_placeable(tx, ty) {
+            return false;
+        }
+        for r in &mut self.ropes {
+            let end = r.row + r.length.max(1.0).ceil() as i32 - 1;
+            if r.col == tx && ty == end + 1 {
+                r.length = (ty - r.row + 1) as f32;
+                self.forget_routes();
+                return true;
+            }
+        }
+        self.ropes.push(RopeSpec::at(tx, ty, 1));
+        self.forget_routes();
+        true
+    }
+
+    /// Remove the rope hanging from `(tx, ty)`, if any. Returns whether one went.
+    ///
+    /// `(tx, ty)` may be any cell of the line, for [`Self::rope_at`]'s reason.
+    pub fn remove_rope_at(&mut self, tx: i32, ty: i32) -> bool {
+        let before = self.ropes.len();
+        self.ropes.retain(|r| {
+            let last = r.row + r.length.max(1.0).ceil() as i32 - 1;
+            !(r.col == tx && (r.row..=last).contains(&ty))
+        });
+        self.ropes.len() != before
+    }
+
+    /// The grip a body at `body` takes on the nearest rope, if its hands are on one.
+    ///
+    /// The hands are the **top centre of the body**, which is where a person's hands are when
+    /// they reach up to catch a line, and the grab is "the line passes the hands": within
+    /// [`Physics::rope_grab`] tiles horizontally of the rope's column and anywhere between the
+    /// anchor and the rope's end vertically. A miss on either axis is a miss, so a body can jump
+    /// past a rope without catching it — which is the decision the object adds.
+    ///
+    /// **The length is where the hands caught it**, not the rope's own: grabbing high on a long
+    /// line is a short pendulum and grabbing low is a long one, so the same rope is a different
+    /// swing from a different jump. Clamped to the rope's length, so a body that reaches past the
+    /// end catches the end.
+    pub fn rope_grab(&self, body: Rect, ph: &crate::Physics) -> Option<crate::physics::RopeGrip> {
+        let (hx, hy) = (body.x + body.w * 0.5, body.y);
+        let mut best: Option<crate::physics::RopeGrip> = None;
+        for r in &self.ropes {
+            let (ax, ay) = r.anchor();
+            if (hx - ax).abs() > ph.rope_grab {
+                continue;
+            }
+            if hy < ay - 0.01 || hy > ay + r.length {
+                continue;
+            }
+            let dist = ((hx - ax).powi(2) + (hy - ay).powi(2)).sqrt();
+            let grip = crate::physics::RopeGrip {
+                anchor_x: ax,
+                anchor_y: ay,
+                length: dist.max(ph.rope_min_length).min(r.length),
+                max_length: r.length,
+            };
+            // The lowest catch wins when two lines are within reach: a body is holding the
+            // rope it is closest to meeting, not the one nearest its feet.
+            if best.is_none_or(|b| grip.length > b.length) {
+                best = Some(grip);
+            }
+        }
+        best
+    }
+
     /// The enemy whose cell is `(tx, ty)`, as its file kind, topmost of the kinds a click can
     /// mean. Used by the editor's eraser and the inspector.
     pub fn enemy_at(&self, tx: i32, ty: i32) -> Option<&'static str> {
@@ -2038,6 +2289,8 @@ impl Level {
             Some("flyer")
         } else if self.platform_tiles().contains(&(tx, ty)) {
             Some("platform")
+        } else if self.rope_at(tx, ty).is_some() {
+            Some("rope")
         } else {
             None
         }
@@ -2049,7 +2302,8 @@ impl Level {
             + self.chasers.len()
             + self.flyers.len()
             + self.turrets.len()
-            + self.platforms.len();
+            + self.platforms.len()
+            + self.ropes.len();
         self.walkers
             .retain(|w| (tile_of_x(w.x, PHYSICS.walker_w), tile_of_bottom(w.bottom())) != (tx, ty));
         self.chasers
@@ -2068,11 +2322,16 @@ impl Level {
         });
         self.platforms
             .retain(|p| (p.rect.x.round() as i32, tile_of_bottom(p.rect.bottom())) != (tx, ty));
+        self.ropes.retain(|r| {
+            let last = r.row + r.length.max(1.0).ceil() as i32 - 1;
+            !(r.col == tx && (r.row..=last).contains(&ty))
+        });
         self.walkers.len()
             + self.chasers.len()
             + self.flyers.len()
             + self.turrets.len()
             + self.platforms.len()
+            + self.ropes.len()
             != before
     }
 
@@ -2262,6 +2521,7 @@ impl Level {
             ("flyer", self.flyer_tiles()),
             ("turret", self.turret_tiles()),
             ("platform", self.platform_tiles()),
+            ("rope", self.rope_tiles()),
         ] {
             for (tx, ty) in tiles {
                 if tx_out(tx, ty, self.width, self.height) {
@@ -2295,6 +2555,7 @@ impl Level {
                 + self.flyers.len()
                 + self.turrets.len()
                 + self.platforms.len()
+                + self.ropes.len()
                 + self.goals.len()
                 + self.scenery.len(),
         );
@@ -2345,6 +2606,12 @@ impl Level {
             entities.push(RawEntity {
                 sprite: Some(s.sprite.clone()),
                 ..RawEntity::of("scenery", s.x, s.y)
+            });
+        }
+        for r in &self.ropes {
+            entities.push(RawEntity {
+                tiles: Some(r.length.round().max(1.0) as i32),
+                ..RawEntity::of("rope", r.col, r.row)
             });
         }
         let (sx, sy) = self.spawn_tile();

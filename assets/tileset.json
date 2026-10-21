@@ -1506,6 +1506,11 @@
       "name": "blend_timber_b",
       "col": 11,
       "row": 18
+    },
+    {
+      "name": "rope",
+      "col": 12,
+      "row": 18
     }
   ]
 }
