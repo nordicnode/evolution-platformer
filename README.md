@@ -45,12 +45,15 @@ beside it.*
 ## How it plays
 
 **Edit.** Draw a level with the mouse: drag blocks, spikes, springs, enemies
-and the flag out of the palette onto the canvas. The palette shows one shelf at
-a time — ground, hazards, enemies, the level's own furniture, and the two
-clearers — so it stays a handful of cells rather than a box of parts. A lamp on
-the status line says whether the level can be beaten at all; `G` turns on the
-guides — the tile grid, the reachability tint and the full verdict — when you
-want to measure the level instead of look at it.
+and the flag out of the palette onto the canvas. The palette is one list cut
+by what a part *does* — ground, hazards (what kills on touch), traversal
+(what carries a body), enemies, the level's own marks and dressing, and the
+two clearers — so a part is always where its behaviour says it is and nothing
+is hiding behind a tab; `/` searches all of them at once, by name, by
+description or by the word you actually think of ("trap", "pendulum",
+"trampoline"). A lamp on the status line says whether the level can be beaten
+at all; `G` turns on the guides — the tile grid, the reachability tint and the
+full verdict — when you want to measure the level instead of look at it.
 
 **Play.** Run the level yourself, against the clock. Once the AI has a best
 time on the level, the playtest races you against it, and you can turn on a
@@ -64,7 +67,7 @@ ghosted beside it.
 
 ## Features
 
-- **Level editor** with a shelved parts palette, a game-view canvas (the
+- **Level editor** with a searchable parts palette, a game-view canvas (the
 guides are one key), undo/redo, eyedropper, line and
   rectangle tools, a browsable shelf of levels, and a mirror tool that flips
   the whole level in one step.
@@ -79,6 +82,10 @@ guides are one key), undo/redo, eyedropper, line and
   its hands and swings on. The arc is real physics — a pendulum with inertia,
   pumped by leaning and spent on release — so a rope turns a jump into a swing
   and a swing into a launch the running jump cannot match.
+- **Spiked balls:** a ball on a chain that hangs asleep under a ceiling until a body
+  comes near, and then swings. The pendulum is the same constraint physics the rope
+  uses, the trigger is the wind-up rather than the blow, and the ball is a hitbox the
+  whole way through its arc — there is no stomping it, only being somewhere else.
 - **A physics engine of its own** (`crates/dynamics`): point masses, rigid
   links, ropes, gravity and tile collision, stepped one deterministic tick at a
   time. The rope you see is a world in it — a pinned tie, a chain of links and a
@@ -137,11 +144,16 @@ Twelve levels ship with the game, each teaching one thing:
 
 There is also a set of small adversarial levels (`levels/bat-*.json`), one per
 skill the AI is meant to have, and working levels named `levels/scratch-*.json`,
-including the showcase level in the screenshot above and `levels/scratch-rope.json`,
-a pit crossed only by swinging. The editor's palette has a rope brush that paints a
-**cell** at a time, like every other part of a level: a click hangs one cell of line
-from the ceiling above it, and dragging down grows that line a cell per row (a cell
-inside a line is refused, because it is already rope).
+including the showcase level in the screenshot above, `levels/scratch-rope.json`
+(a pit crossed only by swinging) and `levels/scratch-ball.json` (a corridor under a
+spiked ball). The editor's palette has a rope brush that paints a **cell** at a time,
+like every other part of a level: a click hangs one cell of line from the ceiling above
+it, and dragging down grows that line a cell per row (a cell inside a line is refused,
+because it is already rope). The spiked-ball brush hangs a whole ball per click, and a
+drag down from the ball lengthens *its* chain the same way; the chain's length and the
+trigger's radius are the two steppers under the palette, the way a platform's travel
+and width are, and the drop ghost draws the ball at the end of the chain it will hang
+on rather than under the pointer.
 
 `levels/practice/` is a **generated, certified practice suite**: twenty-four
 levels, six mechanics at four tiers, every one checked by the reachability
@@ -194,9 +206,9 @@ playtest, `E` straight to a run.
 
 **Edit:** click paints, drag a palette item to place it, right-drag erases,
 wheel zooms, middle-drag (or alt-drag) pans, ctrl+click picks the tile under
-the pointer as your brush, shift-drag draws a line. `Ctrl+S` saves, `Ctrl+Z`
-and `Ctrl+Y` undo and redo, `G` toggles the guides (grid, reachability tint,
-verdict), `F` fits the level, `P` plays.
+the pointer as your brush, shift-drag draws a line. `/` searches the palette,
+`Ctrl+S` saves, `Ctrl+Z` and `Ctrl+Y` undo and redo, `G` toggles the guides
+(grid, reachability tint, verdict), `F` fits the level, `P` plays.
 
 **Play:** arrows or WASD move and jump, `R` restarts, `G` toggles the
 record-holder ghost, `T` hands control to the planner, `P` or Esc goes back
@@ -215,6 +227,6 @@ findings and the version history of the physics, sensors and scoring are in
 [FINDINGS.md](FINDINGS.md), and the forward plan for the AI is in
 [AI_IMPROVEMENT_PLAN.md](AI_IMPROVEMENT_PLAN.md).
 
-The game is in active development (currently sim 0.17.0, level format v3).
+The game is in active development (currently sim 0.18.0, level format v5).
 Champion files record the exact physics and scoring they were trained under
 and are refused, rather than mis-replayed, if the game has moved on since.

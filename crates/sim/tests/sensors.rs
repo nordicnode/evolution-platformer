@@ -139,7 +139,10 @@ fn the_vector_has_the_documented_named_layout() {
     // it is blind to every timed mechanic in the pack, which is the whole reason for the bump.
     // v14 appends three (whether the body is on a rope, and the two offsets to the nearest line's
     // end): the first *object* the observation can name that is not a tile or an enemy.
-    assert_eq!(sensors::VERSION, 14);
+    // v15 is v9's kind again, for one hazard: a spiked ball is written into the patch as the
+    // spike's own value, so no slot moved and `N_INPUTS` is unmoved — but a champion trained before
+    // it reads a tile that kills a body as air, which is a bump whether the vector got wider or not.
+    assert_eq!(sensors::VERSION, 15);
 
     let names = sensors::input_names();
     assert_eq!(names.len(), sensors::N_INPUTS);

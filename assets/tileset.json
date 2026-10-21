@@ -1511,6 +1511,11 @@
       "name": "rope",
       "col": 12,
       "row": 18
+    },
+    {
+      "name": "spike_ball",
+      "col": 13,
+      "row": 18
     }
   ]
 }

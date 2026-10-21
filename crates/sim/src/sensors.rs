@@ -179,7 +179,15 @@ use crate::physics::{AgentAction, Flyer, LavaBall, Physics, PlayerState, Shot, W
 /// weight where it was and reads zeros where the rope would be — see `Genome::grown_to_inputs`.
 /// That is the whole reason growth is append-only: the levels that have no rope observe exactly
 /// the same vector they observed at v13, and a champion trained on one still plays it.
-pub const VERSION: u32 = 14;
+///
+/// **v15 puts the spiked ball in the patch**, as [`ENC_SPIKE`]. No slot moved and
+/// [`N_INPUTS`] is unchanged. It is a bump rather than a quiet reading because a cell that ends
+/// the episode is no longer only terrain: a level with a ball now says "do not go in" about a
+/// picture that was not there at v14. The value itself is the one the spike already used — the
+/// decision at a ball and at a spike is the same one — which is the same economy v12 made by
+/// giving lava the spike's value. A level without a ball observes exactly the vector it observed
+/// at v14.
+pub const VERSION: u32 = 15;
 
 /// Tiles per side of the local patch (`9×9 = 81` inputs).
 pub const PATCH_RADIUS: i32 = 4;
@@ -395,6 +403,7 @@ pub fn observe_from_stand(
             mover_vel: &[],
             mover_phase: &[],
             turrets: &[],
+            spike_balls: &[],
             vents: &[],
             air_ticks: 0,
             ground_ticks: 0,
@@ -427,6 +436,9 @@ pub struct Scene<'a> {
     pub mover_phase: &'a [f32],
     /// The level's turrets, so the observation can say *when* the next shot leaves.
     pub turrets: &'a [crate::physics::Turret],
+    /// Spiked balls on chains, at this frame's positions. A ball is drawn into the patch as a
+    /// [`ENC_SPIKE`] cell rather than given slots of its own — see [`VERSION`]'s v15 note.
+    pub spike_balls: &'a [crate::physics::SpikeBall],
     /// The level's lava vents, so the observation can say when the next ball is thrown.
     pub vents: &'a [(i32, i32)],
     /// Ticks the body has been off the ground, and on it. Press timing is a function of both.
@@ -475,6 +487,31 @@ pub fn observe_scene(
             let idx = ((r + PATCH_RADIUS) * (2 * PATCH_RADIUS + 1) + (c + PATCH_RADIUS)) as usize;
             if out[idx] == ENC_EMPTY {
                 out[idx] = ENC_ONEWAY;
+            }
+        }
+    }
+
+    // A spiked ball is a cell that ends an episode, so it is drawn into the patch as one. It is
+    // the patch's existing "do not go in" value and not a new encoding: the decision at a ball
+    // and at a spike is the same one, and giving it a number of its own would ask the network to
+    // learn a distinction the action set cannot express. The box is floored like a mover's, so a
+    // ball between two cells shows up in both — the hazard is bigger than the grid under it.
+    for b in scene.spike_balls {
+        let ball = b.aabb();
+        let (c0, c1) = (
+            ball.x.floor() as i32 - ctx,
+            (ball.x + ball.w - 0.001).floor() as i32 - ctx,
+        );
+        let (r0, r1) = (
+            ball.y.floor() as i32 - cty,
+            (ball.y + ball.h - 0.001).floor() as i32 - cty,
+        );
+        for r in r0.max(-PATCH_RADIUS)..=r1.min(PATCH_RADIUS) {
+            for c in c0.max(-PATCH_RADIUS)..=c1.min(PATCH_RADIUS) {
+                let idx = ((r + PATCH_RADIUS) * (2 * PATCH_RADIUS + 1) + (c + PATCH_RADIUS)) as usize;
+                if out[idx] == ENC_EMPTY {
+                    out[idx] = ENC_SPIKE;
+                }
             }
         }
     }

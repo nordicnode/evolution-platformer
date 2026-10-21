@@ -3083,6 +3083,105 @@ fn draw_ropes(sheet: Sheet<'_>, level: &Level, motion: Option<&RopeMotion>) {
     }
 }
 
+/// A spiked ball's chain: the iron link, and the shade the links are set against.
+///
+/// The tileset's own iron (`IRON_LIGHT` and `IRON_FRAME` in `tools/art/common.py`), so the chain
+/// that hangs the ball is the same metal as the rail on a platform and the brackets under a
+/// one-way shelf. A chain drawn in the rope's brown would read as a rope tied to a wrecking ball.
+const CHAIN_LINK: Color32 = Color32::from_rgb(146, 154, 168);
+const CHAIN_DARK: Color32 = Color32::from_rgb(58, 62, 74);
+/// Spacing of the links along the chain, in tiles of *line* rather than pixels: a long chain and a
+/// short one are made of the same links, the rope's own rule for its knots.
+const CHAIN_LINK_PITCH: f32 = 0.25;
+
+/// Draw every spiked ball a level hangs: the chain from its tie, then the ball at its end.
+///
+/// `balls` is the simulation's own pendulums when there is a run to draw, and `None` in a document
+/// with nothing running — where a level's balls hang straight down at rest, which is exactly where
+/// the sim leaves an untriggered one. That is the one place this differs from the rope beside it:
+/// a rope's shape while a body holds it is not a function of the level, so the *editor* can only
+/// draw it hanging; a spiked ball's is a function of the episode, and a level's file says where it
+/// starts. Nothing is integrated in the view — the sim already did it, deterministically.
+fn draw_spike_balls(sheet: Sheet<'_>, level: &Level, balls: Option<&[sim::SpikeBall]>) {
+    match balls {
+        Some(balls) => {
+            for b in balls {
+                draw_spike_ball(
+                    sheet,
+                    (b.anchor_x, b.anchor_y),
+                    (b.x, b.y),
+                    b.w,
+                    b.h,
+                );
+            }
+        }
+        None => {
+            for spec in &level.spike_balls {
+                let (bx, by) = spec.rest();
+                draw_spike_ball(
+                    sheet,
+                    spec.anchor(),
+                    (bx, by),
+                    sim::PHYSICS.spike_ball_w,
+                    sim::PHYSICS.spike_ball_h,
+                );
+            }
+        }
+    }
+}
+
+/// One spiked ball: the chain from `anchor` to the top of the ball, and the ball's picture at its
+/// own hitbox.
+///
+/// The chain stops at the ball's **top edge** rather than at its centre, unlike the rope's line,
+/// and the reason is the picture: a cord drawn to the middle of the ball is a line through a
+/// drawing, and a chain that visibly enters the top of a ball is a chain holding it up. The ball
+/// itself is drawn at the box that kills (`draw_lava_ball`'s rule): the thing a player has to
+/// judge is exactly the rectangle the sim tests.
+fn draw_spike_ball(
+    sheet: Sheet<'_>,
+    anchor: (f32, f32),
+    ball: (f32, f32),
+    w: f32,
+    h: f32,
+) {
+    let painter = sheet.painter;
+    let cord = (sheet.camera.scale() * 0.09).max(1.0);
+    let top = (ball.0, ball.1 - h * 0.5);
+    let from = sheet
+        .camera
+        .to_screen(anchor.0, anchor.1, sheet.viewport);
+    let to = sheet.camera.to_screen(top.0, top.1, sheet.viewport);
+    painter.line_segment([from, to], egui::Stroke::new(cord, CHAIN_DARK));
+
+    // The links, walked along the line in tiles so a chain of four and one of ten are the same
+    // chain: a solid line reads as a wire, and a chain is the one thing on the screen that should
+    // read as *linked*.
+    let (dx, dy) = (top.0 - anchor.0, top.1 - anchor.1);
+    let span = (dx * dx + dy * dy).sqrt();
+    let mut walked = CHAIN_LINK_PITCH;
+    while span > 1.0e-4 && walked < span {
+        let t = walked / span;
+        let p = sheet.camera.to_screen(
+            anchor.0 + dx * t,
+            anchor.1 + dy * t,
+            sheet.viewport,
+        );
+        painter.rect_filled(
+            Rect::from_center_size(p, egui::vec2(cord * 1.7, cord * 1.7)),
+            CornerRadius::ZERO,
+            CHAIN_LINK,
+        );
+        walked += CHAIN_LINK_PITCH;
+    }
+
+    sheet.image_tinted(
+        sheet.world(ball.0 - w * 0.5, ball.1 - h * 0.5, w, h),
+        sheet.sprites.get("spike_ball"),
+        Color32::WHITE,
+    );
+}
+
 /// Which body a frame's ropes are drawn from, given each body's `(rank, on_a_rope)`.
 ///
 /// A level has one set of ropes and a view can have a dozen bodies on them, so the line has to be
@@ -3170,16 +3269,20 @@ pub fn draw_level(
     reach: Option<&ReachReport>,
     clock: f32,
 ) {
-    draw_level_held(sheet, level, opts, reach, clock, None);
+    draw_level_held(sheet, level, opts, reach, clock, None, None);
 }
 
-/// [`draw_level`] with the ropes' **motion** in it, if the caller has been stepping one.
+/// [`draw_level`] with the ropes' **motion** in it, if the caller has been stepping one, and the
+/// spiked balls' **pendulums**, if the caller has a simulation.
 ///
 /// A rope is the one entity whose drawing depends on a body: hanging, it is a column; held, it is
 /// the line the hands carry with whatever the chain has made of the rest. The state lives in the
 /// [`AgentAnim`] of the body in front of it (see [`AgentAnim::motion`]) — so every view with an
 /// agent passes `Some(anim.motion())`, and the callers with nobody to draw, the editor and a
 /// scrubbed route, pass `None` and get the ropes hanging straight.
+///
+/// `balls` is the same split for the same kind of reason: `Some` is a run's own pendulums, and
+/// `None` is a document, whose balls hang at the rests its file gives them.
 pub fn draw_level_held(
     sheet: Sheet<'_>,
     level: &Level,
@@ -3187,6 +3290,7 @@ pub fn draw_level_held(
     reach: Option<&ReachReport>,
     clock: f32,
     motion: Option<&RopeMotion>,
+    balls: Option<&[sim::SpikeBall]>,
 ) {
     let painter = sheet.painter;
     let (tx0, tx1, ty0, ty1) = sheet.camera.visible_tiles(level, sheet.viewport);
@@ -3359,6 +3463,11 @@ pub fn draw_level_held(
     // the body on it. A held rope is drawn from its anchor to the hands, so this has to run after
     // the terrain and before the body.
     draw_ropes(sheet, level, motion);
+    // The spiked balls: the level's own chains, or the simulation's pendulums where there is a run.
+    // Under the authored entities for the rope's reason, and under the bodies for the ball's own:
+    // a spiked ball kills on contact, and a hazard that hides the body that touched it is a death
+    // nobody can read.
+    draw_spike_balls(sheet, level, balls);
 
     if opts.entities {
         draw_level_entities(sheet, level, clock);
@@ -3869,7 +3978,15 @@ pub fn draw_sim_at(
 ) {
     // The ropes come from the animation, which stepped them with this body: the drawn line is the
     // one the agent in front of it is hanging on, whichever view is drawing.
-    draw_level_held(sheet, sim.level(), opts, None, clock, Some(anim.motion()));
+    draw_level_held(
+        sheet,
+        sim.level(),
+        opts,
+        None,
+        clock,
+        Some(anim.motion()),
+        Some(sim.spike_balls()),
+    );
     // And the rubble of the tiles this run has broken, between the terrain it came out of and the
     // bodies that broke it.
     draw_debris(sheet, anim.debris());
@@ -9567,5 +9684,98 @@ mod tests {
             debris_frame(&ctx, &atlas, &sprites, &camera, viewport, anim.debris());
         assert_eq!(chunks, 0, "the chunk is gone once it has smashed");
         assert_eq!(pieces, SHARD_COUNT, "every piece of it is painted");
+    }
+
+    /// A hall with a ceiling at columns 8..12 and a three-tile chain hanging from it — the same
+    /// box the sim's own tests use, so the framing a test reads here is the framing the game does.
+    fn ball_hall(with_ball: bool, col: i32) -> sim::Level {
+        let rows = [
+            ".............".to_string(),
+            ".............".to_string(),
+            "........#####".to_string(),
+            ".............".to_string(),
+            ".............".to_string(),
+            ".............".to_string(),
+            ".............".to_string(),
+            ".............".to_string(),
+            ".............".to_string(),
+            ".............".to_string(),
+            ".............".to_string(),
+            "#############".to_string(),
+            "#############".to_string(),
+        ];
+        let tiles = rows
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let ball = if with_ball {
+            format!(r#",{{"type":"spiked_ball","x":{col},"y":3,"tiles":3}}"#)
+        } else {
+            String::new()
+        };
+        let src = format!(
+            r#"{{"format":"evo-platformer-level","level_format_version":5,"name":"ball-hall","width":13,"height":13,"spawn":{{"x":1,"y":10}},"tiles":[{tiles}],"entities":[{{"type":"goal","x":11,"y":10}}{ball}]}}"#
+        );
+        sim::Level::from_json_str(&src).expect("the ball hall parses")
+    }
+
+    /// **The spiked ball is drawn once, at the box that kills.**
+    ///
+    /// Two things are asserted, and they are the two ways this can be wrong. One picture and not
+    /// two: the level's rest-position ball and a run's live one are alternatives, not layers, so a
+    /// sim view must not draw the document's ball underneath the swung one. And the picture's
+    /// rectangle is the sim's hitbox scaled by the camera — not a cell, not a size constant —
+    /// because a hazard whose art and box disagree is the unfair death the required-art rule
+    /// exists to prevent.
+    #[test]
+    fn a_spiked_ball_is_drawn_once_at_the_box_that_kills() {
+        let ctx = egui::Context::default();
+        let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
+        let uv = atlas.uv("spike_ball").expect("the ball's cell is in the atlas");
+
+        let ball_in = |col: i32| -> Rect {
+            let quads = headless_sprite_quads(&ball_hall(true, col), RenderOpts::playing());
+            quads
+                .iter()
+                .find(|(_, cell)| *cell == uv)
+                .map(|(rect, _)| *rect)
+                .expect("the ball's own sprite was drawn")
+        };
+
+        let bare = headless_sprite_quads(&ball_hall(false, 0), RenderOpts::playing());
+        let with = headless_sprite_quads(&ball_hall(true, 9), RenderOpts::playing());
+        assert_eq!(
+            with.len(),
+            bare.len() + 1,
+            "the ball is one picture, drawn once"
+        );
+
+        // The box, in screen pixels: the sim's own width and height, at the camera's scale.
+        let ball = ball_in(9);
+        let scale = ball.width() / sim::PHYSICS.spike_ball_w;
+        assert!(
+            (ball.height() / sim::PHYSICS.spike_ball_h - scale).abs() < 0.01,
+            "the picture is the hitbox, so its two sides scale together: {ball:?}"
+        );
+        assert!(
+            scale > 8.0,
+            "a hazard the player cannot see is not a hazard: {scale} px per tile"
+        );
+
+        // And the picture is the *level's* ball: moving the entity two columns moves the sprite
+        // two tiles and nothing else. A view that read a constant, or a chain drawn at the wrong
+        // anchor, shows up here as a picture that did not move with its ball.
+        let moved = ball_in(11);
+        assert!(
+            (moved.center().x - ball.center().x - 2.0 * scale).abs() < 2.0,
+            "two columns of level is two tiles of screen: {} against {} at {scale}",
+            moved.center().x,
+            ball.center().x
+        );
+        assert!(
+            (moved.center().y - ball.center().y).abs() < 0.51,
+            "a ball in another column hangs at the same height"
+        );
     }
 }

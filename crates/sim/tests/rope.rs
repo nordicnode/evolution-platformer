@@ -194,7 +194,13 @@ fn a_rope_round_trips_through_the_file() {
     let level = swing_hall();
     let json = level.to_json_pretty().expect("the level writes");
     assert!(json.contains("\"type\": \"rope\""), "{json}");
-    assert!(json.contains("\"level_format_version\": 4"), "{json}");
+    assert!(
+        json.contains(&format!(
+            "\"level_format_version\": {}",
+            sim::level::LEVEL_FORMAT_VERSION
+        )),
+        "the writer emits the build's format version: {json}"
+    );
     let back = Level::from_json_str(&json).expect("what it writes, it reads");
     assert_eq!(back.ropes, level.ropes);
     assert_eq!(back.ropes[0].length, 7.0);

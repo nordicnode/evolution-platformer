@@ -692,10 +692,16 @@ const SPEED_STEP: Vec2 = Vec2::new(30.0, 26.0);
 /// ladder's range without a viewer having to press one to find out — and the lit state and the
 /// request come from [`pace_step`], so a plate cannot be lit while asking for nothing, or quiet
 /// while it would move the pace.
-fn pace_row(ui: &mut egui::Ui, atlas: Option<&Atlas>, current: u32, unit: &str) -> i32 {
+fn pace_row(ui: &mut egui::Ui, atlas: Option<&Atlas>, current: u32, hover: &str) -> i32 {
     let mut step = 0;
     let rung = speed_rung(current);
+    // One row: the label, then the stepper. The description used to go *under* the stepper as a
+    // wrapped sentence — "the pace it plays at, in real time" — which made the control two lines
+    // tall on one rung of the ladder and one line on the others. A pace that changes its own row's
+    // height when a viewer presses + is a control that moves under the pointer that just used it.
     ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("pace").small().color(theme::TEXT_DIM))
+            .on_hover_text(hover);
         let down = pace_step(rung, false);
         if ui::icon_button(ui, atlas, None, "\u{2212}", SPEED_STEP, false, down != 0)
             .on_hover_text("one rung slower — the minus key")
@@ -716,13 +722,6 @@ fn pace_row(ui: &mut egui::Ui, atlas: Option<&Atlas>, current: u32, unit: &str) 
             step = up;
         }
     });
-    // The description goes *under* the stepper rather than beside it. Beside it, the replay's
-    // "the pace it plays at, in real time" made the row wider than the panel, and a panel that is
-    // sized to its content grows to fit the row; the canvas is then laid out against the width the
-    // panel reserved a frame earlier and the two disagree. Under it, the phrase wraps in the column
-    // like every other sentence in the panel, and the two buttons stay a stepper instead of being
-    // pushed apart by the words between them.
-    small_dim(ui, unit);
     step
 }
 
@@ -756,27 +755,30 @@ fn speed_rung(speed: u32) -> usize {
     })
 }
 
-/// The four things the run's panel says, and no more.
+/// The three things the run's panel says, and no more.
 ///
 /// A pure function of the summary, so what the panel *claims* can be checked without a window — the
-/// same split [`chart_geometry`] and [`search_line`] use. Four, because a panel beside a level is
-/// glanced at rather than read: where the run has got to, whether anything has reached the flag,
-/// **how quickly the flag was reached**, and how good the best agent is. Everything else the window
-/// knows about the search is one press away in the Details window ([`lab_details`]), and every line
-/// kept here is one more thing between the eye and the answer to "is it getting anywhere?".
+/// same split [`chart_geometry`] and [`search_line`] use. Three, because the panel is glanced at
+/// beside a level and not read: where the run has got to, whether anything has reached the flag, and
+/// **how quickly the flag was reached**. Those are the three a player watching a population learn to
+/// jump actually uses — progress, success, and the time they will take to the playtest to race.
 ///
-/// The clock is here rather than in the board because it is the one reading a viewer *acts* on: it is
-/// what they take to the playtest to race, and a time a person has to open a window to find is a time
-/// nobody races. It is a fourth reading rather than a replacement for any of the three, because the
-/// three answer "is it learning" and this one answers "how fast is it" — a run can be at generation
-/// 4 or generation 400 with the same best time.
+/// **The best fitness is not one of them.** It was, and it is the one number on the panel that no
+/// player ever acts on: fitness is what the trainer scores a route with, not what the flag costs, and
+/// the reading that means something to a viewer is the clock. It is in the Details window
+/// ([`lab_details`]) with the average and the minimum, where a person goes to ask why a run is stuck.
+///
+/// **The strict count is not one of them either.** "11 / 200 reached the flag — 0 on every trial" was
+/// two claims in one line, the second of which is a research reading (how many win on *every* drawn
+/// trial of a level that draws its world per episode) and the one that made the line long enough to
+/// wrap. The count is the panel's; the strict count is Details'.
 ///
 /// The flag reading is the one that changes colour. A run nobody has solved yet is a standing fact
-/// about the level; a run that has been solved is the run's *answer*, and the same sentence in the
+/// about the level; a run that has been solved is the run's *answer*, and the same count in the
 /// growth colour is what says which of the two a viewer is looking at. The clock follows the same
 /// rule for the same reason: no win, no time — and the reading says so in dim ink rather than
 /// inventing a number.
-pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
+pub fn menu_readings(summary: &RunSummary) -> [Reading; 3] {
     let generation = match summary.target {
         Some(target) => format!("{} / {}", summary.generation + 1, target),
         None => (summary.generation + 1).to_string(),
@@ -796,15 +798,7 @@ pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
             // same shape as the solved case, so the line is comparable from generation to generation
             // and a run's first win is the same three characters changing colour.
             value: format!("{} / {}", summary.wins, summary.pop_size),
-            // The strict reading is named only when it differs, which is exactly when the level
-            // draws its world per episode: "3 / 200 reached the flag" and "1 of them on every
-            // trial" are two different claims, and the second is the one that survives the next
-            // patrol phase. On a deterministic level the clause never appears.
-            unit: if summary.solved < summary.wins {
-                format!("reached the flag — {} on every trial", summary.solved)
-            } else {
-                "reached the flag".to_string()
-            },
+            unit: "reached the flag".to_string(),
             colour: if summary.solved() { GOOD } else { TEXT_DIM },
         },
         Reading {
@@ -816,9 +810,9 @@ pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
                 None => "\u{2014}".to_string(),
             },
             unit: if summary.fastest.is_some() {
-                "the quickest win".to_string()
+                "best win".to_string()
             } else {
-                "nothing has reached the flag yet".to_string()
+                "no win yet".to_string()
             },
             colour: if summary.fastest.is_some() {
                 GOOD
@@ -826,38 +820,129 @@ pub fn menu_readings(summary: &RunSummary) -> [Reading; 4] {
                 TEXT_DIM
             },
         },
-        Reading {
-            value: format_fitness(summary.max_fitness),
-            unit: "best fitness".to_string(),
-            colour: TEXT,
-        },
     ]
 }
 
-/// One reading, drawn: the number big, its unit small and dim after it.
+/// The column the numbers are set in, in points.
+///
+/// Wide enough for the longest reading the window has — `300 / 3000` in the 16-point monospace — and
+/// fixed so that every unit starts at the same x. Without it the units slide left and right by a
+/// character every time a count gains a digit: `9 / 32` becoming `10 / 32` moved `reached the flag`
+/// sideways between two generations. A column of numbers that re-aligns itself while a person is
+/// reading it is the same jitter as a row that wraps, one axis over.
+const VALUE_COLUMN: f32 = 104.0;
+
+/// One reading, drawn: the number big, its unit small and dim after it, on **exactly one line**.
+///
+/// Truncation rather than wrapping, and that is the point of the function. A wrapped reading does not
+/// only look untidy: it makes its row two lines tall, which pushes the state line, the pace stepper
+/// and every control under it down by a line — mid-run, the moment a qualifier appears or a reading's
+/// unit gets longer. A panel whose controls move while a run is going is a panel that cannot be
+/// clicked without looking, and "— 0 on every trial" appearing at generation 11 did exactly that.
+/// Every unit here is short by construction, and `.truncate()` is the floor under that promise: if a
+/// future unit is too long for the column it is cut with an ellipsis inside its own row rather than
+/// changing the panel's height.
 fn reading_line(ui: &mut egui::Ui, reading: &Reading) {
-    // Wrapped, not a plain row: a reading with a long qualifier — "4 / 200 reached the flag — 1 on
-    // every trial" is the one that does it — was wider than the panel, and a row that cannot wrap
-    // makes the *panel* wider instead. egui sizes a side panel to its content, so the panel grew
-    // past the window, the canvas was laid out against the width it had reserved a frame earlier,
-    // and the two disagreed: the level painted over the panel's left edge while the panel's text
-    // ran off the screen. Letting the qualifier fall under the number keeps both inside the width
-    // the panel asked for.
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            egui::RichText::new(reading.value.clone())
-                .font(FontId::new(HERO_FONT, egui::FontFamily::Monospace))
-                .color(reading.colour),
+    ui.horizontal(|ui| {
+        // Left-aligned in a fixed column: the numbers hug the panel's left edge like every other
+        // line in it, and the *units* all begin on one x, so a count growing a digit changes its own
+        // width and nothing else. Right-aligning the figures was the other way to hold that edge,
+        // and it pushed the whole column right of the section header for no gain.
+        ui.allocate_ui_with_layout(
+            Vec2::new(VALUE_COLUMN, HERO_FONT + 6.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(reading.value.clone())
+                            .font(FontId::new(HERO_FONT, egui::FontFamily::Monospace))
+                            .color(reading.colour),
+                    )
+                    .truncate(),
+                );
+            },
         );
-        ui.label(
-            egui::RichText::new(reading.unit.clone())
-                .small()
-                .color(theme::TEXT_DIM),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(reading.unit.clone())
+                    .small()
+                    .color(theme::TEXT_DIM),
+            )
+            .truncate(),
         );
     });
 }
 
-/// The run's panel: four readings, the trend in a word, and the four things a viewer does to a run.
+/// The run's one sentence about itself: what it is doing, or the one condition a viewer has to be
+/// *told* rather than shown.
+///
+/// It replaces three separate lines that used to appear and disappear — the trend sentence ("solved:
+/// an agent reached the flag"), a warning that the level had been edited since the run began, and a
+/// notice that the run was over. Each was true and each was a paragraph, and each one's arrival or
+/// departure moved the pace stepper and the whole control menu down the panel. One line, always
+/// drawn, always the same height, cut with an ellipsis if it outgrows the column: a panel is allowed
+/// to say one thing about itself, and this is it.
+///
+/// The order is the order a viewer needs it in. A run training on a level that has since been edited
+/// is looking at terrain the canvas is not drawing, which is the most important thing on the panel
+/// when it is true; a run that has finished is over, whatever its trend was; and otherwise the trend
+/// word in the shortest form that is still a word ([`short_trend`]).
+fn run_state(summary: &RunSummary, level_changed: bool) -> (String, Color32, String) {
+    if level_changed {
+        return (
+            "the level changed since this run began".to_string(),
+            WARN,
+            "This run is training on the level as it was when it started. Restart trains a fresh \
+             population on the level as it is now."
+                .to_string(),
+        );
+    }
+    if summary.finished {
+        // "run over" and not "run over after 20 generations": the reading two rows above already
+        // says 20 / 20, and a state line that repeats it is a second answer to a question that has
+        // been answered. The count and the notice are not the same fact, but they are the same
+        // number, and the number is above — so the sentence with the count in it goes on the hover,
+        // where a detail belongs.
+        return (
+            "run over".to_string(),
+            GOOD,
+            format!(
+                "The run has spent the {} generations it was asked for. Restart trains again from \
+                 scratch.",
+                summary.generations_run
+            ),
+        );
+    }
+    let (word, colour) = short_trend(summary.trend);
+    (
+        word.to_string(),
+        colour,
+        "What the fitness chart below is doing, in a word — the chart itself is the reading."
+            .to_string(),
+    )
+}
+
+/// A trend in one word, for the line under the readings.
+///
+/// [`Trend::label`] is a sentence with a colon in it — right for a chart's caption, far too long for
+/// a panel that has one line to give. This is the same seven states said in one or two words each, so
+/// the panel's line is short enough to sit still and a viewer still gets the run's verdict at a
+/// glance. It is a *second* list, deliberately, and a test checks it answers every state: the two
+/// lists answer different questions ("what is the chart saying, in full" and "how is the run going,
+/// in a word"), and collapsing them would make the panel's line as long as the chart's caption.
+fn short_trend(trend: Trend) -> (&'static str, Color32) {
+    match trend {
+        Trend::WarmingUp => ("warming up", TEXT_DIM),
+        Trend::Learning => ("learning", GOOD),
+        Trend::FewGoodAgents => ("few improving", GOOD),
+        Trend::Converged => ("flat", TEXT_DIM),
+        Trend::Degenerating => ("getting worse", WARN),
+        Trend::Stalled => ("stalled", WARN),
+        Trend::Solved => ("solved", GOOD),
+    }
+}
+
+/// The run's panel: three readings, one line about itself, and the four things a viewer does to a run.
 ///
 /// It used to be the whole instrument board — the step the search is taking and how long the best has
 /// stood still, the diversity the archive has covered, the x the population keeps dying at, a row for
@@ -867,17 +952,18 @@ fn reading_line(ui: &mut egui::Ui, reading: &Reading) {
 /// everything says nothing, and the person it was written for is watching a population learn to jump,
 /// not auditing a search.
 ///
-/// So it is a menu. What stays is the four readings ([`menu_readings`]) and the trend word, which
-/// together answer the question a viewer asks of a run in progress, and the controls a person presses
-/// while watching it — pause, one generation, keep the champion, start again — drawn as
-/// [`ui::menu_row`]s with their pictures down the left edge, which is the shape a game pauses into.
-/// Everything else moved one press away into the Details window ([`lab_details`]), where a person
-/// goes *looking* for a number instead of being recited at: nothing was deleted, it was put where it
-/// is asked for.
+/// So it is a menu. What stays is the three readings ([`menu_readings`]), one line about the run
+/// ([`run_state`]), and the controls a person presses while watching it — pause, one generation,
+/// keep the champion, start again — drawn as [`ui::menu_row`]s with their pictures down the left
+/// edge, which is the shape a game pauses into. Everything else moved one press away into the
+/// Details window ([`lab_details`]), where a person goes *looking* for a number instead of being
+/// recited at: nothing was deleted, it was put where it is asked for. The best fitness and the
+/// strict count left this panel in that move too — they are the trainer's numbers, not a player's.
 ///
-/// Two things that are conditions rather than readings are still said here, because a viewer has to
-/// be *told* them rather than shown them: that this run is training on a level that has been edited
-/// since, and that it has stopped. Both cost the panel nothing while they are false.
+/// **Every row is a fixed height.** A reading is one line and truncates rather than wraps, the
+/// state line is one line and is always drawn, and the pace is a single row at every rung of the
+/// ladder. The panel is what a person clicks while a run is going, and a control that moves because
+/// a sentence above it got longer is a control that cannot be hit without looking.
 ///
 /// **Nothing here changes the view.** Leaving the run for the replay is the dock's switch, whose
 /// replay cell is disabled until there is an agent to watch; a panel that offered the same move as
@@ -896,33 +982,16 @@ pub fn lab_panel(
     for reading in menu_readings(summary) {
         reading_line(ui, &reading);
     }
-    // The trend is `render`'s reading of the same history the chart draws, so it is never a phrase
-    // invented here — and it is the panel's only piece of prose, which is what makes it read as a
-    // verdict rather than as one more number.
-    let trend_colour = match summary.trend {
-        Trend::Solved => GOOD,
-        Trend::Stalled | Trend::Degenerating => WARN,
-        _ => TEXT_DIM,
-    };
-    ui.colored_label(trend_colour, summary.trend.label());
-
-    if level_changed {
-        ui.add_space(4.0);
-        ui.colored_label(
-            WARN,
-            "the level has been edited since this run started — Restart trains on what you see",
-        );
-    }
-    if summary.finished {
-        ui.add_space(4.0);
-        ui.colored_label(
-            GOOD,
-            format!(
-                "the run is over after {} generations — Restart trains again",
-                summary.generations_run
-            ),
-        );
-    }
+    // The panel's one sentence. It is always drawn, because a line that only exists in some states
+    // is a line whose arrival moves everything below it: the trend, a stale-level warning and a
+    // finished-run notice used to be three separate labels, each of which pushed the pace stepper
+    // and the control menu down a row when it appeared.
+    ui.add_space(2.0);
+    let (state, colour, detail) = run_state(summary, level_changed);
+    ui.add(
+        egui::Label::new(egui::RichText::new(state).small().color(colour)).truncate(),
+    )
+    .on_hover_text(detail);
 
     // --- the pace the run plays at ------------------------------------------
     ui.add_space(6.0);
@@ -931,7 +1000,13 @@ pub fn lab_panel(
     // before the eye has moved, and a stalled one is unwatchable at 1x. A ladder that lived only in
     // the Details window was a setting a person had to know was there; the keys reached it, but a
     // key is not a control, and the number was two hundred points from the menu it belonged to.
-    actions.speed = pace_row(ui, atlas, view.speed, "the pace it plays at");
+    actions.speed = pace_row(
+        ui,
+        atlas,
+        view.speed,
+        "How fast the population is animated: one generation per frame at the top of the ladder, \
+         slowed down at the bottom.",
+    );
 
     // --- what to do about it ----------------------------------------------
     section(ui, "The controls");
@@ -1669,19 +1744,15 @@ pub fn replay_panel(
     }
 
     // The same stepper the run's panel has, on the same ladder: an episode and a run are two things
-    // watched at a pace, and the one control for it belongs where the transport is. The replay's rung
-    // is named as real time when it is, because that is the only rung of the ladder whose *meaning*
-    // is not just its number.
+    // watched at a pace, and the one control for it belongs where the transport is. The number beside
+    // it is the whole reading now — "1x" is real time on this ladder, and a caption saying so was a
+    // second line that came and went as the rung changed.
     ui.add_space(6.0);
     actions.speed = pace_row(
         ui,
         atlas,
         replay.speed,
-        if replay.speed == crate::replay::REAL_TIME {
-            "the pace it plays at, in real time"
-        } else {
-            "the pace it plays at"
-        },
+        "How fast the episode is played: 1x is real time.",
     );
 
     actions
@@ -3020,20 +3091,32 @@ mod tests {
         );
     }
 
-    /// The panel says four things, and they are what a viewer watching a run asks for: where it has
-    /// got to, whether anything has reached the flag, **how long that took**, and how good the best
-    /// agent is.
+    /// The panel says three things, and they are what a viewer watching a run asks for: where it
+    /// has got to, whether anything has reached the flag, and **how long that took**.
     ///
     /// The *count* is the assertion rather than the wording: the panel's whole problem was being
     /// longer than the question it answers, and a reading added to it later would pass every test
-    /// that only checked what the others said. The clock is the fourth because it is the one a
-    /// viewer acts on — it is what they take to the playtest to race.
+    /// that only checked what the others said. Three because the clock is the third: it is the one
+    /// a viewer acts on — it is what they take to the playtest to race — and the best fitness went
+    /// to the Details window with the average and the minimum, because no player races a fitness.
+    ///
+    /// **No unit is a sentence.** The strict count ("— 0 on every trial") used to be one, and a
+    /// unit long enough to wrap is what made the panel change height mid-run; this asserts the short
+    /// form directly, and the drawing code truncates as the floor under it.
     #[test]
-    fn the_run_panel_says_four_things() {
+    fn the_run_panel_says_three_things() {
         let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
-        let summary = RunSummary::new(&packet(points.clone(), Vec::new(), true), &points);
+        let mut won = packet(points.clone(), Vec::new(), true);
+        // The strict reading differs from the count here — the case that used to append
+        // "— 1 on every trial" — and the panel still says the count and nothing else.
+        won.solved = won.wins.saturating_sub(1);
+        let summary = RunSummary::new(&won, &points);
         let readings = menu_readings(&summary);
-        assert_eq!(readings.len(), 4, "{readings:?}");
+        assert_eq!(readings.len(), 3, "{readings:?}");
+        assert!(
+            readings.iter().all(|r| r.unit.split_whitespace().count() <= 4),
+            "a unit is a label, not a sentence: {readings:?}"
+        );
 
         // The generation, against the run's own target, one-based — the number a viewer reads off
         // the chart's right-hand edge too.
@@ -3048,12 +3131,19 @@ mod tests {
         // the number the episode was scored on, which is the number the playtest races.
         assert_eq!(readings[2].value, sim::format_time(505));
         assert_eq!(readings[2].value, "8.42s");
-        assert_eq!(readings[2].unit, "the quickest win");
+        assert_eq!(readings[2].unit, "best win");
         assert_eq!(readings[2].colour, GOOD);
-        // The best, from the run's own formatter, so the panel and the chart cannot disagree about
-        // what 411.2 looks like.
-        assert_eq!(readings[3].value, format_fitness(411.0));
-        assert_eq!(readings[3].unit, "best fitness");
+
+        // The strict count is a reading for the Details board, not for the panel: a viewer who
+        // wants to know how many agents win on *every* drawn trial opens it, and the panel's line
+        // stays short enough to never wrap.
+        let strict = summary.solved.to_string();
+        assert!(
+            !readings
+                .iter()
+                .any(|r| r.unit.contains(&strict) && r.unit.contains("trial")),
+            "the panel does not carry the strict count: {readings:?}"
+        );
 
         // A run nobody has solved says the same thing in a dimmer colour rather than in a word: a
         // count of zero is the reading.
@@ -3073,8 +3163,76 @@ mod tests {
         untimed.fastest = None;
         let readings = menu_readings(&untimed);
         assert_eq!(readings[2].value, "\u{2014}", "{readings:?}");
-        assert_eq!(readings[2].unit, "nothing has reached the flag yet");
+        assert_eq!(readings[2].unit, "no win yet");
         assert_eq!(readings[2].colour, TEXT_DIM);
+    }
+
+    /// **The panel is the same height whatever it is saying.**
+    ///
+    /// The report was that the panel jitters: a qualifier wrapped to a second line, a stale-level
+    /// warning appeared, a finished run grew its own paragraph — and each one pushed the pace
+    /// stepper and the control menu down by a line, mid-run, while a person was reaching for them.
+    /// Height is the thing a click depends on, so it is what is measured: four states that used to
+    /// draw different numbers of lines, one drawn panel each, and every one of them the same height.
+    #[test]
+    fn the_run_panel_is_the_same_height_whatever_it_is_saying() {
+        let points = history(&[(0, 10.0, 5.0, 0), (1, 411.0, 60.0, 1)]);
+        let mut won = packet(points.clone(), Vec::new(), true);
+        won.solved = 0; // the strict count differs, which used to add "— 0 on every trial"
+        let solved = RunSummary::new(&won, &points);
+        let unsolved = RunSummary::new(
+            &packet(points.clone(), Vec::new(), false),
+            &history(&[(0, 10.0, 5.0, 0), (1, 10.0, 5.0, 0)]),
+        );
+        let mut over = RunSummary::new(&won, &points);
+        over.finished = true;
+        over.generations_run = 1234;
+
+        let heights: Vec<f32> = [(&unsolved, false), (&solved, false), (&over, false), (&solved, true)]
+            .into_iter()
+            .map(|(summary, changed)| {
+                let used = used_rect(280.0, |ui| {
+                    lab_panel(ui, None, summary, &mut ViewState::default(), changed);
+                });
+                used.height()
+            })
+            .collect();
+        for pair in heights.windows(2) {
+            assert!(
+                (pair[0] - pair[1]).abs() < 0.5,
+                "the panel changed height with what it was saying: {heights:?}"
+            );
+        }
+        assert!(heights[0] > 100.0, "the panel was not drawn at all: {heights:?}");
+    }
+
+    /// Every state of the chart's trend has a short word for the panel's one line.
+    ///
+    /// [`short_trend`] is a second list beside [`Trend::label`], so the test that keeps them honest
+    /// is one that walks every variant: a new trend with no short form is a panel that falls back to
+    /// a compile error (the match is exhaustive) and a short form too long for the column is a line
+    /// that truncates the one word it had to say.
+    #[test]
+    fn every_trend_has_a_short_word() {
+        for trend in [
+            Trend::WarmingUp,
+            Trend::Learning,
+            Trend::FewGoodAgents,
+            Trend::Converged,
+            Trend::Degenerating,
+            Trend::Stalled,
+            Trend::Solved,
+        ] {
+            let (word, _) = short_trend(trend);
+            assert!(!word.is_empty(), "{trend:?} has no word");
+            assert!(
+                word.chars().count() <= 18,
+                "{trend:?}'s word is a sentence: {word:?}"
+            );
+            assert_eq!(word, word.trim(), "{trend:?}'s word carries space");
+        }
+        assert_eq!(short_trend(Trend::Solved), ("solved", GOOD));
+        assert_eq!(short_trend(Trend::Stalled), ("stalled", WARN));
     }
 
     /// The replay's panel names the record on screen and quotes the star's own clock.

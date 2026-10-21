@@ -27,7 +27,7 @@ use egui::{ColorImage, Context, Pos2, Rect, TextureHandle, TextureOptions};
 /// The material seams (`blend_*`) are optional the same way, and more so than the rest:
 /// a tileset without them draws a hard edge between two materials, which is what every
 /// tileset drew before they existed.
-pub const REQUIRED: [&str; 80] = [
+pub const REQUIRED: [&str; 81] = [
     "empty",
     // The ground: one sprite per 4-bit open-side mask, and the rock the same way for
     // every mask with no sky above it.
@@ -77,6 +77,10 @@ pub const REQUIRED: [&str; 80] = [
     "lava_top_b",
     "lava_ball",
     "vine",
+    // The spiked ball is the same kind of required picture the lava ball is: a hazard whose art
+    // is the hitbox the player has to see. A tileset without it would draw a body dying to
+    // nothing, so the load is refused instead.
+    "spike_ball",
     // The player's animation set: two idle frames, a six-frame run, one pose per
     // airborne state, and the pose a dead agent is left in.
     "player_idle_a",

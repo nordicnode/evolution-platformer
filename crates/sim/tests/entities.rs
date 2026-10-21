@@ -618,6 +618,9 @@ fn every_new_entity_round_trips_through_the_writer() {
     assert!(level.add_flyer_tile(9, 2, 3));
     assert!(level.add_turret_tile(13, 3, -1));
     assert!(level.add_platform_tile(6, 2, 3, 2, true, 1));
+    // A ball needs a ceiling to hang from, so the fixture paints one above its column.
+    assert!(level.set_tile(16, 1, Tile::Solid));
+    assert!(level.add_spike_ball_tile(16, 2));
 
     let json = level.to_json_pretty().expect("the document is writable");
     let back = Level::from_json_str(&json).expect("and readable");
@@ -628,6 +631,18 @@ fn every_new_entity_round_trips_through_the_writer() {
     assert_eq!(back.turrets[0].dir, -1, "the firing direction is kept");
     assert_eq!(back.platforms.len(), 1);
     assert_eq!(back.platforms[0].rect.w, 3.0, "the width is kept");
+    assert_eq!(back.spike_balls.len(), 1, "the ball is kept");
+    assert_eq!(back.spike_balls[0].col, 16, "its column is kept");
+    assert_eq!(back.spike_balls[0].row, 2, "its row is kept");
+    assert_eq!(
+        back.spike_balls[0].length, 3.0,
+        "the chain is kept, shortened to the room under it"
+    );
+    assert_eq!(
+        back.spike_balls[0].reach,
+        sim::level::DEFAULT_SPIKE_BALL_REACH as f32,
+        "the default reach is written down rather than lost"
+    );
     assert!(back.platforms[0].vertical, "the axis is kept");
     assert_eq!(
         back.platforms[0].dir, level.platforms[0].dir,
@@ -854,19 +869,20 @@ fn every_placeable_entity_changes_the_scene_hash_but_not_the_terrain_hash() {
     turret.turrets.push(sim::TurretSpec {
         rect: sim::Rect::new(8.2, 6.2, 0.8, 0.8),
         dir: -1,
-    });
+    });        let mut platform = base.clone();
+        platform
+            .platforms
+            .push(sim::PlatformSpec::at(10, 6, 3, 4, false, 1));
 
-    let mut platform = base.clone();
-    platform
-        .platforms
-        .push(sim::PlatformSpec::at(10, 6, 3, 4, false, 1));
+        let mut ball = base.clone();
+        ball.spike_balls.push(sim::SpikeBallSpec::at(12, 3, 3, 4));
 
-    for (kind, level) in [
-        ("chaser", &chaser),
-        ("flyer", &flyer),
-        ("turret", &turret),
-        ("platform", &platform),
-    ] {
+    for (kind, level) in [            ("chaser", &chaser),
+            ("flyer", &flyer),
+            ("turret", &turret),
+            ("platform", &platform),
+            ("spiked ball", &ball),
+        ] {
         assert_ne!(
             level.scene_hash(),
             scene,
@@ -999,4 +1015,166 @@ fn a_mirrored_shelf_travels_the_mirrored_way() {
     // And the home box moved to the reflected column: a 3-wide shelf at 6 in a 24-wide level is at
     // 24 - (6 + 3) = 15.
     assert_eq!(sliders[0].rect.x, 15.0);
+}
+
+/// **A spiked ball hangs still until a body comes near, then swings on its chain.**
+///
+/// The three halves of the hazard: dormant while the body is far away, woken by proximity, and
+/// a pendulum once awake — the ball rises away from the body that woke it and comes back through
+/// the arc. The trigger is what makes this a trap rather than a rhythm: nothing about the level's
+/// clock says when it starts, only where the body walked.
+#[test]
+fn a_spiked_ball_wakes_when_the_body_comes_near_and_then_swings() {
+    let rows = [
+        "........###.........",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"spiked_ball\",\"x\":9,\"y\":1,\"tiles\":3,\"span\":3}".to_string(),
+        goal(18, 4),
+    ];
+    let level = level("spiked-ball", &rows, (1, 4), &entities);
+
+    let mut sim = sim::Sim::new(&level, 9);
+    common::step_n(&mut sim, AgentAction::Walk, 30);
+    let ball = sim.spike_balls()[0];
+    assert!(!ball.swinging, "a body eight tiles away does not wake it");
+    assert_eq!(ball.x, 9.5, "a dormant ball hangs straight down");
+    assert_eq!(ball.y, 4.0, "three tiles of chain below an anchor at y = 1");
+
+    // Walk into range. The trigger radius is measured from the hanging ball, so the body is
+    // still a couple of tiles short of the arc when the ball starts moving.
+    common::step_n(&mut sim, AgentAction::Run, 60);
+    let ball = sim.spike_balls()[0];
+    assert!(ball.swinging, "the approach should have woken it");
+
+    let (x0, y0) = (ball.x, ball.y);
+    common::step_n(&mut sim, AgentAction::Walk, 12);
+    let ball = sim.spike_balls()[0];
+    assert!(
+        (ball.x - x0).abs() > 0.1 || (ball.y - y0).abs() > 0.1,
+        "a woken ball should be moving: {x0},{y0} -> {},{}",
+        ball.x,
+        ball.y
+    );
+    assert!(ball.y < y0 - 0.1, "and it should have climbed the arc, got {}", ball.y);
+    assert!(
+        (ball.x - 9.5).abs() <= ball.length + 1e-3,
+        "but never further from the anchor than its chain: {}",
+        ball.x
+    );
+
+    // The same actions on a second sim are the same pendulum: the trigger's phase is the body's
+    // position, and the integration is deterministic.
+    let mut again = sim::Sim::new(&level, 9);
+    common::step_n(&mut again, AgentAction::Walk, 30);
+    common::step_n(&mut again, AgentAction::Run, 60);
+    common::step_n(&mut again, AgentAction::Walk, 12);
+    assert_eq!(again.spike_balls()[0].x, ball.x);
+    assert_eq!(again.spike_balls()[0].y, ball.y);
+    assert_eq!(again.spike_balls()[0].swinging, ball.swinging);
+}
+
+/// **The ball is lethal on contact and cannot be stomped.**
+///
+/// It is a hazard and not an enemy: there is no answer to it beyond being somewhere else, so the
+/// contact rule is a death with its own cause rather than the walker's stomp-or-die branch. The
+/// spawn here is inside the resting ball's box, which is exactly the case a player meets when a
+/// ball hangs across a corridor: touching it at all ends the episode.
+#[test]
+fn a_spiked_ball_kills_on_contact() {
+    let rows = [
+        "........###.........",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"spiked_ball\",\"x\":9,\"y\":1,\"tiles\":3,\"span\":4}".to_string(),
+        goal(18, 4),
+    ];
+    let level = level("spiked-ball-contact", &rows, (9, 4), &entities);
+    let mut sim = sim::Sim::new(&level, 1);
+    sim.step(AgentAction::Walk);
+    assert_eq!(sim.outcome(), Outcome::Died, "the resting ball is in the way");
+    assert_eq!(
+        sim.death_cause(),
+        Some(sim::DeathCause::SpikeBall),
+        "and says what killed the body"
+    );
+}
+
+/// **The trigger radius is the authored one, measured from the hanging ball.**
+///
+/// The reach is a field rather than a constant so a level can have a ball that waits until the
+/// body is nearly under it, and one that winds up from across the room. A test that only asked
+/// "does it wake" would pass on a trigger of any size; this walks the same body to the same place
+/// against two reaches and pins the difference.
+#[test]
+fn a_wider_reach_wakes_the_ball_sooner() {
+    let rows = [
+        "........###.........",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let step = |reach: i32| -> u32 {
+        let entities = [
+            format!(
+                "{{\"type\":\"spiked_ball\",\"x\":9,\"y\":1,\"tiles\":3,\"span\":{reach}}}"
+            ),
+            goal(18, 4),
+        ];
+        let level = level("spiked-ball-reach", &rows, (1, 4), &entities);
+        let mut sim = sim::Sim::new(&level, 4);
+        for tick in 0..200 {
+            sim.step(AgentAction::Run);
+            if sim.spike_balls()[0].swinging {
+                return tick;
+            }
+        }
+        panic!("a ball with reach {reach} never woke");
+    };
+    let narrow = step(2);
+    let wide = step(6);
+    assert!(
+        wide < narrow,
+        "a six-tile reach should wake the ball before a two-tile one: {wide} against {narrow}"
+    );
+}
+
+/// **The rest box a level reports and the box the sim builds are one box.**
+///
+/// Two things outside the sim ask where a ball hangs before it moves: the reach oracle (as a
+/// hazard a take-off cannot start inside) and the view (as the picture the editor draws). Both
+/// ask [`sim::SpikeBallSpec::rest_box`], so this pins that it is the *sim's* box — the same width,
+/// height and centre [`sim::SpikeBall::new`] hands the contact test — rather than a second pair of
+/// numbers that would drift the moment one of them changed.
+#[test]
+fn a_spiked_balls_rest_box_is_the_box_the_sim_builds() {
+    let rows = [
+        "........###.........",
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"spiked_ball\",\"x\":9,\"y\":1,\"tiles\":3,\"span\":4}".to_string(),
+        goal(18, 4),
+    ];
+    let level = level("spiked-ball-box", &rows, (1, 4), &entities);
+    let spec = level.spike_balls[0];
+    let built = sim::SpikeBall::new(0, spec, &sim::PHYSICS);
+    assert_eq!(spec.rest_box(), built.aabb());
+    assert!(!built.swinging, "and it is the box of a ball that has not moved");
 }

@@ -1541,6 +1541,61 @@ def rope_sprites() -> list[tuple[str, Image.Image]]:
     return [("rope", rope())]
 
 
+def spike_ball() -> Image.Image:
+    """A spiked ball on a chain: an iron ball with eight spikes, drawn to fill its cell.
+
+    The palette's picture of the spiked-ball brush, and the *ball's* own picture in a level: the
+    chain is a line and the view draws it ([`crate::view::draw_spike_balls`]), but the ball is a
+    body with a hitbox, and the thing that kills a player has to be the thing they can see. So the
+    ball fills its cell the way [`lava_ball`] does — the sim's box is most of a tile and the art
+    is that box — rather than sitting in the middle of one with air around it.
+
+    Two things make it read as a *hazard* rather than as a rock: the spikes are a colour no
+    material in this tileset uses for a surface (cold iron against warm stone), and the ball is
+    shaded as a sphere, so the silhouette is a circle with teeth instead of a blob. The spikes
+    point along the eight compass directions and are drawn *behind* the body, which is what makes
+    them look attached rather than stuck on.
+    """
+    img = cell()
+    px = img.load()
+    body = 20.0
+    for y in range(16):
+        for x in range(16):
+            dx = x + 0.5 - 8.0
+            dy = y + 0.5 - 8.0
+            d2 = dx * dx + dy * dy
+            if d2 <= body:
+                # Lit from the top left, dark along the rim away from it: the one shading trick
+                # the rest of the tileset uses, so the ball belongs to the same light.
+                if d2 > body * 0.6 and dy > 0.5:
+                    px[x, y] = STONE_DARK
+                elif d2 > body * 0.6 and dx + dy < 0.0:
+                    px[x, y] = STONE_LIGHT
+                elif dx + dy < -3.0:
+                    px[x, y] = STONE_LIGHT
+                else:
+                    px[x, y] = STONE_MID
+                continue
+            # The eight spikes: a band one pixel either side of each axis and each diagonal,
+            # running out to the cell's edge. The tip is darker than the root, which is what
+            # keeps a spike from reading as a ray of light.
+            on_spike = (
+                abs(dx) <= 1.0
+                or abs(dy) <= 1.0
+                or abs(abs(dx) - abs(dy)) <= 1.8
+            )
+            if on_spike and d2 <= 50.0:
+                px[x, y] = IRON_LIGHT if d2 <= 40.0 else IRON_BOLT
+    # A rivet on the lit side says *forged*, and gives the eye a scale for the whole ball.
+    px[5, 5] = IRON_LIGHT
+    return img
+
+
+def spike_ball_sprites() -> list[tuple[str, Image.Image]]:
+    """The spiked ball's picture, as a family of one (see [`spike_ball`])."""
+    return [("spike_ball", spike_ball())]
+
+
 def sprites() -> list[tuple[str, Image.Image]]:
     """Every terrain sprite, in the order the manifest lists them."""
     out: list[tuple[str, Image.Image]] = []

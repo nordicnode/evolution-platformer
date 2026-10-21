@@ -95,6 +95,10 @@ FAMILIES = (
     # points at — the manifest is generated, but a reshuffle is a diff across the whole file for
     # one picture that only the palette ever reads.
     ("rope", terrain.rope_sprites),
+    # The spiked ball, appended for the rope's reason and after it: the palette needs a picture of
+    # the ball the brush hangs, and a new family at the end moves no cell that anything else
+    # points at. The chain is drawn, the ball is a sprite (`art/terrain.spike_ball`).
+    ("spike_ball", terrain.spike_ball_sprites),
 )
 
 

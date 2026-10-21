@@ -23,7 +23,9 @@ quietly. Most names are **required** (`crate::atlas::REQUIRED`): the game refuse
 start without them. The eight element sprites a pool cannot be drawn without (`water`,
 `water_top_a`, `water_top_b`, `lava`, `lava_top_a`, `lava_top_b`, `lava_ball`, `vine`) are required
 for the spike's and the pad's reason: each of those tiles has behaviour the game has no fallback
-picture for, and an invisible pool is a body sinking for no visible reason. The rest of the fluid
+picture for, and an invisible pool is a body sinking for no visible reason. The spiked ball (`spike_ball`) is required for the lava ball's reason:
+it is a hazard whose art is its hitbox, and a tileset without it would draw a body dying to nothing.
+The rest of the fluid
 family — the extra body textures, the beds and the walls — is optional on the same terms as the
 tile variants: a tileset without them draws a plain, seamless pool, and the only thing lost is
 the variation and the edges. The tile variants, the last eight props, every material seam and the
@@ -67,6 +69,7 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `lava_wall_l`, `lava_wall_r` | the rim of a lava pool against open air: the crust that forms where the melt meets nothing. Another mirrored pair |
 | `lava_ball` | one ball of lava in flight, drawn to fill its cell because the cell *is* its hitbox: the thing that kills a body is the thing the player can see |
 | `vine` | one cell of climbable vine (`Tile::Vine`, `V`): a stem continuous from row 0 to row 15 so a shaft of them reads as one vine, with leaves alternating down it. Not solid; jump climbs it and releasing slides down it |
+| `spike_ball` | the spiked-ball brush's palette picture **and** the ball a spiked ball is drawn as in a level: an iron ball with eight spikes, drawn to fill its cell because the cell is its hitbox, so the thing that swings is the thing that kills. The chain above it is **drawn** (`crate::view::draw_spike_balls`), a link every quarter tile, because a chain is a line and a sprite is one pose |
 | `rope` | the rope brush's palette picture: a twisted cord tied under a tile, a knot half way down and a loop at the free end, in the three shades (`ROPE_CORD`, `ROPE_LIGHT`, `ROPE_KNOT`) the view draws a rope with. A rope in a level is **drawn**, not tiled (`crate::view::draw_ropes`) — its shape is its swing — so this cell exists for the palette alone |
 | `cracked_ground`, `cracked_sand`, `cracked_brick`, `cracked_wood` | one material's crack, on an otherwise transparent cell, drawn **over** that material's own tile by `crate::view`. The tile it marks is ordinary solid ground until a body stands on it, and then it leaves the level (`sim::physics::CRUMBLE_TICKS`) |
 | `player_idle_a`, `player_idle_b` | the runner at rest, breathing |

@@ -7072,6 +7072,9 @@ same plate as the dock's tools at a smaller size, so "one of these is chosen" re
 everywhere; the grid keeps three rows whatever the shelf holds, so the stroke switch does not jump
 under the pointer that just changed shelves; and **a tab is a place to look, not a tool** — pressing
 one leaves the brush in hand alone, while the eyedropper moves the shelf to whatever it picked up.
+(The tabs themselves are gone now: the same five shelves are headings on one list, and a finder
+searches all of them — see *The palette lost its tabs*. "A place to look, not a tool" is the rule that
+survived the change, and it is why a search never picks a brush either.)
 
 `Brush::ALL` is now `#[cfg(test)]`. The shelves are the only ordering a running window has, and a
 production constant nothing in production reads is a list that quietly stops agreeing with the thing
@@ -7163,3 +7166,199 @@ brittle cells are a material with its transparent crack over it, exactly as the 
 and lava show their animated surface rather than the plain body; and the ledge and the mover are
 their middle variants, which are the shelf drawn whole. `python3 tools/blocks_gallery.py --check`
 compares the file against a fresh render.
+
+**The spiked ball is the first hazard with a phase of its own.** Every hazard before it is either
+still (a spike, a pool of lava) or periodic from the first frame (a turret's cycle, a vent's, a
+platform's), which makes its danger a fact you can *read before entering the room*: wait for the
+right third of the cycle and walk. A ball on a chain could have been the same thing — a pendulum
+started at frame zero — and that was the first cut. It is worse in exactly one way and better in
+exactly one way, and the second one is why it stayed: a rhythm is a puzzle, and a trap is a
+*hazard*. Nothing about the room tells you when this one will arrive; the body's own approach does.
+
+So the ball hangs asleep. A body's centre coming within the authored reach (five tiles by default,
+measured from the **resting ball**, not the ceiling it is tied to) latches the trigger for the rest
+of the episode, and the ball is shoved **away** from the body. That direction is the whole design:
+waking it *into* the body would be a spike with a longer animation — it kills on the tick it is
+touched, which is exactly the unfairness the animation would exist to hide. Shoving it away makes
+the trigger a wind-up. The ball climbs the far side of its arc, comes back through the corridor
+about a second later, and the body has had a second to see what is happening.
+
+The motion is the rope's constraint and nothing else: a point mass on an inextensible line, gravity,
+one projection onto the circle per tick with the radial velocity spent against it. There is no
+`sin`/`cos` and no keyframe. The ball is woken at 0.22 tiles a tick against gravity 0.0125, which
+`v²/2g` turns into 1.9 tiles of climb — about 59° on the four-tile default, or 2.3 tiles either side
+of the anchor. The trigger looks at the *rest* position even while the ball is swinging, for the
+same reason the palette draws it there: the thing a body approaches is where the ball hangs, and a
+trigger that chased the arc would make the range depend on how hard the ball was already swinging.
+A little drag (0.9995 a tick) lets a triggered ball settle instead of sweeping forever, and the
+trigger never re-arms — a trap that resets when you step back is a door that closes again, and a
+phase that resets on proximity would make the same level play differently at its edge.
+
+Nothing collides with the chain. The ball is one box, and contact with it is one rule: it kills. It
+is not stompable, it cannot be blocked, and there is no answer to it except being somewhere else —
+which is what separates a hazard from an enemy in this game. That single rule is also why the chain
+is drawn and not simulated: a chain you could hang from would be a rope, and a rope is a way through
+a level, not a thing to time.
+
+**Its state is the episode's, so it is hashed — but only where a level has one.** A mover's position
+is a function of the frame count and is therefore absent from the state hash; a ball's is not, because
+*when it woke* is a fact about the body, so its position and velocity are folded in. The fold is
+conditional: a level with no spiked ball hashes exactly as it did at 0.17.0, which is what keeps every
+recorded episode on the shipped pack replaying to its own hash, while a level with one cannot
+collide with the old shape. The observation takes the other route: a ball's cell is written into the
+9×9 patch as the spike's own "do not go in" value. The decision at a ball and at a spike is the same
+one, and a value of its own would ask the network to learn a distinction the eleven actions cannot
+express. Sensors therefore move to v15 with no new slots, the format to 5 with one new entity kind
+(`tiles` is the chain, `span` the trigger), and the sim to 0.18.0.
+
+**The oracle models the box, not the swing.** The reach sweep refuses a take-off inside a ball's rest
+box and ends any canonical trajectory that overlaps it — jump, climb, swim, vine or rope, since all
+five share the terminal test. That is the one box a route can be held to before anything is woken.
+Modelling the pendulum itself would mean the oracle's answer depended on *when* the body arrived,
+which is a policy question and not a reachability one; answering "beatable" from a route that walks
+into the resting ball, on the other hand, is the false positive the sweep exists to avoid. The move
+set moves to v12 for it, so every cached verdict from v11 is a miss rather than a stale answer.
+
+The editor paints it the way the rope is painted, with one difference that is about the object: a
+click hangs a **whole ball** (shortened to the room below it), and a drag down from the ball
+lengthens *that* chain a cell per row. The chain's length and the trigger's radius are the brush's
+two steppers, beside the platform's travel and width and for the same reason — they are the hazard's
+*shape*, not a detail of the click — and the drop ghost draws the ball at the end of the chain it
+would hang on, not under the pointer, because a ghost that promised the weight in the wrong tile
+would be promising a different hazard. A rope has to be a cell at a time because its
+length is its shape; a ball with a one-tile chain is a spike with a hinge, and asking for four rows
+of drag before the first swing is asking a person to draw the hazard's parameter before they can see
+it. The chain is drawn from its tie to the top of the ball — a line to the middle of the picture
+would be a line through a drawing — with a link every quarter tile of line, so a long chain and a
+short one are made of the same links. The ball sprite is required art, for `lava_ball`'s reason: it
+is drawn at its own hitbox, and a hazard nobody can see is a hazard that reads as an unfair death.
+
+## The palette lost its tabs
+
+The report was simple and about the thing a level editor is *for*: "it's very hard to find what you
+want to place — they are all hiding in different categories." The window had five shelves behind five
+tabs, and a part could only be found by guessing its category first. A person looking for the spiked
+ball had to guess that it was filed under World; the only way to find out was to open each tab in turn
+and look. Five guesses is not a palette, it is a filing cabinet. (The shelves themselves were wrong
+too — that is the next paragraph — but the tabs were the first thing to go, because even a perfect
+taxonomy is a bad *only* way in.)
+
+**The headings are a table of contents, not doors.** Every shelf is drawn on one list, in the order
+the canvas is built, each under its own heading with a count and a rule under it. The window answers
+"what can I place?" once, by scrolling, instead of five times. The tab strip is gone; a heading that
+looked pressable would promise the one thing it no longer does, so it is plain type, in the window's
+gold when it holds the brush in hand.
+
+**The finder searches the whole list at once.** A single field above the list narrows it, and it
+matches three things: the part's label, its own sentence ([`Brush::about`]) and a list of
+[`Brush::keywords`] written for exactly this — the words a designer reaches for that the window did not
+choose. Nothing in the palette is called a pendulum; "pendulum" finds the spiked ball and the rope,
+the two things that swing. Nothing is called a trampoline; "trampoline" finds the spring. Every word
+of the query has to match, so "cracked
+timber" is one part rather than eight, and a group with no match loses its heading entirely: typing
+*narrows* the list rather than marking it, and an empty result says "no part matches" instead of
+showing an empty box. The field is reachable by pointing at it and by `/` (the convention every
+application with a long list shares), clears on Esc from inside it and on the × plate beside it, and
+**a search never picks a brush** — looking is not choosing, exactly as a tab never was.
+
+**The parts list got three columns and all of the leftover height.** Two numbers in the old layout were
+wrong in ways the screenshot made obvious. The cells were 48 points, which fits two columns in the
+190-point panel and left a third of the width empty, so a 26-part list was twice as tall as it needed
+to be; 44 puts three on a row with the plate's own lip still visible. And the list had a hardcoded
+250-point footer reserved under it for controls it did not always have: with only the stroke switch
+showing, the list stopped mid-shelf with 150 points of blank panel underneath and a *second* scroll
+area around the whole panel, so the wheel scrolled a scroll. The controls that belong to the brush in
+hand — the stroke's shape, a flyer's beat, a platform's travel and width, a spiked ball's chain and
+trigger, the scenery picker — and the brush's own line are now two bottom panels, added before the
+list, and the list scrolls in everything between the finder and them. A short window now gives room to
+the tools and scrolls the parts, instead of pushing the stroke switch off the panel.
+
+**The list's width is reserved, not discovered.** egui only takes room for a scrollbar once it knows
+the content overflows, which on the first frame it does not: the headings came out eleven points wider
+and then snapped narrower as the bar appeared — a visible jog on the frame a window opens. Twelve
+points are reserved whether or not the bar is drawn, and the layout test that compares the window
+against itself as the document becomes dirty caught it before a person did.
+
+Four facts hold it in the app's own frame test (`the_palette_lists_every_shelf_and_the_finder_narrows_them`):
+every shelf's heading is drawn with no query; "ball" leaves one heading and no others and does not
+change the brush in hand; "pendulum" — a word in no label — finds the spiked ball; "zzz" says so; and
+`/` puts the cursor in the field, which is then typed into. `every_brush_is_on_exactly_one_shelf`
+still holds the other half, that the shelves partition the brushes, so a part cannot be missing from
+the list or appear on two of them.
+
+**The shelves themselves were the second complaint, and it was fair.** They had been cut by where a
+thing *came from* — a ceiling, a material, a list of "the level's furniture" — and the result was
+the spiked ball under *World* with the flag while the vine sat under *Hazards* with the spikes: a
+hazard filed with the furniture and a climbable filed with the traps, so at most one of the two
+could be right. What they should have been cut by is what a part *does* to a body, which is the
+question a person placing it is asking. Six shelves now, cut by that question:
+
+* **Ground** — the four materials and their brittle twins: solid, or solid until stood on.
+* **Hazards** — what kills on touch: the spikes, the lava, and the spiked ball. Its chain and its
+  ceiling are how it is built and nothing to do with what it is for.
+* **Traversal** — what carries a body: the one-way ledge, the spring, the water, the vine, the rope
+  and the moving platform. None of them hurts anything, and all of them are a way across.
+* **Enemies** — the four agents that move and want the body dead.
+* **Level** — where it starts, where it ends, and the scenery that is only ever looked at.
+* **Clear** — the two brushes that act on a cell instead of filling one.
+
+The rule is now a test (`a_part_is_shelved_with_the_parts_it_behaves_like`), because the report was
+exactly what a rule with no test costs: membership is asserted by behaviour — everything that kills
+sits together, everything that carries sits together, the marks sit with the dressing, and a brush
+is on the enemies' shelf if and only if it is an agent — so the next time a part is added, "where
+does it go" has an answer that is not an opinion.
+
+The finder is what makes six shelves affordable: a person who does not know which shelf a part is
+on does not have to learn the taxonomy, and the taxonomy still decides the order for the person
+scrolling. The segmentation is not decoration; it is the answer to "where would I look?".
+
+`docs/images/editor-showcase.png` is re-shot from the new window, so the README's picture of the
+palette is the palette: three columns under six headings, a finder above them, and the stroke
+switch and the brush's line pinned under the list.
+
+## The run panel stopped being a report
+
+The screenshot that produced this said it plainly: the panel read `4 / 200 reached the flag — 1 on
+every trial` across two lines, then `solved: an agent reached the flag`, then a paragraph saying the
+run was over, then `− 8x +` with `the pace it plays at` under it. Every one of those lines was true.
+Together they were a report, and the report *moved*: a qualifier that wrapped added a line, a warning
+appeared and pushed the pace stepper down, a finished run grew two lines under it, and the caption
+under the stepper wrapped at the top of the ladder and not at the bottom. The panel is a column of
+controls a person clicks while watching a run, and a control that moves a line down between the look
+and the click is a control that gets missed.
+
+**The fix is a row that cannot change height, not smaller type.** Three readings, each on exactly one
+line and truncated rather than wrapped (`Label::truncate()`), so a unit too long for the column is cut
+inside its own row; one state line, always drawn, same height whether it says "learning" or "the level
+changed since this run began"; and the pace as a single row — `pace − 8x +` — with what it does on the
+hover instead of in a caption under it. Nothing below the readings can be pushed by anything above it,
+because nothing above it can grow.
+
+**What left the panel.** The best fitness was the panel's fourth reading, and it is the one number no
+player ever acts on: fitness is how the trainer scores a route, not what the flag costs, and a viewer's
+clock is how fast the flag was reached. It is in Details with the average and the minimum, where a
+person asks why a run is stuck. The strict count (`— 1 on every trial`, how many agents win on *every*
+drawn trial of a level that draws its world per episode) went with it: it is a research reading and it
+was also the phrase that made the line wrap. The panel says `4 / 200 reached the flag`; Details says
+how many of the four win every time.
+
+**The trend became a word, and the warnings became that word's line.** `Trend::label` is a sentence
+with a colon in it — right for the chart's caption, far too long for one line under three numbers — so
+`short_trend` says the same seven states in one or two words (`warming up`, `learning`, `few
+improving`, `flat`, `getting worse`, `stalled`, `solved`). And the two paragraphs that used to appear under it
+— a run training on a level that has since been edited, and a run that has finished — are answers to
+the same question the trend answers, so they are now the same line, in priority order: a stale level
+first (the canvas is not the terrain the run is on), then "over", then the trend. Their explanations
+live on the hover, where a sentence belongs when it is a detail rather than a headline.
+
+**The tests are about height.** `the_run_panel_says_three_things` pins the count and that no unit is a
+sentence; `the_run_panel_is_the_same_height_whatever_it_is_saying` draws the panel in four states that
+used to differ by a line — unsolved, solved with a differing strict count, finished, and training on an
+edited level — and asserts one height; `every_trend_has_a_short_word` walks every variant of the trend,
+which is what keeps the second list honest when a state is added. `neither_panel_grows_past_the_column`
+still holds the horizontal half of the same promise, and `docs/images/evolve.png` is re-shot: the same
+command and the same twenty generations, with three numbers and one word where the paragraphs were.
+
+This supersedes the "it is a menu" pass in the section above, which cut the *board* down to four
+readings. The complaint behind that one was length; this one was movement, and the answer to movement
+is not fewer words but a fixed height.

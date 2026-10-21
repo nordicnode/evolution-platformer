@@ -54,6 +54,15 @@ use render::chart::HistoryPoint;
 /// Height of the fitness chart's strip at the bottom of the window.
 const CHART_PANEL_HEIGHT: f32 = 150.0;
 
+/// The palette finder's widget id.
+///
+/// Named rather than left to egui's positional default because `/` has to give the field the
+/// keyboard from outside the widget: a positional id changes when the row around the field does,
+/// and a key that stops working because a clear button appeared is a key nobody trusts.
+fn find_id() -> egui::Id {
+    egui::Id::new("palette-find")
+}
+
 /// A rule between two groups of dock controls.
 ///
 /// The bar carries a dozen and more plates, and a row of equals is a row with no order: which of
@@ -477,13 +486,21 @@ struct EvoApp {
     /// numbers, so nothing is lost — what is gone is the assumption that everyone wants graph
     /// paper all the time.
     guides: bool,
-    /// Which shelf of the palette is on screen ([`BrushGroup`]).
+    /// What the palette's finder is filtering by.
     ///
-    /// The palette shows one shelf at a time: eight cells that are the job in hand rather than
-    /// twenty-five that are every job at once. Held here rather than in the editor because it is
-    /// a fact about the *window* — which tab a person is looking at — and the document it edits
-    /// must not carry it into a file.
-    palette_group: BrushGroup,
+    /// The palette shows every shelf on one list, so this is the only thing that narrows it: an
+    /// empty field is the whole box of parts, and a word is every part that answers to it (see
+    /// [`Brush::matches`]). Held here rather than in the editor because it is a fact about the
+    /// *window* — what a person is looking for — and the document it edits must not carry it into
+    /// a file.
+    palette_find: String,
+    /// Whether the finder should take the keyboard on this frame.
+    ///
+    /// A flag rather than a focus request at the key itself: the field is drawn later in the
+    /// frame, and asking a widget that does not exist yet for the focus is asking nobody. `/` sets
+    /// it, [`Self::palette`] spends it on the field it just drew, and it is cleared every time — a
+    /// focus that outlived the frame would steal the keyboard back from every click that followed.
+    palette_find_focus: bool,
     /// Whether the inspector is showing the level's *numbers* — its size, what it is made of,
     /// the physics it may ask for — or just its verdict.
     ///
@@ -736,7 +753,8 @@ impl EvoApp {
             levels_dir,
             pending_size,
             guides: false,
-            palette_group: BrushGroup::Ground,
+            palette_find: String::new(),
+            palette_find_focus: false,
             details_open: false,
             dragging: None,
             last_pointer: None,
@@ -1543,6 +1561,14 @@ impl EvoApp {
         if grid && self.mode == Mode::Edit {
             self.guides = !self.guides;
         }
+        // `/` puts the keyboard in the palette's finder. The whole reason the finder exists is
+        // that a part was hard to *find*, and making the person find the field first — pointing at
+        // a panel, clicking a text box — is the same problem one level up. A key that opens a search
+        // is the convention every application with a big list shares, and it costs nothing the
+        // window already binds. The field is drawn after this runs, so the request is left for it.
+        if self.mode == Mode::Edit && ctx.input(|i| i.key_pressed(egui::Key::Slash)) {
+            self.palette_find_focus = true;
+        }
         // `f` is one key with two meanings, split by mode rather than by modifier: in the
         // editor it fits the level in the window, and in the views that watch an agent
         // move it is the terminal's follow/whole-level toggle. Both are the same idea —
@@ -1776,6 +1802,9 @@ impl EvoApp {
             None,
             clock,
             Some(rope_anim.motion()),
+            // The star's pendulums, for the rope's reason: a spiked ball is part of the episode,
+            // and the episode being watched is the star's.
+            Some(replay.star_sim().spike_balls()),
         );
         // The pieces of the floor this episode broke, between the terrain and the bodies.
         view::draw_debris(sheet, rope_anim.debris());
@@ -2883,118 +2912,144 @@ impl EvoApp {
         ui.add_space(10.0);
     }
 
-    /// The palette: which shelf of parts is on screen, the parts on it, and the shape of the
-    /// stroke.
+    /// The palette's head and list: a finder, and **every** part under its shelf's heading.
     ///
-    /// **One shelf at a time.** Twenty-five cells in one wrapped grid was a wall of tiny pictures:
-    /// the eight materials that build the floor, the six ways a floor can hurt and the four things
-    /// that patrol it are three different jobs, and a person does one of them at a time (see
-    /// [`BrushGroup`]). The tabs say which shelf is up, and the widest shelf is eight cells — so the
-    /// panel is a small ordered thing to look at rather than a box of parts emptied onto a table.
+    /// The tools that act on the brush in hand are not here — they are bottom panels beside the
+    /// brush's own line (see [`Self::palette_tools`] and the side panel's own note), because they
+    /// have to stay where the pointer left them while this list scrolls.
     ///
-    /// **A shelf is a place to look, not a tool.** Pressing a tab leaves the brush in hand alone,
-    /// which is what makes browsing safe: the gold cell is the answer to "what am I holding", and it
-    /// is on whichever shelf that brush lives on.
+    /// **The shelves are a table of contents now, not doors.** This used to show one shelf at a
+    /// time behind five tabs, and that was the wrong trade for a level editor: a person looking for
+    /// the spiked ball had to know it was filed under World, and the only way to find out was to
+    /// open each tab in turn. The five groups are still the ordering — ground, hazards, enemies,
+    /// world, clear — but all of them are on one scrolling list under their own headings, so the
+    /// answer to "what can I place?" is one look rather than five.
     ///
-    /// **The grid keeps its height whatever the shelf holds.** Ground has eight cells and Clear has
-    /// two, and a stroke switch that jumped up and down as a person changed shelves would be a
-    /// control that moves out from under the pointer that just used it. Three rows are reserved for
-    /// every shelf, so everything below the grid stays put.
+    /// **The finder searches every shelf at once.** It matches a brush's label, its sentence and
+    /// its synonyms ([`Brush::matches`]), so "trap", "pendulum" and "trampoline" find parts whose
+    /// labels are not those words; several words must all match, so "cracked timber" is one part.
+    /// A heading is gold when it holds the brush in hand, and a group with no match is not drawn at
+    /// all, which is what makes typing *narrow* the list rather than merely mark it.
+    ///
+    /// **The list takes all the height between the finder and the tools.** It is the one thing here
+    /// that grows with the window, and a hardcoded reserve under it used to leave a third of the
+    /// panel empty on a tall window and push the stroke switch off a short one. The controls that
+    /// must not scroll away are bottom panels, so the list gets whatever they do not need.
     ///
     /// Every cell is a plate drawn through the same [`ui::bevel`] as the dock's tools: a resting
     /// cell is a card, the one under the pointer lifts, the one being pressed sinks into its socket,
-    /// and the selected brush is the window's gold with its picture still legible on it. The tabs
-    /// are the same plate at a smaller size, so "one of these is chosen" reads the same in the
-    /// palette as it does on the bar above it.
+    /// and the selected brush is the window's gold with its picture still legible on it.
     fn palette(&mut self, ui: &mut egui::Ui) {
         panel::section(ui, "PARTS");
-        let shown = self.palette_group;
-        // The tabs, wrapped: five words at their plates' own widths do not fit 190 points on one
-        // line, and a clipped tab is a tab nobody can read. The row takes two lines rather than
-        // shrinking a word to where it is a smudge.
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-            for group in BrushGroup::ALL {
-                let response = ui::icon_button(
-                    ui,
-                    None,
-                    None,
-                    group.label(),
-                    Vec2::new(8.0, 26.0),
-                    group == shown,
-                    true,
-                )
-                .on_hover_text(group.about());
-                self.remember_tool(group.label(), response.rect);
+        // The finder, on the panel's whole width with the "show everything" plate beside it when
+        // there is something to show. Escape empties it from inside the field: the same promise as
+        // the plate, on the key a person reaches for when a search has gone wrong.
+        ui.horizontal(|ui| {
+            let clear = !self.palette_find.is_empty();
+            let width = (ui.available_width() - if clear { 26.0 } else { 0.0 }).max(60.0);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.palette_find)
+                    .id(find_id())
+                    .desired_width(width)
+                    .hint_text("find a part"),
+            );
+            // `/` asked for the keyboard before this field was drawn, so the request is spent here,
+            // on the widget it was about. Once, not every frame: focus is egui's to keep after this,
+            // and a window that re-asked would pull the caret back out of whatever came next.
+            if std::mem::take(&mut self.palette_find_focus) {
+                field.request_focus();
+            }
+            let field = field.on_hover_text(
+                "Every part, whichever shelf it is on. Matches names, descriptions and the \
+                 words a person reaches for — 'trap' finds what kills, 'pendulum' finds the \
+                 spiked ball. Press / to put the cursor here; Esc empties it.",
+            );
+            self.remember_tool("find a part", field.rect);
+            if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.palette_find.clear();
+            }
+            if clear {
+                let response =
+                    ui::icon_button(ui, None, None, "×", Vec2::new(20.0, 26.0), false, true)
+                        .on_hover_text("Show every part again.");
+                self.remember_tool("clear find", response.rect);
                 if response.clicked() {
-                    self.palette_group = group;
-                    self.editor.message = format!("{} parts", group.label());
+                    self.palette_find.clear();
                 }
             }
         });
         ui.add_space(8.0);
-        // Forty-eight rather than forty: a cell drawn as a plate spends [`theme::PRESS_SINK`] and
-        // its lip on the picture, and a sixteen-pixel tile at twenty-six points is the smallest an eye
-        // can still tell a plank from a brick at. Three columns at this size are what a 190-point
-        // panel holds, which is what caps the shelf at a glanceable eight.
-        const CELL: f32 = 48.0;
+        // Forty-four, which is the size that puts **three** cells on a row in a 190-point panel.
+        // The number is arrived at from the panel rather than from the tile: a cell drawn as a plate
+        // spends [`theme::PRESS_SINK`] and its lip on the picture, so the picture is a little
+        // smaller than the cell, and a sixteen-pixel tile at twenty-six points is the smallest an
+        // eye can still tell a plank from a brick at. Forty-eight fitted two columns and left a
+        // third of the width empty, which made a 26-part list twice as tall as it needed to be.
+        const CELL: f32 = 44.0;
         const GAP: f32 = 4.0;
-        const COLUMNS: f32 = 3.0;
-        let rows = ((shown.brushes().len() as f32) / COLUMNS).ceil().max(1.0);
-        let height = rows * CELL + (rows - 1.0) * GAP;
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), height),
-            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
-            |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(GAP, GAP);
-                for &brush in shown.brushes() {
-                    let selected = self.editor.brush == Some(brush);
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::new(CELL, CELL), Sense::click_and_drag());
-                    let state = ui::PlateState::of(&response, selected, true);
-                    let plate = ui::bevel(state, rect);
-                    let painter = ui.painter_at(rect);
-                    ui::paint(&painter, &plate);
-                    // Two layers, when a brush has two. A cracked brush's own icon is a
-                    // *transparent crack* — what it paints is a material plus a crack — so its
-                    // cell draws the material the crack breaks underneath it, in the same socket
-                    // and at the same size. That is the pair the level draws for a brittle tile,
-                    // and it is what makes a cracked cell read as "the floor above this one, about
-                    // to go" rather than as a scratch on the palette. Every other brush has no
-                    // base layer and is unchanged.
-                    let (icon, flip) = self.brush_icon(brush);
-                    for (name, flip) in [
-                        Self::brush_base(brush).map(|n| (n, false)),
-                        Some((icon, flip)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        if let Ok(uv) = self.atlas.uv(name) {
-                            painter.image(
-                                self.atlas.texture_id(),
-                                plate.content.shrink(2.0),
-                                crate::view::facing(uv, flip),
-                                Color32::WHITE,
-                            );
+        let mut shown = 0usize;
+        // **The bar's width is reserved whether or not the bar is drawn.** egui only takes room
+        // for a scrollbar once it knows the list overflows, which on the first frame it does not:
+        // the headings came out eleven points wider, then snapped narrower as the bar appeared —
+        // a visible jog on the frame a window opens, and the sort of thing a layout test catches
+        // and a person reads as a flicker. Reserving it always makes every frame of the list the
+        // same width, and a short list simply has a few points of air on its right.
+        const BAR: f32 = 12.0;
+        let list_width = (ui.available_width() - BAR).max(60.0);
+        egui::ScrollArea::vertical()
+            .id_salt("palette-parts")
+            .auto_shrink([false, false])
+            .max_height(ui.available_height())
+            .show(ui, |ui| {
+                ui.set_width(list_width);
+                for group in BrushGroup::ALL {
+                    let brushes: Vec<Brush> = group
+                        .brushes()
+                        .iter()
+                        .copied()
+                        .filter(|brush| brush.matches(&self.palette_find))
+                        .collect();
+                    if brushes.is_empty() {
+                        continue;
+                    }
+                    shown += brushes.len();
+                    let count = brushes.len();
+                    self.palette_heading(ui, group, count);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(GAP, GAP);
+                        for brush in brushes {
+                            self.palette_cell(ui, brush, CELL);
                         }
-                    }
-                    let response = response.on_hover_text(format!(
-                        "{}: {}\nDrag onto the level to place it.",
-                        brush.label(),
-                        brush.about()
-                    ));
-                    if response.clicked() {
-                        self.editor.brush = Some(brush);
-                        self.editor.message = format!("{} brush", brush.label());
-                    }
-                    if response.drag_started() {
-                        self.dragging = Some(brush);
-                        self.editor.brush = Some(brush);
-                    }
+                    });
+                    ui.add_space(6.0);
                 }
-            },
-        );
+                if shown == 0 {
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 22.0),
+                        Sense::hover(),
+                    );
+                    self.remember_tool("no parts match", rect);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "no part matches",
+                        FontId::monospace(10.0),
+                        theme::TEXT_DIM,
+                    );
+                }
+            });
+    }
+
+    /// The controls that belong to the brush in hand, pinned under the parts rather than scrolling
+    /// with them.
+    ///
+    /// The stroke's shape, a flyer's beat, a platform's travel and width, a spiked ball's chain and
+    /// trigger, and the scenery picker: what a person reaches for *while painting*, which is why
+    /// they live at a fixed place instead of at the end of a list that moves. They are added as a
+    /// bottom panel above the note, so a short window gives the room to them and scrolls the parts —
+    /// the opposite (a list with a fixed height and the tools pushed off the panel) is what a window
+    /// 40 points short of the content used to do.
+    fn palette_tools(&mut self, ui: &mut egui::Ui) {
         // The shape of the stroke: one tile at a time, or a box, or a line. A switch rather than
         // a menu, because it is changed as often as the brush itself — and the same switch the
         // dock uses for the modes, so the window has one way of saying "one of these three".
@@ -3027,14 +3082,15 @@ impl EvoApp {
             self.editor.message = format!("{} stroke", shape.label());
         }
 
-        // The three brushes that carry a number, and the numbers, shown only while one of them
-        // is in hand: a flyer's beat and a platform's travel are the same knob (how far it
-        // goes), a platform also has a width, and a turret has a direction instead. The row is
-        // conditional for the scenery picker's own reason — a control that belongs to one brush
-        // is noise in front of the other twenty-one.
+        // The brushes that carry a number, and the numbers, shown only while one of them is in
+        // hand: a flyer's beat and a platform's travel are the same knob (how far it goes), a
+        // platform also has a width, a turret has a direction instead, and a spiked ball has the
+        // two numbers that are its whole design shape — how long the chain is and how near a body
+        // has to come to wake it. The row is conditional for the scenery picker's own reason — a
+        // control that belongs to one brush is noise in front of the other twenty-one.
         if matches!(
             self.editor.brush,
-            Some(Brush::Flyer | Brush::Turret | Brush::Platform)
+            Some(Brush::Flyer | Brush::Turret | Brush::Platform | Brush::SpikeBall)
         ) {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -3061,6 +3117,25 @@ impl EvoApp {
                             "How many tiles the flyer beats across, centred on the click. \
                              The default is eight, and the whole point of a flyer is the span: \
                              two tiles is a nuisance in one doorway, eight is a thing to time.",
+                        );
+                } else if self.editor.brush == Some(Brush::SpikeBall) {
+                    ui.label(egui::RichText::new("chain").small().color(theme::TEXT_DIM));
+                    ui.add(
+                        egui::DragValue::new(&mut self.editor.spike_ball_length).range(1..=16),
+                    )
+                    .on_hover_text(
+                        "How many tiles of chain the ball hangs on. The ball swings on that \
+                         radius, so a long chain is a wide arc and a slow one. Shortened to the \
+                         room below the click; drag down from a placed ball to lengthen its \
+                         chain a cell at a time.",
+                    );
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("trigger").small().color(theme::TEXT_DIM));
+                    ui.add(egui::DragValue::new(&mut self.editor.spike_ball_reach).range(1..=16))
+                        .on_hover_text(
+                            "How close a body has to come to the hanging ball to set it swinging, \
+                             in tiles. Measured from the ball rather than the ceiling, so this is \
+                             the radius of the circle the author can see around the weight.",
                         );
                 } else {
                     ui.label(egui::RichText::new("travel").small().color(theme::TEXT_DIM));
@@ -3164,6 +3239,90 @@ impl EvoApp {
                     }
                 }
             });
+        }
+    }
+
+    /// One shelf's heading on the parts list: its name, how many parts are showing under it, a
+    /// rule under both, and the brush-in-hand's shelf in the window's gold.
+    ///
+    /// A heading, not a tab: every shelf is open at once now, so it is a label rather than a plate,
+    /// and a heading that looked pressable would promise the one thing it no longer does.
+    fn palette_heading(&mut self, ui: &mut egui::Ui, group: BrushGroup, count: usize) {
+        let active = self.editor.brush.is_some_and(|b| b.group() == group);
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+        self.remember_tool(group.label(), rect);
+        let painter = ui.painter_at(rect);
+        painter.text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            group.label().to_uppercase(),
+            FontId::monospace(10.0),
+            if active {
+                theme::ACCENT
+            } else {
+                theme::TEXT_DIM
+            },
+        );
+        painter.text(
+            rect.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            count.to_string(),
+            FontId::monospace(10.0),
+            theme::TEXT_DIM,
+        );
+        painter.hline(
+            rect.x_range(),
+            rect.bottom() - 2.0,
+            Stroke::new(1.0_f32, theme::EDGE),
+        );
+        response.on_hover_text(group.about());
+    }
+
+    /// One cell of the palette: the plate, the brush's picture (with the material under a cracked
+    /// brush's transparent crack), the tooltip, and what a click or a drag out of the palette does.
+    fn palette_cell(&mut self, ui: &mut egui::Ui, brush: Brush, cell: f32) {
+        let selected = self.editor.brush == Some(brush);
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(cell), Sense::click_and_drag());
+        let state = ui::PlateState::of(&response, selected, true);
+        let plate = ui::bevel(state, rect);
+        let painter = ui.painter_at(rect);
+        ui::paint(&painter, &plate);
+        // Two layers, when a brush has two. A cracked brush's own icon is a *transparent crack* —
+        // what it paints is a material plus a crack — so its cell draws the material the crack
+        // breaks underneath it, in the same socket and at the same size. That is the pair the level
+        // draws for a brittle tile, and it is what makes a cracked cell read as "the floor above
+        // this one, about to go" rather than as a scratch on the palette. Every other brush has no
+        // base layer and is unchanged.
+        let (icon, flip) = self.brush_icon(brush);
+        for (name, flip) in [
+            Self::brush_base(brush).map(|n| (n, false)),
+            Some((icon, flip)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(uv) = self.atlas.uv(name) {
+                painter.image(
+                    self.atlas.texture_id(),
+                    plate.content.shrink(2.0),
+                    crate::view::facing(uv, flip),
+                    Color32::WHITE,
+                );
+            }
+        }
+        let response = response.on_hover_text(format!(
+            "{}: {}\nDrag onto the level to place it.",
+            brush.label(),
+            brush.about()
+        ));
+        if response.clicked() {
+            self.editor.brush = Some(brush);
+            self.editor.message = format!("{} brush", brush.label());
+        }
+        if response.drag_started() {
+            self.dragging = Some(brush);
+            self.editor.brush = Some(brush);
         }
     }
 
@@ -3894,6 +4053,7 @@ impl EvoApp {
                         None,
                         session.clock,
                         Some(rope_anim.motion()),
+                        Some(session.sim().spike_balls()),
                     );
                     // Whatever the player has broken: the piece falls over the hole it left,
                     // between the level and the body.
@@ -4123,6 +4283,10 @@ impl EvoApp {
             None,
             clock,
             rope_anim.map(view::AgentAnim::motion),
+            // The champion's pendulums: every lane has its own copy of the level's balls, and the
+            // one on the canvas is the run in front of the viewer. Lane 0 is the champion, which
+            // is the same body the ropes are drawn from whenever it is holding one.
+            self.lanes.as_ref().map(|lanes| lanes.sim(0).spike_balls()),
         );
 
         if let Some(generation) = self.view.scrub {
@@ -4256,12 +4420,6 @@ impl EvoApp {
         // exists to prevent. A plain right-click has no modifier and still erases.
         if picking && (primary || secondary) {
             self.editor.pick_at(tx, ty);
-            // The palette follows the tool it just took. An eyedropper can pick up a brush that
-            // lives on a shelf the person is not looking at, and a gold cell nobody can see is a
-            // palette that disagrees with what is in hand.
-            if let Some(brush) = self.editor.brush {
-                self.palette_group = brush.group();
-            }
         } else if secondary {
             // Right-click erases whatever is under the cursor, regardless of the brush.
             self.editor.erase_at(tx, ty);
@@ -4332,6 +4490,29 @@ impl EvoApp {
                         Color32::from_white_alpha(170),
                     );
                 }
+            }
+            span
+        } else if brush == Brush::SpikeBall {
+            // The ball does not land in the cell that was clicked: the click is the chain's first
+            // cell, and the weight hangs a chain-length below it. A ghost that drew the ball under
+            // the pointer would promise a hazard in the wrong place — the platform's own reason for
+            // drawing its full width — and the chain between the tie and the ball is the promise.
+            let mut span = target;
+            if let Some((_, ball_y)) = self.editor.spike_ball_drop(tx, ty) {
+                let ball = self.camera.tile_rect(tx, ball_y, rect);
+                span = span.union(ball);
+                if let Ok(uv) = self.atlas.uv("spike_ball") {
+                    painter.image(
+                        self.atlas.texture_id(),
+                        ball,
+                        uv,
+                        Color32::from_white_alpha(170),
+                    );
+                }
+                painter.line_segment(
+                    [target.center_bottom(), ball.center_top()],
+                    Stroke::new(1.0_f32, theme::ACCENT.gamma_multiply(0.5)),
+                );
             }
             span
         } else {
@@ -4750,10 +4931,18 @@ impl EvoApp {
                     // window that can say what the held brush *is* without taking room from
                     // anything else, and the space under a short shelf is otherwise a panel that
                     // has finished — which reads as an unfinished one.
+                    //
+                    // Added first, so it is the *bottom* of the panel: egui gives each bottom panel
+                    // the foot of the room the panels before it left, so the note takes the last
+                    // line, the brush's own controls sit just above it, and the parts scroll in
+                    // what is left between the finder and the controls.
                     egui::TopBottomPanel::bottom("palette-foot")
                         .frame(egui::Frame::new())
                         .show_inside(ui, |ui| self.brush_note(ui));
-                    egui::ScrollArea::vertical().show(ui, |ui| self.palette(ui))
+                    egui::TopBottomPanel::bottom("palette-tools")
+                        .frame(egui::Frame::new())
+                        .show_inside(ui, |ui| self.palette_tools(ui));
+                    self.palette(ui)
                 });
         }
         // A run's panel, and *only* a run's. The editor used to have one as well — the verdict at
@@ -5495,36 +5684,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// **A palette tab is a place to look, not a tool.** Pressing one changes the shelf on screen
-    /// and leaves the brush in hand alone — the gold cell is the answer to "what am I holding", and
-    /// it is wherever that brush lives.
+    /// **Every shelf is on the list, and the finder searches all of them at once.**
+    ///
+    /// The complaint this replaced was that a part was *findable only by guessing its tab*: the
+    /// four groups are still the ordering, but all five headings are drawn on the first frame, and
+    /// typing a word hides every group the word does not reach. The brush in hand is untouched by
+    /// either — looking is not picking.
     #[test]
-    fn a_palette_tab_changes_the_shelf_and_not_the_brush() {
-        let (ctx, root, mut app) = window("palette-shelves");
-        assert_eq!(
-            app.palette_group,
-            BrushGroup::Ground,
-            "the floor comes first"
-        );
+    fn the_palette_lists_every_shelf_and_the_finder_narrows_them() {
+        let (ctx, root, mut app) = window("palette-finder");
+        for group in BrushGroup::ALL {
+            let _ = centre_of(&app, group.label());
+        }
         let held = app.editor.brush;
-        assert_eq!(
-            app.palette_group.brushes().len(),
-            8,
-            "the ground shelf is the four materials and their brittle twins"
+        // The list's width is the same on the first frame as on the second: a bar that only takes
+        // room once egui knows the list overflows made the headings eleven points wider for one
+        // frame, which is a jog on the frame a window opens.
+        let first = app.tool_rects.clone();
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(first, app.tool_rects, "the parts list settles at once");
+
+        // `/` is the way in without the mouse: the key asks for the field, the field is drawn
+        // after the key is read, and the next frame's typing lands in it.
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Slash,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("rope".to_string())],
+        );
+        assert_eq!(app.palette_find, "rope", "`/` puts the cursor in the finder");
+        assert_eq!(app.editor.brush, held, "and does not pick anything");
+        app.palette_find.clear();
+        frame(&ctx, &mut app, vec![]);
+
+        // Type into the finder: the field is the one control the palette added, and egui needs a
+        // click to focus it before it will take a `Text` event.
+        let field = centre_of(&app, "find a part");
+        click(&ctx, &mut app, field);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("ball".to_string())],
+        );
+        assert_eq!(app.palette_find, "ball");
+        let headings: Vec<&str> = app.tool_rects.iter().map(|(n, _)| *n).collect();
+        assert!(
+            headings.contains(&BrushGroup::Hazard.label()),
+            "the spiked ball is on the hazards' shelf, so searching for it finds that: {headings:?}"
+        );
+        for group in [
+            BrushGroup::Ground,
+            BrushGroup::Traversal,
+            BrushGroup::Enemy,
+            BrushGroup::Level,
+            BrushGroup::Clear,
+        ] {
+            assert!(
+                !headings.contains(&group.label()),
+                "{} has no part matching 'ball', so its heading is gone: {headings:?}",
+                group.label()
+            );
+        }
+        assert_eq!(app.editor.brush, held, "a search is not a pick");
+
+        // A word that is nobody's label still finds the parts, because the finder reads the
+        // synonyms as well: nothing in the palette is called a pendulum, and two things swing —
+        // the spiked ball on its chain and the rope a body catches.
+        app.palette_find.clear();
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("pendulum".to_string())],
+        );
+        let headings: Vec<&str> = app.tool_rects.iter().map(|(n, _)| *n).collect();
+        for group in [BrushGroup::Hazard, BrushGroup::Traversal] {
+            assert!(
+                headings.contains(&group.label()),
+                "'pendulum' finds {} too: {headings:?}",
+                group.label()
+            );
+        }
+        assert!(
+            !headings.contains(&BrushGroup::Enemy.label()),
+            "and nothing that does not swing: {headings:?}"
         );
 
-        let hazards = centre_of(&app, "Hazards");
-        click(&ctx, &mut app, hazards);
-        assert_eq!(app.palette_group, BrushGroup::Hazard);
-        assert_eq!(
-            app.editor.brush, held,
-            "browsing a shelf picked up a brush nobody asked for"
-        );
-        assert_eq!(
-            app.palette_group.brushes().len(),
-            6,
-            "and the shelf on screen is the hazards, not the ground"
-        );
+        // And a word nothing answers to says so rather than showing an empty box.
+        app.palette_find = "zzz".to_string();
+        frame(&ctx, &mut app, vec![]);
+        let _ = centre_of(&app, "no parts match");
+        for group in BrushGroup::ALL {
+            let headings: Vec<&str> = app.tool_rects.iter().map(|(n, _)| *n).collect();
+            assert!(
+                !headings.contains(&group.label()),
+                "an empty search draws no shelf headings"
+            );
+        }
+
+        // Clearing the field is the way back to the whole palette.
+        app.palette_find.clear();
+        frame(&ctx, &mut app, vec![]);
+        for group in BrushGroup::ALL {
+            let _ = centre_of(&app, group.label());
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

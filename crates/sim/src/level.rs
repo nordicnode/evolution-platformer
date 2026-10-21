@@ -53,7 +53,12 @@ pub const LEVEL_FORMAT: &str = "evo-platformer-level";
 /// wrong *promise* from a file that says version 3. So the writer emits 4, a v4 build still reads
 /// 1 through 3 (every earlier meaning is unchanged), and a champion trained on a rope level
 /// carries 4 in its provenance like every other version this format has had.
-pub const LEVEL_FORMAT_VERSION: u32 = 4;
+///
+/// **Bumped to 5 for the spiked ball**, the same shape of change for the same reason: one new
+/// entity (`"spiked_ball"`), no new glyph. A v4 build refuses the entity by name, which is the
+/// correct answer to a file it cannot play — but a file that claims version 4 and contains one
+/// would be promising otherwise.
+pub const LEVEL_FORMAT_VERSION: u32 = 5;
 
 /// Smallest grid the editor will build. Not a loader rule — a level is legal from
 /// 1x1 — but a painter with less room than this has nothing to paint with.
@@ -489,13 +494,14 @@ struct RawEntity {
     /// an existing file's shape is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sprite: Option<String>,
-    /// A flyer's travel or a platform's travel, in tiles. Omitted from every other kind.
+    /// A flyer's travel or a platform's travel, in tiles; a spiked ball's trigger range.
+    /// Omitted from every other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     span: Option<i32>,
     /// A turret's firing direction (`+1` right, `-1` left).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dir: Option<i8>,
-    /// A moving platform's width, in tiles.
+    /// A moving platform's width, a rope's length, or a spiked ball's chain, in tiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tiles: Option<i32>,
     /// A moving platform's axis: `"x"` (default, a slider) or `"y"` (a lift).
@@ -752,6 +758,96 @@ impl RopeSpec {
     }
 }
 
+/// A **spiked ball on a chain**: a pendulum hanging from a ceiling that starts swinging when a
+/// body comes near it.
+///
+/// The pack's first hazard that is *dormant until approached* and then moves on its own. Every
+/// other hazard is either still (a spike, a pool) or periodic from frame zero (a turret, a vent,
+/// a platform), so its phase is a fact about the level; this one's phase is a fact about the
+/// body — which is what makes it a trap rather than a rhythm to read before entering the room.
+///
+/// **Hangs from the underside of row `row`, like a rope.** The cell an author paints is the
+/// first cell of air under the ceiling; the anchor is the middle of the cell above's bottom
+/// edge, and `length` tiles of chain put the ball's centre at `row + length`. The chain is a
+/// line, not terrain: nothing collides with it, and the ball is the only part with a hitbox.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpikeBallSpec {
+    /// Column the chain hangs in.
+    pub col: i32,
+    /// Row of the chain's **topmost** cell. The ceiling it is tied to is the row above.
+    pub row: i32,
+    /// How much chain is out, in tiles: the radius of the swing.
+    pub length: f32,
+    /// How close a body has to come to the hanging ball to set it swinging, in tiles. Measured
+    /// from the ball's rest centre to the body's centre, so it is the radius of a circle the
+    /// author can see around the ball rather than a number about the anchor.
+    pub reach: f32,
+}
+
+/// A spiked ball's chain when the file does not say one: four tiles.
+///
+/// Shared with the editor for the reason every default in this module is. Four tiles is long
+/// enough that the ball sweeps a corridor rather than guarding one cell, and short enough that
+/// its arc (about 2.3 tiles to each side at the speed the sim gives it) stays inside the room a
+/// person drew. A one-tile chain is a spike with a hinge; a ten-tile one is a wrecking ball with
+/// a work order.
+pub const DEFAULT_SPIKE_BALL_TILES: i32 = 4;
+
+/// How near a spiked ball has to be to a body to be woken, in tiles, when the file does not
+/// say: five.
+///
+/// Measured from the hanging ball, not the ceiling: a body walks *under* the ball, so a radius
+/// around the anchor would wake it once the body was already inside the arc. Five tiles is about
+/// a second of running at sprint speed — long enough that the ball is clearly moving before the
+/// body arrives, short enough that a level's other hazards do not all start at once.
+pub const DEFAULT_SPIKE_BALL_REACH: i32 = 5;
+
+impl SpikeBallSpec {
+    /// A ball hung at tile `(tx, ty)` with `length` tiles of chain and a `reach`-tile trigger.
+    /// The one place the geometry is stated, for the editor and the loader both.
+    pub fn at(tx: i32, ty: i32, length: i32, reach: i32) -> SpikeBallSpec {
+        SpikeBallSpec {
+            col: tx,
+            row: ty,
+            length: length.max(1) as f32,
+            reach: reach.max(1) as f32,
+        }
+    }
+
+    /// Where the chain is tied: the middle of the underside of the ceiling above the cell.
+    pub fn anchor(&self) -> (f32, f32) {
+        (self.col as f32 + 0.5, self.row as f32)
+    }
+
+    /// Where the ball's centre hangs when it is at rest: straight down the chain.
+    pub fn rest(&self) -> (f32, f32) {
+        let (ax, ay) = self.anchor();
+        (ax, ay + self.length)
+    }
+
+    /// The lowest row the chain and ball occupy, for the eraser and the picker: the ball's cell.
+    pub fn last_row(&self) -> i32 {
+        self.row + self.length.ceil() as i32
+    }
+
+    /// The box the ball hangs in when the level has just been loaded, in world tiles.
+    ///
+    /// The sim's own hitbox ([`PHYSICS::spike_ball_w`], [`PHYSICS::spike_ball_h`]) at the resting
+    /// centre, because the two things that ask this question are asking the sim's question: the
+    /// reach oracle's "is this body inside a hazard?", and the view's picture of where a ball is
+    /// before anything has woken it. A second width constant here would be a hazard whose drawn
+    /// ball and lethal ball were different sizes.
+    pub fn rest_box(&self) -> Rect {
+        let (x, y) = self.rest();
+        Rect::new(
+            x - PHYSICS.spike_ball_w * 0.5,
+            y - PHYSICS.spike_ball_h * 0.5,
+            PHYSICS.spike_ball_w,
+            PHYSICS.spike_ball_h,
+        )
+    }
+}
+
 /// The on-disk shape, in write order. Serializing this rather than hand-building
 /// JSON is what keeps the writer and the loader from ever disagreeing about keys:
 /// they are the same struct.
@@ -777,6 +873,8 @@ pub struct ResizeReport {
     pub dropped_enemies: usize,
     /// Moving platforms the new grid had no room for.
     pub dropped_platforms: usize,
+    /// Spiked balls whose chain no longer fits under the new top or bottom edge.
+    pub dropped_balls: usize,
     /// Placed scenery that fell outside the new grid. Decoration is disposable, so it is
     /// simply dropped (like a walker) rather than clamped back in (like the goal).
     pub dropped_scenery: usize,
@@ -795,6 +893,7 @@ impl ResizeReport {
         self.dropped_walkers > 0
             || self.dropped_enemies > 0
             || self.dropped_platforms > 0
+            || self.dropped_balls > 0
             || self.dropped_scenery > 0
     }
 }
@@ -833,6 +932,8 @@ pub struct Level {
     pub platforms: Vec<PlatformSpec>,
     /// Ropes, with the length each one hangs: a swing a body can grab in the air.
     pub ropes: Vec<RopeSpec>,
+    /// Spiked balls on chains: the pendulum traps, with the length and trigger each one carries.
+    pub spike_balls: Vec<SpikeBallSpec>,
     /// Lazily computed move-graph route table for this level.
     ///
     /// **The slot is shared between clones, not copied by them.** The graph is a pure
@@ -929,6 +1030,7 @@ impl Level {
             turrets: Vec::new(),
             platforms: Vec::new(),
             ropes: Vec::new(),
+            spike_balls: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1023,6 +1125,29 @@ impl Level {
                         ));
                     }
                     level.ropes.push(RopeSpec::at(e.x, e.y, length));
+                }
+                // A spiked ball hangs from the underside of the row above its cell, exactly as
+                // a rope does, and its chain has to end with the whole ball inside the map: the
+                // ball is a hitbox, and one hanging through the floor is a hazard the player
+                // cannot see to avoid. `row + length + 1` leaves the half tile the ball's box
+                // reaches past its centre.
+                "spiked_ball" => {
+                    let length = e.tiles.unwrap_or(DEFAULT_SPIKE_BALL_TILES).max(1);
+                    let reach = e.span.unwrap_or(DEFAULT_SPIKE_BALL_REACH).max(1);
+                    if e.x < 0
+                        || e.x >= level.width
+                        || e.y < 1
+                        || e.y + length + 1 > level.height
+                    {
+                        return Err(format!(
+                            "spiked ball at ({}, {}) on a {} tile chain does not hang inside a \
+                             {}x{} level",
+                            e.x, e.y, length, level.width, level.height
+                        ));
+                    }
+                    level
+                        .spike_balls
+                        .push(SpikeBallSpec::at(e.x, e.y, length, reach));
                 }
                 "goal" => {
                     // One flag per level, refused here as well as in the editor: the oracle,
@@ -1533,6 +1658,15 @@ impl Level {
             h.u8(p.vertical as u8);
             h.i8(p.dir);
         }
+        // A ball is a hazard a run is scored against, exactly as a turret is: moving one
+        // changes every episode on the level, so a run keyed on this hash has to restart.
+        h.u32(self.spike_balls.len() as u32);
+        for b in &self.spike_balls {
+            h.i32(b.col);
+            h.i32(b.row);
+            h.f32(b.length);
+            h.f32(b.reach);
+        }
         h.finish()
     }
 
@@ -1598,6 +1732,7 @@ impl Level {
             turrets: Vec::new(),
             platforms: Vec::new(),
             ropes: Vec::new(),
+            spike_balls: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1716,6 +1851,16 @@ impl Level {
             .map(|r| RopeSpec {
                 col: self.width - 1 - r.col,
                 ..*r
+            })
+            .collect();
+        // A ball's column is the only horizontal fact it carries; the swing itself is the
+        // body's doing, so there is no direction for a mirror to turn.
+        out.spike_balls = self
+            .spike_balls
+            .iter()
+            .map(|b| SpikeBallSpec {
+                col: self.width - 1 - b.col,
+                ..*b
             })
             .collect();
         out.flyers = self
@@ -1858,6 +2003,13 @@ impl Level {
         // swing that lets go of a body over the void.
         self.ropes
             .retain(|r| r.col < width && r.row >= 1 && (r.row as f32 + r.length) <= height as f32);
+
+        // A ball is dropped when its chain no longer fits: half a pendulum is not a shorter
+        // pendulum, it is a hitbox hanging through the floor.
+        let before = self.spike_balls.len();
+        self.spike_balls
+            .retain(|b| b.col < width && b.row >= 1 && b.last_row() < height);
+        report.dropped_balls = before - self.spike_balls.len();
 
         let before = self.scenery.len();
         self.scenery.retain(|s| !tx_out(s.x, s.y, width, height));
@@ -2276,6 +2428,126 @@ impl Level {
         best
     }
 
+    // ---- the spiked ball ---------------------------------------------------------------
+
+    /// Tile positions of every spiked ball: the cell its chain hangs from (its first cell).
+    pub fn spike_ball_tiles(&self) -> Vec<(i32, i32)> {
+        self.spike_balls.iter().map(|b| (b.col, b.row)).collect()
+    }
+
+    /// Whether a spiked ball may hang at `(tx, ty)`: on the map, tied to something solid above
+    /// it, with air to hang through and room for the shortest chain plus the ball's own box.
+    ///
+    /// The same ceiling rule as a rope, and for the same reason: a pendulum hanging from nothing
+    /// is a floating hazard. The room rule is the spiked ball's own — the ball is a hitbox, so a
+    /// chain that puts it through the bottom of the map is refused rather than shortened here;
+    /// [`Self::add_spike_ball_tile`] shortens the *default* to the room there is.
+    pub fn spike_ball_placeable(&self, tx: i32, ty: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height)
+            && ty >= 1
+            && ty + 2 <= self.height
+            && self.is_opaque(tx, ty - 1)
+            && self.tile(tx, ty) == Some(Tile::Empty)
+    }
+
+    /// Hang a spiked ball at `(tx, ty)` with an **authored** chain length and trigger radius.
+    ///
+    /// The chain is shortened to the room under the new bottom edge, so a click near the floor
+    /// still hangs a whole ball rather than being refused; the trigger is not, because it is a
+    /// distance around the ball rather than a length of line, and a radius that quietly shrank
+    /// would be a trap the author could not predict.
+    pub fn add_spike_ball(&mut self, tx: i32, ty: i32, length: i32, reach: i32) -> bool {
+        if !self.spike_ball_placeable(tx, ty) {
+            return false;
+        }
+        let room = (self.height - ty - 1).max(1);
+        self.spike_balls.push(SpikeBallSpec::at(
+            tx,
+            ty,
+            length.max(1).min(room),
+            reach.max(1),
+        ));
+        self.forget_routes();
+        true
+    }
+
+    /// Hang a spiked ball at `(tx, ty)` with the loader's own defaults, shortened to the room
+    /// under the new bottom edge.
+    pub fn add_spike_ball_tile(&mut self, tx: i32, ty: i32) -> bool {
+        self.add_spike_ball(
+            tx,
+            ty,
+            DEFAULT_SPIKE_BALL_TILES,
+            DEFAULT_SPIKE_BALL_REACH,
+        )
+    }
+
+    /// Whether a **cell** of spiked ball may be painted at `(tx, ty)`.
+    ///
+    /// Two answers, the rope's two: a first cell hangs a ball (empty, with a ceiling above), and
+    /// the cell just below a chain extends that chain. The editor asks this for the drop ghost, so
+    /// a drag that has run out of room is refused before the mouse button comes up rather than
+    /// shortening a chain the person did not ask to change.
+    pub fn spike_ball_cell_placeable(&self, tx: i32, ty: i32) -> bool {
+        if self.spike_ball_placeable(tx, ty) {
+            return true;
+        }
+        self.tile(tx, ty) == Some(Tile::Empty)
+            && self
+                .spike_balls
+                .iter()
+                .any(|b| b.col == tx && ty == b.last_row() + 1)
+    }
+
+    /// Paint one cell of spiked ball at `(tx, ty)`: hang a whole ball there, or grow the chain of
+    /// the one above it by a cell.
+    ///
+    /// The rope's gesture, for the rope's reason: the thing a drag down a column should make is
+    /// **one** longer chain, not a stack of four-tile balls one row apart. A click on a ceiling
+    /// hangs the default chain ([`DEFAULT_SPIKE_BALL_TILES`], shortened to the room below it), and
+    /// dragging past the ball extends it a cell per row — which is how a person asks for a longer
+    /// arc without a number field to find.
+    ///
+    /// Growing is refused where the new ball would not fit: the chain's last cell plus the half
+    /// tile its box reaches has to be inside the map, exactly as the loader checks.
+    ///
+    /// `length` and `reach` are the **brush's** numbers and are used only when this cell starts a
+    /// new ball: a cell below an existing chain grows that chain by one, because the chain it is
+    /// growing already has a length and a stepper cannot be right about it from the outside.
+    pub fn add_spike_ball_cell(&mut self, tx: i32, ty: i32, length: i32, reach: i32) -> bool {
+        if !self.spike_ball_cell_placeable(tx, ty) {
+            return false;
+        }
+        for b in &mut self.spike_balls {
+            if b.col == tx && ty == b.last_row() + 1 {
+                b.length += 1.0;
+                self.forget_routes();
+                return true;
+            }
+        }
+        self.add_spike_ball(tx, ty, length, reach)
+    }
+
+    /// The spiked ball whose chain or ball passes through `(tx, ty)`, if any.
+    ///
+    /// A ball *occupies* the cells of its chain and the cell its weight hangs in, not just the
+    /// one it is tied at, for [`Self::rope_at`]'s reason: a person picks and erases the thing
+    /// they can see, which is the ball at the bottom.
+    pub fn spike_ball_at(&self, tx: i32, ty: i32) -> Option<&SpikeBallSpec> {
+        self.spike_balls
+            .iter()
+            .find(|b| b.col == tx && (b.row..=b.last_row()).contains(&ty))
+    }
+
+    /// Remove the spiked ball hanging from `(tx, ty)`, if any. `(tx, ty)` may be any cell of its
+    /// chain or the ball itself. Returns whether one went.
+    pub fn remove_spike_ball_at(&mut self, tx: i32, ty: i32) -> bool {
+        let before = self.spike_balls.len();
+        self.spike_balls
+            .retain(|b| !(b.col == tx && (b.row..=b.last_row()).contains(&ty)));
+        self.spike_balls.len() != before
+    }
+
     /// The enemy whose cell is `(tx, ty)`, as its file kind, topmost of the kinds a click can
     /// mean. Used by the editor's eraser and the inspector.
     pub fn enemy_at(&self, tx: i32, ty: i32) -> Option<&'static str> {
@@ -2291,6 +2563,8 @@ impl Level {
             Some("platform")
         } else if self.rope_at(tx, ty).is_some() {
             Some("rope")
+        } else if self.spike_ball_at(tx, ty).is_some() {
+            Some("spiked_ball")
         } else {
             None
         }
@@ -2303,7 +2577,8 @@ impl Level {
             + self.flyers.len()
             + self.turrets.len()
             + self.platforms.len()
-            + self.ropes.len();
+            + self.ropes.len()
+            + self.spike_balls.len();
         self.walkers
             .retain(|w| (tile_of_x(w.x, PHYSICS.walker_w), tile_of_bottom(w.bottom())) != (tx, ty));
         self.chasers
@@ -2326,12 +2601,15 @@ impl Level {
             let last = r.row + r.length.max(1.0).ceil() as i32 - 1;
             !(r.col == tx && (r.row..=last).contains(&ty))
         });
+        self.spike_balls
+            .retain(|b| !(b.col == tx && (b.row..=b.last_row()).contains(&ty)));
         self.walkers.len()
             + self.chasers.len()
             + self.flyers.len()
             + self.turrets.len()
             + self.platforms.len()
             + self.ropes.len()
+            + self.spike_balls.len()
             != before
     }
 
@@ -2522,6 +2800,7 @@ impl Level {
             ("turret", self.turret_tiles()),
             ("platform", self.platform_tiles()),
             ("rope", self.rope_tiles()),
+            ("spiked ball", self.spike_ball_tiles()),
         ] {
             for (tx, ty) in tiles {
                 if tx_out(tx, ty, self.width, self.height) {
@@ -2556,6 +2835,7 @@ impl Level {
                 + self.turrets.len()
                 + self.platforms.len()
                 + self.ropes.len()
+                + self.spike_balls.len()
                 + self.goals.len()
                 + self.scenery.len(),
         );
@@ -2612,6 +2892,13 @@ impl Level {
             entities.push(RawEntity {
                 tiles: Some(r.length.round().max(1.0) as i32),
                 ..RawEntity::of("rope", r.col, r.row)
+            });
+        }
+        for b in &self.spike_balls {
+            entities.push(RawEntity {
+                tiles: Some(b.length.round().max(1.0) as i32),
+                span: Some(b.reach.round().max(1.0) as i32),
+                ..RawEntity::of("spiked_ball", b.col, b.row)
             });
         }
         let (sx, sy) = self.spawn_tile();

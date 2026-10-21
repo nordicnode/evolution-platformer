@@ -77,6 +77,10 @@ const EDIT: &[Key] = &[
         what: "save the level to its file",
     },
     Key {
+        keys: "/",
+        what: "search the palette — every part, whichever shelf it is on",
+    },
+    Key {
         keys: "G",
         what: "the guides — grid, reachability and the verdict",
     },

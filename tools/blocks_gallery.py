@@ -79,8 +79,9 @@ class Item:
 # Palette order, in rows: the materials with their brittle twins beside them
 # (`BrushGroup::Ground`), then the hazards and the ways through a level
 # (`Hazard` and `World`), then the cast (`Enemy`) and the one piece of scenery.
-# That is all twenty-three placeable brushes plus the runner, who is not a brush
-# but is the one body every level is about — a 6x4 grid exactly.
+# That is all twenty-four placeable brushes plus the runner, who is not a brush
+# but is the one body every level is about — twenty-five cells, five rows of six
+# with one cell short.
 ITEMS: tuple[Item, ...] = (
     Item("GRASS", ("ground_1",)),
     Item("CRACKED", ("ground_1", "cracked_ground"), brush="cracked_ground"),
@@ -102,6 +103,9 @@ ITEMS: tuple[Item, ...] = (
     Item("LAVA", ("lava_top_a",), brush="lava"),
     Item("VINE", ("vine",)),
     Item("ROPE", ("rope",)),
+    # The chain is drawn in a level and the ball is a sprite, so the sheet shows the one
+    # picture the palette's brush draws (`terrain.spike_ball`).
+    Item("SPIKED BALL", ("spike_ball",)),
     Item("SPAWN", ("spawn_marker",)),
     Item("FLAG", ("goal_flag_2",), brush="goal_top"),
     Item("RUNNER", ("player_idle_a",), placeable=False),

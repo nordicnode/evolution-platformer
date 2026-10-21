@@ -91,6 +91,15 @@ pub const GLYPH_MOVER: char = 'M';
 /// and a rope is the one thing in a level that is a *line* — the drawing that says "a cell you can
 /// hang in" is the one a person would draw.
 pub const GLYPH_ROPE: char = '|';
+/// A spiked ball hanging on a chain.
+///
+/// A capital `O` for the ball's weight, and a colon for the chain above it: the chain is a line
+/// the way a rope is, but it is not a rope a body can grab, so it gets a glyph of its own rather
+/// than borrowing `|`. The pair says the one thing a reader needs about the hazard — that the
+/// heavy thing at the bottom is tied to the ceiling, so its arc is a fact about the room.
+pub const GLYPH_SPIKE_BALL: char = 'O';
+/// A spiked ball's chain, one glyph per cell it hangs through.
+pub const GLYPH_CHAIN: char = ':';
 /// A ball of lava in flight.
 ///
 /// A star rather than a letter, for the same reason a shot is `o`: it is the one body in the
@@ -107,7 +116,7 @@ pub const GLYPH_UNKNOWN: char = '?';
 ///
 /// A legend, not a whitelist — see the module docs. Watch mode draws each agent
 /// with its own letter and those letters are not listed here.
-pub const GLYPHS: [(char, &str); 27] = [
+pub const GLYPHS: [(char, &str); 29] = [
     (GLYPH_SOLID, "solid tile"),
     (GLYPH_SAND, "sand tile (solid, a beach)"),
     (GLYPH_BRICK, "stone brick tile (solid masonry)"),
@@ -161,6 +170,8 @@ pub const GLYPHS: [(char, &str); 27] = [
     (GLYPH_LAVA_BALL, "a lava ball in flight"),
     (GLYPH_MOVER, "a moving platform"),
     (GLYPH_ROPE, "a rope (grab it in the air and swing)"),
+    (GLYPH_SPIKE_BALL, "a spiked ball on a chain"),
+    (GLYPH_CHAIN, "the chain a spiked ball hangs from"),
     (GLYPH_PLAYER, "the player"),
 ];
 
@@ -376,6 +387,28 @@ impl<'a> Scene<'a> {
                     true,
                 ));
             }
+        }
+        // A spiked ball is drawn where it is *this frame*, not where its chain is tied: the ball
+        // is the part that kills, and a reader looking at a woken one needs to see the arc it is
+        // on. The chain cells above it are what keep it from looking like a floating hazard.
+        for ball in sim.spike_balls() {
+            let top = ball.y - ball.h * 0.5;
+            let first = ball.anchor_y as i32;
+            // Up to the last cell the ball's box does *not* reach: the ball takes every cell its
+            // box touches (a box that straddles a boundary is two cells, like a mover's), and a
+            // chain glyph under the ball would be overwritten by the ball's own 'O' anyway.
+            let last = top.ceil() as i32 - 1;
+            for row in first..=last {
+                bodies.push(Body::new(
+                    ball.anchor_x.floor(),
+                    row as f32,
+                    1.0,
+                    1.0,
+                    GLYPH_CHAIN,
+                    true,
+                ));
+            }
+            bodies.push(Body::from_rect(ball.aabb(), GLYPH_SPIKE_BALL, true));
         }
         Scene::new(sim.level(), bodies)
     }
@@ -1056,6 +1089,54 @@ mod tests {
             drawn,
             vec![3, 4, 5],
             "one glyph per cell of the line, from the ceiling down:\n{frame}"
+        );
+    }
+
+    /// **The ball is drawn where it kills, and the chain from the ceiling to it.** A reader of a
+    /// terminal frame has to be able to tell a hazard hanging in a doorway from one already
+    /// swinging through the tile they are standing in, and the tie is what says the ball's arc is
+    /// the room's shape rather than a body's whim.
+    #[test]
+    fn a_spiked_ball_draws_its_chain_and_its_ball() {
+        let rows = [
+            "............",
+            "............",
+            "####........",
+            "............",
+            "............",
+            "............",
+            "############",
+        ];
+        let tiles = rows
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let src = format!(
+            "{{\"format\":\"evo-platformer-level\",\"level_format_version\":5,\"name\":\"ball\",\
+             \"width\":12,\"height\":7,\"spawn\":{{\"x\":1,\"y\":5}},\"tiles\":[{tiles}],\
+             \"entities\":[{{\"type\":\"spiked_ball\",\"x\":2,\"y\":3,\"tiles\":2}},\
+             {{\"type\":\"goal\",\"x\":10,\"y\":5}}]}}"
+        );
+        let level = Level::from_json_str(&src).expect("the spiked ball parses");
+        let ball = level.spike_balls[0];
+        assert_eq!(ball.rest(), (2.5, 5.0), "two tiles down from the tie");
+
+        let sim = Sim::new(&level, 1);
+        let frame = render_scene(&Scene::from_sim(&sim), Viewport::whole(&level));
+        let rows = rows_of(&frame);
+        let column: Vec<char> = (0..level.height)
+            .map(|row| rows[row as usize].chars().nth(2).unwrap_or(' '))
+            .collect();
+        assert_eq!(column[3], GLYPH_CHAIN, "the chain starts at the ceiling");
+        // The ball's box is centred in row 5 and is most of a tile tall, so it covers the two
+        // cells it straddles — the hazard is bigger than the grid under it, exactly as the
+        // observation patch says.
+        assert_eq!(column[4], GLYPH_SPIKE_BALL, "the ball's top half");
+        assert_eq!(column[5], GLYPH_SPIKE_BALL, "the ball's bottom half");
+        assert!(
+            !column.contains(&GLYPH_ROPE),
+            "a chain is not a rope a body can grab"
         );
     }
 

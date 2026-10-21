@@ -6,10 +6,10 @@
 //! If the growth is what it claims, the two runs agree on every frame, the outcome and the
 //! frontier — not approximately, exactly.
 //!
-//! **Why the growth is still hypothetical here.** Sensors v14 (the rope's three slots) has landed,
-//! and the committed fixture is a v14 champion — `the_saved_l11_champion_survives_growth...`
-//! asserts that, because a fixture left one layout behind would be testing the migration instead of
-//! the invariance. The proof therefore grows *this* layout by the eight columns a next append-only
+//! **Why the growth is still hypothetical here.** Sensors v15 (the spiked ball, read into the patch
+//! with no new slots) has landed, and the committed fixture is a v15 champion —
+//! `the_saved_l11_champion_survives_growth...` asserts that, because a fixture left one layout
+//! behind would be testing the migration instead of the invariance. The proof therefore grows *this* layout by the eight columns a next append-only
 //! bump would add, which is the machine every future bump reuses: `ChampionFile::migrate_sensors`
 //! is the same call this test exercises by hand.
 //!

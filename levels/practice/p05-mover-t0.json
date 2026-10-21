@@ -1,6 +1,6 @@
 {
   "format": "evo-platformer-level",
-  "level_format_version": 4,
+  "level_format_version": 5,
   "name": "P05 mover tier 0 (suite v1)",
   "width": 58,
   "height": 15,

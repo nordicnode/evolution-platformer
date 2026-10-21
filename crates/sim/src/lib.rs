@@ -41,11 +41,13 @@ mod route_cache;
 use crate::physics::tile_span;
 
 pub use crate::hash::StateHasher;
-pub use crate::level::{FlyerSpec, Level, PlatformSpec, Rect, Scenery, Tile, TurretSpec};
+pub use crate::level::{
+    FlyerSpec, Level, PlatformSpec, Rect, Scenery, SpikeBallSpec, Tile, TurretSpec,
+};
 pub use crate::meta::{MetaController, MetaPlay, Skill, SkillEvent, SkillTrace};
 pub use crate::physics::{
-    AgentAction, Flyer, LavaBall, Mover, Physics, PlayerState, Shot, Turret, Walker, WalkerMode,
-    PHYSICS,
+    AgentAction, Flyer, LavaBall, Mover, Physics, PlayerState, Shot, SpikeBall, Turret, Walker,
+    WalkerMode, PHYSICS,
 };
 pub use crate::rng::{common_episode_seed, episode_seed, rng_from_seed, Rng};
 
@@ -134,6 +136,8 @@ pub enum DeathCause {
     Shot,
     Walker,
     Flyer,
+    /// A spiked ball on a chain.
+    SpikeBall,
     Pit,
 }
 
@@ -145,6 +149,7 @@ impl DeathCause {
             DeathCause::Shot => "turret shot",
             DeathCause::Walker => "walker",
             DeathCause::Flyer => "flyer",
+            DeathCause::SpikeBall => "spiked ball",
             DeathCause::Pit => "fell out",
         }
     }
@@ -410,6 +415,9 @@ pub struct Sim {
     /// Moving platforms. Their *positions* are a function of the frame count; only which one
     /// the body is riding is state, and that is [`Sim::riding`].
     movers: Vec<Mover>,
+    /// Spiked balls on chains, in file order. Unlike a mover their state is *not* a function of
+    /// the clock — when a ball was woken is a fact about the body — so their motion is hashed.
+    spike_balls: Vec<SpikeBall>,
     /// The mover the body stood on last frame, so this frame's motion can carry it.
     riding: Option<usize>,
     /// Deck ids the body has stood on at least once, in first-arrival order.
@@ -516,6 +524,12 @@ impl Sim {
             .enumerate()
             .map(|(i, spec)| Turret::new(i as u32, *spec, &PHYSICS))
             .collect();
+        let spike_balls = level
+            .spike_balls
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| SpikeBall::new(i as u32, *spec, &PHYSICS))
+            .collect();
         let movers = level
             .platforms
             .iter()
@@ -549,6 +563,7 @@ impl Sim {
             lava_balls: Vec::new(),
             lava_vents: level.lava_vents(),
             movers,
+            spike_balls,
             riding: None,
             decks_stood: Vec::new(),
             air_ticks: 0,
@@ -602,6 +617,11 @@ impl Sim {
 
     pub fn turrets(&self) -> &[Turret] {
         &self.turrets
+    }
+
+    /// The spiked balls, with the positions and speeds they have this frame.
+    pub fn spike_balls(&self) -> &[SpikeBall] {
+        &self.spike_balls
     }
 
     pub fn shots(&self) -> &[Shot] {
@@ -890,6 +910,17 @@ impl Sim {
             }
         }
 
+        // ---- spiked balls: the trap wakes as the body comes near -------------
+        //
+        // Updated *after* the body has moved, so the trigger sees where the body is this frame
+        // rather than where it was one tick ago. From the tick it wakes, the ball is a pendulum;
+        // the contact test below is against the position it has now, exactly as the lava ball's
+        // and the shot's are.
+        let body = self.player.aabb();
+        for b in self.spike_balls.iter_mut() {
+            b.tick(body, ph);
+        }
+
         // ---- hazards ------------------------------------------------------
         if touched.touched_spike {
             self.die(DeathCause::Spike);
@@ -904,6 +935,19 @@ impl Sim {
                 .any(|b| b.alive && self.player.aabb().overlaps(&b.aabb()))
         {
             self.die(DeathCause::Lava);
+            return;
+        }
+
+        // ---- spiked balls: no stomping a ball of spikes -------------------
+        // One contact rule and nothing else: the ball kills, and the body's own collision with
+        // the chain does not exist. It is a hazard rather than an enemy precisely because there
+        // is no answer to it beyond being somewhere else when it arrives.
+        if self
+            .spike_balls
+            .iter()
+            .any(|b| self.player.aabb().overlaps(&b.aabb()))
+        {
+            self.die(DeathCause::SpikeBall);
             return;
         }
 
@@ -1324,6 +1368,7 @@ impl Sim {
                 mover_vel: &scratch.mover_vel,
                 mover_phase: &scratch.mover_phase,
                 turrets: &self.turrets,
+                spike_balls: &self.spike_balls,
                 vents: &self.lava_vents,
                 air_ticks: self.air_ticks,
                 ground_ticks: self.ground_ticks,
@@ -1420,6 +1465,16 @@ impl Sim {
         h.u32(self.movers.len() as u32);
         for m in &self.movers {
             m.hash_into(&mut h);
+        }
+        // Conditional rather than "count folded in even at zero": a level with no spiked ball
+        // must hash exactly as it did before the hazard existed, because every recorded episode
+        // on the shipped pack is checked by replaying to its own hash. A level with one folds in
+        // the count and the pendulum, and cannot collide with the old shape.
+        if !self.spike_balls.is_empty() {
+            h.u32(self.spike_balls.len() as u32);
+            for b in &self.spike_balls {
+                b.hash_into(&mut h);
+            }
         }
         match self.riding {
             Some(i) => {

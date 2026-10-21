@@ -134,8 +134,16 @@ members = [
 # releases the body with the speed the arc built. A rope is a new kind of state (the grip), a new
 # entity and three new observation slots, so the trio moves:
 # sim 0.17.0, sensors v14 (`on_rope`, `rope_dx`, `rope_dy` appended) and level format 4.
+# 0.18.0: **the spiked ball.** A ball on a chain hung under a ceiling, still until a body comes
+# within its authored reach and a pendulum from then on — the rope's own constraint, with the mass
+# it swings being the hazard rather than a body. Its state is the *episode's* and not the clock's
+# (when it woke is a fact about the body), so a level with one hashes it and a level without one
+# hashes exactly as it did at 0.17.0: every recorded episode on the shipped pack still replays to
+# its own hash. A new entity kind and a new lethal picture, so the trio moves together:
+# sim 0.18.0, sensors v15 (a ball draws itself into the patch as the spike's "do not go in" value)
+# and level format 5 (`"spiked_ball"`, with `tiles` for the chain and `span` for the trigger).
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"

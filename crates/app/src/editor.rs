@@ -163,6 +163,14 @@ pub enum Brush {
     /// first cell needs something solid above it — a rope is tied to a ceiling — and the rest
     /// follow the line already hanging there.
     Rope,
+    /// Hangs a spiked ball on a chain: a pendulum that sleeps until a body comes near it.
+    ///
+    /// Stamped a **ball** at a time rather than a cell at a time, which is the one way it differs
+    /// from the rope beside it: a click under a ceiling hangs the default chain, and dragging past
+    /// the ball lengthens *that* chain a cell per row (`Level::add_spike_ball_cell`). The ceiling
+    /// rule is the rope's — a pendulum tied to nothing is a floating hazard — and the room rule is
+    /// its own, because the ball has a hitbox that must not hang through the floor.
+    SpikeBall,
     /// Places a piece of scenery (a bush, tree, rock, flower...): decoration the physics
     /// never sees. Which sprite is decided by [`Editor::scene_sprite`], because there are
     /// two dozen of them and two dozen palette buttons would be two dozen brushes.
@@ -171,68 +179,89 @@ pub enum Brush {
     Erase,
 }
 
-/// The palette's shelves: which brushes are shown together, and so which cells are on screen.
+/// The palette's shelves: the headings the parts are listed under, and so the order of the cells.
 ///
-/// Twenty-five cells in one wrapped grid is a wall. The eight materials that build the floor, the
-/// six ways a floor can hurt and the four things that patrol it are three different jobs, and a
-/// person holds one of them at a time — so the palette shows one shelf at a time and the tabs say
-/// which. That is the whole difference between a palette and a box of parts emptied onto a table.
+/// Twenty-six cells in one undifferentiated list is a wall, and the headings are what stops it being
+/// one. **They are a table of contents, not doors:** every shelf is on screen at once, under its own
+/// heading, and the finder narrows the whole list rather than asking a person to open five tabs in
+/// turn looking for a spiked ball.
 ///
-/// The shelves are grouped by **what a person is doing**, not by the simulator's taxonomy. Water
-/// sits with the traps because it kills by being fallen into; a rope sits with the platform and the
-/// flag because it is a way through the level; and the two cells that act on a cell rather than
-/// fill one keep a shelf of their own, because they are what a person reaches for while *fixing* a
-/// level rather than while building one.
+/// The shelves are cut by **what a part does to a body**, which is the question a person placing it
+/// is asking — not by where the part came from in the code, not by the simulator's taxonomy, and not
+/// by what it looks like. A cell is solid ground, or it kills on touch, or it changes how a body
+/// moves, or it is an agent that wants the body dead, or it marks where the level starts and ends
+/// (and the dressing does nothing at all), or it edits a cell instead of filling one. Two parts that
+/// behave alike are always on the same shelf, however differently they are built: the spiked ball is
+/// a hazard because contact kills, not because it hangs from a ceiling like the rope; the rope is a
+/// way through because a body swings on it; and the vine is a way through for the same reason it is
+/// one, even though it is a plant.
+///
+/// The rule is also the test (`a_part_is_shelved_with_the_parts_it_behaves_like`): the first cut had
+/// the spiked ball under the level's furniture with the flag and the rope under the hazards, so a
+/// person looking for "the thing that kills you" found half of them on each of two shelves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrushGroup {
     /// The floor and its materials, each with its brittle twin beside it.
     Ground,
-    /// The spikes, pads, liquids, climbables and one-ways: what a floor can be made of that hurts.
+    /// What kills on touch: the spikes, the lava, and the spiked ball. Nothing here needs a body to
+    /// make a mistake; being where it is is the mistake.
     Hazard,
+    /// What carries a body: the one-way ledge, the spring, the water, the vine, the rope and the
+    /// moving platform. Hurt none of them, and all of them are still a way through a level.
+    Traversal,
     /// The four things that move and want the body dead.
     Enemy,
-    /// Where the level starts, where it ends, and what carries you between the two.
-    World,
+    /// Where the level starts, where it ends, and the scenery that is only ever looked at.
+    Level,
     /// The two brushes that act on a cell rather than fill it.
     Clear,
 }
 
 impl BrushGroup {
-    /// Every shelf, in the order the palette's tabs draw them: the canvas is built from the ground
-    /// up, then made dangerous, then inhabited, then given a route and finally tidied.
-    pub const ALL: [BrushGroup; 5] = [
+    /// Every shelf, in the order the palette lists them: the canvas is built from the ground
+    /// up, then made dangerous, then given a way across, then inhabited, then marked and dressed,
+    /// and finally tidied.
+    pub const ALL: [BrushGroup; 6] = [
         BrushGroup::Ground,
         BrushGroup::Hazard,
+        BrushGroup::Traversal,
         BrushGroup::Enemy,
-        BrushGroup::World,
+        BrushGroup::Level,
         BrushGroup::Clear,
     ];
 
-    /// What the tab says. One word, because the tab is as wide as the word and five of them have
-    /// to fit a panel that is 190 points wide ([`crate::ui::icon_button`] widens a plate to its
-    /// caption, so a longer name is a wrapped row rather than a clipped one).
+    /// What the heading says. One word, because the heading shares its line with a count and every
+    /// one of them has to fit a panel that is 190 points wide.
     pub fn label(self) -> &'static str {
         match self {
             BrushGroup::Ground => "Ground",
             BrushGroup::Hazard => "Hazards",
+            BrushGroup::Traversal => "Traversal",
             BrushGroup::Enemy => "Enemies",
-            BrushGroup::World => "World",
+            BrushGroup::Level => "Level",
             BrushGroup::Clear => "Clear",
         }
     }
 
-    /// What is on this shelf, for the tab's hover: the sentence a one-word tab cannot hold.
+    /// What is on this shelf, for the heading's hover: the sentence a one-word heading cannot hold.
+    ///
+    /// Each one states the *rule* rather than listing the contents, because the rule is what tells a
+    /// person where the part they are imagining will be: "kills on touch" answers "where is the
+    /// spiked ball" without knowing the shelf's name.
     pub fn about(self) -> &'static str {
         match self {
             BrushGroup::Ground => "the floor: four materials, each with its brittle twin",
-            BrushGroup::Hazard => "spikes, pads, water, lava, vines and one-way ledges",
-            BrushGroup::Enemy => "walkers, chasers, flyers and turrets",
-            BrushGroup::World => "spawn, flag, moving platform, rope and scenery",
+            BrushGroup::Hazard => "what kills on touch: spikes, lava and the spiked ball",
+            BrushGroup::Traversal => {
+                "what carries a body: one-way ledge, spring, water, vine, rope, moving platform"
+            }
+            BrushGroup::Enemy => "the four agents that want the body dead: walkers, chasers, flyers, turrets",
+            BrushGroup::Level => "where it starts, where it ends, and the scenery that is only looked at",
             BrushGroup::Clear => "clear a cell, or erase what is on it",
         }
     }
 
-    /// The brushes on this shelf, in palette order.
+    /// The brushes on this shelf, in the heading's order.
     pub fn brushes(self) -> &'static [Brush] {
         match self {
             BrushGroup::Ground => &[
@@ -245,22 +274,17 @@ impl BrushGroup {
                 Brush::Plank,
                 Brush::CrackedPlank,
             ],
-            BrushGroup::Hazard => &[
-                Brush::Spike,
-                Brush::Spring,
+            BrushGroup::Hazard => &[Brush::Spike, Brush::Lava, Brush::SpikeBall],
+            BrushGroup::Traversal => &[
                 Brush::OneWay,
+                Brush::Spring,
                 Brush::Water,
-                Brush::Lava,
                 Brush::Vine,
+                Brush::Rope,
+                Brush::Platform,
             ],
             BrushGroup::Enemy => &[Brush::Walker, Brush::Chaser, Brush::Flyer, Brush::Turret],
-            BrushGroup::World => &[
-                Brush::Spawn,
-                Brush::Goal,
-                Brush::Platform,
-                Brush::Rope,
-                Brush::Scenery,
-            ],
+            BrushGroup::Level => &[Brush::Spawn, Brush::Goal, Brush::Scenery],
             BrushGroup::Clear => &[Brush::Empty, Brush::Erase],
         }
     }
@@ -331,19 +355,20 @@ impl Shape {
 }
 
 impl Brush {
-    /// Every brush, in the order the shelves were cut from them.
+    /// Every brush, in the order the shelves draw them.
     ///
-    /// **Test-only, and deliberately so.** The palette draws one [`BrushGroup`] at a time now, so
-    /// the shelves are the only ordering a running window has; this list is the *whole set*, which
-    /// is a question only the checks ask — that every brush has an icon, and that the shelves
-    /// partition them. A production constant nothing in production reads is a list that quietly
-    /// stops agreeing with the thing it claims to describe.
+    /// **Test-only, and deliberately so.** The palette draws the shelves' contents and never this
+    /// list, so the shelves are the only ordering a running window has; this list is the *whole
+    /// set*, which is a question only the checks ask — that every brush has an icon, and that the
+    /// shelves partition them. A production constant nothing in production reads is a list that
+    /// quietly stops agreeing with the thing it claims to describe.
     ///
-    /// The order is the old palette's: material, then *what that material's brittle self is*, all
-    /// the way down, because that is how a person reaches for `cracked` in the same glance they
-    /// found `ground` — which is why the shelves keep the pairs side by side.
+    /// Kept in shelf order rather than in the old palette's material order: two lists with two
+    /// orders is a second answer to "where does this part live", and the test that compares them
+    /// should be comparing one answer with itself.
     #[cfg(test)]
-    pub const ALL: [Brush; 25] = [
+    pub const ALL: [Brush; 26] = [
+        // Ground: each material's brittle twin beside it.
         Brush::Solid,
         Brush::Cracked,
         Brush::Sand,
@@ -352,22 +377,28 @@ impl Brush {
         Brush::CrackedBrick,
         Brush::Plank,
         Brush::CrackedPlank,
-        Brush::OneWay,
+        // Hazards: what kills on touch.
         Brush::Spike,
+        Brush::Lava,
+        Brush::SpikeBall,
+        // Traversal: what carries a body.
+        Brush::OneWay,
         Brush::Spring,
         Brush::Water,
-        Brush::Lava,
         Brush::Vine,
-        Brush::Scenery,
-        Brush::Empty,
-        Brush::Spawn,
-        Brush::Goal,
+        Brush::Rope,
+        Brush::Platform,
+        // Enemies.
         Brush::Walker,
         Brush::Chaser,
         Brush::Flyer,
         Brush::Turret,
-        Brush::Platform,
-        Brush::Rope,
+        // Level: start, finish, dressing.
+        Brush::Spawn,
+        Brush::Goal,
+        Brush::Scenery,
+        // Clear.
+        Brush::Empty,
         Brush::Erase,
     ];
 
@@ -386,16 +417,15 @@ impl Brush {
             | Brush::CrackedBrick
             | Brush::Plank
             | Brush::CrackedPlank => BrushGroup::Ground,
-            Brush::Spike
+            Brush::Spike | Brush::Lava | Brush::SpikeBall => BrushGroup::Hazard,
+            Brush::OneWay
             | Brush::Spring
-            | Brush::OneWay
             | Brush::Water
-            | Brush::Lava
-            | Brush::Vine => BrushGroup::Hazard,
+            | Brush::Vine
+            | Brush::Rope
+            | Brush::Platform => BrushGroup::Traversal,
             Brush::Walker | Brush::Chaser | Brush::Flyer | Brush::Turret => BrushGroup::Enemy,
-            Brush::Spawn | Brush::Goal | Brush::Platform | Brush::Rope | Brush::Scenery => {
-                BrushGroup::World
-            }
+            Brush::Spawn | Brush::Goal | Brush::Scenery => BrushGroup::Level,
             Brush::Empty | Brush::Erase => BrushGroup::Clear,
         }
     }
@@ -464,6 +494,9 @@ impl Brush {
             // the loop at its end, in the view's three shades), and a family of one in the atlas
             // for exactly this button.
             Brush::Rope => "rope",
+            // The ball's own sprite, the way the rope has one: a chain is a line the view draws,
+            // but the ball is a *thing*, and the palette has to show the thing that swings.
+            Brush::SpikeBall => "spike_ball",
             Brush::Erase => "walker_dead",
         }
     }
@@ -494,8 +527,64 @@ impl Brush {
             Brush::Turret => "turret",
             Brush::Platform => "move platform",
             Brush::Rope => "rope",
+            Brush::SpikeBall => "spike ball",
             Brush::Erase => "erase",
         }
+    }
+
+    /// **The words a person looks for this part with**, beyond the label and the sentence.
+    ///
+    /// A palette that can be searched is only as good as the words it is searched with, and the
+    /// words a designer reaches for are not always the ones this window chose: the thing that
+    /// swings is a *pendulum* as often as it is a spiked ball, a spring is a *trampoline* on the
+    /// afternoon somebody draws one, and the floor is *dirt* or *grass* depending on the level.
+    /// These are synonyms for the finder and nothing else — no label, no tooltip, no file — so a
+    /// wrong guess here costs a search result and never a level.
+    pub fn keywords(self) -> &'static str {
+        match self {
+            Brush::Solid => "ground grass dirt soil floor wall block",
+            Brush::Cracked => "brittle crumble break collapse crumbling",
+            Brush::Sand => "beach desert dune floor",
+            Brush::CrackedSand => "brittle crumble break beach desert",
+            Brush::Brick => "stone masonry wall block castle",
+            Brush::CrackedBrick => "brittle crumble break masonry wall",
+            Brush::Plank => "wood timber deck boards floor jetty",
+            Brush::CrackedPlank => "brittle crumble break deck timber",
+            Brush::OneWay => "shelf ledge platform deck",
+            Brush::Spike => "trap hazard lethal spikes thorns",
+            Brush::Spring => "trampoline bounce bouncepad pad launch jump",
+            Brush::Water => "pool liquid swim lake sea",
+            Brush::Lava => "fire molten hazard vent kill pool",
+            Brush::Vine => "climb rope plant ivy jungle",
+            Brush::Scenery => "decor decoration bush tree rock flower prop",
+            Brush::Spawn => "start player begin respawn",
+            Brush::Goal => "flag finish exit end win target",
+            Brush::Walker => "enemy patrol monster stomp goomba",
+            Brush::Chaser => "enemy hunt chase monster",
+            Brush::Flyer => "enemy flying bat bird",
+            Brush::Turret => "enemy gun shoot cannon fire",
+            Brush::Platform => "mover moving lift elevator shuttle",
+            Brush::Rope => "swing line hang grab pendulum vine",
+            Brush::SpikeBall => "ball chain pendulum trap hazard wrecking swing mace",
+            Brush::Empty => "clear air delete hole",
+            Brush::Erase => "delete remove eraser pick axe",
+        }
+    }
+
+    /// **Does this brush answer to `query`?**
+    ///
+    /// A part matches when every word of the query appears somewhere in its label, its sentence or
+    /// its [`Self::keywords`], so `cracked timber` finds the brittle plank and `trap` finds every
+    /// thing that kills by being touched. Case is folded and surrounding space is ignored; an empty
+    /// query matches everything, which is what makes clearing the field the way back to the whole
+    /// palette.
+    pub fn matches(self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        let hay = format!("{}\n{}\n{}", self.label(), self.about(), self.keywords()).to_lowercase();
+        query.split_whitespace().all(|term| hay.contains(term))
     }
 
     /// What this brush does, for the tooltip.
@@ -569,6 +658,13 @@ impl Brush {
                 a cell per row. Jump at it to catch the line, hold jump to hang on, and press a \
                 direction to pump the swing. Let go to fly off it with the arc's own speed."
             }
+            Brush::SpikeBall => {
+                "A spiked ball on a chain: hangs asleep until a body comes near, then swings. \n\
+                Click under a ceiling to hang it; drag down from the ball to lengthen the chain. \
+                The chain's length and the trigger's radius are the two numbers under the \
+                palette, and the ghost shows where the ball will hang. Contact kills — there is \
+                no stomping it."
+            }
             Brush::Erase => "Removes the entity under the cursor, then the tile.",
         }
     }
@@ -611,6 +707,17 @@ pub struct Editor {
     /// from the right is a different course from one that leaves. Kept across placements so a
     /// pair of shelves going the same way is one decision.
     pub platform_dir: i8,
+    /// How many tiles of chain a placed spiked ball hangs on, and how near a body has to come to
+    /// wake it.
+    ///
+    /// The loader's own defaults ([`sim::level::DEFAULT_SPIKE_BALL_TILES`],
+    /// [`sim::level::DEFAULT_SPIKE_BALL_REACH`]), for [`Self::enemy_span`]'s reason: a ball placed
+    /// in the window and one written by hand are the same hazard, and the two numbers should not
+    /// depend on who wrote the level. Kept as a pair because they are the ball's two design
+    /// decisions — how wide the arc is, and how much warning the body gets — and a person tuning
+    /// one is looking at the other.
+    pub spike_ball_length: i32,
+    pub spike_ball_reach: i32,
 
     /// How a drag lays tiles down: freehand, a rectangle or a line.
     pub shape: Shape,
@@ -665,6 +772,8 @@ impl Editor {
             platform_tiles: sim::level::DEFAULT_PLATFORM_TILES,
             platform_vertical: false,
             platform_dir: 1,
+            spike_ball_length: sim::level::DEFAULT_SPIKE_BALL_TILES,
+            spike_ball_reach: sim::level::DEFAULT_SPIKE_BALL_REACH,
             shape: Shape::Free,
             line: false,
             shape_anchor: None,
@@ -758,10 +867,37 @@ impl Editor {
             Brush::Turret => self.level.turret_placeable(tx, ty),
             Brush::Platform => self.level.platform_placeable(tx, ty, self.platform_tiles),
             Brush::Rope => self.level.rope_cell_placeable(tx, ty),
+            Brush::SpikeBall => self.level.spike_ball_cell_placeable(tx, ty),
             Brush::Scenery => self.level.scenery_placeable(self.scene_sprite, tx, ty),
             Brush::Goal => self.level.goal_placeable(tx, ty),
             _ => true,
         }
+    }
+
+    /// Where the spiked-ball brush would put its **ball** if it were clicked at `(tx, ty)`.
+    ///
+    /// The click is the chain's first cell, so the ball lands a chain-length below it — four tiles
+    /// on the default, shortened to the room there is. The drop ghost asks this so it can promise
+    /// the hazard that will exist rather than the tile under the pointer, the same way the
+    /// platform's ghost draws the whole shelf instead of one cell of it.
+    ///
+    /// Returns `None` when the cell is refused, which is what colours the ghost's outline bad.
+    pub fn spike_ball_drop(&self, tx: i32, ty: i32) -> Option<(i32, i32)> {
+        if !self.can_place(Brush::SpikeBall, tx, ty) {
+            return None;
+        }
+        // A cell under a hanging chain lengthens that chain: the ball moves one row down.
+        if self
+            .level
+            .spike_balls
+            .iter()
+            .any(|b| b.col == tx && ty == b.last_row() + 1)
+        {
+            return Some((tx, ty));
+        }
+        let room = (self.level.height - ty - 1).max(1);
+        let length = self.spike_ball_length.max(1).min(room);
+        Some((tx, ty + length))
     }
 
     /// Apply the active brush at a tile. Returns whether the document changed.
@@ -1007,6 +1143,20 @@ impl Editor {
                 }
                 self.level.add_rope_cell(tx, ty)
             }
+            Brush::SpikeBall => {
+                if !self.can_place(Brush::SpikeBall, tx, ty) {
+                    self.message =
+                        "a spiked ball needs a ceiling, air to hang through and room below"
+                            .to_string();
+                    return false;
+                }
+                self.level.add_spike_ball_cell(
+                    tx,
+                    ty,
+                    self.spike_ball_length,
+                    self.spike_ball_reach,
+                )
+            }
             Brush::Scenery => {
                 if !self.can_place(Brush::Scenery, tx, ty) {
                     self.message =
@@ -1116,6 +1266,19 @@ impl Editor {
                 self.brush = Some(Brush::Platform);
             }
             Some("rope") => self.brush = Some(Brush::Rope),
+            Some("spiked_ball") => {
+                // A pick brings the ball's own numbers, like a turret's facing or a platform's
+                // width: placing a second one should swing the way the first one did.
+                if let Some(i) = self.level.spike_balls.iter().position(|b| {
+                    b.col == tx && (b.row..=b.last_row()).contains(&ty)
+                }) {
+                    if let Some(b) = self.level.spike_balls.get(i) {
+                        self.spike_ball_length = b.length.round().max(1.0) as i32;
+                        self.spike_ball_reach = b.reach.round().max(1.0) as i32;
+                    }
+                }
+                self.brush = Some(Brush::SpikeBall);
+            }
             Some("chaser") => self.brush = Some(Brush::Chaser),
             Some("walker") => self.brush = Some(Brush::Walker),
             _ => {}
@@ -2522,11 +2685,242 @@ mod tests {
         assert_eq!(ed.brush, Some(Brush::Rope));
     }
 
+    /// **The brush's two numbers are the ball's own, and a pick adopts them.**
+    ///
+    /// A ball is a shape, not a cell: the chain sets the radius of the arc and the trigger sets
+    /// how much warning a body gets, so both are properties of the *brush* the way a platform's
+    /// width is. Placing a second ball should swing like the first one, which is what the pick
+    /// half of this test says.
+    #[test]
+    fn the_spiked_ball_brush_places_the_chain_and_trigger_it_carries() {
+        let mut ed = doc();
+        for tx in 0..40 {
+            ed.level.set_tile(tx, 2, Tile::Solid);
+        }
+        ed.spike_ball_length = 2;
+        ed.spike_ball_reach = 8;
+        ed.brush = Some(Brush::SpikeBall);
+        ed.begin_stroke();
+        assert!(ed.paint(8, 3));
+        ed.end_stroke();
+
+        let ball = ed.level.spike_balls[0];
+        assert_eq!(ball.length, 2.0, "the chain is the number that was set");
+        assert_eq!(ball.reach, 8.0, "and so is the trigger");
+        assert_eq!(
+            ed.spike_ball_drop(8, 3),
+            Some((8, 5)),
+            "the ghost promises the shorter chain the stepper would hang"
+        );
+
+        // A pick brings the numbers it found, so a row of balls is one decision.
+        ed.spike_ball_length = 4;
+        ed.spike_ball_reach = 3;
+        ed.brush = Some(Brush::Erase);
+        assert!(ed.pick_at(8, 5), "the ball is picked where it is drawn");
+        assert_eq!(ed.brush, Some(Brush::SpikeBall));
+        assert_eq!(ed.spike_ball_length, 2, "the pick adopts the chain");
+        assert_eq!(ed.spike_ball_reach, 8, "and the trigger");
+    }
+
+    /// **A spiked ball is stamped whole, and a drag down grows its chain.**
+    ///
+    /// The one way the brush differs from the rope beside it: a click is a *ball*, not a cell, so
+    /// a person gets something that swings without having to drag four rows first. Everything
+    /// below the ball belongs to it, so the next cell down lengthens that chain rather than
+    /// stacking a second ball on top of the first, and the eraser takes the ball from the cell it
+    /// is drawn in rather than from the tie above it.
+    #[test]
+    fn the_spiked_ball_brush_hangs_one_ball_and_grows_its_chain() {
+        let mut ed = doc();
+        for tx in 0..40 {
+            ed.level.set_tile(tx, 2, Tile::Solid);
+        }
+        ed.brush = Some(Brush::SpikeBall);
+
+        ed.begin_stroke();
+        assert!(ed.paint(8, 3));
+        ed.end_stroke();
+        assert_eq!(ed.level.spike_balls.len(), 1);
+        let placed = ed.level.spike_balls[0];
+        assert_eq!((placed.col, placed.row), (8, 3));
+        assert_eq!(
+            placed.length,
+            sim::level::DEFAULT_SPIKE_BALL_TILES as f32,
+            "a click hangs the default chain, not a one-tile hinge"
+        );
+        assert_eq!(
+            placed.reach,
+            sim::level::DEFAULT_SPIKE_BALL_REACH as f32,
+            "the trigger is the loader's own number, not a second one"
+        );
+        assert_eq!(
+            placed.anchor(),
+            (8.5, 3.0),
+            "tied to the underside of the ceiling"
+        );
+        assert_eq!(
+            ed.spike_ball_drop(8, 3),
+            Some((8, 3 + placed.length as i32)),
+            "the ghost promises the ball at the end of the chain, not at the pointer"
+        );
+
+        // The cell below the ball is a longer chain, not a second ball.
+        let below = placed.last_row() + 1;
+        ed.begin_stroke();
+        assert!(ed.paint(8, below));
+        ed.end_stroke();
+        assert_eq!(ed.level.spike_balls.len(), 1, "one ball, not two");
+        assert_eq!(ed.level.spike_balls[0].length, placed.length + 1.0);
+        assert_eq!(
+            ed.spike_ball_drop(8, below + 1),
+            Some((8, below + 1)),
+            "and the ghost moves the ball down with the chain it is growing"
+        );
+        assert_eq!(
+            ed.spike_ball_drop(8, below),
+            None,
+            "the cell the ball now hangs in is part of the chain, not a new one"
+        );
+
+        // A cell in the middle of the chain is the ball already: refused, and said so.
+        assert!(!ed.can_place(Brush::SpikeBall, 8, 5));
+        ed.begin_stroke();
+        assert!(!ed.paint(8, 5));
+        ed.end_stroke();
+        assert_eq!(ed.level.spike_balls[0].length, placed.length + 1.0);
+
+        // Without a ceiling there is nothing to tie the pendulum to.
+        assert_eq!(ed.spike_ball_drop(30, 6), None, "a refused drop has no ball");
+        assert!(!ed.can_place(Brush::SpikeBall, 30, 6));
+        ed.begin_stroke();
+        assert!(!ed.paint(30, 6));
+        ed.end_stroke();
+        assert!(ed.message.contains("ceiling"), "{:?}", ed.message);
+
+        // A ball is erased from the cell it is drawn in, and picked from the same place.
+        let ball = ed.level.spike_balls[0];
+        ed.brush = Some(Brush::Erase);
+        assert!(ed.paint(ball.col, ball.last_row()));
+        assert!(ed.level.spike_balls.is_empty());
+
+        ed.brush = Some(Brush::SpikeBall);
+        ed.begin_stroke();
+        assert!(ed.paint(8, 3));
+        ed.end_stroke();
+        ed.brush = Some(Brush::Erase);
+        assert!(ed.pick_at(8, 3 + 2), "the chain hangs, so the mid-cell picks it");
+        assert_eq!(ed.brush, Some(Brush::SpikeBall));
+    }
+
+    /// **The finder's rules: every word, either case, and nothing asked is everything shown.**
+    ///
+    /// One `contains` would pass the palette's frame test and still fail a person: "cracked
+    /// timber" has to be the one part whose name is both words (timber alone is its neighbour), a
+    /// capital has to be the same letter as a lowercase one, and an emptied field has to be the
+    /// whole palette — otherwise clearing a search leaves a box with nothing in it.
+    #[test]
+    fn a_search_matches_every_word_in_any_case() {
+        assert!(Brush::Solid.matches(""), "an empty search is everything");
+        assert!(Brush::Solid.matches("  \t "), "and so is one of spaces");
+        assert!(Brush::Plank.matches("TIMBER"), "case is folded");
+        assert!(
+            Brush::Plank.matches("  timber  "),
+            "space around the word is ignored"
+        );
+        assert!(
+            Brush::CrackedPlank.matches("cracked timber"),
+            "two words, both in the name"
+        );
+        assert!(
+            !Brush::Plank.matches("cracked timber"),
+            "every word has to land: timber is a plank, but not a cracked one"
+        );
+        assert!(
+            !Brush::Solid.matches("brittle"),
+            "a part does not answer a word that belongs to its neighbour"
+        );
+        assert!(
+            Brush::SpikeBall.matches("pendulum"),
+            "a synonym finds the part whose label never uses it"
+        );
+        // Every part answers its own name, which is the one promise a finder cannot break.
+        for brush in Brush::ALL {
+            assert!(
+                brush.matches(brush.label()),
+                "{} does not find itself",
+                brush.label()
+            );
+        }
+    }
+
+    /// **A part is shelved with the parts it behaves like.**
+    ///
+    /// The report that produced this shelf cut: the spiked ball was filed under World with the
+    /// flag, while the vine was filed under Hazards with the spikes — a hazard with the furniture
+    /// and a climbable with the traps, so at most one of the two could be right. A shelf is a claim
+    /// about what a part *does*, and these are the claims written down. They are asserted as a list
+    /// rather than derived from the physics because the physics has no field for "a way through" —
+    /// what it can hold is that the parts a person compares sit together.
+    #[test]
+    fn a_part_is_shelved_with_the_parts_it_behaves_like() {
+        // Contact kills. The ball's chain and its ceiling are how it is built, not what it is for.
+        for brush in [Brush::Spike, Brush::Lava, Brush::SpikeBall] {
+            assert_eq!(
+                brush.group(),
+                BrushGroup::Hazard,
+                "{} ends the run on touch, so it is a hazard",
+                brush.label()
+            );
+        }
+        // Nothing harmless keeps them company, whatever material or element it is made of.
+        for brush in [
+            Brush::OneWay,
+            Brush::Spring,
+            Brush::Water,
+            Brush::Vine,
+            Brush::Rope,
+            Brush::Platform,
+        ] {
+            assert_eq!(
+                brush.group(),
+                BrushGroup::Traversal,
+                "{} hurts nothing, so it is a way through, not a hazard",
+                brush.label()
+            );
+        }
+        // The level's marks sit with its dressing: neither is ever in the body's way.
+        for brush in [Brush::Spawn, Brush::Goal, Brush::Scenery] {
+            assert_eq!(
+                brush.group(),
+                BrushGroup::Level,
+                "{} is set-up rather than an obstacle",
+                brush.label()
+            );
+        }
+        // And the agents are one shelf and only one: every brush that moves and wants the body
+        // dead is filed as an enemy, and nothing else is.
+        for brush in Brush::ALL {
+            let agent = matches!(
+                brush,
+                Brush::Walker | Brush::Chaser | Brush::Flyer | Brush::Turret
+            );
+            assert_eq!(
+                brush.group() == BrushGroup::Enemy,
+                agent,
+                "{} is {} agent, so it {} on the enemies' shelf",
+                brush.label(),
+                if agent { "an" } else { "not an" },
+                if agent { "belongs" } else { "does not belong" }
+            );
+        }
+    }
+
     /// **Every brush is on exactly one shelf, and the shelves are the whole palette.**
     ///
     /// A brush missing from every shelf is a tool nobody can pick up; one on two shelves is the
     /// same cell drawn twice; and a shelf whose contents disagree with [`Brush::group`] is a
-    /// palette that puts a click somewhere other than where the tab says. The three are one
+    /// palette that files a part somewhere other than where [`Brush::group`] says. The three are one
     /// assertion because they are one fact: the shelves partition the brushes.
     #[test]
     fn every_brush_is_on_exactly_one_shelf() {
@@ -2534,7 +2928,7 @@ mod tests {
         for group in BrushGroup::ALL {
             assert!(
                 !group.brushes().is_empty(),
-                "{group:?} is a tab with nothing behind it"
+                "{group:?} is a heading with nothing under it"
             );
             for brush in group.brushes() {
                 assert_eq!(

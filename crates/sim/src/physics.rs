@@ -349,6 +349,26 @@ pub struct Physics {
     /// Three quarters of a tile is close to the body's own height and keeps the constraint's
     /// arithmetic away from a degenerate radius.
     pub rope_min_length: f32,
+
+    // ---- the spiked ball -------------------------------------------------
+    /// The ball's hitbox: a touch smaller than a tile, so it has to *reach* a body rather than
+    /// merely share its cell. The art fills the cell, so the box is what a player can see coming.
+    pub spike_ball_w: f32,
+    pub spike_ball_h: f32,
+    /// The tangential speed the ball is woken with, tiles/tick.
+    ///
+    /// This is the swing's whole energy budget: `v²/(2g)` is the height it climbs, so 0.22
+    /// against gravity 0.0125 lifts it 1.94 tiles — a chain-length-dependent amplitude of about
+    /// 59° on the four-tile default, or 2.3 tiles to either side of the anchor. Faster than a
+    /// run (0.10) at the bottom of the arc, which is what makes crossing under one a timing
+    /// decision rather than a walk.
+    pub spike_ball_kick: f32,
+    /// Share of the ball's speed that survives each tick: a little air and a little friction.
+    ///
+    /// 0.9995 is 3% a second, so a triggered ball keeps sweeping for half a minute instead of
+    /// hanging dead two swings later — long enough for a body that backed off to meet it again,
+    /// short enough that it eventually settles.
+    pub spike_ball_drag: f32,
 }
 
 pub const PHYSICS: Physics = Physics {
@@ -427,6 +447,13 @@ pub const PHYSICS: Physics = Physics {
     // A ball's arc is ~40 ticks; 150 is the backstop for a vent that has been buried by a
     // bridge since it fired.
     lava_ticks: 150,
+
+    // The ball is most of a tile across, so the hazard the player sees is the box that kills
+    // them. `kick` and `drag` are the pendulum's own numbers; see their fields.
+    spike_ball_w: 0.85,
+    spike_ball_h: 0.85,
+    spike_ball_kick: 0.22,
+    spike_ball_drag: 0.9995,
     // Under `run_accel` on purpose: a pendulum has a whole arc to be pushed along.
     rope_pump: 0.008,
     // A hand's reach, not a box: a jump that misses the line by half a tile misses it.
@@ -2586,6 +2613,133 @@ impl Mover {
         h.f32(self.span);
         h.u8(self.vertical as u8);
         h.i8(self.dir);
+    }
+}
+
+/// A spiked ball on a chain: a pendulum that hangs still until a body comes near it.
+///
+/// It is simulated as a **point mass on an inextensible line**, the same model the rope uses for
+/// a body's swing ([`RopeGrip`]) and for the same reasons: the constraint is a projection rather
+/// than a spring, the position is carried in Cartesian coordinates, and there is no `sin`/`cos`
+/// anywhere — a pendulum integrated like this is a square root and four multiplies a tick, and it
+/// is deterministic on every build. The one difference is that the mass is the *hazard*, not a
+/// body: nothing pumps it, nothing can grab it, and its whole state is where it is and how fast.
+///
+/// **Still until woken.** A ball is placed hanging straight down and does not move until a body's
+/// centre comes within its authored reach. Being woken is one way — the trigger latches for the
+/// episode — because a trap that re-arms the moment a body steps back is a door that closes
+/// again, and because a phase that resets on proximity would make the same level play differently
+/// every time the body crossed the edge of the circle.
+///
+/// **The first shove is away from the body.** Waking it into the body's side would be a hazard
+/// that kills on the trigger tick, which is a spike with a longer animation; shoving it away
+/// makes the trigger a *wind-up*, and the ball comes back through the spot the body is heading
+/// for with about a second of warning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpikeBall {
+    pub id: u32,
+    /// The pivot: the middle of the underside of the ceiling tile.
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+    /// The radius of the arc, in tiles.
+    pub length: f32,
+    /// How close a body has to come to the resting ball to wake it, in tiles.
+    pub reach: f32,
+    /// The ball's centre, in world tiles.
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    /// Whether the trigger has fired. Latched for the episode.
+    pub swinging: bool,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl SpikeBall {
+    /// A ball hanging still at the end of its chain.
+    pub fn new(id: u32, spec: crate::level::SpikeBallSpec, ph: &Physics) -> SpikeBall {
+        let (ax, ay) = spec.anchor();
+        SpikeBall {
+            id,
+            anchor_x: ax,
+            anchor_y: ay,
+            length: spec.length,
+            reach: spec.reach,
+            x: ax,
+            y: ay + spec.length,
+            vx: 0.0,
+            vy: 0.0,
+            swinging: false,
+            w: ph.spike_ball_w,
+            h: ph.spike_ball_h,
+        }
+    }
+
+    pub fn aabb(&self) -> Rect {
+        Rect::new(
+            self.x - self.w * 0.5,
+            self.y - self.h * 0.5,
+            self.w,
+            self.h,
+        )
+    }
+
+    /// One tick: wake if the body is near, then move the pendulum.
+    ///
+    /// The trigger is tested against the **resting** ball rather than the moving one: the thing a
+    /// body approaches is where the ball hangs, and a trigger that chased the ball would make the
+    /// range depend on how hard it was already swinging.
+    pub fn tick(&mut self, body: Rect, ph: &Physics) {
+        if !self.swinging {
+            let (rx, ry) = (self.anchor_x, self.anchor_y + self.length);
+            let (bx, by) = body.center();
+            let dx = bx - rx;
+            let dy = by - ry;
+            if dx * dx + dy * dy > self.reach * self.reach {
+                return;
+            }
+            self.swinging = true;
+            // Away from the body: the ball climbs the far side, then returns through the arc.
+            self.vx = if bx < self.anchor_x {
+                ph.spike_ball_kick
+            } else {
+                -ph.spike_ball_kick
+            };
+            self.vy = 0.0;
+            return;
+        }
+
+        let drag = ph.spike_ball_drag.clamp(0.0, 1.0);
+        self.vx *= drag;
+        self.vy = (self.vy + ph.gravity) * drag;
+        self.x += self.vx;
+        self.y += self.vy;
+
+        // The line can pull but never push: put the mass back on the circle and take the radial
+        // part of its velocity away. Doing it as a projection is why the swing cannot explode —
+        // the error is one tick deep however fast the arc is.
+        let dx = self.x - self.anchor_x;
+        let dy = self.y - self.anchor_y;
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist > 1.0e-6 {
+            let ux = dx / dist;
+            let uy = dy / dist;
+            self.x = self.anchor_x + ux * self.length;
+            self.y = self.anchor_y + uy * self.length;
+            let radial = self.vx * ux + self.vy * uy;
+            self.vx -= radial * ux;
+            self.vy -= radial * uy;
+        }
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.u32(self.id);
+        h.f32(self.x);
+        h.f32(self.y);
+        h.f32(self.vx);
+        h.f32(self.vy);
+        h.u8(self.swinging as u8);
     }
 }
 

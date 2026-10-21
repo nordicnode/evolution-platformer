@@ -241,7 +241,14 @@ impl Default for ReachOptions {
 /// same way a jump that grabs a vine is a climb). No terrain rule changed; what changed is that a
 /// level whose only crossing is a rope is no longer answered "unbeatable", so every cached verdict
 /// and route graph from v10 is a miss.
-pub const MOVE_SET_VERSION: u32 = 11;
+/// v12: **a spiked ball's resting box is a hazard a move cannot start inside or pass through.** The
+/// sweep now refuses a take-off inside the ball and ends a trajectory that overlaps it, because the
+/// ball is lethal whether or not it has been woken, and the one box the oracle can be certain about
+/// is the one the ball hangs in before anything comes near. What it deliberately does *not* model is
+/// the trigger and the arc: a pendulum's phase is the body's, so a route planned around a swing
+/// could only be right on the episode it was planned for. No canonical move changed; what a level
+/// with a ball in it answers did, so every cached verdict and route graph from v11 is a miss.
+pub const MOVE_SET_VERSION: u32 = 12;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -999,7 +1006,7 @@ fn hazard_start(level: &Level, player: &PlayerState) -> Option<Trajectory> {
                 || (level.is_lava(tx, ty)
                     && body.overlaps(&crate::level::Rect::new(tx as f32, ty as f32, 1.0, 1.0)))
         })
-    });
+    }) || inside_spike_ball(level, &body);
     inside.then_some(Trajectory {
         landed_on: None,
         landed_at: None,
@@ -1008,6 +1015,22 @@ fn hazard_start(level: &Level, player: &PlayerState) -> Option<Trajectory> {
         fell_out: false,
         ticks: 0,
     })
+}
+
+/// **Is this body inside a spiked ball's resting box?**
+///
+/// The oracle's model of the pendulum, and it is deliberately only the ball: the trigger and the
+/// swing are a *phase*, and a trajectory that planned around one could only be right on the
+/// episode it was planned for. What a route can be held to is the ball's **rest** — the box it
+/// hangs in before anything comes near, which is the box a body walking underneath meets — so the
+/// sweep treats that as the lethal cell it is and leaves the arc to the player. The alternative
+/// (ignoring the hazard between take-off and landing) would hand the planner a route straight
+/// through the one thing the level was built around.
+pub fn inside_spike_ball(level: &Level, body: &crate::level::Rect) -> bool {
+    level
+        .spike_balls
+        .iter()
+        .any(|b| body.overlaps(&b.rest_box()))
 }
 
 /// The ways a trajectory can end other than by landing: hazard, flag, or the void.
@@ -1021,7 +1044,7 @@ fn trajectory_terminal(
     contact: &crate::physics::TickContact,
     ticks: u32,
 ) -> Option<Trajectory> {
-    if contact.touched_spike || contact.touched_lava {
+    if contact.touched_spike || contact.touched_lava || inside_spike_ball(level, &player.aabb()) {
         return Some(Trajectory {
             landed_on: None,
             landed_at: None,

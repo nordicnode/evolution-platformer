@@ -1,6 +1,6 @@
 {
   "format": "evo-platformer-level",
-  "level_format_version": 4,
+  "level_format_version": 5,
   "name": "P04 crumble tier 0 (suite v1)",
   "width": 64,
   "height": 15,
