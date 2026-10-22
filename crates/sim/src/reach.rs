@@ -248,7 +248,19 @@ impl Default for ReachOptions {
 /// the trigger and the arc: a pendulum's phase is the body's, so a route planned around a swing
 /// could only be right on the episode it was planned for. No canonical move changed; what a level
 /// with a ball in it answers did, so every cached verdict and route graph from v11 is a miss.
-pub const MOVE_SET_VERSION: u32 = 12;
+/// v13: **a falling trap's column is a hazard a move cannot start inside or pass through.** The
+/// band its body can occupy is where the trap certainly can be, so a stand under one is not a
+/// stand the route graph will walk through, and a trajectory that enters the band ends there —
+/// the spiked ball's rule (v12) applied to a machine. **Its limit is the spike's:** a platform is a
+/// run of the tile grid, so a floor under a trap stays one platform and a jump that *clears* the
+/// band from a take-off outside it is still reported.
+///
+/// v14: **the press became a rock, and the band is read from the floor instead of the file.** A
+/// press's stroke was authored (its `span`); a boulder falls under gravity to the first solid row
+/// under it, so the band runs from its socket to that floor and a rock over a pit runs to the
+/// bottom of the level. No canonical move changed; what a level with one in it answers did, so
+/// every cached verdict and route graph from v13 is a miss.
+pub const MOVE_SET_VERSION: u32 = 14;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -812,8 +824,9 @@ fn oracle_tick(
     player: &mut PlayerState,
     action: AgentAction,
     options: ReachOptions,
+    solids: &[Rect],
 ) -> (TickContact, bool) {
-    let contact = player.tick(level, &PHYSICS, action);
+    let contact = player.tick(level, &PHYSICS, action, solids);
     let launched = options.spring && crate::physics::spring_launch(level, player, &PHYSICS);
     (contact, launched)
 }
@@ -876,9 +889,12 @@ fn simulate_jump_with(
     // during the ticks it takes to clear the edge.
     let mut airborne = false;
     let mut prev_feet = player.y + player.h;
+    // The crates the file puts on the level, as the boxes the body collides with. The
+    // oracle cannot push one, so it models the authored position: see `Level::block_rects`.
+    let solids = level.block_rects();
     for t in 0..MAX_TRAJECTORY_TICKS {
         let action = trajectory_action(takeoff, hover, t, ph);
-        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options, &solids);
         let feet = player.y + player.h;
         // A pad's throw is not a button, so there is nothing left to hold: `bounce` spends the jump
         // cut, and a trajectory that went on claiming a held jump would be asking for an action the
@@ -1006,7 +1022,8 @@ fn hazard_start(level: &Level, player: &PlayerState) -> Option<Trajectory> {
                 || (level.is_lava(tx, ty)
                     && body.overlaps(&crate::level::Rect::new(tx as f32, ty as f32, 1.0, 1.0)))
         })
-    }) || inside_spike_ball(level, &body);
+    }) || inside_spike_ball(level, &body)
+        || inside_rock(level, &body);
     inside.then_some(Trajectory {
         landed_on: None,
         landed_at: None,
@@ -1033,6 +1050,20 @@ pub fn inside_spike_ball(level: &Level, body: &crate::level::Rect) -> bool {
         .any(|b| body.overlaps(&b.rest_box()))
 }
 
+/// **Is this body inside the band a rock falls through?**
+///
+/// The spiked ball's model for a trap: the rock's fall is not terrain, so the oracle takes the one
+/// box it can be certain about — everything the rock can occupy, from its socket to the floor
+/// under it — and calls all of it lethal. The alternative would plan a walk through the column on
+/// the strength of the rock still hanging, and hand the planner a route that is a coin flip in a
+/// *real* episode (where the body's own approach is what releases it).
+///
+/// The band is a fact about the level's neighbourhood, not about a sim, so the editor asks this
+/// question about a document as well as a run: [`crate::level::RockSpec::band`].
+pub fn inside_rock(level: &Level, body: &crate::level::Rect) -> bool {
+    level.rocks.iter().any(|r| body.overlaps(&r.band(level)))
+}
+
 /// The ways a trajectory can end other than by landing: hazard, flag, or the void.
 ///
 /// Shared by the jump and the wall climb so the two cannot disagree about what stops a
@@ -1044,7 +1075,11 @@ fn trajectory_terminal(
     contact: &crate::physics::TickContact,
     ticks: u32,
 ) -> Option<Trajectory> {
-    if contact.touched_spike || contact.touched_lava || inside_spike_ball(level, &player.aabb()) {
+    if contact.touched_spike
+        || contact.touched_lava
+        || inside_spike_ball(level, &player.aabb())
+        || inside_rock(level, &player.aabb())
+    {
         return Some(Trajectory {
             landed_on: None,
             landed_at: None,
@@ -1138,9 +1173,12 @@ fn simulate_wall_climb_with(
     }
 
     let mut airborne = false;
+    // The crates the file puts on the level, as the boxes the body collides with. The
+    // oracle cannot push one, so it models the authored position: see `Level::block_rects`.
+    let solids = level.block_rects();
     for t in 0..MAX_CLIMB_TICKS {
         let action = climb_action(dir, t, ph);
-        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options, &solids);
         if !player.grounded {
             airborne = true;
         }
@@ -1349,9 +1387,12 @@ fn simulate_swim_with(
 
     let mut airborne = false;
     let mut entered_water = false;
+    // The crates the file puts on the level, as the boxes the body collides with. The
+    // oracle cannot push one, so it models the authored position: see `Level::block_rects`.
+    let solids = level.block_rects();
     for t in 0..MAX_SWIM_TICKS {
         let action = swim_action(dir, dive, player.in_water, t);
-        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options, &solids);
         if player.in_water {
             entered_water = true;
         }
@@ -1520,10 +1561,13 @@ fn simulate_vine_climb_with(
 
     let mut airborne = false;
     let mut exiting = false;
+    // The crates the file puts on the level, as the boxes the body collides with. The
+    // oracle cannot push one, so it models the authored position: see `Level::block_rects`.
+    let solids = level.block_rects();
     for t in 0..MAX_CLIMB_TICKS {
         let feet = player.y + player.h;
         let action = vine_action(exit, player.on_vine, feet, top_row, &mut exiting);
-        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options, &solids);
         if !player.grounded {
             airborne = true;
         }
@@ -1689,10 +1733,13 @@ fn simulate_rope_swing_with(
     let mut caught = false;
     let mut airborne = false;
     let mut prev_feet = player.y + player.h;
+    // The crates the file puts on the level, as the boxes the body collides with. The
+    // oracle cannot push one, so it models the authored position: see `Level::block_rects`.
+    let solids = level.block_rects();
     for t in 0..MAX_ROPE_TICKS {
         let on_rope = player.on_rope();
         let action = script.action(dir, on_rope, release);
-        let (contact, launched) = oracle_tick(level, &mut player, action, options);
+        let (contact, launched) = oracle_tick(level, &mut player, action, options, &solids);
         if player.on_rope() {
             caught = true;
         }

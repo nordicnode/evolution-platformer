@@ -86,6 +86,22 @@ guides are one key), undo/redo, eyedropper, line and
   comes near, and then swings. The pendulum is the same constraint physics the rope
   uses, the trigger is the wind-up rather than the blow, and the ball is a hitbox the
   whole way through its arc — there is no stomping it, only being somewhere else.
+- **Belts:** a floor that moves what stands on it, `>` and `<` in the level file, and it
+  does not care what that is: a body walks on, a crate rides. The carry is a translation
+  rather than a force, so a belt changes a jump's *reach* without changing the jump, and a
+  body in the air over one is not carried at all — the tile is a floor with a direction,
+  not a current.
+- **Rocks:** a boulder hung in a socket under a ceiling. A body that comes near wakes it,
+  it shudders for half a second and falls once — under the same gravity a crate falls
+  under — and then it is spent. A falling rock crushes; a settled one is a one-tile step,
+  so the answer is to back off and let it come down, and the corridor it blocked is a
+  corridor with a ledge in it. There is no clock and no second fall: the level really has
+  changed by the time you get there.
+- **Crates:** a one-tile solid a body can stand on and, by walking into it, shove along at
+  walking pace — the first thing in the pack a body can *move*. It falls if it is pushed off
+  an edge, stops flush at a wall or another crate, and stays where it was left — unless it was
+  left on a belt, which carries it away at the belt's pace with whatever is riding on top. In
+  the level file it is one `block` entity, and the sensors read it as the ground it is.
 - **A physics engine of its own** (`crates/dynamics`): point masses, rigid
   links, ropes, gravity and tile collision, stepped one deterministic tick at a
   time. The rope you see is a world in it — a pinned tie, a chain of links and a

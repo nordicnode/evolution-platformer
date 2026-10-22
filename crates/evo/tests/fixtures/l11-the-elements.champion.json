@@ -2257,7 +2257,7 @@
     "genome_id": 1,
     "level_name": "L11-the-elements",
     "level_hash": "fnv1a64:6ffbb73687a02bde",
-    "level_format_version": 5,
+    "level_format_version": 6,
     "sim_version": "0.18.0",
     "sensor_version": 15,
     "fitness_version": 9,

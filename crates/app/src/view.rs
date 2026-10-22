@@ -1455,6 +1455,22 @@ fn hangs_from_ceiling(sprite: &str) -> bool {
 /// at, and not the cell above: a tree at [`TREE_SIZE`] grows past the cell it stands in, and
 /// the two halves only meet if the one is placed off the other. Cell-relative halves were
 /// right while every prop was one cell and are the first thing to break when one is not.
+/// Does this hashed prop grow through a **thing the level put there**?
+///
+/// A hashed prop is dressing placed by a hash of its surface tile, and the hash knows about
+/// terrain and nothing else — so a tree can choose a column a rock hangs over, and a tree drawn
+/// through a boulder is a boulder hidden inside a tree. The prop's own cells are what matter: a
+/// tree is [`Prop::size`] tiles up plus its crown, and the check walks exactly those.
+///
+/// Entities only. A prop under a low ceiling still draws through it, which is the older, separate
+/// question of headroom and not this one: a bush in a one-tile alcove is dressing that fits an
+/// alcove, and a tree that meets a bridge is a tree drawn too tall for its room.
+fn prop_covers_entity(level: &Level, prop: &Prop) -> bool {
+    let steps = prop.size.ceil() as i32 + i32::from(prop.crown.is_some());
+    let dir = if prop.hangs { 1 } else { -1 };
+    (0..steps).any(|i| level.enemy_at(prop.cell.0, prop.cell.1 + dir * i).is_some())
+}
+
 fn draw_prop(sheet: Sheet<'_>, level: &Level, prop: &Prop) {
     let cell = sheet.tile(prop.cell.0, prop.cell.1);
     // Whole points, like every other sprite in the view: a prop drawn at 22.4 points a side
@@ -3106,13 +3122,7 @@ fn draw_spike_balls(sheet: Sheet<'_>, level: &Level, balls: Option<&[sim::SpikeB
     match balls {
         Some(balls) => {
             for b in balls {
-                draw_spike_ball(
-                    sheet,
-                    (b.anchor_x, b.anchor_y),
-                    (b.x, b.y),
-                    b.w,
-                    b.h,
-                );
+                draw_spike_ball(sheet, (b.anchor_x, b.anchor_y), (b.x, b.y), b.w, b.h);
             }
         }
         None => {
@@ -3138,19 +3148,11 @@ fn draw_spike_balls(sheet: Sheet<'_>, level: &Level, balls: Option<&[sim::SpikeB
 /// drawing, and a chain that visibly enters the top of a ball is a chain holding it up. The ball
 /// itself is drawn at the box that kills (`draw_lava_ball`'s rule): the thing a player has to
 /// judge is exactly the rectangle the sim tests.
-fn draw_spike_ball(
-    sheet: Sheet<'_>,
-    anchor: (f32, f32),
-    ball: (f32, f32),
-    w: f32,
-    h: f32,
-) {
+fn draw_spike_ball(sheet: Sheet<'_>, anchor: (f32, f32), ball: (f32, f32), w: f32, h: f32) {
     let painter = sheet.painter;
     let cord = (sheet.camera.scale() * 0.09).max(1.0);
     let top = (ball.0, ball.1 - h * 0.5);
-    let from = sheet
-        .camera
-        .to_screen(anchor.0, anchor.1, sheet.viewport);
+    let from = sheet.camera.to_screen(anchor.0, anchor.1, sheet.viewport);
     let to = sheet.camera.to_screen(top.0, top.1, sheet.viewport);
     painter.line_segment([from, to], egui::Stroke::new(cord, CHAIN_DARK));
 
@@ -3162,11 +3164,9 @@ fn draw_spike_ball(
     let mut walked = CHAIN_LINK_PITCH;
     while span > 1.0e-4 && walked < span {
         let t = walked / span;
-        let p = sheet.camera.to_screen(
-            anchor.0 + dx * t,
-            anchor.1 + dy * t,
-            sheet.viewport,
-        );
+        let p = sheet
+            .camera
+            .to_screen(anchor.0 + dx * t, anchor.1 + dy * t, sheet.viewport);
         painter.rect_filled(
             Rect::from_center_size(p, egui::vec2(cord * 1.7, cord * 1.7)),
             CornerRadius::ZERO,
@@ -3252,6 +3252,17 @@ fn draw_level_entities(sheet: Sheet<'_>, level: &Level, clock: f32) {
             Color32::WHITE,
         );
     }
+    // A rock in a document hangs where the file put it: a document has no body to wake it, so the
+    // socket is the only position there is to draw, and it is the one an author is placing.
+    for r in &level.rocks {
+        draw_rock(sheet, r.home());
+    }
+    // And a crate stands where the file put it. A document has no pushes to show, so the authored
+    // box *is* the crate: unlike a rock, whose position is a fact about the episode, a crate moved is
+    // a crate the episode changed, and the editor is drawing the level before that.
+    for b in &level.blocks {
+        draw_block(sheet, b.rect());
+    }
 }
 
 /// Draw the level: its scenery, its tiles, its goal flag, and (optionally) its grid and
@@ -3312,6 +3323,9 @@ pub fn draw_level_held(
             let prop = scenery_sprite(sheet.sprites, level, tx, ty, clock)
                 .or_else(|| hanging_sprite(sheet.sprites, level, tx, ty, clock));
             if let Some(prop) = prop {
+                if prop_covers_entity(level, &prop) {
+                    continue;
+                }
                 draw_prop(sheet, level, &prop);
             }
         }
@@ -3412,6 +3426,18 @@ pub fn draw_level_held(
                         draw_vine_to_shelf(sheet, tx, ty, rect, uv);
                     }
                 }
+                // ---- the belt: a machine cell, not a material ------------------
+                //
+                // Drawn as its own sprite rather than through the material autotile, because a belt
+                // is not made *of* anything: it is a mechanism that happens to be solid ground. The
+                // arrow in the picture is the direction the sim carries at, so a level's belts read
+                // as one-way floors without a legend.
+                Some(Tile::BeltRight) => {
+                    sheet.image(rect, sheet.sprites.get("belt_r"));
+                }
+                Some(Tile::BeltLeft) => {
+                    sheet.image(rect, sheet.sprites.get("belt_l"));
+                }
                 Some(Tile::Empty) | Some(Tile::Goal) | None => {}
             }
             if opts.grid {
@@ -3468,6 +3494,10 @@ pub fn draw_level_held(
     // a spiked ball kills on contact, and a hazard that hides the body that touched it is a death
     // nobody can read.
     draw_spike_balls(sheet, level, balls);
+    // **The rocks belong to whoever owns the episode.** A document has none, so the editor's
+    // rocks are drawn hanging where they were authored ([`draw_level_entities`]); a run's are
+    // drawn where the fall has them this frame ([`draw_sim_objects`]). Both go through
+    // [`draw_rock`], so the two can only differ by a frame.
 
     if opts.entities {
         draw_level_entities(sheet, level, clock);
@@ -3789,6 +3819,29 @@ fn dashed_outline(painter: &Painter, rect: Rect, stroke: Stroke) {
     }
 }
 
+/// Draw a rock at `rect`, which the caller owns.
+///
+/// The mover's split, for the mover's reason: the editor has a spec's home, the run has a frame's
+/// box, and one drawing has to serve both or the two will disagree about where a rock is.
+fn draw_rock(sheet: Sheet<'_>, rect: sim::Rect) {
+    sheet.image(
+        sheet.world(rect.x, rect.y, rect.w, rect.h),
+        sheet.sprites.get("boulder"),
+    );
+}
+
+/// Draw a crate at `rect`, which the caller owns.
+///
+/// The same split the rock gets, and it matters more here: the editor draws the file's crate and a
+/// run draws the one the body shoved, so a drawing that read either position for itself would show
+/// a crate in one place on the canvas and another on the playthrough.
+fn draw_block(sheet: Sheet<'_>, rect: sim::Rect) {
+    sheet.image(
+        sheet.world(rect.x, rect.y, rect.w, rect.h),
+        sheet.sprites.get("block"),
+    );
+}
+
 /// Draw a moving platform as the shelf it is: an iron rail over timber, one piece per tile
 /// of its width, with the ends cut.
 ///
@@ -3951,6 +4004,39 @@ pub fn draw_reach_overlay(sheet: Sheet<'_>, level: &Level, report: &ReachReport)
     }
 }
 
+/// The level's own objects as **a run** has moved them: the rocks where this episode has them, and
+/// the crates where it has shoved them.
+///
+/// These are the two things about a level that stop being the document's the moment an episode
+/// starts. A rock is a body that falls once and stays where it lands, not the socket its file
+/// names; a crate is a box a body can push, so where it is drawn is where the episode left it.
+/// `opts.entities` is deliberately not consulted: it governs the *authored* placement
+/// ([`draw_level_entities`]), which a live view must not draw, and it is off in every playing
+/// view — so a canvas that waited for it would draw neither of these, which is exactly what
+/// happened.
+///
+/// **A shuddering rock is drawn shaking**, by a fraction of a tile on the tick's parity: the
+/// warning is a fact about the sim and the view has to say so, because a rock that began to fall
+/// with no visible beat would be the trap this element replaced.
+///
+/// Every view with a [`Sim`] in it calls this, under the bodies: a falling rock is a hazard that
+/// hides the body it hit, and a settled one is a step a body has to be seen standing on.
+pub fn draw_sim_objects(sheet: Sheet<'_>, sim: &Sim) {
+    for rock in sim.rocks() {
+        let mut rect = rock.aabb();
+        if rock.shuddering() {
+            // One art pixel either side, on alternate ticks: at any integer zoom the shake is a
+            // whole screen pixel, which is what makes it read as a stone working loose.
+            let nudge = if rock.warn % 2 == 0 { 0.0625 } else { -0.0625 };
+            rect.x += nudge;
+        }
+        draw_rock(sheet, rect);
+    }
+    for block in sim.blocks() {
+        draw_block(sheet, block.aabb());
+    }
+}
+
 /// Draw a live episode: the level, and every agent in it with the pose its state implies.
 pub fn draw_sim(sheet: Sheet<'_>, sim: &Sim, opts: RenderOpts, clock: f32, anim: &AgentAnim) {
     draw_sim_at(sheet, sim, opts, clock, anim, None);
@@ -3990,6 +4076,8 @@ pub fn draw_sim_at(
     // And the rubble of the tiles this run has broken, between the terrain it came out of and the
     // bodies that broke it.
     draw_debris(sheet, anim.debris());
+    // The rocks and the crates as this run has them, under the bodies.
+    draw_sim_objects(sheet, sim);
     draw_agents_at(sheet, sim, clock, Color32::WHITE, anim, true, at);
 }
 
@@ -9732,7 +9820,9 @@ mod tests {
     fn a_spiked_ball_is_drawn_once_at_the_box_that_kills() {
         let ctx = egui::Context::default();
         let atlas = Atlas::load(&ctx, assets_dir()).expect("the shipped tileset loads");
-        let uv = atlas.uv("spike_ball").expect("the ball's cell is in the atlas");
+        let uv = atlas
+            .uv("spike_ball")
+            .expect("the ball's cell is in the atlas");
 
         let ball_in = |col: i32| -> Rect {
             let quads = headless_sprite_quads(&ball_hall(true, col), RenderOpts::playing());

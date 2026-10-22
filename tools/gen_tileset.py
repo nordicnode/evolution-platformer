@@ -99,6 +99,15 @@ FAMILIES = (
     # the ball the brush hangs, and a new family at the end moves no cell that anything else
     # points at. The chain is drawn, the ball is a sprite (`art/terrain.spike_ball`).
     ("spike_ball", terrain.spike_ball_sprites),
+    # The belt and the rock, appended for the rope's reason: two directions of belt and a
+    # boulder are things a level draws as *sprites* (unlike the rope's line and the ball's
+    # chain), and a family at the end moves no cell anything else points at.
+    ("belts", terrain.belt_sprites),
+    ("boulder", terrain.boulder_sprites),
+    # The crate, appended for the same reason and *after* the boulder: it is a body rather than a
+    # tile, so it is a sprite family, and a family at the end of the manifest moves no cell that
+    # any sprite already in the atlas points at.
+    ("block", terrain.block_sprites),
 )
 
 

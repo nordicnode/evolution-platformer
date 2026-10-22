@@ -988,10 +988,8 @@ pub fn lab_panel(
     // and the control menu down a row when it appeared.
     ui.add_space(2.0);
     let (state, colour, detail) = run_state(summary, level_changed);
-    ui.add(
-        egui::Label::new(egui::RichText::new(state).small().color(colour)).truncate(),
-    )
-    .on_hover_text(detail);
+    ui.add(egui::Label::new(egui::RichText::new(state).small().color(colour)).truncate())
+        .on_hover_text(detail);
 
     // --- the pace the run plays at ------------------------------------------
     ui.add_space(6.0);
@@ -3114,7 +3112,9 @@ mod tests {
         let readings = menu_readings(&summary);
         assert_eq!(readings.len(), 3, "{readings:?}");
         assert!(
-            readings.iter().all(|r| r.unit.split_whitespace().count() <= 4),
+            readings
+                .iter()
+                .all(|r| r.unit.split_whitespace().count() <= 4),
             "a unit is a label, not a sentence: {readings:?}"
         );
 
@@ -3188,22 +3188,30 @@ mod tests {
         over.finished = true;
         over.generations_run = 1234;
 
-        let heights: Vec<f32> = [(&unsolved, false), (&solved, false), (&over, false), (&solved, true)]
-            .into_iter()
-            .map(|(summary, changed)| {
-                let used = used_rect(280.0, |ui| {
-                    lab_panel(ui, None, summary, &mut ViewState::default(), changed);
-                });
-                used.height()
-            })
-            .collect();
+        let heights: Vec<f32> = [
+            (&unsolved, false),
+            (&solved, false),
+            (&over, false),
+            (&solved, true),
+        ]
+        .into_iter()
+        .map(|(summary, changed)| {
+            let used = used_rect(280.0, |ui| {
+                lab_panel(ui, None, summary, &mut ViewState::default(), changed);
+            });
+            used.height()
+        })
+        .collect();
         for pair in heights.windows(2) {
             assert!(
                 (pair[0] - pair[1]).abs() < 0.5,
                 "the panel changed height with what it was saying: {heights:?}"
             );
         }
-        assert!(heights[0] > 100.0, "the panel was not drawn at all: {heights:?}");
+        assert!(
+            heights[0] > 100.0,
+            "the panel was not drawn at all: {heights:?}"
+        );
     }
 
     /// Every state of the chart's trend has a short word for the panel's one line.

@@ -309,7 +309,14 @@ fn encode_tile(t: Tile) -> f32 {
         // what a body can do, not what the world is made of. A material that looked different
         // to the sensors would be a new problem for the population to solve, which is the one
         // thing adding a *colour* of ground must never be.
+        // A belt is ground, and it reads as ground. Its *direction* is not in this table, and
+        // that is a decision: the patch is the world a body can act on, and a belt is a floor to
+        // stand on like any other. Being carried shows up where the body feels it — in `vx` — so
+        // a policy learns a belt by standing on one rather than by reading a code for it, and
+        // adding a code would have meant a sensor version that invalidates every champion on
+        // disk for a cell whose action is "walk on it".
         Tile::Solid | Tile::Sand | Tile::Brick | Tile::Plank => ENC_SOLID,
+        Tile::BeltRight | Tile::BeltLeft => ENC_SOLID,
         // A cracked tile is solid for the same reason and until the same moment, and then it is
         // not: the variant is a fact about the ground's *future* rather than about what it is
         // made of, which is why it reads differently here and not differently anywhere else.
@@ -404,6 +411,8 @@ pub fn observe_from_stand(
             mover_phase: &[],
             turrets: &[],
             spike_balls: &[],
+            blocks: &[],
+            rocks: &[],
             vents: &[],
             air_ticks: 0,
             ground_ticks: 0,
@@ -439,6 +448,21 @@ pub struct Scene<'a> {
     /// Spiked balls on chains, at this frame's positions. A ball is drawn into the patch as a
     /// [`ENC_SPIKE`] cell rather than given slots of its own — see [`VERSION`]'s v15 note.
     pub spike_balls: &'a [crate::physics::SpikeBall],
+    /// Crates, at this frame's positions, drawn into the patch as [`ENC_SOLID`] cells.
+    ///
+    /// A crate is solid, so it reads as solid: the policy sees a wall where the crate is and an
+    /// empty cell where it was, which is exactly the feedback pushing needs. No slot moved and
+    /// [`VERSION`] did not bump, for the belt's reason and the spiked ball's economy: the value is
+    /// one the patch already had, and a level with no crate observes the vector it always did.
+    pub blocks: &'a [crate::physics::Block],
+    /// Rocks, at this frame's positions, drawn into the patch as [`ENC_SOLID`] cells.
+    ///
+    /// A rock is a solid whether it is hanging, falling or settled, so it reads as the block it
+    /// is. It matters most *after* it has fallen: a settled rock is a one-tile step in a corridor,
+    /// and a policy that could not see it would walk into an obstacle the level's own terrain says
+    /// is not there. No slot moved and [`VERSION`] did not bump, for the crate's reason: the value
+    /// is one the patch already had, and a level with no rock observes the vector it always did.
+    pub rocks: &'a [crate::physics::Rock],
     /// The level's lava vents, so the observation can say when the next ball is thrown.
     pub vents: &'a [(i32, i32)],
     /// Ticks the body has been off the ground, and on it. Press timing is a function of both.
@@ -508,9 +532,59 @@ pub fn observe_scene(
         );
         for r in r0.max(-PATCH_RADIUS)..=r1.min(PATCH_RADIUS) {
             for c in c0.max(-PATCH_RADIUS)..=c1.min(PATCH_RADIUS) {
-                let idx = ((r + PATCH_RADIUS) * (2 * PATCH_RADIUS + 1) + (c + PATCH_RADIUS)) as usize;
+                let idx =
+                    ((r + PATCH_RADIUS) * (2 * PATCH_RADIUS + 1) + (c + PATCH_RADIUS)) as usize;
                 if out[idx] == ENC_EMPTY {
                     out[idx] = ENC_SPIKE;
+                }
+            }
+        }
+    }
+
+    // A crate is ground that moves when a body leans on it, and it is drawn as the ground it is.
+    // Solid rather than one-way: a body cannot walk through a crate, so a patch that let a policy
+    // plan straight through one would be describing a level nobody is playing. The box is floored
+    // like a ball's, so a crate between two cells shows up in both.
+    for b in scene.blocks {
+        let block = b.aabb();
+        let (c0, c1) = (
+            block.x.floor() as i32 - ctx,
+            (block.x + block.w - 0.001).floor() as i32 - ctx,
+        );
+        let (r0, r1) = (
+            block.y.floor() as i32 - cty,
+            (block.y + block.h - 0.001).floor() as i32 - cty,
+        );
+        for r in r0.max(-PATCH_RADIUS)..=r1.min(PATCH_RADIUS) {
+            for c in c0.max(-PATCH_RADIUS)..=c1.min(PATCH_RADIUS) {
+                let idx =
+                    ((r + PATCH_RADIUS) * (2 * PATCH_RADIUS + 1) + (c + PATCH_RADIUS)) as usize;
+                if out[idx] == ENC_EMPTY {
+                    out[idx] = ENC_SOLID;
+                }
+            }
+        }
+    }
+
+    // A rock is a box of stone wherever it is: hanging over a corridor, on its way down, or
+    // settled into the floor. Solid, like the crate, and floored like a ball's box, so a rock
+    // between two cells shows up in both.
+    for rock in scene.rocks {
+        let box_ = rock.aabb();
+        let (c0, c1) = (
+            box_.x.floor() as i32 - ctx,
+            (box_.x + box_.w - 0.001).floor() as i32 - ctx,
+        );
+        let (r0, r1) = (
+            box_.y.floor() as i32 - cty,
+            (box_.y + box_.h - 0.001).floor() as i32 - cty,
+        );
+        for r in r0.max(-PATCH_RADIUS)..=r1.min(PATCH_RADIUS) {
+            for c in c0.max(-PATCH_RADIUS)..=c1.min(PATCH_RADIUS) {
+                let idx =
+                    ((r + PATCH_RADIUS) * (2 * PATCH_RADIUS + 1) + (c + PATCH_RADIUS)) as usize;
+                if out[idx] == ENC_EMPTY {
+                    out[idx] = ENC_SOLID;
                 }
             }
         }

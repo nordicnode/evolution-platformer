@@ -58,7 +58,14 @@ pub const LEVEL_FORMAT: &str = "evo-platformer-level";
 /// entity (`"spiked_ball"`), no new glyph. A v4 build refuses the entity by name, which is the
 /// correct answer to a file it cannot play — but a file that claims version 4 and contains one
 /// would be promising otherwise.
-pub const LEVEL_FORMAT_VERSION: u32 = 5;
+///
+/// **Bumped to 6 for the belt and the rock**: two new glyphs (`>`, `<`) for a floor that
+/// carries what stands on it, and one new entity (`"rock"`) for a ceiling that drops a boulder.
+/// The belt is the first *glyph* since version 3 and the rock the first entity since 5, so
+/// this bump has both halves of the rule at once: a v5 build calls a `>` row corrupt (its glyph
+/// table is shorter) and refuses a `rock` by name, and both are the right answers to a file
+/// it cannot play. **A v6 build reads 1 through 5**, because this pass only *added*.
+pub const LEVEL_FORMAT_VERSION: u32 = 6;
 
 /// Smallest grid the editor will build. Not a loader rule — a level is legal from
 /// 1x1 — but a painter with less room than this has nothing to paint with.
@@ -111,6 +118,17 @@ pub const GLYPH_WATER: char = '~';
 /// **fires**: a lava cell with open air above it is a vent, and it spits a ball up on a
 /// rhythm. See [`Tile::Lava`].
 pub const GLYPH_LAVA: char = 'L';
+
+/// A **belt** running right (`>`): a solid floor that carries a body standing on it.
+///
+/// The glyph is an arrow, and it says the whole rule: a belt is a tile you stand on, and the
+/// direction it carries is the direction the character points. Two glyphs rather than one plus a
+/// sign field because a cell in the grid has no room for a second field — the level file writes
+/// tiles as characters and nothing else — and because `>` and `<` are the two pictures of the
+/// thing an author is drawing. See [`Tile::BeltRight`].
+pub const GLYPH_BELT_RIGHT: char = '>';
+/// A **belt** running left (`<`). The mirror of [`GLYPH_BELT_RIGHT`], drawn by mirroring it.
+pub const GLYPH_BELT_LEFT: char = '<';
 
 /// A vine (`V`): not solid, not lethal, and **climbable**.
 ///
@@ -245,6 +263,25 @@ pub enum Tile {
     /// airborne, which is what lets a body jump onto a vine, grab it and climb, instead of
     /// being caught by the first one it walks past.
     Vine = 15,
+    /// A **belt running right** (`>`): ground that moves the body standing on it.
+    ///
+    /// The first tile that is *solid and does something*: every other tile in the pack is either
+    /// ground (a material, a ledge) or a cell a body passes through (spike, spring, water, lava,
+    /// vine). A belt is the floor itself with a direction, and that is the whole of why it is
+    /// worth a tile: it changes a jump's **carry** without changing the jump, so a run built on
+    /// one is the same run at a different speed.
+    ///
+    /// **The carry is applied to the body, not to the tile.** The belt never moves; the body
+    /// standing on it is translated by [`crate::physics::Physics::belt_speed`] each tick, in the
+    /// belt's direction, before its own tick — so the body's own velocity, its jump and its
+    /// acceleration are untouched, and stepping off a belt leaves the body with exactly the speed
+    /// it had. That is the difference between a belt and a slope, and it is why a belt cannot
+    /// make a jump the level's physics does not already allow: it adds a fraction of a tile of
+    /// travel per tick, and the oracle's canonical jumps simply do not model it.
+    BeltRight = 16,
+    /// A **belt running left** (`<`). One behaviour, two glyphs, so a level never needs a
+    /// direction field on a cell. See [`Tile::BeltRight`].
+    BeltLeft = 17,
 }
 
 impl Tile {
@@ -257,7 +294,7 @@ impl Tile {
     /// the one where it shows: five letters were still being offered as agent names after the trap
     /// tiles took them (`d`, `s`, `b`, `w`, `v`). So a tile is added **here** as well as to the enum,
     /// and every list that matters is derived from this.
-    pub const ALL: [Tile; 16] = [
+    pub const ALL: [Tile; 18] = [
         Tile::Empty,
         Tile::Solid,
         Tile::Sand,
@@ -274,6 +311,8 @@ impl Tile {
         Tile::Water,
         Tile::Lava,
         Tile::Vine,
+        Tile::BeltRight,
+        Tile::BeltLeft,
     ];
 
     pub fn from_glyph(c: char) -> Option<Tile> {
@@ -294,6 +333,8 @@ impl Tile {
             GLYPH_WATER => Some(Tile::Water),
             GLYPH_LAVA => Some(Tile::Lava),
             GLYPH_VINE => Some(Tile::Vine),
+            GLYPH_BELT_RIGHT => Some(Tile::BeltRight),
+            GLYPH_BELT_LEFT => Some(Tile::BeltLeft),
             _ => None,
         }
     }
@@ -316,6 +357,8 @@ impl Tile {
             Tile::Water => GLYPH_WATER,
             Tile::Lava => GLYPH_LAVA,
             Tile::Vine => GLYPH_VINE,
+            Tile::BeltRight => GLYPH_BELT_RIGHT,
+            Tile::BeltLeft => GLYPH_BELT_LEFT,
         }
     }
 
@@ -343,6 +386,8 @@ impl Tile {
                 | Tile::CrackedBrick
                 | Tile::CrackedPlank
                 | Tile::OneWay
+                | Tile::BeltRight
+                | Tile::BeltLeft
         )
     }
 
@@ -388,6 +433,19 @@ impl Tile {
 
     pub fn is_vine(self) -> bool {
         matches!(self, Tile::Vine)
+    }
+
+    /// Is this tile a conveyor belt, and if so which way does it carry?
+    ///
+    /// `+1` right, `-1` left, `None` for every other tile. One question rather than two (`is_belt`
+    /// then `belt_dir`) because every caller wants the direction or nothing, and a caller that
+    /// asked "is this a belt" and then forgot to ask which way is a body carried the wrong way.
+    pub fn belt_dir(self) -> Option<i8> {
+        match self {
+            Tile::BeltRight => Some(1),
+            Tile::BeltLeft => Some(-1),
+            _ => None,
+        }
     }
 
     /// Does this cell end an episode on contact?
@@ -898,6 +956,103 @@ impl ResizeReport {
     }
 }
 
+/// A **crate**: a one-tile solid a body can stand on and shove along the floor.
+///
+/// The first *movable* solid in the pack, and the reason it is a body rather than a tile: a tile is
+/// a fact about the level, and a crate's whole point is that the level is no longer the same after a
+/// body has leaned on it. It falls, it lands, it stops at walls, and a body pressing into its side
+/// moves it — which makes it the one object in the pack a body can *change* to get somewhere.
+///
+/// **It is not simulated as a rigid body against other crates.** Two crates colliding is a stack,
+/// and a stack is a physics problem this pack deliberately does not have: a crate stops when the
+/// box it would move into is terrain or another crate, and otherwise it moves. A row of crates
+/// therefore shoves along as a train, one at a time, from the front — which is the behaviour a
+/// person expects from a crate and the whole of the simulation a crate needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockSpec {
+    /// The column and the row whose **bottom edge** the crate rests its own bottom on, the
+    /// anchoring every other entity in the format uses.
+    pub col: i32,
+    pub row: i32,
+}
+
+impl BlockSpec {
+    /// A crate standing in tile `(tx, ty)`, one tile square.
+    ///
+    /// Anchored like a walker and not like a tile: its bottom edge is the bottom of row `ty`, so a
+    /// crate authored in the cell above a floor rests on that floor. `bottom_of` is the one place
+    /// that arithmetic lives.
+    pub fn at(tx: i32, ty: i32) -> BlockSpec {
+        BlockSpec { col: tx, row: ty }
+    }
+
+    /// Where it stands, in world units.
+    pub fn rect(&self) -> Rect {
+        Rect::new(
+            self.col as f32,
+            crate::physics::bottom_of(self.row) - PHYSICS.block_size,
+            PHYSICS.block_size,
+            PHYSICS.block_size,
+        )
+    }
+}
+
+/// A **rock**: a boulder that hangs under a ceiling until a body comes near, then falls once.
+///
+/// The pack's trap that is spent rather than timed: it does not hunt and it does not repeat, and
+/// the level it is in is different after it has fallen. The spec is therefore only *where it
+/// hangs* — how far it drops is a fact about the terrain under it, and how it falls is gravity.
+///
+/// **It hangs from the underside of row `row`, in column `col`, and its body is one tile.** The
+/// anchor is a cell rather than a point, because the box is one the author has to see: it occupies
+/// the whole cell it was placed in, and it stops on the first solid tile below it. See
+/// [`crate::physics::Rock`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RockSpec {
+    /// The column the rock is in.
+    pub col: i32,
+    /// The row the rock hangs in: its top edge is the bottom of the ceiling row.
+    pub row: i32,
+}
+
+impl RockSpec {
+    /// A rock hanging in column `col`, in row `row`.
+    pub fn at(col: i32, row: i32) -> RockSpec {
+        RockSpec { col, row }
+    }
+
+    /// The box it hangs in: **the cell it was authored in**, one tile.
+    ///
+    /// The cell rather than the boundary under it, unlike a rope: a rope's `row` is its first
+    /// *cell of line*, and its anchor is the ceiling above that cell; a rock's `row` is the cell
+    /// its body fills, so a rock painted under a ceiling stands in the cell the author clicked and
+    /// falls from the bottom of it.
+    pub fn home(&self) -> Rect {
+        Rect::new(
+            self.col as f32,
+            self.row as f32,
+            PHYSICS.rock_size,
+            PHYSICS.rock_size,
+        )
+    }
+
+    /// **Everything the rock can occupy**, from where it hangs to the first floor under it.
+    ///
+    /// The oracle's model of a rock, and it is the press's band with the stroke read off the
+    /// terrain instead of out of the file: a rock that has fallen can be at any point between its
+    /// socket and the floor, so a route that planned a walk through that column would be planning
+    /// on the rock being somewhere it cannot promise. A rock over a pit has no floor under it and
+    /// its band runs to the bottom of the level — which is the honest answer, because a rock with
+    /// nothing to land on falls out of the world.
+    pub fn band(&self, level: &Level) -> Rect {
+        let home = self.home();
+        let room = (self.row + 1..level.height)
+            .take_while(|row| !level.is_opaque(self.col, *row))
+            .count();
+        Rect::new(home.x, home.y, home.w, home.h + room as f32)
+    }
+}
+
 /// A parsed, validated level. Immutable during an episode.
 #[derive(Clone, Debug)]
 pub struct Level {
@@ -934,6 +1089,11 @@ pub struct Level {
     pub ropes: Vec<RopeSpec>,
     /// Spiked balls on chains: the pendulum traps, with the length and trigger each one carries.
     pub spike_balls: Vec<SpikeBallSpec>,
+    /// Rocks: the boulders that hang under a ceiling and fall once when a body comes near.
+    pub rocks: Vec<RockSpec>,
+    /// Crates: the movable solids, in file order (order is part of the sim: a ring of crates pushed
+    /// into each other resolves front-first, and which one is the front is file order).
+    pub blocks: Vec<BlockSpec>,
     /// Lazily computed move-graph route table for this level.
     ///
     /// **The slot is shared between clones, not copied by them.** The graph is a pure
@@ -1031,6 +1191,8 @@ impl Level {
             platforms: Vec::new(),
             ropes: Vec::new(),
             spike_balls: Vec::new(),
+            rocks: Vec::new(),
+            blocks: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1134,11 +1296,7 @@ impl Level {
                 "spiked_ball" => {
                     let length = e.tiles.unwrap_or(DEFAULT_SPIKE_BALL_TILES).max(1);
                     let reach = e.span.unwrap_or(DEFAULT_SPIKE_BALL_REACH).max(1);
-                    if e.x < 0
-                        || e.x >= level.width
-                        || e.y < 1
-                        || e.y + length + 1 > level.height
-                    {
+                    if e.x < 0 || e.x >= level.width || e.y < 1 || e.y + length + 1 > level.height {
                         return Err(format!(
                             "spiked ball at ({}, {}) on a {} tile chain does not hang inside a \
                              {}x{} level",
@@ -1160,6 +1318,26 @@ impl Level {
                     }
                     level.goals.push(goal_rect(e.x, e.y));
                 }
+                // A rock hangs from the **bottom of its own row**, like a rope: the cell it is
+                // authored in is the one its body fills, and the tile above it is the ceiling it
+                // hangs from. How far it falls is not in the file: that is the first solid row
+                // under it, found when it lets go ([`crate::physics::Rock`]), because a boulder
+                // falls under gravity rather than on an authored stroke.
+                "rock" => {
+                    if e.x < 0 || e.x >= level.width || e.y < 0 || e.y + 1 > level.height {
+                        return Err(format!(
+                            "rock at ({}, {}) does not hang inside a {}x{} level",
+                            e.x, e.y, level.width, level.height
+                        ));
+                    }
+                    level.rocks.push(RockSpec::at(e.x, e.y));
+                }
+                // A crate is anchored like every other entity: its bottom edge on the bottom of
+                // its row. The loader does not require a floor under it — a crate authored in the
+                // air falls on the first tick, which is the sim's own answer to a bad drop — but
+                // the editor only places one with ground under it, so a *saved* level never has
+                // a crate that moves before anyone touches it.
+                "block" => level.blocks.push(BlockSpec::at(e.x, e.y)),
                 // Scenery carries its own sprite name; an unnamed one is a mistake in the
                 // file rather than a piece of nothing, so it is refused like any bad entity.
                 "scenery" => {
@@ -1465,6 +1643,36 @@ impl Level {
             && !self.is_spike(tx, surface_row - 1)
             && !self.is_lava(tx, surface_row - 1)
             && !self.is_solid(tx, surface_row - 1)
+            && !self.rocked_stand(tx, surface_row)
+    }
+
+    /// Is the ground at `(tx, surface_row)` **inside a rock's fall**, so a body standing on it is
+    /// a body the boulder will reach?
+    ///
+    /// The reach oracle's model of a rock, and it is deliberately as conservative as the spiked
+    /// ball's: a stand under a rock is not a place a *route* can be planned through, because the
+    /// rock may be anywhere between its socket and the floor by the time the body gets there. The
+    /// test is the body's whole standing box — one column wide and `player_h` tall — against the
+    /// band from the rock's socket to the first floor under it ([`RockSpec::band`]), so a rock
+    /// that only clips the top of a body still refuses the stand. A rock over a pit falls out of
+    /// the world and refuses the whole column; a rock *under* a bridge refuses nothing above it,
+    /// which is what makes the high road over one a route.
+    ///
+    /// It lives on [`Level`] rather than in `reach` because `is_standable` is where every consumer
+    /// of "may a body stand here" already asks (the route graph, the checkpoint zones, the
+    /// platform extraction and the sensors' stand reading), and a second definition of the same
+    /// question is how the editor's verdict and a run's route start disagreeing.
+    pub fn rocked_stand(&self, tx: i32, surface_row: i32) -> bool {
+        if self.rocks.is_empty() {
+            return false;
+        }
+        let body = Rect::new(
+            tx as f32,
+            surface_row as f32 - PHYSICS.player_h,
+            1.0,
+            PHYSICS.player_h,
+        );
+        self.rocks.iter().any(|r| body.overlaps(&r.band(self)))
     }
 
     /// The **landing zone** containing a standing tile: the run of standable tiles around
@@ -1667,6 +1875,21 @@ impl Level {
             h.f32(b.length);
             h.f32(b.reach);
         }
+        // A rock is a hazard a run is scored against, on the turret's terms: moving one changes
+        // every episode on the level, so a run keyed on this hash has to restart. *Where it has
+        // fallen to* is state rather than terrain, and that is [`crate::Sim::state_hash`]'s job.
+        h.u32(self.rocks.len() as u32);
+        for r in &self.rocks {
+            h.i32(r.col);
+            h.i32(r.row);
+        }
+        // A crate moves, so a run has to restart when one is added, moved or taken away: the
+        // episodes it was scored on had a solid there that this one does not.
+        h.u32(self.blocks.len() as u32);
+        for b in &self.blocks {
+            h.i32(b.col);
+            h.i32(b.row);
+        }
         h.finish()
     }
 
@@ -1733,6 +1956,8 @@ impl Level {
             platforms: Vec::new(),
             ropes: Vec::new(),
             spike_balls: Vec::new(),
+            rocks: Vec::new(),
+            blocks: Vec::new(),
             goals: Vec::new(),
             scenery: Vec::new(),
             routes_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -2474,12 +2699,7 @@ impl Level {
     /// Hang a spiked ball at `(tx, ty)` with the loader's own defaults, shortened to the room
     /// under the new bottom edge.
     pub fn add_spike_ball_tile(&mut self, tx: i32, ty: i32) -> bool {
-        self.add_spike_ball(
-            tx,
-            ty,
-            DEFAULT_SPIKE_BALL_TILES,
-            DEFAULT_SPIKE_BALL_REACH,
-        )
+        self.add_spike_ball(tx, ty, DEFAULT_SPIKE_BALL_TILES, DEFAULT_SPIKE_BALL_REACH)
     }
 
     /// Whether a **cell** of spiked ball may be painted at `(tx, ty)`.
@@ -2548,6 +2768,107 @@ impl Level {
         self.spike_balls.len() != before
     }
 
+    // ---- the rock ----------------------------------------------------------------------
+
+    /// The cell each rock hangs in: its column and the row under the ceiling it hangs from.
+    pub fn rock_tiles(&self) -> Vec<(i32, i32)> {
+        self.rocks.iter().map(|r| (r.col, r.row)).collect()
+    }
+
+    /// Whether a rock may be hung at `(tx, ty)`: under a solid tile, with clear sky below it.
+    ///
+    /// The ceiling rule is the rope's and the spiked ball's: a boulder bolted to nothing is a
+    /// floating hazard. The *fall* rule is the rock's own: a rock with a floor directly under its
+    /// cell has nowhere to go, so at least one clear row is required — a rock that cannot drop is
+    /// a decoration that kills on touch, which is a worse object than either a rock or a wall.
+    /// A floor further down is not required: a rock that falls into a pit is a hazard over a pit,
+    /// and the sim finds the first solid row when it lets go.
+    pub fn rock_placeable(&self, tx: i32, ty: i32) -> bool {
+        if tx_out(tx, ty, self.width, self.height)
+            || ty < 1
+            || !self.is_opaque(tx, ty - 1)
+            || self.is_opaque(tx, ty)
+        {
+            return false;
+        }
+        let below = self.is_opaque(tx, ty + 1);
+        !below && self.rocks.iter().all(|r| r.col != tx || r.row != ty)
+    }
+
+    /// Hang a rock at `(tx, ty)`.
+    pub fn add_rock_tile(&mut self, tx: i32, ty: i32) -> bool {
+        if !self.rock_placeable(tx, ty) {
+            return false;
+        }
+        self.rocks.push(RockSpec::at(tx, ty));
+        self.forget_routes();
+        true
+    }
+
+    /// The rock hanging in `(tx, ty)`, if any.
+    pub fn rock_at(&self, tx: i32, ty: i32) -> Option<&RockSpec> {
+        self.rocks.iter().find(|r| r.col == tx && r.row == ty)
+    }
+
+    /// Remove the rock hanging in `(tx, ty)`, if any. Returns whether one went.
+    pub fn remove_rock_at(&mut self, tx: i32, ty: i32) -> bool {
+        let before = self.rocks.len();
+        self.rocks.retain(|r| r.col != tx || r.row != ty);
+        self.rocks.len() != before
+    }
+
+    // ---- the crate ---------------------------------------------------------------------
+
+    /// The cell each crate occupies: `(column, row)` of its box.
+    pub fn block_tiles(&self) -> Vec<(i32, i32)> {
+        self.blocks.iter().map(|b| (b.col, b.row)).collect()
+    }
+
+    /// Where every crate stands in the file, as boxes.
+    ///
+    /// The **authored** positions, which is what the editor draws and what the reach oracle models:
+    /// the oracle cannot push, so it must be given the crate the author placed rather than the one
+    /// an episode has moved. The sim's own live crates are [`crate::physics::Block`]s, not this.
+    pub fn block_rects(&self) -> Vec<Rect> {
+        self.blocks.iter().map(|b| b.rect()).collect()
+    }
+
+    /// Whether a crate may stand in `(tx, ty)`: an empty cell with **floor directly under it**.
+    ///
+    /// The floor rule is the crate's own, and it is about authorship rather than about physics: a
+    /// crate dropped in mid-air is legal in the sim (it falls) but a level that starts with a crate
+    /// in motion is a level whose first frame is not the picture the author saved. Requiring a floor
+    /// makes the authored position the resting one, so the editor, the file and the first frame all
+    /// agree.
+    pub fn block_placeable(&self, tx: i32, ty: i32) -> bool {
+        !tx_out(tx, ty, self.width, self.height)
+            && self.tile(tx, ty) == Some(Tile::Empty)
+            && self.is_solid(tx, ty + 1)
+            && self.block_at(tx, ty).is_none()
+    }
+
+    /// Put a crate in `(tx, ty)`. Returns whether the document changed.
+    pub fn add_block_tile(&mut self, tx: i32, ty: i32) -> bool {
+        if !self.block_placeable(tx, ty) {
+            return false;
+        }
+        self.blocks.push(BlockSpec::at(tx, ty));
+        self.forget_routes();
+        true
+    }
+
+    /// The crate occupying `(tx, ty)`, if any.
+    pub fn block_at(&self, tx: i32, ty: i32) -> Option<&BlockSpec> {
+        self.blocks.iter().find(|b| b.col == tx && b.row == ty)
+    }
+
+    /// Remove the crate in `(tx, ty)`, if any. Returns whether one went.
+    pub fn remove_block_at(&mut self, tx: i32, ty: i32) -> bool {
+        let before = self.blocks.len();
+        self.blocks.retain(|b| b.col != tx || b.row != ty);
+        self.blocks.len() != before
+    }
+
     /// The enemy whose cell is `(tx, ty)`, as its file kind, topmost of the kinds a click can
     /// mean. Used by the editor's eraser and the inspector.
     pub fn enemy_at(&self, tx: i32, ty: i32) -> Option<&'static str> {
@@ -2565,6 +2886,10 @@ impl Level {
             Some("rope")
         } else if self.spike_ball_at(tx, ty).is_some() {
             Some("spiked_ball")
+        } else if self.rock_at(tx, ty).is_some() {
+            Some("rock")
+        } else if self.block_at(tx, ty).is_some() {
+            Some("block")
         } else {
             None
         }
@@ -2578,7 +2903,9 @@ impl Level {
             + self.turrets.len()
             + self.platforms.len()
             + self.ropes.len()
-            + self.spike_balls.len();
+            + self.spike_balls.len()
+            + self.rocks.len()
+            + self.blocks.len();
         self.walkers
             .retain(|w| (tile_of_x(w.x, PHYSICS.walker_w), tile_of_bottom(w.bottom())) != (tx, ty));
         self.chasers
@@ -2603,6 +2930,8 @@ impl Level {
         });
         self.spike_balls
             .retain(|b| !(b.col == tx && (b.row..=b.last_row()).contains(&ty)));
+        self.rocks.retain(|r| r.col != tx || r.row != ty);
+        self.blocks.retain(|b| b.col != tx || b.row != ty);
         self.walkers.len()
             + self.chasers.len()
             + self.flyers.len()
@@ -2610,6 +2939,8 @@ impl Level {
             + self.platforms.len()
             + self.ropes.len()
             + self.spike_balls.len()
+            + self.rocks.len()
+            + self.blocks.len()
             != before
     }
 
@@ -2801,6 +3132,8 @@ impl Level {
             ("platform", self.platform_tiles()),
             ("rope", self.rope_tiles()),
             ("spiked ball", self.spike_ball_tiles()),
+            ("rock", self.rock_tiles()),
+            ("crate", self.block_tiles()),
         ] {
             for (tx, ty) in tiles {
                 if tx_out(tx, ty, self.width, self.height) {
@@ -2900,6 +3233,12 @@ impl Level {
                 span: Some(b.reach.round().max(1.0) as i32),
                 ..RawEntity::of("spiked_ball", b.col, b.row)
             });
+        }
+        for r in &self.rocks {
+            entities.push(RawEntity::of("rock", r.col, r.row));
+        }
+        for b in &self.blocks {
+            entities.push(RawEntity::of("block", b.col, b.row));
         }
         let (sx, sy) = self.spawn_tile();
         let raw = RawLevel {

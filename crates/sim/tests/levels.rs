@@ -92,7 +92,7 @@ fn all_shipped_levels_load_with_the_documented_shape() {
 /// the other half: the level is beatable in principle, the planner can route it, and the tiles
 /// it is made of are the mechanic it names. That is the precondition for a training run to
 /// measure anything at all; the training measurement itself is not a unit test.
-const BATTERY: [(&str, i32, i32, usize); 7] = [
+const BATTERY: [(&str, i32, i32, usize); 9] = [
     ("bat-crumble-bridge", 44, 15, 0),
     ("bat-double-threat", 46, 15, 2),
     ("bat-patrol-wait", 46, 15, 1),
@@ -100,6 +100,17 @@ const BATTERY: [(&str, i32, i32, usize); 7] = [
     ("bat-pit-bait", 36, 16, 0),
     ("bat-spring-chain", 56, 15, 0),
     ("bat-deck-phase", 46, 15, 0),
+    // The machine pass's level: a belt run-up that hurries a body towards the press, a two-tier
+    // room whose **low road runs under a falling rock** and whose high road is a bridge across it, and
+    // a belt on the bridge that carries the crossing. The oracle is the level's own claim: the
+    // low road is a hazard it will not plan through, so a beatable answer here means the bridge
+    // really is a way past the clock rather than a decoration beside one.
+    ("bat-machine-shop", 46, 15, 0),
+    // The crate pass's level: a flat run, a one-cell hole to hop, and a **three-tile wall** that a
+    // jump alone cannot clear. Two crates stand on the floor in front of it — the first is the step
+    // that makes the wall a hop, and walking into it shoves it flush against the wall, which is the
+    // element's first beat: a solid you can move, at walking pace, that stops where you leave it.
+    ("bat-crate-yard", 46, 15, 0),
 ];
 
 #[test]
@@ -184,6 +195,35 @@ fn every_battery_level_contains_the_mechanic_it_names() {
         common::level("bat-deck-phase").platforms.len(),
         2,
         "the deck level needs two movers to phase between"
+    );
+    // The machine shop is about its two elements, and about them being *on* the level rather
+    // than in a corner: a belt a body is carried by, and a rock whose fall the low road runs
+    // through while the bridge crosses above it. A rock tucked away would pass every
+    // reachability test and teach nothing, so the checks are that the belt exists and that the
+    // rock's band reaches the floor.
+    assert!(
+        count("bat-machine-shop", |t| t.belt_dir().is_some()) >= 8,
+        "the machine shop needs a belt run long enough to carry a body"
+    );
+    let shop = common::level("bat-machine-shop");
+    let rock = shop.rocks.first().expect("the shop has a rock");
+    assert!(
+        (rock.band(&shop).bottom() - (shop.height - 2) as f32).abs() < 1e-3,
+        "the rock falls from its socket to the floor it was built over"
+    );
+    // The crate yard is about the crate, and about it being *where the level needs it*: a crate on
+    // the floor a shove from a wall taller than a jump. The wall's height is the design — three
+    // tiles is one more than `jump_v0`/`gravity` clears, so the step is the crate's, not a jump's
+    // — and the check pins it, because a wall one tile shorter would make the crate decoration.
+    let yard = common::level("bat-crate-yard");
+    assert_eq!(yard.blocks.len(), 1, "the yard ships one crate");
+    assert!(
+        yard.block_at(20, 12).is_some(),
+        "one crate stands on the floor a shove short of the wall"
+    );
+    assert!(
+        (10..=12).all(|row| yard.is_solid(22, row)) && !yard.is_solid(22, 9),
+        "and the wall it is a step for is exactly three tiles tall"
     );
     // Pit-bait is about a *shape* rather than a tile: a shelf above the ground line and a flag
     // the direct line cannot touch. The reach test is what proves the shape; this is the cheap
@@ -1227,5 +1267,216 @@ fn a_shuttle_across_lava_is_the_crossing_the_verdict_reports() {
         !report.goal_reached,
         "the same channel with no shuttle is a gap, and the verdict must say so — otherwise the \
          answer above was not about the shuttle"
+    );
+}
+
+/// **The crate yard's wall is out of a jump's reach and inside a crate's.**
+///
+/// The level's whole design is one arithmetic: a body jumps 2.37 tiles and the wall is three, so
+/// the floor is not enough; a crate is one tile, so the crate's top makes the wall's top a hop. The
+/// test does what a player would — walk right until the crate is shoved flush against the wall,
+/// hop onto the crate, hop again — and requires the body to end standing **on the wall**, which is
+/// the only claim the level makes. It also pins the number the design rests on, so a change to the
+/// jump arc that quietly made the floor enough would show up here rather than in a screenshot.
+#[test]
+fn the_crate_yard_step_is_the_jump_the_wall_needs() {
+    let level = common::level("bat-crate-yard");
+    assert!(
+        sim::PHYSICS.discrete_max_jump_height() < 3.0,
+        "the wall is three tiles: a jump must not clear it, or the crate is decoration"
+    );
+    let mut sim = sim::Sim::new(&level, 3);
+
+    // Walk right: the body shoves the crate to the wall and stops behind it.
+    for _ in 0..240 {
+        sim.step(AgentAction::Run);
+    }
+    let crate_box = sim.blocks()[0].aabb();
+    assert!(
+        (crate_box.x - 21.0).abs() < 1.0e-3,
+        "the crate should be shoved flush against the wall at 21.0, at {:.4}",
+        crate_box.x
+    );
+    assert!(
+        (sim.player().aabb().right() - crate_box.x).abs() < 1.0e-2,
+        "and the body should be flush behind it"
+    );
+
+    // Hop onto the crate: a fresh press, held through the rise.
+    for _ in 0..8 {
+        sim.step(AgentAction::RunJump);
+    }
+    let mut on_crate = false;
+    for _ in 0..60 {
+        sim.step(AgentAction::Run);
+        if sim.player().grounded {
+            on_crate = true;
+            break;
+        }
+    }
+    assert!(on_crate, "the body should land on the crate");
+    assert!(
+        (sim.player().aabb().bottom() - crate_box.y).abs() < 1.0e-3,
+        "with its feet on the crate's top ({:.3}), at {:.3}",
+        crate_box.y,
+        sim.player().aabb().bottom()
+    );
+
+    // Hop again, pressing right: over the wall's lip and down onto its top.
+    let mut on_wall = false;
+    for _ in 0..30 {
+        sim.step(AgentAction::RunJump);
+        if sim.player().grounded && sim.player().aabb().bottom() < 12.5 {
+            on_wall = true;
+            break;
+        }
+    }
+    assert!(on_wall, "the second hop should put the body on the wall");
+    assert!(
+        (sim.player().aabb().bottom() - 10.0).abs() < 1.0e-3,
+        "standing on the wall's top (y 10.0), at {:.3}",
+        sim.player().aabb().bottom()
+    );
+    assert!(
+        sim.player().x >= 22.0,
+        "and on the wall's own column, at x {:.3}",
+        sim.player().x
+    );
+}
+
+/// **The machine shop's low road is passable — once.** The complaint this pass answers.
+///
+/// The press that used to hang in this corridor ran on a clock, so a body walking the low road had
+/// to guess the phase: there was no guaranteed window long enough to cross, and the level's only
+/// reliable answer was the bridge. A rock is woken by the body itself, so the sequence is a
+/// *decision* rather than a gamble — walk up, stop short, let it come down — and then the corridor
+/// has a one-tile step in it instead of a hazard. This walks the low road for real, on the shipped
+/// level, and stops at the flag.
+#[test]
+fn the_machine_shop_low_road_opens_once_the_rock_has_fallen() {
+    let level = common::level("bat-machine-shop");
+    let mut sim = sim::Sim::new(&level, 3);
+    common::settle(&mut sim);
+
+    // Up to the trigger, then stop: the body that keeps walking is the one it lands on. The low
+    // road starts behind a two-tile step, so the driver jumps whenever it is grounded and either
+    // at a step or pushing against one.
+    let mut frames = 0u32;
+    let mut jump_until = 0u32;
+    let mut woken = false;
+    for _ in 0..600 {
+        if sim.rocks()[0].woken {
+            woken = true;
+            break;
+        }
+        frames += 1;
+        let body = sim.player();
+        if body.grounded && frames >= jump_until {
+            let at_step = (body.x > 8.4 && body.x < 10.2) || (body.x > 15.0 && body.x < 16.4);
+            if at_step || body.vx.abs() < 0.03 {
+                jump_until = frames + 12;
+            }
+        }
+        sim.step(if frames < jump_until {
+            AgentAction::RunJump
+        } else {
+            AgentAction::Run
+        });
+    }
+    assert!(woken, "walking the low road should wake the rock");
+    assert_eq!(
+        sim.outcome(),
+        sim::Outcome::Running,
+        "waking it must not be the death"
+    );
+    for _ in 0..240 {
+        sim.step(AgentAction::Walk);
+        if sim.rocks()[0].landed {
+            break;
+        }
+    }
+    assert!(
+        sim.rocks()[0].landed,
+        "the rock must be down before the road is open"
+    );
+    assert_eq!(
+        sim.outcome(),
+        sim::Outcome::Running,
+        "a body that stops when the rock shakes survives it"
+    );
+
+    // Over the step it left behind, and on along the floor to the flag.
+    for _ in 0..1600 {
+        if sim.outcome().is_finished() {
+            break;
+        }
+        frames += 1;
+        let body = sim.player();
+        if body.grounded && frames >= jump_until {
+            let at_step = (body.x > 15.0 && body.x < 16.4) || (body.x > 8.4 && body.x < 10.2);
+            if at_step || body.vx.abs() < 0.03 {
+                jump_until = frames + 12;
+            }
+        }
+        sim.step(if frames < jump_until {
+            AgentAction::RunJump
+        } else {
+            AgentAction::Run
+        });
+    }
+    assert_eq!(
+        sim.outcome(),
+        sim::Outcome::Won,
+        "the low road past a fallen rock has to reach the flag (x {})",
+        sim.player().x
+    );
+}
+
+/// **Running past the rock clears it.** The other half of the fairness claim.
+///
+/// A body that keeps moving is not hit: the warning plus the fall is longer than the run from the
+/// trigger to the far edge, so a player who does not stop is already past it when the stone lands —
+/// behind them. A trap that only rewarded standing still would be the press with a different picture.
+/// This drives the shipped level through the corridor without ever jumping at the rock.
+#[test]
+fn running_past_the_machine_shop_rock_clears_it() {
+    let level = common::level("bat-machine-shop");
+    let mut sim = sim::Sim::new(&level, 3);
+    common::settle(&mut sim);
+    let mut frames = 0u32;
+    let mut jump_until = 0u32;
+    let mut woken = false;
+    for _ in 0..1200 {
+        if sim.outcome().is_finished() {
+            break;
+        }
+        frames += 1;
+        let body = sim.player();
+        if body.grounded && frames >= jump_until {
+            // Only the two-tile step out of the spawn room: no jump at the rock.
+            let at_step = body.x > 8.4 && body.x < 10.2;
+            let blocked_at_the_step = body.vx.abs() < 0.03 && body.x < 11.0;
+            if at_step || blocked_at_the_step {
+                jump_until = frames + 12;
+            }
+        }
+        sim.step(if frames < jump_until {
+            AgentAction::RunJump
+        } else {
+            AgentAction::Run
+        });
+        woken |= sim.rocks()[0].woken;
+    }
+    assert!(woken, "the run has to pass the rock's trigger");
+    assert_eq!(
+        sim.outcome(),
+        sim::Outcome::Won,
+        "running past the rock must not be a death (x {}, rock y {})",
+        sim.player().x,
+        sim.rocks()[0].y
+    );
+    assert!(
+        sim.rocks()[0].landed,
+        "and the rock is spent behind the body"
     );
 }

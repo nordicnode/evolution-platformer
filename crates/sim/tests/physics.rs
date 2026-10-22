@@ -727,7 +727,7 @@ fn a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips() {
     // nothing of it is in the hazard. This is the case the report was written about.
     let mut flush = placed(&level, ph, SPIKE_COLUMN as f32 - ph.player_w, 4.0);
     assert!(
-        !flush.tick(&level, ph, AgentAction::Walk).touched_spike,
+        !flush.tick(&level, ph, AgentAction::Walk, &[]).touched_spike,
         "a body standing beside the spike, with its box ending at the cell's edge, does not \
          touch it"
     );
@@ -738,7 +738,7 @@ fn a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips() {
     let mut in_the_band = placed(&level, ph, SPIKE_COLUMN as f32 + 0.2, drawn_top - 0.02);
     assert!(
         !in_the_band
-            .tick(&level, ph, AgentAction::Walk)
+            .tick(&level, ph, AgentAction::Walk, &[])
             .touched_spike,
         "a body that never reaches down to the topmost drawn pixel has cleared the spike"
     );
@@ -747,7 +747,7 @@ fn a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips() {
     let mut into_the_drawing = placed(&level, ph, SPIKE_COLUMN as f32 + 0.2, drawn_top + 0.02);
     assert!(
         into_the_drawing
-            .tick(&level, ph, AgentAction::Walk)
+            .tick(&level, ph, AgentAction::Walk, &[])
             .touched_spike,
         "a body whose box reaches into the drawn part of the spike is killed"
     );
@@ -757,7 +757,7 @@ fn a_spike_kills_where_it_is_drawn_and_not_in_the_air_above_its_tips() {
     let mut standing_in_it = placed(&level, ph, SPIKE_COLUMN as f32 + 0.2, 4.0);
     assert!(
         standing_in_it
-            .tick(&level, ph, AgentAction::Walk)
+            .tick(&level, ph, AgentAction::Walk, &[])
             .touched_spike,
         "a body standing in a spike's own cell is inside the obstacle"
     );

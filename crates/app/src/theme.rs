@@ -519,6 +519,11 @@ pub fn material_colour(tile: sim::Tile) -> Option<Color32> {
         Tile::Water => Some(Color32::from_rgb(58, 132, 176)),
         Tile::Lava => Some(Color32::from_rgb(232, 112, 44)),
         Tile::Vine => Some(Color32::from_rgb(86, 156, 92)),
+        // A belt is the fifth thing here that is not a material: steel, between stone and the
+        // water, because a map has to show a floor that *moves* as an answer to a gap rather
+        // than as more ground. It is also the only ground on the map that is not warm, which is
+        // exactly how it reads on a canvas at full size.
+        Tile::BeltRight | Tile::BeltLeft => Some(Color32::from_rgb(122, 134, 148)),
     }
 }
 

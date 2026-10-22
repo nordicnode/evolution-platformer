@@ -140,6 +140,22 @@ pub enum Brush {
     Lava,
     /// A vine: not solid, and a body climbs it.
     Vine,
+    /// A **belt running right**: solid floor that carries a body standing on it.
+    ///
+    /// Two brushes rather than one with a direction switch, and it is the brittle-ground decision
+    /// again: a direction toggle is a mode a person has to hold in their head ("which way is a belt
+    /// right now?"), and the palette already has a shelf of cells that say what they do by being
+    /// seen. The pair also draws as the two pictures the level file writes — `>` and `<`.
+    Belt,
+    /// A **belt running left**. See [`Brush::Belt`].
+    BeltLeft,
+    /// Hangs a **rock**: a boulder under a ceiling that falls once when a body comes near.
+    ///
+    /// One cell, like the spiked ball: a click under a solid tile hangs the boulder, and it needs
+    /// nothing else — how far it falls is the room below it, and how it falls is gravity. There is
+    /// no number in the palette because there is nothing left to choose: the level says where it
+    /// hangs, and the level's own floor says where it stops.
+    Rock,
     /// Clears terrain.
     Empty,
     /// Moves the spawn point.
@@ -171,6 +187,14 @@ pub enum Brush {
     /// rule is the rope's — a pendulum tied to nothing is a floating hazard — and the room rule is
     /// its own, because the ball has a hitbox that must not hang through the floor.
     SpikeBall,
+    /// Places a **crate**: a one-tile solid a body can stand on and shove along by walking
+    /// into it.
+    ///
+    /// One cell, like the rock, and placed by the level's own rule
+    /// ([`Level::block_placeable`]): an empty cell with floor directly under it, so the crate
+    /// starts the episode resting rather than in the middle of a fall. It has no numbers — a crate
+    /// has no span, no rhythm and no direction: its whole design is where it starts.
+    Block,
     /// Places a piece of scenery (a bush, tree, rock, flower...): decoration the physics
     /// never sees. Which sprite is decided by [`Editor::scene_sprite`], because there are
     /// two dozen of them and two dozen palette buttons would be two dozen brushes.
@@ -251,12 +275,19 @@ impl BrushGroup {
     pub fn about(self) -> &'static str {
         match self {
             BrushGroup::Ground => "the floor: four materials, each with its brittle twin",
-            BrushGroup::Hazard => "what kills on touch: spikes, lava and the spiked ball",
-            BrushGroup::Traversal => {
-                "what carries a body: one-way ledge, spring, water, vine, rope, moving platform"
+            BrushGroup::Hazard => {
+                "what kills on touch: spikes, lava, the spiked ball and the falling rock"
             }
-            BrushGroup::Enemy => "the four agents that want the body dead: walkers, chasers, flyers, turrets",
-            BrushGroup::Level => "where it starts, where it ends, and the scenery that is only looked at",
+            BrushGroup::Traversal => {
+                "what carries a body: one-way ledge, belts, spring, water, vine, rope, moving \
+                 platform, crate"
+            }
+            BrushGroup::Enemy => {
+                "the four agents that want the body dead: walkers, chasers, flyers, turrets"
+            }
+            BrushGroup::Level => {
+                "where it starts, where it ends, and the scenery that is only looked at"
+            }
             BrushGroup::Clear => "clear a cell, or erase what is on it",
         }
     }
@@ -274,14 +305,17 @@ impl BrushGroup {
                 Brush::Plank,
                 Brush::CrackedPlank,
             ],
-            BrushGroup::Hazard => &[Brush::Spike, Brush::Lava, Brush::SpikeBall],
+            BrushGroup::Hazard => &[Brush::Spike, Brush::Lava, Brush::SpikeBall, Brush::Rock],
             BrushGroup::Traversal => &[
                 Brush::OneWay,
+                Brush::Belt,
+                Brush::BeltLeft,
                 Brush::Spring,
                 Brush::Water,
                 Brush::Vine,
                 Brush::Rope,
                 Brush::Platform,
+                Brush::Block,
             ],
             BrushGroup::Enemy => &[Brush::Walker, Brush::Chaser, Brush::Flyer, Brush::Turret],
             BrushGroup::Level => &[Brush::Spawn, Brush::Goal, Brush::Scenery],
@@ -367,7 +401,7 @@ impl Brush {
     /// orders is a second answer to "where does this part live", and the test that compares them
     /// should be comparing one answer with itself.
     #[cfg(test)]
-    pub const ALL: [Brush; 26] = [
+    pub const ALL: [Brush; 30] = [
         // Ground: each material's brittle twin beside it.
         Brush::Solid,
         Brush::Cracked,
@@ -381,13 +415,17 @@ impl Brush {
         Brush::Spike,
         Brush::Lava,
         Brush::SpikeBall,
+        Brush::Rock,
         // Traversal: what carries a body.
         Brush::OneWay,
+        Brush::Belt,
+        Brush::BeltLeft,
         Brush::Spring,
         Brush::Water,
         Brush::Vine,
         Brush::Rope,
         Brush::Platform,
+        Brush::Block,
         // Enemies.
         Brush::Walker,
         Brush::Chaser,
@@ -417,13 +455,16 @@ impl Brush {
             | Brush::CrackedBrick
             | Brush::Plank
             | Brush::CrackedPlank => BrushGroup::Ground,
-            Brush::Spike | Brush::Lava | Brush::SpikeBall => BrushGroup::Hazard,
+            Brush::Spike | Brush::Lava | Brush::SpikeBall | Brush::Rock => BrushGroup::Hazard,
             Brush::OneWay
+            | Brush::Belt
+            | Brush::BeltLeft
             | Brush::Spring
             | Brush::Water
             | Brush::Vine
             | Brush::Rope
-            | Brush::Platform => BrushGroup::Traversal,
+            | Brush::Platform
+            | Brush::Block => BrushGroup::Traversal,
             Brush::Walker | Brush::Chaser | Brush::Flyer | Brush::Turret => BrushGroup::Enemy,
             Brush::Spawn | Brush::Goal | Brush::Scenery => BrushGroup::Level,
             Brush::Empty | Brush::Erase => BrushGroup::Clear,
@@ -473,6 +514,10 @@ impl Brush {
             Brush::Plank => "wood_1",
             Brush::CrackedPlank => "cracked_wood",
             Brush::OneWay => "oneway_m",
+            Brush::Belt => "belt_r",
+            Brush::BeltLeft => "belt_l",
+            Brush::Block => "block",
+            Brush::Rock => "boulder",
             Brush::Spike => "spike",
             Brush::Spring => "spring",
             Brush::Water => "water",
@@ -512,6 +557,10 @@ impl Brush {
             Brush::Plank => "timber",
             Brush::CrackedPlank => "cracked timber",
             Brush::OneWay => "one-way",
+            Brush::Belt => "belt right",
+            Brush::BeltLeft => "belt left",
+            Brush::Block => "crate",
+            Brush::Rock => "rock",
             Brush::Spike => "spikes",
             Brush::Spring => "spring",
             Brush::Water => "water",
@@ -551,6 +600,12 @@ impl Brush {
             Brush::Plank => "wood timber deck boards floor jetty",
             Brush::CrackedPlank => "brittle crumble break deck timber",
             Brush::OneWay => "shelf ledge platform deck",
+            Brush::Belt => "conveyor conveyor belt carry treadmill speed run floor tread",
+            Brush::Block => "crate box push shove block movable step barrier container",
+            Brush::BeltLeft => {
+                "conveyor conveyor belt carry treadmill speed run floor tread reverse"
+            }
+            Brush::Rock => "rock boulder stone fall falling drop trap hazard ceiling crush",
             Brush::Spike => "trap hazard lethal spikes thorns",
             Brush::Spring => "trampoline bounce bouncepad pad launch jump",
             Brush::Water => "pool liquid swim lake sea",
@@ -604,6 +659,23 @@ impl Brush {
             Brush::OneWay => {
                 "One-way platform: ground from above, air from below and from \
                 the side. A body jumps up through it and lands on top of it."
+            }
+            Brush::Belt => {
+                "Belt running right: solid floor that carries whatever stands on it — a body, or \
+                a crate with a body riding on top. A jump off one lands further than the level's \
+                own jump allows."
+            }
+            Brush::BeltLeft => "Belt running left: the same floor, carrying the other way.",
+            Brush::Block => {
+                "Crate: a one-tile solid a body can stand on and shove along by walking into it. \
+                It slides at walking pace, stops at a wall or at another crate, and stays where it \
+                is left — on a belt, it rides the belt and carries its rider along. Push one under \
+                a ledge to make a step."
+            }
+            Brush::Rock => {
+                "Rock: hangs under a ceiling and falls once when a body comes near. \
+                It shakes for a moment first, a falling rock crushes, and where it lands it \
+                stays — usually as a step. One per socket, and it never comes back."
             }
             Brush::Spike => "Spike: not solid, lethal on contact.",
             Brush::Spring => {
@@ -868,6 +940,8 @@ impl Editor {
             Brush::Platform => self.level.platform_placeable(tx, ty, self.platform_tiles),
             Brush::Rope => self.level.rope_cell_placeable(tx, ty),
             Brush::SpikeBall => self.level.spike_ball_cell_placeable(tx, ty),
+            Brush::Rock => self.level.rock_placeable(tx, ty),
+            Brush::Block => self.level.block_placeable(tx, ty),
             Brush::Scenery => self.level.scenery_placeable(self.scene_sprite, tx, ty),
             Brush::Goal => self.level.goal_placeable(tx, ty),
             _ => true,
@@ -1034,6 +1108,8 @@ impl Editor {
         match brush {
             Brush::Solid => self.level.set_tile(tx, ty, Tile::Solid),
             Brush::OneWay => self.level.set_tile(tx, ty, Tile::OneWay),
+            Brush::Belt => self.level.set_tile(tx, ty, Tile::BeltRight),
+            Brush::BeltLeft => self.level.set_tile(tx, ty, Tile::BeltLeft),
             Brush::Cracked => self.level.set_tile(tx, ty, Tile::Cracked),
             Brush::Sand => self.level.set_tile(tx, ty, Tile::Sand),
             Brush::CrackedSand => self.level.set_tile(tx, ty, Tile::CrackedSand),
@@ -1142,6 +1218,28 @@ impl Editor {
                     return false;
                 }
                 self.level.add_rope_cell(tx, ty)
+            }
+            Brush::Rock => {
+                if !self.can_place(Brush::Rock, tx, ty) {
+                    self.message = if self.level.rock_at(tx, ty).is_some() {
+                        "there is already a rock here".to_string()
+                    } else {
+                        "a rock needs a ceiling to hang from and a clear row below it".to_string()
+                    };
+                    return false;
+                }
+                self.level.add_rock_tile(tx, ty)
+            }
+            Brush::Block => {
+                if !self.can_place(Brush::Block, tx, ty) {
+                    self.message = if self.level.block_at(tx, ty).is_some() {
+                        "there is already a crate here".to_string()
+                    } else {
+                        "a crate needs an empty cell with floor directly under it".to_string()
+                    };
+                    return false;
+                }
+                self.level.add_block_tile(tx, ty)
             }
             Brush::SpikeBall => {
                 if !self.can_place(Brush::SpikeBall, tx, ty) {
@@ -1269,9 +1367,12 @@ impl Editor {
             Some("spiked_ball") => {
                 // A pick brings the ball's own numbers, like a turret's facing or a platform's
                 // width: placing a second one should swing the way the first one did.
-                if let Some(i) = self.level.spike_balls.iter().position(|b| {
-                    b.col == tx && (b.row..=b.last_row()).contains(&ty)
-                }) {
+                if let Some(i) = self
+                    .level
+                    .spike_balls
+                    .iter()
+                    .position(|b| b.col == tx && (b.row..=b.last_row()).contains(&ty))
+                {
                     if let Some(b) = self.level.spike_balls.get(i) {
                         self.spike_ball_length = b.length.round().max(1.0) as i32;
                         self.spike_ball_reach = b.reach.round().max(1.0) as i32;
@@ -1279,6 +1380,7 @@ impl Editor {
                 }
                 self.brush = Some(Brush::SpikeBall);
             }
+            Some("block") => self.brush = Some(Brush::Block),
             Some("chaser") => self.brush = Some(Brush::Chaser),
             Some("walker") => self.brush = Some(Brush::Walker),
             _ => {}
@@ -1313,6 +1415,8 @@ impl Editor {
                 Some(Tile::Plank) => self.brush = Some(Brush::Plank),
                 Some(Tile::CrackedPlank) => self.brush = Some(Brush::CrackedPlank),
                 Some(Tile::OneWay) => self.brush = Some(Brush::OneWay),
+                Some(Tile::BeltRight) => self.brush = Some(Brush::Belt),
+                Some(Tile::BeltLeft) => self.brush = Some(Brush::BeltLeft),
                 Some(Tile::Spike) => self.brush = Some(Brush::Spike),
                 Some(Tile::Spring) => self.brush = Some(Brush::Spring),
                 Some(Tile::Water) => self.brush = Some(Brush::Water),
@@ -2791,7 +2895,11 @@ mod tests {
         assert_eq!(ed.level.spike_balls[0].length, placed.length + 1.0);
 
         // Without a ceiling there is nothing to tie the pendulum to.
-        assert_eq!(ed.spike_ball_drop(30, 6), None, "a refused drop has no ball");
+        assert_eq!(
+            ed.spike_ball_drop(30, 6),
+            None,
+            "a refused drop has no ball"
+        );
         assert!(!ed.can_place(Brush::SpikeBall, 30, 6));
         ed.begin_stroke();
         assert!(!ed.paint(30, 6));
@@ -2809,7 +2917,10 @@ mod tests {
         assert!(ed.paint(8, 3));
         ed.end_stroke();
         ed.brush = Some(Brush::Erase);
-        assert!(ed.pick_at(8, 3 + 2), "the chain hangs, so the mid-cell picks it");
+        assert!(
+            ed.pick_at(8, 3 + 2),
+            "the chain hangs, so the mid-cell picks it"
+        );
         assert_eq!(ed.brush, Some(Brush::SpikeBall));
     }
 

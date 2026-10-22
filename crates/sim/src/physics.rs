@@ -5,7 +5,7 @@
 //! from — or into — the jump-reachability oracle in [`crate::reach`].
 
 use crate::hash::StateHasher;
-use crate::level::{Level, Rect};
+use crate::level::{Level, Rect, Tile};
 use crate::DECISION_TICKS;
 
 /// The physics bible. Units are **tiles and ticks** (1 tick = [`crate::DT`] s).
@@ -369,6 +369,54 @@ pub struct Physics {
     /// hanging dead two swings later — long enough for a body that backed off to meet it again,
     /// short enough that it eventually settles.
     pub spike_ball_drag: f32,
+
+    // ---- the belt --------------------------------------------------------
+    /// How far a belt carries a body standing on it, in tiles per tick.
+    ///
+    /// **One art pixel a tick**, the same 1/16 the mover slides at and for the same reason: at any
+    /// integer zoom the carried body moves a whole number of screen pixels per frame, so a belt
+    /// reads as a moving floor rather than as a floor that stutters. 0.0625 is 3.75 tiles a
+    /// second — 62% of a run — which is the one speed at which a belt is worth stepping onto: fast
+    /// enough to matter to a jump's carry, slow enough that a body can still walk against it.
+    pub belt_speed: f32,
+
+    // ---- the rock --------------------------------------------------------
+    /// A rock's side, in tiles. One cell, because the art is one cell.
+    pub rock_size: f32,
+    /// Ticks a woken rock shudders before it lets go, so a body that woke it can get clear.
+    ///
+    /// **This is the whole difference between a trap and an unfair one.** The first version of
+    /// the falling trap was a press on a clock: it never gave a body enough time to cross, because
+    /// the corridor was shut for most of every cycle and the window moved under the player. A rock
+    /// that starts to shake, and then falls once, gives the one thing a clock never did — a beat
+    /// between the warning and the consequence, and then a world that stays changed.
+    pub rock_warn: u32,
+    /// How near a body has to come, in tiles of clear space, to wake a rock.
+    ///
+    /// Measured from the rock's box, so a body running past at floor level wakes it about two
+    /// tiles early: the warning plus the fall is longer than the run to the far side, which is
+    /// what makes "keep running" an answer and not a coin flip.
+    pub rock_reach: f32,
+    /// How far below a rock a body can be and still wake it, in tiles.
+    ///
+    /// A body *above* the rock (on the bridge over it) never wakes it: the condition is that the
+    /// body is under the rock's bottom edge. The depth bound is there so a rock high over a shaft
+    /// is not woken by somebody walking along the bottom of a different room.
+    pub rock_depth: f32,
+
+    // ---- the crate -------------------------------------------------------
+    /// A crate's width and height, in tiles: one cell.
+    ///
+    /// The art is one cell and the box is the art, on the spiked ball's rule: a solid a body bumps
+    /// into has to be the solid it can see. It is also the size that makes a crate a *step* — one
+    /// tile is a hop a body can make, two would be a wall it needs the crate to be pushed to.
+    pub block_size: f32,
+    /// How fast a body shoves a crate it is leaning on, tiles/tick.
+    ///
+    /// A run, exactly (`run_speed`): pushing is walking pace with a crate in front of you, and a
+    /// body that could shove faster than it can walk would be moving a box it is not keeping up
+    /// with. The crate is the load, so it sets the pace.
+    pub block_push: f32,
 }
 
 pub const PHYSICS: Physics = Physics {
@@ -454,6 +502,16 @@ pub const PHYSICS: Physics = Physics {
     spike_ball_h: 0.85,
     spike_ball_kick: 0.22,
     spike_ball_drag: 0.9995,
+    // The shelf's own speed, for the shelf's own reason: one art pixel a tick.
+    belt_speed: 0.0625,
+    // One cell, a half-second shudder, and a body two tiles away wakes it: see the fields.
+    rock_size: 1.0,
+    rock_warn: 30,
+    rock_reach: 2.0,
+    rock_depth: 6.0,
+    // One cell, and a shove at walking pace: see the fields.
+    block_size: 1.0,
+    block_push: 0.10,
     // Under `run_accel` on purpose: a pendulum has a whole arc to be pushed along.
     rope_pump: 0.008,
     // A hand's reach, not a box: a jump that misses the line by half a tile misses it.
@@ -1341,7 +1399,21 @@ impl PlayerState {
     }
 
     /// Advance one tick: intent, gravity, then per-axis AABB resolution.
-    pub fn tick(&mut self, level: &Level, ph: &Physics, action: AgentAction) -> TickContact {
+    /// One tick of the body.
+    ///
+    /// `solids` are boxes the body collides with that are **not terrain**: crates, and whatever
+    /// else the pack grows that moves. They are passed rather than looked up because they are not
+    /// facts about the level — a crate's position is a fact about the episode — and because the
+    /// oracle deliberately models them at their authored position ([`crate::reach`]), which is a
+    /// different answer from the one the sim gives. The sim hands over its live crates; the oracle
+    /// hands over the file's.
+    pub fn tick(
+        &mut self,
+        level: &Level,
+        ph: &Physics,
+        action: AgentAction,
+        solids: &[Rect],
+    ) -> TickContact {
         let mut contact = TickContact::default();
 
         // ---- a pull-up owns the body until it ends -----------------------
@@ -1622,6 +1694,13 @@ impl PlayerState {
             self.tick_rope(level, ph, action, &mut contact);
         } else {
             self.x += self.vx;
+            // Crates are boxes, not cells, so they are resolved before the grid: the grid puts the
+            // body flush against a wall at a cell edge, and a crate's edge is anywhere. Same rule
+            // either way — the body stops where it would have entered, and its speed is spent —
+            // and doing it first means a body stopped by a crate does not also run the cell test.
+            if self.vx != 0.0 {
+                self.resolve_solids(solids, &mut contact);
+            }
             let (ty0, ty1) = row_span(self.y, self.h);
             if self.vx > 0.0 {
                 let col = tile_span(self.x, self.w).1;
@@ -1695,31 +1774,51 @@ impl PlayerState {
                     }
                 }
             }
+            let prev_bottom = self.y + self.h;
             self.y += self.vy;
             let (tx0, tx1) = tile_span(self.x, self.w);
             self.grounded = false;
             if self.vy > 0.0 {
                 let row = row_span(self.y, self.h).1;
+                let mut stop: Option<f32> = None;
                 for tx in tx0..=tx1 {
                     if level.is_solid(tx, row) {
-                        self.y = row as f32 - self.h;
-                        self.vy = 0.0;
-                        self.grounded = true;
-                        self.jump_cut_applied = false;
-                        contact.landed = true;
+                        stop = Some(row as f32);
                         break;
                     }
                 }
+                // A crate top is a floor wherever it happens to be. The *higher* of the two
+                // surfaces wins: the body stands on the first thing it reaches, and a crate
+                // resting against a step is a step's worth of height above the floor.
+                if let Some(top) =
+                    crate_landing(solids, self.x, self.w, prev_bottom, self.y + self.h)
+                {
+                    stop = Some(stop.map_or(top, |t| t.min(top)));
+                }
+                if let Some(top) = stop {
+                    self.y = top - self.h;
+                    self.vy = 0.0;
+                    self.grounded = true;
+                    self.jump_cut_applied = false;
+                    contact.landed = true;
+                }
             } else if self.vy < 0.0 {
                 let row = tile_span(self.y, self.h).0;
+                let mut ceiling: Option<f32> = None;
                 for tx in tx0..=tx1 {
                     // Rising through a one-way shelf is the move the tile exists for.
                     if level.is_opaque(tx, row) {
-                        self.y = (row + 1) as f32;
-                        self.vy = 0.0;
-                        contact.hit_ceiling = true;
+                        ceiling = Some((row + 1) as f32);
                         break;
                     }
+                }
+                if ceiling.is_none() {
+                    ceiling = crate_underside(solids, self.x, self.w, prev_bottom - self.h, self.y);
+                }
+                if let Some(top) = ceiling {
+                    self.y = top;
+                    self.vy = 0.0;
+                    contact.hit_ceiling = true;
                 }
             }
         }
@@ -1779,6 +1878,29 @@ impl PlayerState {
         self.in_water = in_water;
         self.on_vine = matches!(medium, Medium::Vine);
         contact
+    }
+
+    /// Stop the body against any crate whose box it walked into this tick.
+    ///
+    /// Only the direction of travel matters: a body moving right is put back at the crate's left
+    /// edge and so on, which is the same statement the tile loop above makes with cells. A body
+    /// with no horizontal speed is left alone even if it overlaps — a crate shoved into a standing
+    /// body is the pusher's business, and teleporting the body out of it would be a second rule.
+    fn resolve_solids(&mut self, solids: &[Rect], contact: &mut TickContact) {
+        for s in solids {
+            if !self.aabb().overlaps(s) {
+                continue;
+            }
+            if self.vx > 0.0 {
+                self.x = s.x - self.w;
+            } else if self.vx < 0.0 {
+                self.x = s.x + s.w;
+            } else {
+                continue;
+            }
+            self.vx = 0.0;
+            contact.hit_wall = true;
+        }
     }
 
     /// A push off the water's surface: the body leaves the water at
@@ -2677,12 +2799,7 @@ impl SpikeBall {
     }
 
     pub fn aabb(&self) -> Rect {
-        Rect::new(
-            self.x - self.w * 0.5,
-            self.y - self.h * 0.5,
-            self.w,
-            self.h,
-        )
+        Rect::new(self.x - self.w * 0.5, self.y - self.h * 0.5, self.w, self.h)
     }
 
     /// One tick: wake if the body is near, then move the pendulum.
@@ -2777,6 +2894,297 @@ pub fn clear_travel(home: Rect, span: f32, vertical: bool, dir: i8, level: &Leve
 ///
 /// `is_opaque`, not `is_solid`: a one-way shelf is not a wall, so a platform may slide
 /// through one — the same rule a body follows.
+/// Which way the belt under `body` carries it, if the body is standing on one.
+///
+/// **The tile under the body's centre**, not under either edge, and for water's reason: a body
+/// straddling two belts (or a belt and a floor) is carried by the one it is *on*, and the middle
+/// of its feet is the only answer that does not flicker as it crosses a boundary. The caller does
+/// the "is it grounded" half — a belt only carries a body whose weight is on it.
+///
+/// The row is read from just **below** the feet ([`Level::tile_y`] of `y + h + 0.05`), which is the
+/// same half-tile tolerance the sim uses to decide what a body is standing on: a body resting on
+/// the tile has its feet exactly on the boundary, and a body a hair above it is still standing.
+pub fn belt_dir_at(level: &Level, body: &Rect) -> Option<i8> {
+    let row = Level::tile_y(body.y + body.h + 0.05);
+    let col = Level::tile_x(body.x + body.w * 0.5);
+    level.tile(col, row).and_then(Tile::belt_dir)
+}
+
+/// A **rock**: a boulder that hangs under a ceiling until a body comes near, then falls once.
+///
+/// **It follows gravity, and it is spent by falling.** That is the whole of it, and it is a
+/// different object from the press it replaces: a press was a clock, so a corridor was shut for
+/// most of every cycle and the window a body needed moved under it. A rock is *state* — it sleeps,
+/// it wakes once, it falls, it lands, and it never moves again — so the answer to a rock is
+/// patience and then a level that has changed, rather than a rhythm to be timed forever.
+///
+/// **It shudders before it lets go.** A trap that falls the tick it is woken is a trap a body
+/// cannot see; [`Physics::rock_warn`] is the beat between the warning and the consequence, and it
+/// is what makes running past one a decision instead of a dice roll.
+///
+/// **A falling rock kills; a settled one is a step.** Once it lands it is a one-tile solid like a
+/// crate — a body can stand on it, and a corridor it has fallen into can be jumped. That is the
+/// property the press never had, and the reason this element can be put in a level at all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rock {
+    pub id: u32,
+    /// Where it hangs: one tile, top edge on the bottom of its row.
+    pub home: Rect,
+    /// Its box this frame. Equal to `home` until it is woken and released.
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Vertical speed, tiles/tick. Always `>= 0`: a rock falls, and nothing lifts it.
+    pub vy: f32,
+    /// `true` once a body has come near. Never cleared: a rock falls once.
+    pub woken: bool,
+    /// Ticks left of the shudder before release. Meaningless until `woken`.
+    pub warn: u32,
+    /// `true` once it has come to rest. Never cleared: nothing moves it again.
+    pub landed: bool,
+}
+
+impl Rock {
+    /// A rock hanging at `spec`.
+    pub fn new(id: u32, spec: crate::level::RockSpec) -> Rock {
+        let home = spec.home();
+        Rock {
+            id,
+            home,
+            x: home.x,
+            y: home.y,
+            w: home.w,
+            h: home.h,
+            vy: 0.0,
+            woken: false,
+            warn: 0,
+            landed: false,
+        }
+    }
+
+    pub fn aabb(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+
+    /// `true` while it is in the air under its own weight — the only time it kills.
+    pub fn falling(&self) -> bool {
+        self.woken && !self.landed && self.warn == 0
+    }
+
+    /// `true` while it is shuddering in its socket: the frame the view shakes it on.
+    pub fn shuddering(&self) -> bool {
+        self.woken && !self.landed && self.warn > 0
+    }
+
+    /// Does `body` wake it? Near in the column, and **under** the rock rather than on top of it.
+    ///
+    /// The vertical half is what keeps a body walking the bridge over a rock from waking it: what
+    /// a rock threatens is the room below it, and that is the room its trigger is in.
+    fn wakes_on(&self, body: &Rect, ph: &Physics) -> bool {
+        let near =
+            body.x + body.w >= self.x - ph.rock_reach && body.x <= self.x + self.w + ph.rock_reach;
+        let under = body.y + body.h > self.y + self.h - 0.5;
+        let close = body.y < self.y + self.h + ph.rock_depth;
+        near && under && close
+    }
+
+    /// Step the rock: wake (with the shudder), fall under gravity, and stop on the first surface.
+    ///
+    /// `crates` are landing surfaces as well as terrain, on the crate's own rule: a rock that fell
+    /// *through* a crate would be a hole in the world. Position is clamped to the surface rather
+    /// than resolved incrementally because the fall is at most `max_fall` (< 1 tile) a tick, so
+    /// the cell the new bottom is in is the first one it can have entered.
+    pub fn tick(&mut self, body: &Rect, level: &Level, ph: &Physics, crates: &[Rect]) {
+        if self.landed {
+            return;
+        }
+        if !self.woken {
+            if self.wakes_on(body, ph) {
+                self.woken = true;
+                self.warn = ph.rock_warn;
+            }
+            return;
+        }
+        if self.warn > 0 {
+            self.warn -= 1;
+            return;
+        }
+        let prev_bottom = self.y + self.h;
+        self.vy = (self.vy + ph.gravity).min(ph.max_fall);
+        self.y += self.vy;
+        let bottom = self.y + self.h;
+        let mut surface: Option<f32> = None;
+        let row = row_span(self.y, self.h).1;
+        let (x0, x1) = tile_span(self.x, self.w);
+        for tx in x0..=x1 {
+            if level.is_solid(tx, row) {
+                let top = row as f32;
+                surface = Some(surface.map_or(top, |s: f32| s.min(top)));
+            }
+        }
+        if let Some(top) = crate_landing(crates, self.x, self.w, prev_bottom, bottom) {
+            surface = Some(surface.map_or(top, |s: f32| s.min(top)));
+        }
+        if let Some(top) = surface {
+            self.y = top - self.h;
+            self.vy = 0.0;
+            self.landed = true;
+        }
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.f32(self.y);
+        h.f32(self.vy);
+        h.u8(u8::from(self.woken));
+        h.u32(self.warn);
+        h.u8(u8::from(self.landed));
+    }
+}
+
+/// A **crate**: a one-tile solid that falls, lands and can be shoved.
+///
+/// The one object in the pack a body can *change*: a wall is a fact about the level and a crate is a
+/// fact about where a body left it. That is why it is simulated as a body rather than a tile — a
+/// tile is hashed into the document, and a moved crate is the same document with a crate somewhere
+/// else.
+///
+/// **It has no horizontal velocity.** A shove translates it and stops; nothing carries it on. That
+/// is the design decision that keeps it simple and readable: a crate with momentum would slide, need
+/// friction, need to decide whether a body standing on it rides the slide, and would make "push the
+/// crate to the wall" a skill of timing rather than of walking. A crate is moved, not thrown.
+///
+/// **Two crates do not stack.** A crate stops when the box it would move into is terrain or another
+/// crate, and otherwise it moves; a row of them therefore shoves along front-first, one at a time,
+/// which is what a person expects and all the simulation a crate needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Block {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Vertical speed, tiles/tick. Always `>= 0`: a crate falls, and nothing lifts it.
+    pub vy: f32,
+    pub grounded: bool,
+}
+
+impl Block {
+    /// A crate at the position its file gives it.
+    pub fn new(spec: crate::level::BlockSpec) -> Block {
+        let rect = spec.rect();
+        Block {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w.max(0.1),
+            h: rect.h.max(0.1),
+            vy: 0.0,
+            grounded: false,
+        }
+    }
+
+    pub fn aabb(&self) -> Rect {
+        Rect::new(self.x, self.y, self.w, self.h)
+    }
+
+    /// Gravity, then the tile grid: land on the first solid row under the box.
+    ///
+    /// It does not resolve sideways, because nothing gives it sideways speed: the only horizontal
+    /// motion a crate has is [`Block::push`], which refuses a move into terrain before it makes it.
+    pub fn tick(&mut self, level: &Level, ph: &Physics) {
+        self.vy = (self.vy + ph.gravity).min(ph.max_fall);
+        self.grounded = false;
+        self.y += self.vy;
+        let (x0, x1) = tile_span(self.x, self.w);
+        if self.vy >= 0.0 {
+            let row = row_span(self.y, self.h).1;
+            if (x0..=x1).any(|tx| level.is_solid(tx, row)) {
+                self.y = row as f32 - self.h;
+                self.vy = 0.0;
+                self.grounded = true;
+            }
+        } else {
+            let row = row_span(self.y, self.h).0;
+            if (x0..=x1).any(|tx| level.is_opaque(tx, row)) {
+                self.y = (row + 1) as f32;
+                self.vy = 0.0;
+            }
+        }
+    }
+
+    pub(crate) fn hash_into(&self, h: &mut StateHasher) {
+        h.f32(self.x);
+        h.f32(self.y);
+        h.f32(self.vy);
+    }
+}
+
+/// Try to shove the crate at `blocks[i]` `dx` tiles sideways. Returns whether it moved.
+///
+/// Refused when the box it would occupy is terrain or another crate — the two things a crate
+/// cannot go through — so a crate pushed at a wall stops exactly flush against it and the body
+/// behind it is then stopped by the crate, which is the whole of the interaction.
+///
+/// A free function taking the whole list rather than a method on one crate, because the refusal
+/// is a fact about the list: two crates cannot be in the same box, and a method that could not see
+/// its neighbours would either allow that or need the list anyway.
+pub fn push_block(level: &Level, blocks: &mut [Block], i: usize, dx: f32) -> bool {
+    if dx == 0.0 || !dx.is_finite() || i >= blocks.len() {
+        return false;
+    }
+    let mut next = blocks[i];
+    next.x += dx;
+    let moved = next.aabb();
+    if rect_hits_opaque(level, moved) {
+        return false;
+    }
+    if blocks
+        .iter()
+        .enumerate()
+        .any(|(j, o)| j != i && o.aabb().overlaps(&moved))
+    {
+        return false;
+    }
+    blocks[i].x = next.x;
+    true
+}
+
+/// The highest crate top a descending body's feet crossed this tick, if any.
+///
+/// The horizontal test is strict, so a body flush against a crate's side is *beside* it and does
+/// not land on it: `tile_span` uses the same epsilon trick for the same reason. The vertical test
+/// is a crossing (above the top before the move, at or below it after), not an overlap, because an
+/// overlap cannot tell a body arriving on a surface from one that was already inside it.
+fn crate_landing(solids: &[Rect], x: f32, w: f32, prev_bottom: f32, bottom: f32) -> Option<f32> {
+    const EPS: f32 = 1.0e-3;
+    let mut best: Option<f32> = None;
+    for s in solids {
+        if x + w <= s.x + EPS || x >= s.x + s.w - EPS {
+            continue;
+        }
+        if prev_bottom <= s.y + EPS && bottom >= s.y {
+            best = Some(best.map_or(s.y, |b: f32| b.min(s.y)));
+        }
+    }
+    best
+}
+
+/// The underside of the crate a rising body's head crossed this tick, if any: the mirror of
+/// [`crate_landing`], so a jump under a crate is stopped by it instead of passing through it.
+fn crate_underside(solids: &[Rect], x: f32, w: f32, prev_top: f32, top: f32) -> Option<f32> {
+    const EPS: f32 = 1.0e-3;
+    let mut best: Option<f32> = None;
+    for s in solids {
+        if x + w <= s.x + EPS || x >= s.x + s.w - EPS {
+            continue;
+        }
+        let underside = s.y + s.h;
+        if prev_top >= underside - EPS && top <= underside {
+            best = Some(best.map_or(underside, |b: f32| b.max(underside)));
+        }
+    }
+    best
+}
+
 pub(crate) fn rect_hits_opaque(level: &Level, rect: Rect) -> bool {
     let (x0, x1) = tile_span(rect.x, rect.w);
     let (y0, y1) = row_span(rect.y, rect.h);
@@ -2863,7 +3271,7 @@ mod tests {
             } else {
                 AgentAction::Run
             };
-            player.tick(&level, ph, action);
+            player.tick(&level, ph, action, &[]);
             apex = apex.max(start_bottom - (player.y + player.h));
             if t > ph.min_jump_hold && player.grounded {
                 break;
@@ -3055,7 +3463,7 @@ mod tests {
             player.set_speed_cap(PHYSICS.sprint_speed);
             let x0 = player.x;
             for _ in 0..40 {
-                player.tick(level, &PHYSICS, action);
+                player.tick(level, &PHYSICS, action, &[]);
             }
             (player.x - x0).abs()
         };

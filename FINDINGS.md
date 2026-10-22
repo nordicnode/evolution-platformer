@@ -7362,3 +7362,447 @@ command and the same twenty generations, with three numbers and one word where t
 This supersedes the "it is a menu" pass in the section above, which cut the *board* down to four
 readings. The complaint behind that one was length; this one was movement, and the answer to movement
 is not fewer words but a fixed height.
+
+## The machine pass: a floor that moves and a ceiling that comes down
+
+Two elements, one batch, and they are deliberately a *pair*: the belt adds a way to change a jump's
+reach without touching the jump, and the crusher adds a hazard whose whole answer is patience. Both
+are things the level format could not say before version 6.
+
+### The belt is a tile, and the carry is a translation
+
+A belt is `>` or `<` in the grid: two tile variants, two glyphs, two palette brushes — no direction
+field, because a cell in the grid has nowhere to put one and the two characters are the picture an
+author is drawing anyway. It is **solid and opaque**, so every existing consumer of "is there ground
+here" (`is_solid`, the route graph, the sensors, the oracle's platform table) treats it as a floor
+with no change at all.
+
+The carry is applied in `Sim::step`, **before the body's own tick and only while it is grounded**:
+the body is translated `belt_speed` in the belt's direction, the translation is refused if it would
+put the body inside a wall (the shelf's rule, for the shelf's reason), and the body's velocity is
+untouched. Three consequences, and they are the design:
+
+* **Being carried is not being accelerated.** Stepping off a belt leaves no momentum behind, so a
+  belt cannot make a jump the level's physics does not already allow — it spends its effect on the
+  distance you are *already* carrying into the take-off.
+* **A body in the air over a belt is not carried.** A belt is a floor, not a current; a belt that
+  carried jumpers would silently lengthen every jump off it, and the oracle's canonical jumps would
+  be wrong about the level in a way no test of the tile would catch.
+* **The belt is invisible to the sensors, on purpose.** The patch encodes it as `ENC_SOLID`, because
+  the patch is about what a cell *is* to a body and a belt is a floor. The carry is felt where a body
+  feels everything else — in `vx` — and giving the belt its own code would have cost a sensor version
+  and invalidated every champion on disk for a cell whose action is "walk on it".
+
+`belt_speed` is 1/16 of a tile per tick, the mover's number for the mover's reason: one art pixel a
+tick at every integer zoom, so a carried body moves a whole number of screen pixels per frame. It is
+3.75 tiles a second, 62% of a run.
+
+### The crusher is a clock, and it kills at every point in its stroke
+
+A crusher hangs in the cell it was authored in, under a solid tile, and slams down `travel` tiles on
+a cycle of **drop (10 ticks), hold (26), rise (44)** — a two-second press whose fall is a
+quarter-second slam. Its position is `f(tick, phase)` exactly as a mover's is, with the phase derived
+from its **column** (coprime stride 29 against the 80-tick cycle), so a row of presses drums down the
+corridor instead of thudding as one and nothing about it has to be stored in an episode. Its stroke
+is clamped at load time to the first opaque row below it, so a press authored through a floor slams
+onto the floor.
+
+**Contact kills, always.** A retracted head is a slab hanging in a cell; a closed one is a slab on the
+floor. Deciding otherwise would make the retracted press a decoration and the closed one a trap, and
+the decision a press asks for — *wait for it to lift* — is the same in both halves of the cycle. The
+death has its own cause (`DeathCause::Crusher`), so a run can say what killed it.
+
+**The oracle's model is the spiked ball's, and it has the spike's limit.** The band the head can
+sweep is a hazard: a stand under it is not a stand (`Level::is_standable` asks `pressed_stand`), a
+take-off inside it is corrupt, and a trajectory that enters it ends there instead of landing. That is
+the honest model, because whether a press's column is crossable is the *clock's* question and the
+clock is not terrain. What it does **not** do is split a platform: `extract_platforms` is a run of the
+tile grid, so a floor under a press stays one platform and a jump that clears the band from a take-off
+outside it is still reported. That is exactly the spike's own limit in the platform pass, and the
+demo level is built so its route does not depend on the difference — `bat-machine-shop` puts the press
+under a **bridge**, and the bridge is the route.
+
+### The level, and how it is proven
+
+`levels/bat-machine-shop.json` is the battery's eighth level: a belt run-up on the low road that
+hurries a body towards a press, two steps up, and a bridge across the press's column with a second
+belt on it. The low road runs under the press (clear at rest, lethal closed) and the high road is the
+oracle's route. Proven three ways, each an artifact rather than a claim:
+
+* `train-cli reach` — `OK … platforms 5 reachable 5`, and the battery test asserts the press's stroke
+  really does reach the floor it was built over and that there are at least eight belt cells.
+* `train-cli routeplan` — `PLANNED … 2 legs, 2 of 2 rungs closed`, i.e. the planner has a certified
+  route that replays to a win.
+* `train-cli think` — **a real controller played it and reached the flag in 275 frames** (4.58 s),
+  which is the only one of the three that is an episode rather than a model.
+
+`docs/images/machine-shop.png` is that level drawn by the shipped renderer
+(`evo-app --level levels/bat-machine-shop.json --screenshot`): belts with their arrows, the press
+under the bridge, and both new brushes in the palette's Traversal and Hazards shelves.
+
+### Tests
+
+`entities.rs` grew five: a right belt and a left belt carry a standing body at the speed the physics
+says and a body in the air over one is not carried; a press's three phases come off `Crusher`'s clock
+with the phase taken out; a body standing in the column dies with `DeathCause::Crusher` inside one
+cycle; a six-tile stroke over a two-tile room is clamped to the floor; and the oracle refuses the
+band (not a stand, inside the band, the floor either side still a stand). The round-trip test carries a
+press through the writer. `levels.rs` gained the shop to the battery table and to the
+"contains the mechanic it names" check. `assets/README.md` names the three new sprites, which is what
+`atlas::tests` reads.
+
+`levels/practice/*` was regenerated (`train-cli fuzz --out levels/practice`) because the writer now
+emits version 6; the diff is the version line only. `crates/evo/tests/fixtures/l11-the-elements.champion.json`
+was regenerated the same way (`cargo run -p evo --example make_migration_fixture`), for the same
+reason and with the same diff.
+
+### What this pass deliberately did not do
+
+* **The pushable block** was left for the next pass and has since landed — the crate is in the body's
+  own collision pass now (see *The crate* below), which was the part of it that could not be faked.
+* **The mastery league is already shipped**, and already on by default: `GaConfig::mastery`, the
+  league selection score, `--mastery` / `--no-mastery` in both front ends and the panel's toggle. A
+  "mastery league" item is therefore not a new mode but a *reading* of the one that exists (what the
+  league has bought since it armed), and that is where the next pass on it starts.
+
+## The crate: the first thing a body can move
+
+**What it is.** A one-tile wooden crate, `"block"` in the level file, one `BlockSpec` per cell. It
+falls, it lands, it can be stood on, and a body that walks into it shoves it along — at walking pace,
+in the direction the body is pressing, and only while the body is on the ground. It is the first
+object in the pack that a body can *change*: a wall is a fact about the level, and a crate is a fact
+about where a body left it.
+
+**It is a body, not a tile, and that is the whole design decision.** A tile is hashed into the level
+document; a crate that has been shoved is the same document with a crate somewhere else. So it lives
+in the sim (`physics::Block`, `Sim::blocks`), its position is episode state and is hashed
+(conditionally, like a spiked ball, so every episode recorded without a crate hashes exactly as it
+did), and the level file only says where it *starts*. Three consequences follow, and they are all
+deliberate:
+
+* **No horizontal velocity.** A shove translates the crate and stops. Nothing carries it on, so there
+  is no friction to tune, no slide for a body standing on it to ride, and no such thing as pushing a
+  crate into a gap and watching it keep going. A crate is moved, not thrown.
+* **No stacking physics.** A crate's move is refused when the box it would occupy is terrain or
+  another crate; otherwise it moves. Two crates therefore shove along front-first, one at a time — a
+  row of them is not a conveyor, and the crate in the middle can only go where there is room.
+* **It falls on its own.** Gravity, a landing on the first solid row under the box, and a clamp at
+  the ceiling. Push a crate off a ledge and it is gone: it lands below, and the step it was is now
+  down there.
+
+**How a body collides with one.** `PlayerState::tick` grew a `solids: &[Rect]` parameter — boxes that
+are not terrain — and resolves them *before* the grid: a crate's edge is anywhere, a cell's edge is on
+the grid, and doing the box first means a body stopped by a crate does not also run the cell test. The
+vertical pass takes a crate top as a landing surface with the same crossing test a mover's deck uses
+(two landing candidates, the higher wins), and a crate's underside as a ceiling. The sim passes its
+live crates each tick, rebuilt into a buffer it owns rather than allocating one per tick.
+
+**Pushing happens before the body's tick, and the shove carries the body with it.** Both halves are
+the belt's lesson. Pushing before the tick means the body starts its tick where the crate has left the
+world, so it is never caught inside a box that moved. Carrying the body is the part that took a
+measurement: the first version moved only the crate, and the body — flush against it, its speed spent
+by the collision — re-accelerated from nothing every time, so the crate took a shove every four or five
+ticks and crawled. With the body carried the pair advances at exactly `block_push` per tick, the body
+stays flush, and pushing is a steady walk at 0.10 tiles a tick, which is `run_speed`: the load sets the
+pace, and a sprinting body cannot outrun the thing it is pushing.
+
+**The sensors read it as the ground it is.** A crate is drawn into the 9×9 patch as `ENC_SOLID`, the
+value a wall already uses — a crate is solid, so it reads solid, and once it has moved the cell it left
+reads empty and the cell it arrived in reads solid, which is exactly the feedback pushing needs. No
+slot moved, `N_INPUTS` is unchanged and `VERSION` did **not** bump: the value was already in the patch,
+the way the belt's and the spiked ball's economies were, and a level with no crate observes the vector
+it always observed.
+
+**The oracle's model is the file's crate, and it has a limit worth stating.** `Level::block_rects`
+gives the oracle the crate where the **author** put it, and the trajectories collide with it there —
+that is strictly better than an oracle that cannot see a crate at all (a body would be planned straight
+through a solid). What it cannot do is push one: the oracle has no notion of a body changing the world,
+so a crate that has moved is invisible to it, and — the bigger half — **a crate is not a stand**: the
+route graph's platforms are runs of the tile grid, so standing on a crate is not a move the graph knows
+about. `bat-crate-yard` is therefore certified by a route that does not need a shove, and the crate
+route on it is proven by a scripted episode instead.
+
+### The level, and how it is proven
+
+`levels/bat-crate-yard.json` is the battery's ninth level: a flat yard, a crate, and a **three-tile
+shelf** whose face is one tile above a jump. `PHYSICS::discrete_max_jump_height()` is 2.375, so the
+floor is not enough; the crate is one tile, so its top makes the shelf a hop. The level is built so the
+first thing a body does — walk right — is also the correct thing: the crate is shoved flush against the
+face, and the body then stands on it and jumps up. Shove it the other way, off the back, and the step is
+gone.
+
+* `train-cli reach` — `OK … platforms 3 reachable 3`; the battery table gained the level, and the
+  "contains the mechanic it names" test pins the crate's cell, the wall's three tiles and the missing
+  fourth.
+* `train-cli routeplan` — `PLANNED … 2 legs, 2 of 2 rungs closed` (through the wall jump, not the
+  crate: that is the limit above, stated rather than hidden). `train-cli battery` reports the level
+  `reach yes  plan yes` with the rest of the pack.
+* `levels.rs::the_crate_yard_step_is_the_jump_the_wall_needs` — a **scripted episode** on the real
+  level: walk right until the crate is flush at 21.0, hop onto it (feet on its top at y 12.0), hop
+  again pressing right, and land **on the shelf** at feet 10.0. That is the level's claim, measured in
+  the sim rather than asserted.
+* `docs/images/crate-yard.png` is the level drawn by the shipped renderer
+  (`evo-app --level levels/bat-crate-yard.json --screenshot`), with the crate brush in the palette's
+  Traversal shelf.
+
+### Tests
+
+`entities.rs` grew six: a body shoves a crate at walking pace and is never inside it; a crate stops
+flush at a wall and then stops the body (its speed spent); two crates refuse to become a train; a body
+dropped on a crate lands on its top; the sensor patch reads the crate as solid and follows it when it
+moves; and two runs that pushed it the same way agree on the position and the state hash — a shorter
+push is a different state. `levels.rs` gained the battery entry, the mechanic check and the scripted
+route. The writer round-trips the entity, and `assets/README.md` names the `block` sprite, which is what
+`atlas::tests` reads.
+
+### What this pass deliberately did not do
+
+* **Stacking, ladders and thrown crates.** The refusal rule is the whole of the crate's interaction
+  with other crates. A stack is a rigid-body problem (and one the pack does not have); a crate a body
+  can climb onto another crate from is a step, and two crates side by side already give two heights.
+* **A crate in the route graph.** Making a crate a *stand* means teaching `extract_platforms` and
+  `edges_at_column` about a box that is not on the grid, and teaching the oracle that its own jump can
+  move one. That is the piece that would let a level be authored so its route *needs* a shove, and it
+  is the honest next step for the element rather than something to fake in a level.
+
+## The objects were only in the editor (the play/evolve canvases never drew them)
+
+Reported after the crate pass: *"The new objects you added only display when in edit mode. They are not
+visible in play or evolve mode."* Exactly true, and it was one structural mistake covering the whole
+element family — the belt, the press and the crate.
+
+### The cause
+
+Two passes each drew a thing where it happened to be easy to see it:
+
+* the press and the crate were drawn by `draw_level_entities`, the **document's** entity pass, which
+  `RenderOpts::entities` gates;
+* `draw_sim_at` drew the run's own presses (at their stroke frame) and crates (where they had been
+  pushed) — and `draw_sim_at` is used by the splash's demo, not by a canvas.
+
+`RenderOpts::playing()` sets `entities: false` on purpose: a live view must not draw walkers where the
+*file* put them. So in Play, Evolve and Replay neither pass ran: the canvases draw the level and their
+bodies by hand (`draw_level_held` + `draw_agents_at`/`draw_replay`), and the two loops that drew the
+simulation's objects lived only inside `draw_sim_at`. The editor was the one view that set
+`entities: true`, which is why the objects appeared to exist only there.
+
+The belts were never affected: a belt is a *tile*, drawn by the terrain pass in every view.
+
+### The fix
+
+`view::draw_sim_objects(sheet, sim)` is now the one place a run's presses and crates are drawn — the
+press at `press.rect_at(sim.stats().frames)`, the crate at `block.aabb()` — and `draw_sim_at` calls it
+instead of keeping its own copy. Every canvas with a `Sim` calls it under its bodies:
+
+* **Play** — `session.sim()`, after the debris and before `draw_agents_at`.
+* **Evolve** — lane 0's sim (the champion: the same run the ropes and the spiked balls come from),
+  after `draw_level_held`, so it is drawn under every lane.
+* **Replay** — `replay.star_sim()`, after the debris and before `draw_replay`.
+
+The function deliberately ignores `opts.entities`: that switch is about *authored intent* (a document's
+placement), and a playing view turning it off must not also turn off the objects the episode moved.
+
+### The test that would have caught it
+
+`app::tests::the_playtest_draws_the_presses_and_crates_the_episode_has` builds a yard with a press over
+the floor and a crate a few tiles ahead of the spawn, enters the playtest, holds right for 150 ticks
+(the crate is distinguishable from the document's by having moved), then runs one real frame of the
+window and counts painted quads by their uv corners: exactly one `block` and one `crusher` quad. With
+the play call removed by hand the test reports *"the playtest drew 0 crates"* — which is the bug.
+
+### Verified
+
+* `cargo test -p app` — 299 passed (the new test included).
+* `cargo test --workspace` — green; `cargo clippy --workspace --all-targets -- -D warnings` — clean
+  (two lints in the crate tests from the previous pass were fixed: a `== false` and an `x - 1 >= y`).
+* `evo-app --level levels/bat-crate-yard.json --play --screenshot out/crate-play.png` — the crate is on
+  the yard in the playtest.
+* `evo-app --level levels/bat-crate-yard.json --evolve --screenshot out/crate-evolve.png` — the crate
+  is on the evolve canvas under the lanes.
+* `evo-app --level levels/bat-machine-shop.json --replay --screenshot out/press-replay.png` — the press
+  hangs in the replay.
+
+### What this pass deliberately did not do
+
+* **A scrubbed route still has no objects.** `--evolve`'s recorded-route overlay draws a `Trace`
+  (positions per frame, no sim), so the crate a past champion shoved is not in it. Drawing it would
+  mean recording crate positions in the trace; that is a format change, and the route overlay is a
+  diagram of where bodies went rather than an episode to watch.
+
+## The falling trap was impossible: the press is now a rock that falls once
+
+Reported after the machine pass: *"The falling trap thing is impossible to pass. It doesn't give the
+user enough time to pass below it before it falls again."* The ask was explicit about the fix:
+*"change these to be like a falling rock, which follows the laws of gravity, and can only fall once
+(doesn't reload or repeat) once the player approaches it or passes below it."*
+
+### Why the press could not be made fair
+
+The press was a **clock**: `Crusher::rect_at(tick)` was a pure function of the frame count, with a
+ten-tick slam, a twenty-six-tick hold and a forty-four-tick lift, phase derived from the column. That
+made it deterministic for free and hashless, and it made it unpassable by construction: the corridor
+was shut for 36 of every 80 ticks, the window moved with the body's arrival, and no phase of the clock
+gave a body walking the corridor a guaranteed opening. The corridor's only answer was to be somewhere
+else — which in the machine shop meant the bridge over it, and the level was certified through the
+bridge rather than through the room it was built around.
+
+A clock cannot be fixed by retuning. Any periodic trap asks the player to *time* something the level
+does not show; the honest fix is a trap whose trigger is visible and whose consequence happens once.
+
+### The rock
+
+`physics::Rock` replaces `Crusher` outright:
+
+* **It hangs in its socket until a body comes near** — within `rock_reach` (2 tiles) of its column and
+  **below** its bottom edge. A body walking the bridge over a rock never wakes it; a body approaching
+  along the floor does, without having to be underneath.
+* **It shudders for `rock_warn` (30 ticks, half a second) before it lets go.** This is the whole
+  difference between a trap and an unfair one: the warning is long enough that a body which keeps
+  running clears the far edge before the stone reaches head height, and a body that stops is safe. The
+  view draws the shudder as a one-art-pixel shake on the tick's parity, so the beat is visible.
+* **It falls under the pack's own gravity** (`ph.gravity`, terminal `ph.max_fall`) and lands on the
+  first solid row under it, or on a crate's top — the same surface rules a crate uses, because a rock
+  that fell through a crate would be a hole in the world.
+* **It falls once.** `woken` and `landed` are never cleared, so a second approach changes nothing.
+* **A falling rock kills; a settled one is a step.** Sleeping and settled rocks are in the body's
+  `solids` list (the crates' buffer), so a body collides with them, stands on them and bumps its head
+  on them. While a rock is *falling* it is deliberately left out of that list — a body cannot be pushed
+  out of the way of one — and an overlap with a woken rock is `DeathCause::Rock`. That one test covers
+  the body that stood still, the one that jumped into it, and the one it landed on.
+
+The state is hashed (position, velocity, warn counter, woken, landed) **conditionally**, exactly as
+the crates and spiked balls are: a level with no rock hashes precisely what it always did, so every
+recorded episode on the pack still replays to its own hash. The sensors draw a rock into the 9×9 patch
+as `ENC_SOLID` — it is a solid wherever it is, and after it lands it is a one-tile step the policy has
+to see or walk into.
+
+### The oracle keeps the band
+
+`inside_crusher` became `inside_rock`, and `Level::pressed_stand` became `rocked_stand`, but the model
+is the same conservative one: the band a rock can occupy is a hazard, so a stand inside it is not a
+stand a route can be planned through. The band is now read from the level instead of the file
+(`RockSpec::band`): from the socket down to the first opaque row under it, or the bottom of the level
+over a pit. That is sound for a one-shot trap — the rock may still be anywhere in the band when the
+body arrives, because the body's own approach is what releases it — and it keeps the machine shop's
+high road a route. `MOVE_SET_VERSION` moved to 14: the band is a fact about the neighbourhood now, so
+verdicts cached from 13 are misses.
+
+### The shipped level
+
+`bat-machine-shop.json`'s entity is now `{"type": "rock", "x": 16, "y": 10}` — one cell, no `span`,
+because how far it falls is not an authored number any more. The level gained the thing it was
+missing: a walkable low road.
+
+`levels.rs::the_machine_shop_low_road_opens_once_the_rock_has_fallen` is the test that would have
+caught the complaint. It drives the shipped level over the two-tile step into the corridor, wakes the
+rock, **stops**, waits for it to land, then jumps the step it left and walks on to the flag —
+`Outcome::Won`, at frame 368. The press could not be walked at all.
+
+### The editor and the art
+
+* `Brush::Rock` replaces `Brush::Crusher` and carries **no number**: a rock's drop is the room under
+  it. Placement still requires a ceiling above and now at least one clear row below (a rock with a
+  floor in its own cell has nowhere to fall and would be a trap that kills on touch).
+* The `crusher` sprite (a toothed iron-bound slab) is gone. `terrain.boulder()` draws one cell of
+  natural stone: a round silhouette with a flattened base, lit from above-left, cracked and flecked in
+  the deep-stone tones. It is the `boulder` atlas family (the name `rock` was already the decor prop's),
+  and `draw_rock` draws it at the socket in a document and at the rock's own box in a run.
+* The ASCII glyph is `R` (`GLYPH_ROCK`), drawn wherever the fall has it.
+
+### One view bug this exposed
+
+The boulder hangs in a cell a hashed tree had chosen, so the shipped render drew a rock inside a tree.
+Hashed props are placed by a hash of their surface tile and know about terrain, not entities.
+`view::prop_covers_entity` now skips a prop whose own cells (its size plus a crown, up or down) contain
+a level entity — `Level::enemy_at`. It costs the level one tree and fixes the class: a prop can no
+longer be drawn through a rock, a spiked ball, a rope or a crate.
+
+### Tests
+
+`entities.rs` lost four press tests and gained five rock tests: it sleeps until a body comes near and
+stays asleep otherwise; it shudders where it hangs, falls under gravity, stops on the floor and never
+moves again (and a body walking back into it is stopped by its side); a falling one kills with
+`DeathCause::Rock`; a settled one is a standable step; two runs of one seed agree on the fall and the
+state hash; and the oracle refuses the band while the bridge over the socket remains a stand. The
+writer round-trip test covers the new entity, and `levels.rs` checks that the shop's rock band reaches
+the floor it was built over. Two episodes on the shipped level are the end-to-end proof, one for each
+answer a player has: **stopping** short of the socket, waiting for it to land and jumping the step it
+leaves (`the_machine_shop_low_road_opens_once_the_rock_has_fallen`), and **running** straight through,
+which clears the stone with time to spare and wins with it spent behind the body
+(`running_past_the_machine_shop_rock_clears_it`).
+
+### Verified
+
+* `cargo test --workspace` — green; `cargo clippy --workspace --all-targets -- -D warnings` — clean;
+  `cargo fmt --check` — clean.
+* `train-cli battery` — `OK bat-machine-shop reach yes plan yes`, with the rest of the pack.
+* `evo-app --level levels/bat-machine-shop.json --play --screenshot out/rock-play.png` — the boulder
+  hangs under the bridge in the playtest; `docs/images/machine-shop.png` is the editor's view with the
+  boulder brush in the palette.
+
+### What this pass deliberately did not do
+
+* **Rolling, stacking or being pushed.** A rock falls straight down and stops; it is not a physics
+  body with a horizontal axis, and it cannot be shoved like a crate. That keeps it one object with one
+  verb (fall) instead of a second crate with a different picture.
+* **Crushing crates or other rocks.** A rock lands on a crate and stays; it does not break it, and it
+  cannot land on another rock (rocks are not in its surface list). Both would be new interactions with
+  their own rules, and neither is needed by the trap.
+* **Resetting on death or restart.** There is nothing to reset: an episode builds its rocks from the
+  level, so a restart is a new episode with the boulder back in its socket.
+
+## A belt carries a crate, and a crate carries its rider
+
+**The bug, in one line.** A crate shoved onto a belt stopped dead. The belt carried
+`self.player` and nothing else; a crate's tick knew gravity and its own landing, and the only
+horizontal motion a crate had ever had was a shove. So a belt with a box parked on it was a belt
+switched off, and a level that wanted a crate delivered somewhere had no way to say it.
+
+**The rule, and why it is the belt's rule rather than the crate's.** A crate on a belt is moved by
+the floor, at `belt_speed`, in the belt's direction, one belt-step per tick — the same translation
+the body gets. It is not a shove that happens to be authored by a tile: the belt does not care
+whether the thing standing on it is walking, and `belt_dir_at` already answers "which way is the
+floor under this box going", so the crate's half is one call to the function the body's half uses.
+
+**The shove wins the tick.** If a body is pressing on a crate and the crate is on a belt, applying
+both would be wrong twice over. The crate would step `belt_speed` further than the body every
+frame, the flush contact the shove test requires (`right == crate.x`, to a thousandth) would be
+broken, and one steady push would become a stutter of separate bumps — the very failure the
+shove-carries-the-body change fixed for flat ground. So the crate's shove is checked first, and a
+crate that was shoved this tick is not also carried. A belt is slower than a walk (0.0625 against
+0.10), so the shove is also the faster of the two, and the one a pushing player expects to see.
+
+**Whoever is standing on the crate rides it.** Without this the crate would slide out from under
+its rider: the body stays put for a tick, is left in the air over the cell the crate has vacated,
+falls, lands on the crate again, and is carried once — a box that shakes. The rider is tested the
+same way a mover's rider is (over the crate horizontally, feet within `enemy_stomp_tol` of its
+top) and carried by the same `dx`, so the pair moves as one and the feet stay flush.
+
+**A carry may not put a body inside a box.** The belt's carry used to refuse only terrain
+(`rect_hits_opaque`). That was enough while crates could not exist on a belt, but the belt now
+pushes a body a belt-step forward *before* the shove test looks at it, and a body carried into its
+own crate is not flush — it is inside — so the flush test would fail every tick and the crate
+would never be pushed at all on a belt. `Sim::carry_refused` is the belt's rule extended from
+terrain to the boxes a body also cannot walk through (crates, settled rocks); the belt's body
+carry and the crate-rider carry both use it. Rocks in the air are left out, exactly as they are
+left out of the body's solids: a falling rock is a hit, not a wall.
+
+**Nothing new is hashed.** A crate's position was already episode state and already hashed, so a
+crate that rode a belt hashes differently from one that did not, with no format or version change:
+`Sim::blocks` is the same field, and the belt is not state at all. The oracle still models crates
+where the *author* put them (the crate pass's stated limit), so a level whose answer relies on a
+delivered crate is proven by a scripted episode, not by `reach`.
+
+### Tests
+
+Three in `entities.rs`, one per half of the rule:
+
+* `a_belt_carries_a_crate_standing_on_it` — a crate left on a right belt gains `32 × belt_speed`
+  tiles in 32 ticks, and the mirrored left belt carries one left.
+* `a_body_riding_a_belted_crate_travels_with_it` — the rider covers exactly the crate's distance
+  and its feet stay on the crate's top for the whole ride.
+* `a_shove_on_a_belt_is_still_one_stepping_push` — in steady state the crate advances at
+  `block_push` per tick, *not* `block_push + belt_speed`, and the body stays flush behind it.
+
+The workspace suite, clippy and fmt are clean; no shipped level has both a belt and a crate, so the
+battery's existing certification is untouched.

@@ -109,6 +109,16 @@ pub const GLYPH_CHAIN: char = ':';
 pub const GLYPH_LAVA_BALL: char = '*';
 /// Goal trigger glyph.
 pub const GLYPH_GOAL: char = '!';
+/// A rock, wherever its fall has it this frame: hanging, coming down or settled.
+pub const GLYPH_ROCK: char = 'R';
+/// A crate: the one-tile solid a body can shove.
+///
+/// A lowercase letter rather than a box of its own, and lowercase `c` rather than an `O`, an `H`
+/// or a `B`: the capital is the press it may well be standing under, and every shape a terminal
+/// can draw as a box is already a tile (`#` ground, `=` shelf, `^` spike). It is a *thing*, so it
+/// gets a letter like the other things, and the case is what tells the reader that the crate is
+/// the movable one.
+pub const GLYPH_BLOCK: char = 'c';
 /// Substitute for a glyph that cannot be drawn in one cell.
 pub const GLYPH_UNKNOWN: char = '?';
 
@@ -116,7 +126,7 @@ pub const GLYPH_UNKNOWN: char = '?';
 ///
 /// A legend, not a whitelist — see the module docs. Watch mode draws each agent
 /// with its own letter and those letters are not listed here.
-pub const GLYPHS: [(char, &str); 29] = [
+pub const GLYPHS: [(char, &str); 33] = [
     (GLYPH_SOLID, "solid tile"),
     (GLYPH_SAND, "sand tile (solid, a beach)"),
     (GLYPH_BRICK, "stone brick tile (solid masonry)"),
@@ -158,6 +168,14 @@ pub const GLYPHS: [(char, &str); 29] = [
         "lava (not solid, lethal, and a vent when open to the air)",
     ),
     (GLYPH_VINE, "vine (not solid, climbable)"),
+    (
+        sim::level::GLYPH_BELT_RIGHT,
+        "belt carrying right (solid: it moves what stands on it)",
+    ),
+    (
+        sim::level::GLYPH_BELT_LEFT,
+        "belt carrying left (solid: it moves what stands on it)",
+    ),
     (GLYPH_EMPTY, "empty space"),
     (GLYPH_GOAL, "goal flag"),
     (GLYPH_WALKER_ALIVE, "live walker enemy"),
@@ -172,6 +190,8 @@ pub const GLYPHS: [(char, &str); 29] = [
     (GLYPH_ROPE, "a rope (grab it in the air and swing)"),
     (GLYPH_SPIKE_BALL, "a spiked ball on a chain"),
     (GLYPH_CHAIN, "the chain a spiked ball hangs from"),
+    (GLYPH_ROCK, "a rock, hanging or fallen"),
+    (GLYPH_BLOCK, "a crate (solid, and a body can shove it)"),
     (GLYPH_PLAYER, "the player"),
 ];
 
@@ -372,6 +392,18 @@ impl<'a> Scene<'a> {
                 GLYPH_MOVER,
                 true,
             ));
+        }
+        // A rock is drawn where it is *this frame*, like a shelf: a reader has to see the boulder
+        // coming down, and one drawn at its socket would be a level whose deaths happen under an
+        // empty cell. A settled rock is drawn where it landed, which is the step it has become.
+        for rock in sim.rocks() {
+            bodies.push(Body::new(rock.x, rock.y, rock.w, rock.h, GLYPH_ROCK, true));
+        }
+        // A crate is drawn where it has been shoved to, which is the whole point of it: its
+        // glyph is a body's because it takes a cell like one, and a frame that left it at the
+        // authored position would show a level the reader is not playing.
+        for block in sim.blocks() {
+            bodies.push(Body::from_rect(block.aabb(), GLYPH_BLOCK, true));
         }
         // A rope is drawn as the cells it hangs through, one glyph each, because that is what a
         // terminal can say about a line. It is not a body (nothing collides with it) but it takes

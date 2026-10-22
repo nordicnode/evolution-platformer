@@ -621,6 +621,12 @@ fn every_new_entity_round_trips_through_the_writer() {
     // A ball needs a ceiling to hang from, so the fixture paints one above its column.
     assert!(level.set_tile(16, 1, Tile::Solid));
     assert!(level.add_spike_ball_tile(16, 2));
+    // A rock needs its own ceiling, and one clear row under it to fall through.
+    assert!(level.set_tile(18, 1, Tile::Solid));
+    assert!(level.add_rock_tile(18, 2));
+    // A crate needs floor directly under it, and the fixture's floor is row 4: column 2 is
+    // clear above it, while the shelf's run starts at column 4.
+    assert!(level.add_block_tile(2, 3));
 
     let json = level.to_json_pretty().expect("the document is writable");
     let back = Level::from_json_str(&json).expect("and readable");
@@ -631,6 +637,12 @@ fn every_new_entity_round_trips_through_the_writer() {
     assert_eq!(back.turrets[0].dir, -1, "the firing direction is kept");
     assert_eq!(back.platforms.len(), 1);
     assert_eq!(back.platforms[0].rect.w, 3.0, "the width is kept");
+    assert_eq!(back.rocks.len(), 1, "the rock is kept");
+    assert_eq!(back.rocks[0].col, 18, "its column is kept");
+    assert_eq!(back.rocks[0].row, 2, "its row is kept");
+    assert_eq!(back.blocks.len(), 1, "the crate is kept");
+    assert_eq!(back.blocks[0].col, 2, "its column is kept");
+    assert_eq!(back.blocks[0].row, 3, "its row is kept");
     assert_eq!(back.spike_balls.len(), 1, "the ball is kept");
     assert_eq!(back.spike_balls[0].col, 16, "its column is kept");
     assert_eq!(back.spike_balls[0].row, 2, "its row is kept");
@@ -869,20 +881,22 @@ fn every_placeable_entity_changes_the_scene_hash_but_not_the_terrain_hash() {
     turret.turrets.push(sim::TurretSpec {
         rect: sim::Rect::new(8.2, 6.2, 0.8, 0.8),
         dir: -1,
-    });        let mut platform = base.clone();
-        platform
-            .platforms
-            .push(sim::PlatformSpec::at(10, 6, 3, 4, false, 1));
+    });
+    let mut platform = base.clone();
+    platform
+        .platforms
+        .push(sim::PlatformSpec::at(10, 6, 3, 4, false, 1));
 
-        let mut ball = base.clone();
-        ball.spike_balls.push(sim::SpikeBallSpec::at(12, 3, 3, 4));
+    let mut ball = base.clone();
+    ball.spike_balls.push(sim::SpikeBallSpec::at(12, 3, 3, 4));
 
-    for (kind, level) in [            ("chaser", &chaser),
-            ("flyer", &flyer),
-            ("turret", &turret),
-            ("platform", &platform),
-            ("spiked ball", &ball),
-        ] {
+    for (kind, level) in [
+        ("chaser", &chaser),
+        ("flyer", &flyer),
+        ("turret", &turret),
+        ("platform", &platform),
+        ("spiked ball", &ball),
+    ] {
         assert_ne!(
             level.scene_hash(),
             scene,
@@ -1061,7 +1075,11 @@ fn a_spiked_ball_wakes_when_the_body_comes_near_and_then_swings() {
         ball.x,
         ball.y
     );
-    assert!(ball.y < y0 - 0.1, "and it should have climbed the arc, got {}", ball.y);
+    assert!(
+        ball.y < y0 - 0.1,
+        "and it should have climbed the arc, got {}",
+        ball.y
+    );
     assert!(
         (ball.x - 9.5).abs() <= ball.length + 1e-3,
         "but never further from the anchor than its chain: {}",
@@ -1102,7 +1120,11 @@ fn a_spiked_ball_kills_on_contact() {
     let level = level("spiked-ball-contact", &rows, (9, 4), &entities);
     let mut sim = sim::Sim::new(&level, 1);
     sim.step(AgentAction::Walk);
-    assert_eq!(sim.outcome(), Outcome::Died, "the resting ball is in the way");
+    assert_eq!(
+        sim.outcome(),
+        Outcome::Died,
+        "the resting ball is in the way"
+    );
     assert_eq!(
         sim.death_cause(),
         Some(sim::DeathCause::SpikeBall),
@@ -1128,9 +1150,7 @@ fn a_wider_reach_wakes_the_ball_sooner() {
     ];
     let step = |reach: i32| -> u32 {
         let entities = [
-            format!(
-                "{{\"type\":\"spiked_ball\",\"x\":9,\"y\":1,\"tiles\":3,\"span\":{reach}}}"
-            ),
+            format!("{{\"type\":\"spiked_ball\",\"x\":9,\"y\":1,\"tiles\":3,\"span\":{reach}}}"),
             goal(18, 4),
         ];
         let level = level("spiked-ball-reach", &rows, (1, 4), &entities);
@@ -1176,5 +1196,696 @@ fn a_spiked_balls_rest_box_is_the_box_the_sim_builds() {
     let spec = level.spike_balls[0];
     let built = sim::SpikeBall::new(0, spec, &sim::PHYSICS);
     assert_eq!(spec.rest_box(), built.aabb());
-    assert!(!built.swinging, "and it is the box of a ball that has not moved");
+    assert!(
+        !built.swinging,
+        "and it is the box of a ball that has not moved"
+    );
+}
+
+/// **A belt carries the body standing on it, and only that body.**
+///
+/// The three halves of the rule: the floor translates a standing body at the belt's own speed, the
+/// direction comes from the glyph rather than from a sign, and a body in the air over the same
+/// cell is not carried — a belt is a floor, not a current. The last test is the one that keeps the
+/// mechanic honest: a belt that carried jumpers would be a physics the oracle does not model.
+#[test]
+fn a_belt_carries_a_body_standing_on_it() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        ">>>>>>>>>>>>>>>>>>>>",
+    ];
+    let right_level = level("belt-right", &rows, (2, 3), &[goal(19, 3)]);
+    let mut sim = sim::Sim::new(&right_level, 3);
+    let start = sim.player().x;
+    // Idle on the belt: the body's own velocity is zero, so every tile of this is the belt.
+    common::step_n(&mut sim, AgentAction::Walk, 32);
+    let moved = sim.player().x - start;
+    let expected = 32.0 * PHYSICS.belt_speed;
+    assert!(
+        (moved - expected).abs() < 0.2,
+        "a right belt should carry {expected:.3} tiles in 32 ticks, carried {moved:.3}"
+    );
+    assert!(moved > 0.0, "and it should carry right, got {moved:.3}");
+
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "<<<<<<<<<<<<<<<<<<<<",
+    ];
+    let left_level = level("belt-left", &rows, (10, 3), &[goal(0, 3)]);
+    let mut sim = sim::Sim::new(&left_level, 3);
+    let start = sim.player().x;
+    common::step_n(&mut sim, AgentAction::Walk, 32);
+    assert!(
+        sim.player().x < start - 1.0,
+        "a left belt should carry left: {start:.3} -> {:.3}",
+        sim.player().x
+    );
+}
+
+/// **A body in the air over a belt is not carried.**
+///
+/// The belt test is the one that would pass by accident if the carry were written as a force on
+/// the cell: a jumper spends most of its arc over the belt it took off from, and a current in the
+/// air would lengthen every jump off a belt for free — a physics the reach oracle cannot see.
+#[test]
+fn a_belt_does_not_carry_a_body_that_is_in_the_air_over_it() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        ">>>>>>>>>>>>>>>>>>>>",
+    ];
+    let level = level("belt-air", &rows, (2, 3), &[goal(19, 3)]);
+    let mut sim = sim::Sim::new(&level, 3);
+    // One tick of jump: the body leaves the belt and is over it for the next forty.
+    common::step_n(&mut sim, AgentAction::JumpInPlace, 1);
+    common::step_n(&mut sim, AgentAction::Walk, 1);
+    assert!(!sim.player().grounded, "the jump should have left the belt");
+    let airborne_x = sim.player().x;
+    let airborne = sim.stats().frames;
+    common::step_n(&mut sim, AgentAction::Walk, 8);
+    assert!(!sim.player().grounded, "still in the arc");
+    let drift = (sim.player().x - airborne_x).abs();
+    assert!(
+        drift < PHYSICS.belt_speed * 4.0,
+        "an airborne body must not be carried: drifted {drift:.3} over {airborne} airborne frames"
+    );
+}
+
+/// **A rock sleeps, wakes once, falls under gravity, and is spent.**
+///
+/// The whole design in one episode: it hangs in its socket while the body is away, shudders for
+/// `rock_warn` ticks when the body comes near, falls under the same gravity a crate falls under,
+/// stops on the floor rather than through it, and never moves again — a second approach and a
+/// second hundred ticks leave it exactly where it landed.
+#[test]
+fn a_rock_wakes_falls_once_and_stays_put() {
+    let rows = [
+        "....###.............",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"rock\",\"x\":5,\"y\":1}".to_string(),
+        goal(19, 3),
+    ];
+    let level = level("rock-fall", &rows, (1, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 5);
+    assert_eq!(sim.rocks().len(), 1);
+    assert_eq!(
+        (sim.rocks()[0].home.x, sim.rocks()[0].home.y),
+        (5.0, 1.0),
+        "a rock hangs in the cell it was authored in"
+    );
+
+    // Far away and doing nothing: asleep, in its socket.
+    for _ in 0..20 {
+        sim.step(AgentAction::Walk);
+    }
+    assert!(!sim.rocks()[0].woken, "a rock must not wake on its own");
+    assert_eq!(sim.rocks()[0].y, 1.0);
+
+    // Walk up to it. The trigger is proximity, so the body does not have to be underneath.
+    let mut woke = false;
+    for _ in 0..80 {
+        sim.step(AgentAction::Run);
+        if sim.rocks()[0].woken {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "walking up to a rock must wake it");
+    assert!(
+        sim.rocks()[0].shuddering() && sim.rocks()[0].y == 1.0,
+        "a woken rock shudders where it hangs before it lets go"
+    );
+
+    // Back off, so the fall can be watched rather than cut short by the body's death. The warning
+    // plus the fall is longer than the retreat, which is the whole reason it is a warning.
+    let mut landed = false;
+    for _ in 0..200 {
+        sim.step(AgentAction::Retreat);
+        if sim.rocks()[0].landed {
+            landed = true;
+            break;
+        }
+    }
+    assert!(landed, "the rock must come down");
+    assert_eq!(sim.outcome(), Outcome::Running, "and the body got clear");
+    let rock = sim.rocks()[0];
+    assert!(
+        (rock.y + rock.h - 4.0).abs() < 1.0e-3,
+        "it stops with its bottom on the floor's top edge, not in the floor: bottom {}",
+        rock.y + rock.h
+    );
+    assert!(!rock.falling(), "and it is no longer in the air");
+
+    // **Once.** A body walking back into it neither wakes it again nor moves it, and the settled
+    // rock is solid: the body ends flush against its side rather than passing through.
+    let settled = sim.rocks()[0].y;
+    for _ in 0..200 {
+        sim.step(AgentAction::Run);
+        if sim.outcome().is_finished() {
+            break;
+        }
+    }
+    assert_eq!(
+        sim.outcome(),
+        Outcome::Running,
+        "a settled rock does not kill"
+    );
+    assert_eq!(sim.rocks()[0].y, settled, "and nothing moves it again");
+    assert!(
+        sim.player().aabb().right() <= 5.0 + 1.0e-3,
+        "the body should be stopped by the rock's side, not inside it: right {}",
+        sim.player().aabb().right()
+    );
+}
+
+/// **A falling rock kills the body under it.** The trap's one consequence.
+///
+/// The body stands under the socket and does nothing, so the wake is the first tick and the death
+/// is the rock's own fall: `DeathCause::Rock`, inside a second.
+#[test]
+fn a_falling_rock_kills_the_body_under_it() {
+    let rows = [
+        "....###.............",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"rock\",\"x\":5,\"y\":1}".to_string(),
+        goal(19, 3),
+    ];
+    let level = level("rock-kill", &rows, (5, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 5);
+    for _ in 0..240 {
+        sim.step(AgentAction::Walk);
+        if sim.outcome().is_finished() {
+            break;
+        }
+    }
+    assert_eq!(sim.outcome(), Outcome::Died);
+    assert_eq!(sim.death_cause(), Some(sim::DeathCause::Rock));
+}
+
+/// **A settled rock is a step**: a body stands on its top instead of sinking into it.
+///
+/// The property the press never had, and the reason the element can be put in a corridor at all:
+/// after it has fallen, the level it blocked is a level with a one-tile ledge in it.
+#[test]
+fn a_settled_rock_is_a_step_a_body_can_stand_on() {
+    let rows = [
+        "....###.............",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"rock\",\"x\":5,\"y\":1}".to_string(),
+        goal(19, 3),
+    ];
+    let level = level("rock-step", &rows, (1, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 5);
+    for _ in 0..80 {
+        sim.step(AgentAction::Run);
+        if sim.rocks()[0].woken {
+            break;
+        }
+    }
+    for _ in 0..200 {
+        sim.step(AgentAction::Retreat);
+        if sim.rocks()[0].landed {
+            break;
+        }
+    }
+    let rock = sim.rocks()[0];
+    assert!(
+        rock.landed,
+        "the fixture's rock has to be down for this test"
+    );
+
+    // A body placed on its top: one tick of gravity must leave it standing there.
+    let mut body = sim::PlayerState::spawn(&level, &PHYSICS);
+    body.x = rock.x;
+    body.y = rock.y - PHYSICS.player_h;
+    body.grounded = true;
+    body.tick(&level, &PHYSICS, AgentAction::Walk, &[rock.aabb()]);
+    assert!(
+        body.grounded && (body.y + body.h - rock.y).abs() < 1.0e-3,
+        "the body should stand on the rock's top, feet {} against top {}",
+        body.y + body.h,
+        rock.y
+    );
+}
+
+/// **Two runs of one seed agree on every part of a fall.** A woken rock is state.
+///
+/// A press used to be a clock and needed no state at all; a rock is woken by where the body went,
+/// so two runs that wove differently must differ, and two that behaved the same must agree to the
+/// last bit of the hashed position and velocity.
+#[test]
+fn a_rocks_fall_is_deterministic() {
+    let rows = [
+        "....###.............",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"rock\",\"x\":5,\"y\":1}".to_string(),
+        goal(19, 3),
+    ];
+    let level = level("rock-determinism", &rows, (1, 3), &entities);
+    let play = || {
+        let mut sim = sim::Sim::new(&level, 11);
+        for _ in 0..70 {
+            sim.step(AgentAction::Run);
+        }
+        for _ in 0..60 {
+            sim.step(AgentAction::Retreat);
+        }
+        let rock = sim.rocks()[0];
+        (rock.y, rock.vy, rock.woken, rock.landed, sim.state_hash())
+    };
+    let a = play();
+    let b = play();
+    assert!(a.2, "the run must actually wake the rock");
+    assert_eq!(a, b, "the fall is a function of the seed and the actions");
+}
+
+/// **The oracle refuses a rock's band, and nothing above it.**
+///
+/// The band a rock can fall through is a hazard a route cannot be planned through — the rock may
+/// be anywhere in it by the time the body arrives, and the body's own approach is what releases
+/// it. The **bridge over the socket is still a stand**: a rock threatens the room below it, not
+/// the deck above, and that is what makes the machine shop's high road a route.
+#[test]
+fn the_oracle_refuses_a_rock_band_but_not_the_bridge_over_it() {
+    let rows = [
+        "....#...............",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [
+        "{\"type\":\"rock\",\"x\":4,\"y\":1}".to_string(),
+        goal(18, 2),
+    ];
+    let level = level("rock-oracle", &rows, (1, 2), &entities);
+    assert_eq!(level.rocks.len(), 1, "the fixture's rock parsed");
+    let body = sim::Rect::new(4.0, 3.0 - PHYSICS.player_h, 1.0, PHYSICS.player_h);
+    assert!(
+        sim::reach::inside_rock(&level, &body),
+        "a body standing under the rock is inside its band"
+    );
+    assert!(
+        !level.is_standable(4, 3),
+        "so the floor under it is not a stand the route graph can use"
+    );
+    assert!(
+        level.is_standable(3, 3) && level.is_standable(5, 3),
+        "and the floor either side of it still is"
+    );
+    assert!(
+        level.is_standable(4, 0),
+        "the bridge the rock hangs under is an ordinary stand"
+    );
+    let on_bridge = sim::Rect::new(4.0, -PHYSICS.player_h, 1.0, PHYSICS.player_h);
+    assert!(
+        !sim::reach::inside_rock(&level, &on_bridge),
+        "and a body walking over the rock is not in its band"
+    );
+}
+
+// ---- the crate -----------------------------------------------------------------------------
+
+/// A crate entity at cell `(x, y)`.
+fn block(x: i32, y: i32) -> String {
+    format!("{{\"type\":\"block\",\"x\":{x},\"y\":{y}}}")
+}
+
+/// **A body leaning on a crate shoves it, one walking step at a time.**
+///
+/// The shove is not a separate verb: a body walking into a crate moves it at exactly the pace the
+/// body would walk, so the two stay flush and the crate looks like it is being carried in front of
+/// the body rather than bumped. The test pins both halves of that — the crate moved, and the body
+/// never got inside it — because a crate that teleported ahead of the body would pass the first
+/// check alone, and a crate that did not move would pass the second.
+#[test]
+fn a_body_shoves_a_crate_at_walking_pace() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [block(6, 3), goal(19, 3)];
+    let level = level("crate-push", &rows, (1, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 5);
+    let start = sim.blocks()[0].x;
+    let mut worst = 0.0f32;
+    for _ in 0..90 {
+        sim.step(AgentAction::Run);
+        let body = sim.player().aabb();
+        let crate_box = sim.blocks()[0].aabb();
+        worst = worst.max(body.right() - crate_box.x);
+    }
+    let moved = sim.blocks()[0].x - start;
+    assert!(
+        moved > 1.0,
+        "ninety ticks of walking should have shoved the crate more than a tile, moved {moved:.3}"
+    );
+    assert!(
+        worst < 1.0e-2,
+        "the body must never be inside the crate it is pushing: worst penetration {worst:.4}"
+    );
+    assert!(
+        (sim.player().aabb().right() - sim.blocks()[0].x).abs() < 1.0e-2,
+        "and it should still be flush behind it: body right {:.4}, crate left {:.4}, body x {:.4}",
+        sim.player().aabb().right(),
+        sim.blocks()[0].x,
+        sim.player().x
+    );
+}
+
+/// **A crate stops flush at a wall, and then it is the wall.**
+///
+/// The refusal is the crate's own: a shove whose box would land in terrain does not happen at all,
+/// so the crate ends up exactly against the wall rather than a step into it. The body behind it is
+/// then stopped by the crate, with its speed spent — the same outcome as walking into a wall, which
+/// is what makes a crate something a level can use to hold a body back.
+#[test]
+fn a_shoved_crate_stops_flush_at_a_wall_and_stops_the_body() {
+    let rows = [
+        "............#.......",
+        "............#.......",
+        "............#.......",
+        "............#.......",
+        "####################",
+    ];
+    let entities = [block(8, 3), goal(1, 3)];
+    let level = level("crate-wall", &rows, (4, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 7);
+    for _ in 0..180 {
+        sim.step(AgentAction::Run);
+    }
+    let crate_box = sim.blocks()[0].aabb();
+    assert!(
+        (crate_box.x - 11.0).abs() < 1.0e-3,
+        "the crate should rest flush at the wall's left edge (11.0), at {:.4}",
+        crate_box.x
+    );
+    let body = sim.player().aabb();
+    assert!(
+        (body.right() - crate_box.x).abs() < 1.0e-3,
+        "and the body should be flush behind it: body right {:.4}, crate left {:.4}",
+        body.right(),
+        crate_box.x
+    );
+    assert!(
+        sim.player().vx == 0.0,
+        "a body pressing a crate into a wall is a body that has stopped"
+    );
+}
+
+/// **Two crates do not stack up into a train: a shove that would need one crate to move two is
+/// refused.**
+///
+/// The front crate is against the wall, so the one behind it cannot move either, and the body makes
+/// no progress. It is the negative half of the push rule, and the reason a row of crates is not a
+/// conveyor: the crate in the middle can only go where there is room for it.
+#[test]
+fn a_crate_with_no_room_behind_it_stops_the_whole_row() {
+    let rows = [
+        "............#.......",
+        "............#.......",
+        "............#.......",
+        "............#.......",
+        "####################",
+    ];
+    let entities = [block(10, 3), block(11, 3), goal(1, 3)];
+    let level = level("crate-row", &rows, (4, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 9);
+    for _ in 0..120 {
+        sim.step(AgentAction::Run);
+    }
+    assert_eq!(sim.blocks()[0].x, 10.0, "the near crate did not move");
+    assert_eq!(sim.blocks()[1].x, 11.0, "and neither did the far one");
+    assert!(
+        (sim.player().aabb().right() - 10.0).abs() < 1.0e-3,
+        "the body is stopped against the first crate"
+    );
+}
+
+/// **A crate is a floor: a body dropped on one lands on its top, not through it.**
+///
+/// A crate is one tile, so it is a step rather than an obstacle — the pack's own hop height clears
+/// it. The body is spawned in the air above the crate so the test measures the landing itself.
+#[test]
+fn a_crate_is_a_step_a_body_can_stand_on() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [block(8, 3), goal(19, 3)];
+    let level = level("crate-step", &rows, (8, 1), &entities);
+    let mut sim = sim::Sim::new(&level, 11);
+    assert!(!sim.player().grounded, "the body starts in the air");
+    common::step_n(&mut sim, AgentAction::Brake, 40);
+    assert!(sim.player().grounded, "and it should have landed");
+    let top = sim.blocks()[0].aabb().y;
+    assert!(
+        (sim.player().aabb().bottom() - top).abs() < 1.0e-3,
+        "the feet should be on the crate's top ({top:.3}), at {:.3}",
+        sim.player().aabb().bottom()
+    );
+}
+
+/// **And the sensors see the crate as the solid it is.**
+///
+/// A crate is drawn into the 9×9 patch as [`ENC_SOLID`] — the value a wall already uses — because
+/// that is what it is to a body: ground from above and a wall from the side. The second half is the
+/// one that matters for learning to push: once the crate has moved, the cell it left reads empty
+/// and the cell it arrived in reads solid, so "walk into it and it gives" is visible in one frame.
+#[test]
+fn the_sensor_patch_reads_a_crate_as_solid_and_follows_it() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [block(6, 3), goal(19, 3)];
+    let level = level("crate-sensed", &rows, (4, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 13);
+    let radius = sim::sensors::PATCH_RADIUS;
+    let side = 2 * radius + 1;
+    // The patch is keyed on the body's centre cell and row-major from its top-left corner.
+    let (cx, cy) = sim.player().aabb().center();
+    let (ctx, cty) = (cx.floor() as i32, cy.floor() as i32);
+    let cell = |col: i32, row: i32| -> f32 {
+        let c = col - ctx;
+        let r = row - cty;
+        sim.observation()[((r + radius) * side + (c + radius)) as usize]
+    };
+    assert_eq!(
+        cell(6, 3),
+        sim::sensors::ENC_SOLID,
+        "the crate's cell reads as the solid it is"
+    );
+    common::step_n(&mut sim, AgentAction::Run, 60);
+    let moved_to = (sim.blocks()[0].x).floor() as i32;
+    assert!(moved_to > 6, "the body should have shoved it along");
+    let (cx, cy) = sim.player().aabb().center();
+    let (ctx, cty) = (cx.floor() as i32, cy.floor() as i32);
+    let cell = |col: i32, row: i32| -> f32 {
+        let c = col - ctx;
+        let r = row - cty;
+        sim.observation()[((r + radius) * side + (c + radius)) as usize]
+    };
+    assert_eq!(
+        cell(moved_to, 3),
+        sim::sensors::ENC_SOLID,
+        "the cell the crate is in now reads solid"
+    );
+    if moved_to > ctx - radius {
+        assert_ne!(
+            cell(6, 3),
+            sim::sensors::ENC_SOLID,
+            "and the cell it left does not"
+        );
+    }
+}
+
+/// **A pushed crate is state, and two runs that pushed it the same way agree on all of it.**
+///
+/// The determinism the pack asks of every element: the same level and the same seed produce the
+/// same crate positions, and the same state hash. A second run that shoved the crate to a different
+/// cell hashes differently, which is what makes the crate a fact about the episode rather than about
+/// the file.
+#[test]
+fn pushing_a_crate_is_deterministic_and_hashed() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "####################",
+    ];
+    let entities = [block(6, 3), goal(19, 3)];
+    let level = level("crate-hash", &rows, (1, 3), &entities);
+    let run = |ticks: u32| -> (f32, u64) {
+        let mut sim = sim::Sim::new(&level, 17);
+        common::step_n(&mut sim, AgentAction::Run, ticks);
+        (sim.blocks()[0].x, sim.state_hash())
+    };
+    let (a, ha) = run(60);
+    let (b, hb) = run(60);
+    assert_eq!(a.to_bits(), b.to_bits(), "same run, same crate");
+    assert_eq!(ha, hb, "same run, same hash");
+    let (c, hc) = run(30);
+    assert!(c < a, "a shorter push leaves the crate further back");
+    assert_ne!(hc, ha, "so the two episodes are different states");
+}
+
+/// **A belt carries the crate standing on it.**
+///
+/// The crate used to stop dead the moment it was left on a belt: the belt only ever moved bodies
+/// and a crate's tick only knew gravity, so a belt with a box parked on it was a belt switched off.
+/// The floor now moves what stands on it, at the floor's own pace — the same pace it carries a
+/// body at — which is the whole rule: a belt does not care whether the thing on it is walking.
+#[test]
+fn a_belt_carries_a_crate_standing_on_it() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        ">>>>>>>>>>>>>>>>>>>>",
+    ];
+    let entities = [block(6, 3), goal(19, 3)];
+    let right = level("crate-belt", &rows, (1, 3), &entities);
+    let mut sim = sim::Sim::new(&right, 19);
+    let start = sim.blocks()[0].x;
+    // The body stands still: every tile the crate gains is the belt's, not a shove.
+    common::step_n(&mut sim, AgentAction::Brake, 32);
+    let moved = sim.blocks()[0].x - start;
+    let expected = 32.0 * PHYSICS.belt_speed;
+    assert!(
+        (moved - expected).abs() < 0.2,
+        "a crate on a right belt should ride {expected:.3} tiles in 32 ticks, rode {moved:.3}"
+    );
+
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        "<<<<<<<<<<<<<<<<<<<<",
+    ];
+    let entities = [block(14, 3), goal(0, 3)];
+    let left = level("crate-belt-left", &rows, (19, 3), &entities);
+    let mut sim = sim::Sim::new(&left, 23);
+    let start = sim.blocks()[0].x;
+    common::step_n(&mut sim, AgentAction::Brake, 32);
+    assert!(
+        sim.blocks()[0].x < start - 1.0,
+        "a crate on a left belt should ride left: {start:.3} -> {:.3}",
+        sim.blocks()[0].x
+    );
+}
+
+/// **Whoever is standing on a crate rides it.**
+///
+/// A crate that slid out from under its rider would be a lift that drops you — the body would be
+/// left in the air over the cell the crate has vacated, fall, and be carried again a tick later,
+/// which reads as a box that shakes rather than a floor that moves. The feet stay flush with the
+/// crate's top for the whole ride.
+#[test]
+fn a_body_riding_a_belted_crate_travels_with_it() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        ">>>>>>>>>>>>>>>>>>>>",
+    ];
+    let entities = [block(8, 3), goal(19, 3)];
+    let level = level("crate-belt-rider", &rows, (8, 2), &entities);
+    let mut sim = sim::Sim::new(&level, 29);
+    let crate_start = sim.blocks()[0].x;
+    let body_start = sim.player().x;
+    common::step_n(&mut sim, AgentAction::Brake, 32);
+    let crate_moved = sim.blocks()[0].x - crate_start;
+    assert!(
+        crate_moved > 1.0,
+        "the crate should have ridden the belt, moved {crate_moved:.3}"
+    );
+    let body_moved = sim.player().x - body_start;
+    assert!(
+        (body_moved - crate_moved).abs() < 0.02,
+        "the rider should travel exactly as far as its crate: body {body_moved:.3}, crate {crate_moved:.3}"
+    );
+    let top = sim.blocks()[0].y;
+    assert!(
+        (sim.player().aabb().bottom() - top).abs() < 1.0e-2,
+        "and it should still be standing on it: feet {:.3}, crate top {top:.3}",
+        sim.player().aabb().bottom()
+    );
+}
+
+/// **A shove is the shove's, not the belt's: pushing a crate on a belt is one steady walk.**
+///
+/// A crate on a belt gets the belt *and* the body's shove if the two are applied independently, so
+/// the crate steps out from under the body's hands every frame, the flush contact that the shove
+/// needs is lost, and one push becomes a stutter of separate bumps. The shove therefore wins the
+/// tick: the crate advances at the body's shoving pace, the body stays flush behind it, and the
+/// belt's own carry is refused for that tick — and for every tick the body keeps pressing, because
+/// a body the belt would carry into its own crate is carried nowhere.
+#[test]
+fn a_shove_on_a_belt_is_still_one_stepping_push() {
+    let rows = [
+        "....................",
+        "....................",
+        "....................",
+        "....................",
+        ">>>>>>>>>>>>>>>>>>>>",
+    ];
+    let entities = [block(6, 3), goal(19, 3)];
+    let level = level("crate-belt-push", &rows, (1, 3), &entities);
+    let mut sim = sim::Sim::new(&level, 31);
+    common::step_n(&mut sim, AgentAction::Run, 60);
+    let steady = sim.blocks()[0].x;
+    common::step_n(&mut sim, AgentAction::Run, 20);
+    let per_tick = (sim.blocks()[0].x - steady) / 20.0;
+    assert!(
+        (per_tick - PHYSICS.block_push).abs() < 0.01,
+        "a shoved crate on a belt should advance at the shove's pace ({:.4}), at {per_tick:.4}",
+        PHYSICS.block_push
+    );
+    assert!(
+        (sim.player().aabb().right() - sim.blocks()[0].x).abs() < 1.0e-2,
+        "and the body stays flush behind it: body right {:.4}, crate left {:.4}",
+        sim.player().aabb().right(),
+        sim.blocks()[0].x
+    );
 }

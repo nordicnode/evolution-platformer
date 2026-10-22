@@ -1808,6 +1808,9 @@ impl EvoApp {
         );
         // The pieces of the floor this episode broke, between the terrain and the bodies.
         view::draw_debris(sheet, rope_anim.debris());
+        // The star's presses and crates, between the debris and the bodies: a replay is one
+        // episode, and these are objects that episode moved.
+        view::draw_sim_objects(sheet, replay.star_sim());
         view::draw_replay(sheet, replay);
     }
 
@@ -3024,10 +3027,8 @@ impl EvoApp {
                     ui.add_space(6.0);
                 }
                 if shown == 0 {
-                    let (rect, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 22.0),
-                        Sense::hover(),
-                    );
+                    let (rect, _) = ui
+                        .allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
                     self.remember_tool("no parts match", rect);
                     ui.painter().text(
                         rect.center(),
@@ -3087,7 +3088,8 @@ impl EvoApp {
         // platform also has a width, a turret has a direction instead, and a spiked ball has the
         // two numbers that are its whole design shape — how long the chain is and how near a body
         // has to come to wake it. The row is conditional for the scenery picker's own reason — a
-        // control that belongs to one brush is noise in front of the other twenty-one.
+        // control that belongs to one brush is noise in front of the other twenty-one. A rock has
+        // no number at all: it falls as far as the room under it.
         if matches!(
             self.editor.brush,
             Some(Brush::Flyer | Brush::Turret | Brush::Platform | Brush::SpikeBall)
@@ -3120,17 +3122,19 @@ impl EvoApp {
                         );
                 } else if self.editor.brush == Some(Brush::SpikeBall) {
                     ui.label(egui::RichText::new("chain").small().color(theme::TEXT_DIM));
-                    ui.add(
-                        egui::DragValue::new(&mut self.editor.spike_ball_length).range(1..=16),
-                    )
-                    .on_hover_text(
-                        "How many tiles of chain the ball hangs on. The ball swings on that \
+                    ui.add(egui::DragValue::new(&mut self.editor.spike_ball_length).range(1..=16))
+                        .on_hover_text(
+                            "How many tiles of chain the ball hangs on. The ball swings on that \
                          radius, so a long chain is a wide arc and a slow one. Shortened to the \
                          room below the click; drag down from a placed ball to lengthen its \
                          chain a cell at a time.",
-                    );
+                        );
                     ui.add_space(2.0);
-                    ui.label(egui::RichText::new("trigger").small().color(theme::TEXT_DIM));
+                    ui.label(
+                        egui::RichText::new("trigger")
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
                     ui.add(egui::DragValue::new(&mut self.editor.spike_ball_reach).range(1..=16))
                         .on_hover_text(
                             "How close a body has to come to the hanging ball to set it swinging, \
@@ -4058,6 +4062,11 @@ impl EvoApp {
                     // Whatever the player has broken: the piece falls over the hole it left,
                     // between the level and the body.
                     view::draw_debris(sheet, session.anim().debris());
+                    // The presses and the crates as **this** episode has them. The level pass above
+                    // draws a document, and `opts.entities` is off in a playing view (a live view
+                    // must not draw the authored placement), so a canvas that left these to the
+                    // level got neither: a press never stroked and a crate never appeared.
+                    view::draw_sim_objects(sheet, session.sim());
                     // The body is drawn *between* the simulator's ticks (`Session::body_at`):
                     // the sim runs at 60 Hz whatever the display does, and drawing the last
                     // tick's position is what made the playtest stutter on a fast screen.
@@ -4288,6 +4297,14 @@ impl EvoApp {
             // is the same body the ropes are drawn from whenever it is holding one.
             self.lanes.as_ref().map(|lanes| lanes.sim(0).spike_balls()),
         );
+
+        // The presses and the crates of the run on the canvas. Every lane keeps its own copy of
+        // the level's movable objects (a crate is shoved by the body in front of you, and each
+        // lane has its own one), and the ones drawn are lane 0's — the champion, the same run the
+        // ropes and the balls come from.
+        if let Some(lanes) = &self.lanes {
+            view::draw_sim_objects(sheet, lanes.sim(0));
+        }
 
         if let Some(generation) = self.view.scrub {
             // A recorded route replaces the live lanes rather than joining them: the two
@@ -5198,6 +5215,132 @@ mod tests {
         let _ = ctx.run(input, |ctx| app.frame(ctx));
     }
 
+    /// How many quads of `sprite` one real frame of the window paints, and where they are.
+    ///
+    /// Counted by their uv corners — the trick `view`'s debris test uses — because the drawing
+    /// that matters here is a *sprite*: an object the canvas forgot leaves no quad at all, and one
+    /// drawn twice leaves two, whatever the shapes above it do.
+    fn quads_of(ctx: &Context, app: &mut EvoApp, sprite: &str) -> (usize, Rect) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 800.0))),
+            time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| app.frame(ctx));
+        let wanted = app
+            .atlas
+            .uv(sprite)
+            .unwrap_or_else(|err| panic!("{sprite} is not in the atlas: {err}"));
+        let corners = [
+            wanted.min,
+            Pos2::new(wanted.max.x, wanted.min.y),
+            wanted.max,
+            Pos2::new(wanted.min.x, wanted.max.y),
+        ];
+        let texture = app.atlas.texture_id();
+        let mut quads = 0;
+        let mut where_ = Rect::NOTHING;
+        for primitive in ctx.tessellate(output.shapes, output.pixels_per_point) {
+            let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
+                continue;
+            };
+            if mesh.texture_id != texture {
+                continue;
+            }
+            for quad in mesh.vertices.chunks(4) {
+                if quad.len() == 4 && corners.iter().all(|c| quad.iter().any(|v| v.uv == *c)) {
+                    quads += 1;
+                    for v in quad {
+                        where_ = where_.union(Rect::from_min_size(v.pos, Vec2::ZERO));
+                    }
+                }
+            }
+        }
+        (quads, where_)
+    }
+
+    /// **A crate and a rock are in the game, not just in the editor.**
+    ///
+    /// The report was that the objects added this week "only display when in edit mode". That was
+    /// exactly true, and the cause was structural: `RenderOpts::playing()` turns the *document's*
+    /// entity pass off (a live view must not draw walkers where the file left them, and the same
+    /// switch governs the authored rock and crate), and the canvases draw the level and their
+    /// bodies by hand rather than through `view::draw_sim`. So nothing drew the simulation's own
+    /// rocks and crates at all. This is the test that would have failed: one frame of the
+    /// playtest on a level holding both, counted in painted quads.
+    #[test]
+    fn the_playtest_draws_the_rocks_and_crates_the_episode_has() {
+        let root = scratch("sim-objects");
+        // A yard with the crate a few tiles ahead of the spawn, so the body can reach it in the
+        // test's hundred ticks, and a rock over the same floor, under its own ceiling tile.
+        let air = ".".repeat(30);
+        let floor = "#".repeat(30);
+        let mut tiles = String::new();
+        for _ in 0..13 {
+            tiles.push_str(&format!("    \"{air}\",\n"));
+        }
+        tiles.push_str(&format!("    \"{floor}\",\n    \"{floor}\"\n"));
+        let level = root.join("levels/sim-objects.json");
+        std::fs::write(
+            &level,
+            format!(
+                r#"{{
+  "format": "evo-platformer-level",
+  "level_format_version": 6,
+  "name": "sim-objects",
+  "width": 30,
+  "height": 15,
+  "spawn": {{ "x": 2, "y": 12 }},
+  "tiles": [
+{tiles}  ],
+  "entities": [
+    {{ "type": "rock", "x": 10, "y": 10 }},
+    {{ "type": "block", "x": 5, "y": 12 }},
+    {{ "type": "goal", "x": 28, "y": 12 }}
+  ]
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = app_on(&ctx, &level);
+        frame(&ctx, &mut app, vec![]);
+        app.enter_play();
+
+        // Shove the crate: hold right until the body has pushed it off the tile it was authored
+        // on. From here on the drawn crate can only come from the *simulation*.
+        let mut session = app.session.take().expect("a playtest session");
+        for _ in 0..150 {
+            session.advance_actions(1.0 / 60.0, |_| sim::AgentAction::Run);
+        }
+        let crate_x = session.sim().blocks()[0].x;
+        assert!(
+            crate_x > 5.5,
+            "the body never reached the crate: it is still at {crate_x}"
+        );
+        app.session = Some(session);
+
+        let (crates, at) = quads_of(&ctx, &mut app, "block");
+        assert_eq!(
+            crates, 1,
+            "the playtest drew {crates} crates, not the one the run has"
+        );
+        assert!(
+            at.width() > 4.0,
+            "the crate's quad is {:.1} points wide: that is not a tile",
+            at.width()
+        );
+        let (rocks, _) = quads_of(&ctx, &mut app, "boulder");
+        assert_eq!(
+            rocks, 1,
+            "the playtest drew {rocks} rocks, not the one over the yard"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Press and release at `at` over three frames, the way a hand does.
     fn click(ctx: &Context, app: &mut EvoApp, at: Pos2) {
         // Hover first: egui decides what a press lands on from the pass before it, so a
@@ -5717,12 +5860,11 @@ mod tests {
                 modifiers: egui::Modifiers::default(),
             }],
         );
-        frame(
-            &ctx,
-            &mut app,
-            vec![egui::Event::Text("rope".to_string())],
+        frame(&ctx, &mut app, vec![egui::Event::Text("rope".to_string())]);
+        assert_eq!(
+            app.palette_find, "rope",
+            "`/` puts the cursor in the finder"
         );
-        assert_eq!(app.palette_find, "rope", "`/` puts the cursor in the finder");
         assert_eq!(app.editor.brush, held, "and does not pick anything");
         app.palette_find.clear();
         frame(&ctx, &mut app, vec![]);
@@ -5731,11 +5873,7 @@ mod tests {
         // click to focus it before it will take a `Text` event.
         let field = centre_of(&app, "find a part");
         click(&ctx, &mut app, field);
-        frame(
-            &ctx,
-            &mut app,
-            vec![egui::Event::Text("ball".to_string())],
-        );
+        frame(&ctx, &mut app, vec![egui::Event::Text("ball".to_string())]);
         assert_eq!(app.palette_find, "ball");
         let headings: Vec<&str> = app.tool_rects.iter().map(|(n, _)| *n).collect();
         assert!(

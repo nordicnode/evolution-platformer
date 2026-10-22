@@ -1596,6 +1596,188 @@ def spike_ball_sprites() -> list[tuple[str, Image.Image]]:
     return [("spike_ball", spike_ball())]
 
 
+def belt(right: bool) -> Image.Image:
+    """A conveyor belt: a tread band along the top, and an arrow in the machine under it.
+
+    **The tread is the top**, because the top is what a body stands on: a belt's collision is the
+    whole cell, and a belt drawn as a band in the middle would promise a surface half a tile below
+    where the body actually walks. The band is timber in the plank family with a dark slat every
+    four pixels, so a row of belts reads as one continuous tread rather than as a row of separate
+    machines — which is also why the band is a *cell edge*, not a framed panel.
+
+    **The arrow is iron**, for the spike ball's reason: a cold-metal detail is the one thing in
+    this tileset that is not scenery, so the eye reads it as the mechanism rather than as part of
+    the floor. It is drawn on the body of the machine, where the tread cannot hide it, and the left
+    belt is this picture mirrored rather than drawn twice: a second drawing is a second chance for
+    the two directions to look like two different objects.
+    """
+    img = cell()
+    px = img.load()
+
+    # The tread: three rows of decking with a lit lip, a dark slat every four pixels, and a
+    # shadow row under it where the belt goes over its rollers.
+    for x in range(16):
+        px[x, 0] = WOOD_TOP
+        for y in (1, 2, 3):
+            px[x, y] = WOOD_MID
+        px[x, 4] = WOOD_DARK
+        if x % 4 == 0:
+            for y in (1, 2, 3):
+                px[x, y] = WOOD_DARK
+    # The machine: a dark iron chassis with a lit top edge, so the belt is a thing in the floor
+    # rather than a stripe painted on it.
+    for y in range(5, 16):
+        for x in range(16):
+            px[x, y] = IRON_FRAME if y > 5 else IRON_BOLT
+    for x in (0, 15):
+        for y in range(5, 16):
+            px[x, y] = IRON_BOLT
+    # The arrow: a chevron pointing right, three pixels thick, on the chassis's middle rows.
+    for y in range(8, 13):
+        reach = 5 - abs(y - 10) * 2
+        for x in range(4, 4 + reach):
+            px[x, y] = IRON_LIGHT
+        px[min(4 + reach, 15), y] = IRON_BOLT
+    # Two rivets on the chassis's shoulder, for scale.
+    px[2, 6] = IRON_LIGHT
+    px[13, 6] = IRON_LIGHT
+    return img if right else img.transpose(Image.FLIP_LEFT_RIGHT)
+
+
+def belt_sprites() -> list[tuple[str, Image.Image]]:
+    """Both directions of belt (see [`belt`]): one picture, mirrored."""
+    return [("belt_r", belt(True)), ("belt_l", belt(False))]
+
+
+def boulder() -> Image.Image:
+    """A boulder: one cell of stone that hangs in a socket and falls when a body comes near.
+
+    **It is round, and the cell is still its hitbox.** The silhouette is a circle with a flattened
+    base, inset by a pixel at the corners, so the box the sim tests is a little larger than the
+    painted pixels — an exaggeration in the player's favour, and the only way a boulder reads as a
+    boulder: the squared slab with teeth that this replaces was the press, and a trap that has
+    become a falling stone has to *look* like one at a glance.
+
+    **The foot is flat and lit from above**, like every other surface in the pack: a settled rock
+    is a step a body stands on, so its bottom row has to meet the ground rather than hover above
+    it. The cracks are the deep stone's, and the two flecks on the shoulder are the same light the
+    walls' speckle uses, so a rock in a corridor is made of the room it is in.
+    """
+    img = cell()
+    px = img.load()
+    cx, cy, radius = 7.5, 7.5, 7.2
+    inside = [[False] * 16 for _ in range(16)]
+    for y in range(16):
+        for x in range(16):
+            d = ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2) ** 0.5
+            # The base is flattened: a circle alone leaves the bottom row empty, and a settled
+            # rock would look like it was floating a pixel over the floor.
+            inside[y][x] = d <= radius or (y >= 13 and abs(x + 0.5 - cx) <= 5.2)
+            px[x, y] = STONE_MID if inside[y][x] else TRANSPARENT
+    # Light from above-left, shade below-right: the rim tells the eye this is a round solid.
+    for y in range(16):
+        for x in range(16):
+            if not inside[y][x]:
+                continue
+            d = ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2) ** 0.5
+            diagonal = (x + 0.5 - cx) + (y + 0.5 - cy)
+            if d > radius - 1.8 and diagonal < -0.5:
+                px[x, y] = STONE_LIGHT
+            elif d > radius - 1.8 and diagonal > 2.5:
+                px[x, y] = STONE_DARK
+    for x in range(3, 13):
+        px[x, 15] = STONE_DEEP
+    # Two cracks, staggered so the face does not read as a pair of eyes, and no crack that leaves
+    # the silhouette.
+    for x, y in [(6, 4), (7, 5), (7, 6), (8, 7), (10, 9), (4, 9), (4, 10), (9, 4)]:
+        if inside[y][x]:
+            px[x, y] = STONE_DARK
+    # The lit shoulder, three flecks: the hash the walls' speckle uses, pinned here by hand so a
+    # regenerated atlas cannot move them.
+    for x, y in [(4, 4), (5, 6), (3, 7)]:
+        if inside[y][x]:
+            px[x, y] = STONE_LIGHT
+    return img
+
+
+def boulder_sprites() -> list[tuple[str, Image.Image]]:
+    """The boulder's picture, as a family of one (see [`boulder`])."""
+    return [("boulder", boulder())]
+
+
+def block() -> Image.Image:
+    """A crate: a one-tile box a body can shove, and a step it can stand on.
+
+    **It fills the cell, and it is opaque.** The cell *is* its hitbox, so a crate drawn with air
+    around it would promise a gap a body cannot walk through — the same rule the spiked ball, the
+    lava ball and the boulder are drawn by. It is also the only sprite in the pack that has
+    to be a box rather than a thing *in* a box: a body standing on it stands on its top edge.
+
+    **Timber with an iron frame**, which is how the tileset says *furniture* rather than *terrain*.
+    The planks are the deck family's ([`WOOD_MID`] under a lit top row), so a crate on a timber
+    floor is made of the same wood the floor is; the frame and the four corner brackets are iron,
+    the one cold material in the set, so the box reads as something brought here and put down. The
+    brackets are the detail that does the work: a planked square with seams alone is a patch of
+    floor, and a patch of floor is a thing a body walks into rather than a thing it can move.
+
+    The bottom row is the frame's dark side with no lit pixel in it, so a crate that is resting on
+    the ground looks like it is resting on the ground rather than hovering a pixel above it — the
+    whole of what "it has landed" has to be, at this size.
+    """
+    img = cell()
+    px = img.load()
+
+    # The frame: a dark iron band all the way round, lit along the top and the left so the box has
+    # a light source like everything else in the pack.
+    for y in range(16):
+        for x in range(16):
+            px[x, y] = IRON_FRAME
+    for x in range(16):
+        px[x, 0] = IRON_BOLT
+    for y in range(1, 16):
+        px[0, y] = IRON_BOLT
+
+    # The planks: two vertical seams and a cross batten, so the box reads as boards nailed over a
+    # frame rather than as a solid block of wood. The batten is the only lit band across the middle,
+    # which is what keeps the two seams from reading as three separate crates side by side.
+    for y in range(1, 15):
+        for x in range(1, 15):
+            px[x, y] = WOOD_MID
+    for x in range(1, 15):
+        px[x, 1] = WOOD_TOP
+        px[x, 14] = WOOD_DARK
+    for seam in (5, 10):
+        for y in range(2, 14):
+            px[seam, y] = WOOD_DARK
+    for x in range(1, 15):
+        px[x, 7] = WOOD_TOP
+        px[x, 8] = WOOD_LIGHT
+
+    # A few grain flecks, hand-placed rather than hashed: the crate is the one sprite a level shows
+    # one at a time, so there is no run of them to vary and a fixed picture is the honest one.
+    for gx, gy in ((3, 3), (8, 11), (12, 4), (3, 11), (13, 12)):
+        px[gx, gy] = WOOD_DARK
+
+    # The corner brackets, each a square of frame with one lit pixel at its corner — the detail
+    # that says a crate can be picked up and put down.
+    for bx, by in ((1, 1), (13, 1), (1, 13), (13, 13)):
+        for y in range(by, by + 2):
+            for x in range(bx, bx + 2):
+                px[x, y] = IRON_FRAME
+        px[bx, by] = IRON_LIGHT
+    return img
+
+
+def block_sprites() -> list[tuple[str, Image.Image]]:
+    """The crate's picture, as a family of one (see [`block`]).
+
+    A family of its own rather than a member of [`sprites`], for the boulder's reason: a family at
+    the end of the atlas moves no cell that anything else points at, and appending to the terrain
+    family would shift the seams, the rope, the ball and the belts that are listed after it.
+    """
+    return [("block", block())]
+
+
 def sprites() -> list[tuple[str, Image.Image]]:
     """Every terrain sprite, in the order the manifest lists them."""
     out: list[tuple[str, Image.Image]] = []

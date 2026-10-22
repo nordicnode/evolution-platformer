@@ -42,12 +42,13 @@ use crate::physics::tile_span;
 
 pub use crate::hash::StateHasher;
 pub use crate::level::{
-    FlyerSpec, Level, PlatformSpec, Rect, Scenery, SpikeBallSpec, Tile, TurretSpec,
+    BlockSpec, FlyerSpec, Level, PlatformSpec, Rect, RockSpec, Scenery, SpikeBallSpec, Tile,
+    TurretSpec,
 };
 pub use crate::meta::{MetaController, MetaPlay, Skill, SkillEvent, SkillTrace};
 pub use crate::physics::{
-    AgentAction, Flyer, LavaBall, Mover, Physics, PlayerState, Shot, SpikeBall, Turret, Walker,
-    WalkerMode, PHYSICS,
+    AgentAction, Block, Flyer, LavaBall, Mover, Physics, PlayerState, Rock, Shot, SpikeBall,
+    Turret, Walker, WalkerMode, PHYSICS,
 };
 pub use crate::rng::{common_episode_seed, episode_seed, rng_from_seed, Rng};
 
@@ -138,6 +139,8 @@ pub enum DeathCause {
     Flyer,
     /// A spiked ball on a chain.
     SpikeBall,
+    /// A rock, whether it is in the air or already down: being under one is what kills.
+    Rock,
     Pit,
 }
 
@@ -150,6 +153,7 @@ impl DeathCause {
             DeathCause::Walker => "walker",
             DeathCause::Flyer => "flyer",
             DeathCause::SpikeBall => "spiked ball",
+            DeathCause::Rock => "rock",
             DeathCause::Pit => "fell out",
         }
     }
@@ -415,9 +419,31 @@ pub struct Sim {
     /// Moving platforms. Their *positions* are a function of the frame count; only which one
     /// the body is riding is state, and that is [`Sim::riding`].
     movers: Vec<Mover>,
+    /// The rocks, in file order, at this episode's positions.
+    ///
+    /// State rather than configuration, unlike a mover: when one woke, how far through its
+    /// shudder it is, where it has fallen to and whether it has landed are all facts about the
+    /// body that walked under it, so all of it is hashed.
+    rocks: Vec<Rock>,
     /// Spiked balls on chains, in file order. Unlike a mover their state is *not* a function of
     /// the clock — when a ball was woken is a fact about the body — so their motion is hashed.
     spike_balls: Vec<SpikeBall>,
+    /// Crates, in file order, at this episode's positions.
+    ///
+    /// The one thing in the world a body can move. Their state is hashed for the same reason a
+    /// ball's is: where a crate has been shoved to is a fact about the episode, not the clock.
+    blocks: Vec<Block>,
+    /// The crates as boxes, rebuilt each tick for the body's collision and the observation.
+    ///
+    /// A buffer rather than a fresh `Vec` per tick: this is the sim's hot path, and a crate is a
+    /// box the body needs *this* tick, not a fact worth allocating for. Its contents mean nothing
+    /// between ticks.
+    block_rects: Vec<Rect>,
+    /// The body's solids this tick: the crates and every rock that is not in the air.
+    ///
+    /// A buffer for [`Sim::block_rects`]' reason, and separate from it because a rock's own
+    /// landing test wants the crates alone: a rock cannot land on itself.
+    solid_rects: Vec<Rect>,
     /// The mover the body stood on last frame, so this frame's motion can carry it.
     riding: Option<usize>,
     /// Deck ids the body has stood on at least once, in first-arrival order.
@@ -551,6 +577,13 @@ impl Sim {
                 ),
             })
             .collect();
+        let rocks = level
+            .rocks
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| Rock::new(i as u32, *spec))
+            .collect();
+        let blocks = level.blocks.iter().map(|spec| Block::new(*spec)).collect();
         let spawn_player = level.spawn_player();
         let current_route_stand = spawn_route_stand(level);
         let spawn_hops = current_route_stand.and_then(|s| level.routes().hops_to_flag(s));
@@ -563,7 +596,11 @@ impl Sim {
             lava_balls: Vec::new(),
             lava_vents: level.lava_vents(),
             movers,
+            rocks,
             spike_balls,
+            blocks,
+            block_rects: Vec::new(),
+            solid_rects: Vec::new(),
             riding: None,
             decks_stood: Vec::new(),
             air_ticks: 0,
@@ -636,6 +673,23 @@ impl Sim {
     /// The lava cells that are spitting: one per open-air lava cell in the level.
     pub fn lava_vents(&self) -> &[(i32, i32)] {
         &self.lava_vents
+    }
+
+    /// The rocks themselves, for a caller that wants a box (`Rock::aabb`) or the phase one is in.
+    ///
+    /// The **entities**, unlike [`Sim::platforms`], because a rock's design is its state: a view
+    /// asks where it is *now* and whether it is shuddering, and one accessor that handed back a
+    /// box would make the second question a second lookup of the same field.
+    pub fn rocks(&self) -> &[Rock] {
+        &self.rocks
+    }
+
+    /// The crates, at this frame's positions.
+    ///
+    /// Live positions and not the file's ([`Level::block_rects`]): a view that drew the file's
+    /// would show a crate where the author put it while the body stood on one at the wall.
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
     }
 
     /// The moving platforms, as the boxes they occupy **this frame**.
@@ -757,6 +811,26 @@ impl Sim {
     }
 
     /// Advance exactly one physics tick (1/[`DT`] of a second).
+    /// Whether a carried body at `rect` would land inside something it cannot occupy: terrain, a
+    /// crate, or a settled rock.
+    ///
+    /// A belt and a crate's own travel both *translate* the body rather than push it, so they
+    /// cannot rely on the body's collision to sort the overlap out afterwards the way a walking
+    /// step does: a body carried a belt-step into a crate is inside it, and the next tick's flush
+    /// test at a crate's face — which wants the two exactly touching — no longer holds. Refusing
+    /// the carry up front is the same rule a belt already follows at a wall, extended from terrain
+    /// to the boxes a body also cannot walk through. It is also what lets a body on a belt shove a
+    /// crate at all: the belt leaves it flush rather than a step inside.
+    fn carry_refused(&self, rect: crate::Rect) -> bool {
+        crate::physics::rect_hits_opaque(&self.level, rect)
+            || self.blocks.iter().any(|b| rect.overlaps(&b.aabb()))
+            || self
+                .rocks
+                .iter()
+                .filter(|r| !r.falling())
+                .any(|r| rect.overlaps(&r.aabb()))
+    }
+
     pub fn step(&mut self, action: AgentAction) {
         if self.outcome.is_finished() {
             return;
@@ -838,7 +912,131 @@ impl Sim {
             }
         }
 
-        let touched = self.player.tick(&self.level, ph, action);
+        // ---- belts: the floor moves the body that stands on it -------------
+        //
+        // **Before the body's tick, and only while it is grounded.** A belt is a floor, so it can
+        // only move what is standing on it: a body in the air over one is not carried, which is
+        // what makes a belt something to land on rather than a current in the air. Moving first
+        // matters for the same reason a mover's carry does — the body starts its own tick where
+        // the belt has put it, so it accelerates from there instead of being dragged back.
+        //
+        // The carry is refused when it would put the body inside something it cannot occupy —
+        // terrain, a crate, a settled rock ([`Sim::carry_refused`]). A belt pressed into a wall
+        // must not push a body into it, and the crate half is what lets a body shove a crate *on* a
+        // belt: without it the belt steps the body a hair inside the crate it is leaning on, the
+        // shove's flush test stops holding, and the crate is never pushed at all. Note the body
+        // keeps its *speed*: being carried is a translation, not an acceleration, so stepping off a
+        // belt leaves no momentum behind.
+        if self.player.grounded {
+            if let Some(dir) = crate::physics::belt_dir_at(&self.level, &self.player.aabb()) {
+                let before = self.player.x;
+                self.player.carry(dir as f32 * ph.belt_speed, 0.0);
+                if self.carry_refused(self.player.aabb()) {
+                    self.player.x = before;
+                }
+            }
+        }
+
+        // ---- crates: they fall, and a body leaning on one shoves it -------
+        //
+        // Both halves happen **before** the body's tick, and for the reason the belt's carry does:
+        // the body starts its own tick where the crate has left the world, so it is never caught
+        // inside a box that moved under it.
+        //
+        // The shove is one tick of *walking* pace, which is what a body pressing into a crate
+        // applies to it, so pushing is walking with a crate in front of you rather than a verb of
+        // its own. It is refused when the crate's step would land it in terrain or another crate,
+        // and then the body's own collision stops the body: a crate at a wall is a wall.
+        //
+        // Only a **grounded** body pushes. A body in the air has nothing to push with, and a jump
+        // that clips a crate's side must not drag it along.
+        for i in 0..self.blocks.len() {
+            let (level, ph) = (&self.level, ph);
+            self.blocks[i].tick(level, ph);
+        }
+        let push = if self.player.grounded {
+            action.input_x()
+        } else {
+            0.0
+        };
+        for i in 0..self.blocks.len() {
+            let b = self.blocks[i];
+            // Re-read each tick of this loop: a shove for one crate has already moved the body,
+            // and the next crate's flush test has to see where the body actually is.
+            let body = self.player.aabb();
+            let mut shoved = false;
+            // Beside the crate, not on top of it: the vertical test is strict, so a body
+            // standing on the box it is pressing along pushes nothing.
+            if push != 0.0 {
+                let flush = if push > 0.0 {
+                    (body.x + body.w - b.x).abs() <= 1.0e-3
+                } else {
+                    (body.x - (b.x + b.w)).abs() <= 1.0e-3
+                };
+                let side_by_side = body.y + body.h > b.y + 1.0e-3 && body.y < b.y + b.h - 1.0e-3;
+                if flush && side_by_side {
+                    let dx = push * ph.block_push;
+                    if crate::physics::push_block(&self.level, &mut self.blocks, i, dx) {
+                        shoved = true;
+                        // **The shove carries the body too**, and that is what makes pushing a
+                        // steady walk instead of a stutter. The body is flush with the crate, so
+                        // its own tick would walk it into the crate's old cell and be stopped
+                        // there with its speed spent; the next tick it would re-accelerate from
+                        // nothing, and the crate would get a shove every four or five ticks
+                        // instead of every one. Moving both is the same translation the belt
+                        // makes, with the crate standing in for the floor.
+                        let before = self.player.x;
+                        self.player.carry(dx, 0.0);
+                        if crate::physics::rect_hits_opaque(&self.level, self.player.aabb()) {
+                            self.player.x = before;
+                        }
+                    }
+                }
+            }
+            // **A belt carries a crate standing on it**, which is the floor's half of the crate's
+            // contract: a crate is a thing a body can put down, and a belt is a floor that moves
+            // what is on it, so the two together are a crate that travels. It used to stop dead
+            // on a belt — the belt only ever moved bodies and the crate tick only knew gravity —
+            // and a belt with a box parked on it was a belt switched off.
+            //
+            // The carry is the *belt's*, not the crate's, so a crate the body is actively shoving
+            // is the shove's for that tick: applying both would put the crate a belt-step ahead of
+            // the body every frame, break the flush contact the shove needs, and turn one steady
+            // push into a stutter. A belt is slower than a walk (0.0625 against 0.10), so the
+            // shove is also the faster of the two and the one a pushing player expects.
+            if !shoved {
+                if let Some(dir) = crate::physics::belt_dir_at(&self.level, &b.aabb()) {
+                    let dx = dir as f32 * ph.belt_speed;
+                    if crate::physics::push_block(&self.level, &mut self.blocks, i, dx) {
+                        // And **whoever is standing on the crate rides it**, for the shove's
+                        // reason: a crate that slid out from under its rider would be a lift that
+                        // drops you, and a belt under a box is a moving floor twice removed.
+                        let top = self.blocks[i].y;
+                        let feet = self.player.y + self.player.h;
+                        let over = self.player.x + self.player.w > self.blocks[i].x + 1.0e-3
+                            && self.player.x < self.blocks[i].x + self.blocks[i].w - 1.0e-3;
+                        if over && (feet - top).abs() <= ph.enemy_stomp_tol {
+                            let before = self.player.x;
+                            self.player.carry(dx, 0.0);
+                            if self.carry_refused(self.player.aabb()) {
+                                self.player.x = before;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.block_rects.clear();
+        self.block_rects
+            .extend(self.blocks.iter().map(|b| b.aabb()));
+        // The body's solids: the crates, and the rocks that are not currently in the air. A
+        // **falling** rock is deliberately left out — a body cannot be pushed out of the way of
+        // one, it is hit by it — and the overlap test below is the hit.
+        self.solid_rects.clear();
+        self.solid_rects.extend(self.block_rects.iter().copied());
+        self.solid_rects
+            .extend(self.rocks.iter().filter(|r| !r.falling()).map(|r| r.aabb()));
+        let touched = self.player.tick(&self.level, ph, action, &self.solid_rects);
         if touched.jumped {
             self.stats.jumps += 1;
         }
@@ -921,6 +1119,14 @@ impl Sim {
             b.tick(body, ph);
         }
 
+        // ---- rocks: a trap that wakes once, falls once, and is spent --------
+        // Stepped after the body has moved, on the spike ball's rule, so the trigger sees where
+        // the body is this frame. The crates are landing surfaces as well as the terrain: a rock
+        // that fell through a crate would be a hole in the world.
+        for rock in self.rocks.iter_mut() {
+            rock.tick(&body, &self.level, ph, &self.block_rects);
+        }
+
         // ---- hazards ------------------------------------------------------
         if touched.touched_spike {
             self.die(DeathCause::Spike);
@@ -948,6 +1154,20 @@ impl Sim {
             .any(|b| self.player.aabb().overlaps(&b.aabb()))
         {
             self.die(DeathCause::SpikeBall);
+            return;
+        }
+
+        // ---- rocks: the falling one kills, the settled one is a step --------
+        // The test is on the **wake**, not on the height, and that covers both halves of the
+        // design in one line: a sleeping or settled rock is a solid the body is resolved out of,
+        // so the only way to be inside one is for it to have come down on you — and a body that
+        // jumped into one on its way down has hit it as surely as one that stood still.
+        if self
+            .rocks
+            .iter()
+            .any(|r| r.woken && self.player.aabb().overlaps(&r.aabb()))
+        {
+            self.die(DeathCause::Rock);
             return;
         }
 
@@ -1369,6 +1589,8 @@ impl Sim {
                 mover_phase: &scratch.mover_phase,
                 turrets: &self.turrets,
                 spike_balls: &self.spike_balls,
+                blocks: &self.blocks,
+                rocks: &self.rocks,
                 vents: &self.lava_vents,
                 air_ticks: self.air_ticks,
                 ground_ticks: self.ground_ticks,
@@ -1474,6 +1696,23 @@ impl Sim {
             h.u32(self.spike_balls.len() as u32);
             for b in &self.spike_balls {
                 b.hash_into(&mut h);
+            }
+        }
+        // A crate's position is state the level cannot supply, and conditional for the same reason:
+        // every recorded episode on the pack was recorded without one.
+        if !self.blocks.is_empty() {
+            h.u32(self.blocks.len() as u32);
+            for b in &self.blocks {
+                b.hash_into(&mut h);
+            }
+        }
+        // And a rock's fall, which is state the level cannot supply: when it woke, where it has
+        // got to and whether it has landed are all facts about the episode. Conditional for the
+        // crates' reason — a level with no rock hashes exactly as it did before boulders existed.
+        if !self.rocks.is_empty() {
+            h.u32(self.rocks.len() as u32);
+            for r in &self.rocks {
+                r.hash_into(&mut h);
             }
         }
         match self.riding {
