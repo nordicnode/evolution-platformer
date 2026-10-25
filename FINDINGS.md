@@ -7806,3 +7806,50 @@ Three in `entities.rs`, one per half of the rule:
 
 The workspace suite, clippy and fmt are clean; no shipped level has both a belt and a crate, so the
 battery's existing certification is untouched.
+
+## The palette was getting wider, two points a frame
+
+**The report.** "The left panel slowly expands — where it lists the objects." Not a flicker, not a
+jump on open: a crawl. I measured it before touching anything, with a test that runs the real frame
+loop and reads the finder field's rect each frame: 164 points at open, 165.09 on the second frame,
+166.97 on the third, then **exactly +2 a frame, forever**. Left alone for a minute it would have
+been a third of the window.
+
+**Why.** Two things multiplied.
+
+1. **The parts list reserved the wrong width for its scroll bar.** `const BAR: f32 = 12.0` was a
+   guess; egui's solid bar allocates `bar_inner_margin + bar_width + bar_outer_margin` = 4 + 10 + 0
+   = **14**. So every frame the list measured itself two points wider than the room the panel had
+   given it (`available - 12` of content plus a 14-point bar = available + 2).
+2. **A side panel is sized to its content.** egui takes `width = max(declared, content + margins)`,
+   so those two points widened the panel, which widened the available width, which widened the
+   list... The ratchet is the feedback loop, and no constant in it was ever going to be right on
+   its own: the fix has to break the loop, not tune the number.
+
+**The fix is two statements of fact instead of two measurements.**
+
+* The reservation is now `ui.spacing().scroll.allocated_width()` — egui's own number, so the list
+  fits the bar whatever the theme says the bar is.
+* The panel is `.exact_width(184.0)`: 164 of column, the width the cells were always sized for
+  ("three across a 190-point panel"), plus the frame's 20 of margin — egui counts margins in
+  `exact_width` and draws the 3-point outline on the edge, so the panel still reads as the 190 it
+  has always been. A panel of chrome should state its width rather than measure whatever is inside
+  it; the run panel already states its own (`min_width(300)`), for the mirror-image reason.
+
+**The same bug, in one frame.** With the width pinned, a second symptom showed up in the new test:
+picking up the **platform** brush widened the panel from 190 to 312 in a single frame, because its
+tools row asked for travel, width and the axis switch on one line in a 164-point column. Those
+numbers now take a line each — travel, width, slide/lift, goes left/right — and a spiked ball's
+chain and trigger likewise. One column, four short lines, and the list above them does not move.
+
+**The test that was missing.** `app::tests::the_palette_stays_the_width_it_opens_at` runs forty
+frames and then selects five brushes with controls of different widths, asserting the panel edge is
+the same rect every time. The palette's existing test checked two frames, which is exactly the
+horizon a two-points-a-frame bug hides behind: it reads as "the parts list settles at once". With
+the old constant restored the new test fails on frame 3 with `(13.0, 164.0) -> (13.0, 165.09375)`,
+which is the report, in an assertion.
+
+**Verified.** `cargo test --workspace` green (app: 300 passed), `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo fmt --check` clean, and two scripted screenshots with a
+platform and a spiked ball in hand — the palette at 190 points in both, with every control inside
+its column.

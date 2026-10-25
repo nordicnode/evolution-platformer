@@ -2997,8 +2997,16 @@ impl EvoApp {
         // a visible jog on the frame a window opens, and the sort of thing a layout test catches
         // and a person reads as a flicker. Reserving it always makes every frame of the list the
         // same width, and a short list simply has a few points of air on its right.
-        const BAR: f32 = 12.0;
-        let list_width = (ui.available_width() - BAR).max(60.0);
+        //
+        // **It is the bar's own width, asked of the style rather than guessed.** This was a
+        // constant twelve while egui's solid bar allocates ten for the handle plus four of inner
+        // margin, so every frame the list measured two points wider than the room it had. A side
+        // panel is sized to its content when that content outgrows it, so the panel grew by those
+        // two points, which widened the list by two, which widened the panel again — a ratchet
+        // that crawled a couple of points per frame until the panel met the level. Asking the
+        // style makes the reservation exact, and the panel stays the width it was given.
+        let bar = ui.spacing().scroll.allocated_width();
+        let list_width = (ui.available_width() - bar).max(60.0);
         egui::ScrollArea::vertical()
             .id_salt("palette-parts")
             .auto_shrink([false, false])
@@ -3095,8 +3103,15 @@ impl EvoApp {
             Some(Brush::Flyer | Brush::Turret | Brush::Platform | Brush::SpikeBall)
         ) {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if self.editor.brush == Some(Brush::Turret) {
+            // **One control to a line.** The palette is a fixed 164-point column, and this block
+            // used to be one horizontal row holding every control its brush has at once. A
+            // turret's two cells fit; a platform's travel, width and axis switch did not, so
+            // picking a platform up widened the whole side panel by a hundred and fifty points to
+            // fit them side by side, and the parts list above moved with it. A number and its
+            // label is about ninety points, so two pairs are already a column too far: each pair
+            // takes its own line, which is the one-column rule the rest of the palette keeps.
+            match self.editor.brush {
+                Some(Brush::Turret) => {
                     let right = self.editor.turret_dir > 0;
                     let options: [(Option<&str>, &str); 2] =
                         [(None, "fire left"), (None, "fire right")];
@@ -3112,47 +3127,61 @@ impl EvoApp {
                     if let Some(cell) = picked {
                         self.editor.turret_dir = if cell == 0 { -1 } else { 1 };
                     }
-                } else if self.editor.brush == Some(Brush::Flyer) {
-                    ui.label(egui::RichText::new("beat").small().color(theme::TEXT_DIM));
-                    ui.add(egui::DragValue::new(&mut self.editor.enemy_span).range(1..=24))
-                        .on_hover_text(
-                            "How many tiles the flyer beats across, centred on the click. \
-                             The default is eight, and the whole point of a flyer is the span: \
-                             two tiles is a nuisance in one doorway, eight is a thing to time.",
-                        );
-                } else if self.editor.brush == Some(Brush::SpikeBall) {
-                    ui.label(egui::RichText::new("chain").small().color(theme::TEXT_DIM));
-                    ui.add(egui::DragValue::new(&mut self.editor.spike_ball_length).range(1..=16))
+                }
+                Some(Brush::Flyer) => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("beat").small().color(theme::TEXT_DIM));
+                        ui.add(egui::DragValue::new(&mut self.editor.enemy_span).range(1..=24))
+                            .on_hover_text(
+                                "How many tiles the flyer beats across, centred on the click. \
+                                 The default is eight, and the whole point of a flyer is the span: \
+                                 two tiles is a nuisance in one doorway, eight is a thing to time.",
+                            );
+                    });
+                }
+                Some(Brush::SpikeBall) => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("chain").small().color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::DragValue::new(&mut self.editor.spike_ball_length).range(1..=16),
+                        )
                         .on_hover_text(
                             "How many tiles of chain the ball hangs on. The ball swings on that \
-                         radius, so a long chain is a wide arc and a slow one. Shortened to the \
-                         room below the click; drag down from a placed ball to lengthen its \
-                         chain a cell at a time.",
+                             radius, so a long chain is a wide arc and a slow one. Shortened to the \
+                             room below the click; drag down from a placed ball to lengthen its \
+                             chain a cell at a time.",
                         );
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new("trigger")
-                            .small()
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.add(egui::DragValue::new(&mut self.editor.spike_ball_reach).range(1..=16))
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("trigger")
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.editor.spike_ball_reach).range(1..=16),
+                        )
                         .on_hover_text(
                             "How close a body has to come to the hanging ball to set it swinging, \
                              in tiles. Measured from the ball rather than the ceiling, so this is \
                              the radius of the circle the author can see around the weight.",
                         );
-                } else {
-                    ui.label(egui::RichText::new("travel").small().color(theme::TEXT_DIM));
-                    ui.add(egui::DragValue::new(&mut self.editor.platform_span).range(1..=12))
-                        .on_hover_text(
-                            "How far the platform travels, from where it is placed, in the \
-                             direction chosen below.",
-                        );
+                    });
                 }
-                if self.editor.brush == Some(Brush::Platform) {
-                    ui.label(egui::RichText::new("width").small().color(theme::TEXT_DIM));
-                    ui.add(egui::DragValue::new(&mut self.editor.platform_tiles).range(1..=8))
-                        .on_hover_text("How many tiles wide the shelf is.");
+                Some(Brush::Platform) => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("travel").small().color(theme::TEXT_DIM));
+                        ui.add(egui::DragValue::new(&mut self.editor.platform_span).range(1..=12))
+                            .on_hover_text(
+                                "How far the platform travels, from where it is placed, in the \
+                                 direction chosen below.",
+                            );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("width").small().color(theme::TEXT_DIM));
+                        ui.add(egui::DragValue::new(&mut self.editor.platform_tiles).range(1..=8))
+                            .on_hover_text("How many tiles wide the shelf is.");
+                    });
                     let vertical = self.editor.platform_vertical;
                     let options: [(Option<&str>, &str); 2] = [(None, "slide"), (None, "lift")];
                     let (picked, row) = ui::segmented_sized(
@@ -3168,7 +3197,8 @@ impl EvoApp {
                         self.editor.platform_vertical = cell == 1;
                     }
                 }
-            });
+                _ => {}
+            }
         }
 
         // A platform's **direction**, on its own line beneath the row that holds its travel,
@@ -3178,7 +3208,7 @@ impl EvoApp {
         // the one thing a person has to learn is that the switch means "which way".
         if self.editor.brush == Some(Brush::Platform) {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("goes").small().color(theme::TEXT_DIM));
                 let vertical = self.editor.platform_vertical;
                 let (back, forward) = if vertical {
@@ -4938,7 +4968,17 @@ impl EvoApp {
         // width for the level.
         if self.mode == Mode::Edit {
             egui::SidePanel::left("palette")
-                .default_width(190.0)
+                // **A stated width, not a measurement of what is inside.** The palette is a
+                // column the cells were sized for — three across a 190-point panel, so 164 of
+                // interior — and every row in it is laid out to fit that column. `default_width`
+                // alone was an invitation rather than a statement: egui sizes a side panel to
+                // its content, so a parts list that measured itself two points wide grew the
+                // panel two points a frame, forever, and a brush whose controls did not fit (the
+                // platform's travel, width and axis switch) widened it by a hundred and fifty in
+                // the frame it was picked up. The 184 is the 164 of column plus the frame's 20
+                // of margin; egui counts margins in `exact_width` and the 3-point outline is
+                // drawn on the edge, so the panel still reads as the 190 it has always been.
+                .exact_width(184.0)
                 // A panel of *chrome*: cream, with the same gold lip as the dock. The window's
                 // menus are one material and the two things you look at — the canvas and the
                 // chart — are another, which is the whole of what stops this reading as a tool.
@@ -5935,6 +5975,68 @@ mod tests {
         for group in BrushGroup::ALL {
             let _ = centre_of(&app, group.label());
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **The palette is the width it opens at, however long the window stays open.**
+    ///
+    /// It used to creep: the parts list reserved twelve points for a scroll bar that allocates
+    /// fourteen, so the list measured two points wider than the room the panel had given it, and
+    /// egui sizes a side panel to its content — so the panel widened by two, which widened the
+    /// list by two, two points a frame, for as long as the window was open. A layout that is right
+    /// on the first frame and wrong on the fortieth is invisible to a test that draws one frame
+    /// (and the finder test above draws two), so this one runs the clock and asks again.
+    #[test]
+    fn the_palette_stays_the_width_it_opens_at() {
+        let (ctx, root, mut app) = window("palette-width");
+        let finder = |app: &EvoApp| {
+            app.tool_rects
+                .iter()
+                .find(|(n, _)| *n == "find a part")
+                .map(|(_, r)| (r.left(), r.width()))
+                .expect("the finder is drawn on the palette")
+        };
+        let first = finder(&app);
+        assert!(
+            (first.1 - 164.0).abs() < 0.5,
+            "the panel opens at its stated 190 points, less the frame's 26: the finder is {:.1}",
+            first.1
+        );
+        for frame_no in 1..=40 {
+            frame(&ctx, &mut app, vec![]);
+            assert_eq!(
+                first,
+                finder(&app),
+                "the palette changed width by frame {frame_no}: {first:?} -> {:?}",
+                finder(&app)
+            );
+        }
+        // The tools under the list change with the brush in hand, and two of those rows are
+        // wider than a plate: a brush whose controls do not fit must not be able to widen the
+        // panel either, or the panel would jump the moment a platform was picked up.
+        for brush in [
+            Brush::Platform,
+            Brush::SpikeBall,
+            Brush::Turret,
+            Brush::Scenery,
+            Brush::Block,
+        ] {
+            app.editor.brush = Some(brush);
+            for _ in 0..6 {
+                frame(&ctx, &mut app, vec![]);
+                assert_eq!(
+                    first,
+                    finder(&app),
+                    "picking {} moved the palette's edge: {first:?} -> {:?}",
+                    brush.label(),
+                    finder(&app)
+                );
+            }
+        }
+        // And the list still fits the cells it was sized for: a fix that stopped the growth by
+        // clipping the parts would pass the loop above and fail a person.
+        let _ = centre_of(&app, BrushGroup::Ground.label());
+        let _ = centre_of(&app, BrushGroup::Clear.label());
         let _ = std::fs::remove_dir_all(root);
     }
 
