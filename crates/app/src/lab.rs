@@ -134,6 +134,25 @@ fn warm_seed_from_plan(level: &Level, cfg: &GaConfig) -> (Option<Vec<Genome>>, S
     )
 }
 
+/// Turn the plan-warmed population into a trainer without throwing away a clone that already
+/// wins from spawn. The timed-plan fit is a warm-start mechanism, but a verified clone is also a
+/// legitimate run record; otherwise generation zero can replace it with an unsolved random member
+/// before the window has a chance to display or save the solution.
+fn trainer_from_plan_population(
+    cfg: &GaConfig,
+    level: &Level,
+    population: Vec<Genome>,
+) -> Result<Trainer, String> {
+    let mut trainer = Trainer::resume(cfg.clone(), population, 0)?;
+    if let Some(clone) = trainer.genomes.first().cloned() {
+        let result = evo::run_episode(level, &clone, &cfg.eval_config(), cfg.master_seed);
+        if result.won() {
+            trainer.seed_record(level, clone, cfg.master_seed)?;
+        }
+    }
+    Ok(trainer)
+}
+
 /// [`warm_seed_from_plan`] with the planner budget and the fit under the caller's control. The
 /// no-route case is testable without a full-depth search, and a test that only needs to see the
 /// clone and the note does not have to pay for the shipped epoch budget.
@@ -862,7 +881,7 @@ impl Generator {
                 None if plan.warm_from_plan => {
                     let (pop, note) = warm_seed_from_plan(&level, &cfg);
                     match pop {
-                        Some(pop) => (Trainer::resume(cfg.clone(), pop, 0)?, Some(note)),
+                        Some(pop) => (trainer_from_plan_population(&cfg, &level, pop)?, Some(note)),
                         None => (Trainer::new(cfg.clone()), Some(note)),
                     }
                 }
@@ -982,7 +1001,7 @@ impl Generator {
                 let (pop, note) = warm_seed_from_plan(&level, &cfg);
                 match pop {
                     Some(pop) => (
-                        Trainer::resume(cfg.clone(), pop, 0)
+                        trainer_from_plan_population(&cfg, &level, pop)
                             .unwrap_or_else(|_| Trainer::new(cfg.clone())),
                         Some(note),
                     ),
@@ -3236,6 +3255,10 @@ mod tests {
             "the note names the plan and the clone: {note}"
         );
         assert!(note.contains("2 of 8 genomes"), "{note}");
+        assert!(
+            warm.best().is_some_and(|best| best.result.won()),
+            "the plan clone wins on the flat level and is retained as the run record"
+        );
 
         // The same level, unwarmed, is the control: same seeds, same budget, a random population.
         let cold = Generator::new(level, cfg, 2, 2, RunPlan::default(), dir, "l1-flat-run")

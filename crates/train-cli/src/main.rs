@@ -87,6 +87,9 @@ fn run(raw: &[String]) -> Result<(), Failure> {
         "reach" => commands::reach(&args),
         "fuzz" => commands::fuzz(&args),
         "routeplan" => commands::routeplan(&args),
+        "certify" => commands::certify(&args),
+        "challenge" => commands::challenge(&args),
+        "showcase" => commands::showcase(&args),
         "battery" => commands::battery(&args),
         "codex" => commands::codex(&args),
         "break" => commands::break_my_level(&args),
@@ -148,7 +151,13 @@ COMMANDS:
     routeplan Compile the Phase 1 route plan: certify the level (oracle + a planner route that
               must win a replay), then cut the route into its legs, one per route crossing, with
               each leg's margin in frames. --all compiles a directory; --out writes the plans.
-              Exits non-zero if any level has no certified plan, so it is the phase's gate too.
+               Exits non-zero if any level has no certified plan, so it is the phase's gate too.
+    certify   Emit the explicit solver contract: physics reachability, timed plan, learned policy,
+              held-out phase validation and action-fault robustness.
+    challenge Generate a difficult level, retaining only planner-certified candidates with timing
+              margin and held-out phase wins.
+    showcase  Build a replay artifact with intended route, learned route, divergence moments,
+              discoveries and a Pareto archive of winning variants.
     battery   Run the §9 adversarial battery: every bat-* level must be both reachable and
               routable by the timed planner, reported together with its timings.
     codex     Detect what a champion's winning episode discovered and record it in the level's
@@ -428,9 +437,12 @@ TRAIN OPTIONS:
                           spends its remaining rounds rolling out from that leg's start. Unlike
                           --from-route, the demonstration is already written in block actions, so
                           a missed press is a fit failure rather than an unrepresentable one. The
-                          `clone` line ends with the per-leg mastery reading — which legs the
-                          clone cleared and which one stopped it — because agreement alone cannot
-                          say where the policy stops playing the level.
+                           `clone` line ends with the per-leg mastery reading — which legs the
+                           clone cleared and which one stopped it — because agreement alone cannot
+                           say where the policy stops playing the level.
+    --auto-plan            Same timed-plan warm start, selected automatically for a fresh terminal
+                           run so it matches the desktop lab's solver-backed start. It is still a
+                           named arm in bench runs and refuses honestly when no plan is found.
     --plan-depth <N>      Expansions the timed planner may make.                    [default 32]
     --plan-beam <N>       Nodes carried into each expansion.                        [default 64]
     --plan-bonus <S>      Selection-only fitness paid for the fraction of the planned route a
@@ -633,9 +645,40 @@ ROUTEPLAN OPTIONS:
     --all                 Compile every *.json level in --levels-dir.
     --levels-dir <DIR>    Directory --all reads.                            [default levels]
     --seed <N>            Episode seed the plan is searched and replayed against. [default 1]
-    --plan-depth <N>      Planner expansions. The practice suite certifies at 48; 64 is the
-                          command's default because `l11-the-elements` needs it. [default 64]
+    --plan-depth <N>      Initial planner expansions. The practice suite certifies at 48; 64 is the
+                           command's default because `l11-the-elements` needs it. [default 64]
+    --plan-step <N>       Anytime depth increment when --plan-max-depth is larger. [default depth]
+    --plan-max-depth <N>  Maximum anytime depth; equal to --plan-depth keeps one fixed search.
+    --cache-dir <DIR>     Reuse replay-verified timed plans in this directory.
     --out <DIR>           Write <stem>.routeplan.json here. Without it the plans are printed.
+
+CERTIFY OPTIONS:
+    --level <PATH>        Level to certify; omitted when --champion supplies its hash.
+    --champion <PATH>     Optional learned policy to validate as well as the planner.
+    --plan-depth/--plan-beam
+                          Timed-planner certification budget.                 [default 64/64]
+    --robust <N>          Held-out phase episodes for a supplied champion.       [default 24]
+    --adversarial <N>     Phase episodes used for action-fault checks.            [default 8]
+    --out <PATH>          Write the machine-readable solver contract.
+
+CHALLENGE OPTIONS:
+    --seed <N>            Deterministic generator seed.                          [default fixed]
+    --candidates <N>      Candidate levels to decorate and certify.               [default 64]
+    --tier <N>            Base practice tier.                                     [default 3]
+    --min-margin <N>      Minimum planner timing slack in frames.                 [default 120]
+    --phase-seeds <N>     Held-out route phase seeds.                             [default 4]
+    --plan-depth/--plan-beam
+                          Planner budget for candidate certification.             [default 64/64]
+    --out <DIR>           Output directory for the level and route plan. [default levels/generated]
+
+SHOWCASE OPTIONS:
+    --champion <PATH>     Champion JSON to present.                              [required]
+    --level <PATH>        Level to present; omitted = champion hash lookup.
+    --seed <N>            Episode seed.                           [default recorded episode]
+    --plan-depth/--plan-beam
+                          Intended-route planning budget.                         [default 64/64]
+    --variants <N>        Winning-route candidates to explore.                   [default 2000]
+    --out <PATH>          Showcase JSON artifact. [default <level>-showcase.json]
 
 REPLAY OPTIONS:
     --champion <PATH>     Champion JSON to replay.                      [required]

@@ -24,6 +24,7 @@
 //! Version trio (§8): [`SIM_VERSION`], [`sensors::VERSION`], and
 //! `evo::fitness::VERSION`. All three are stamped into every champion file.
 
+pub mod challenge;
 pub mod hash;
 pub mod level;
 pub mod meta;
@@ -167,7 +168,8 @@ pub enum Outcome {
     Won,
     /// Spike contact, walker side-hit, or fell into a pit.
     Died,
-    /// Hit the frame cap set by [`FRAMES_PER_TILE`].
+    /// Hit the frame cap set by [`FRAMES_PER_TILE`]. A timed episode only: [`Sim::untimed`]
+    /// never produces this, because a human playtest has no allowance to spend.
     TimedOut,
     /// Hit [`NO_PROGRESS_FRAMES`] without advancing.
     Stuck,
@@ -498,6 +500,15 @@ pub struct Sim {
     /// that was already missing them when the episode started, and two runs can only agree on
     /// this list if they agreed on every fuse that lit.
     broken: Vec<BrokenTile>,
+    /// Whether the two clocks that end a **scored** episode apply: the level's frame budget
+    /// ([`frame_budget`]) and the anti-camper rule ([`NO_PROGRESS_FRAMES`]).
+    ///
+    /// True for everything evolution runs, which is why [`Sim::new`] sets it: a policy that
+    /// camps forever has to be cut off, and an episode that takes too long is not a win. A human
+    /// playtest is the one caller that clears it ([`Sim::untimed`]) — a person exploring a
+    /// level is not a candidate being scored, and a run that ends on a clock rather than on the
+    /// flag or a death is the game taking the keyboard away.
+    timed: bool,
 }
 
 /// One brittle tile that has left the level this episode.
@@ -623,7 +634,26 @@ impl Sim {
             min_hops_reached: spawn_hops,
             crumbles: Vec::new(),
             broken: Vec::new(),
+            timed: true,
         }
+    }
+
+    /// A simulation for a human to play: the level's frame budget and the anti-camper rule do
+    /// not apply, so the episode ends only at the flag or on a death.
+    ///
+    /// This is not a different physics or a different world — the state hash of the first *n*
+    /// ticks is identical to [`Sim::new`]'s — it is the removal of the two clocks that exist to
+    /// bound a *scored* episode. Training, validation and replay all use [`Sim::new`]; the
+    /// desktop playtest and the terminal `play` command use this one.
+    pub fn untimed(level: &Level, seed: u64) -> Self {
+        let mut sim = Self::new(level, seed);
+        sim.timed = false;
+        sim
+    }
+
+    /// Whether this episode applies the level's frame cap and anti-camper clock.
+    pub fn is_timed(&self) -> bool {
+        self.timed
     }
 
     pub fn level(&self) -> &Level {
@@ -1416,12 +1446,16 @@ impl Sim {
             self.stats.best_x = self.player.x;
         }
 
-        if self.stats.no_progress_frames >= NO_PROGRESS_FRAMES {
-            self.outcome = Outcome::Stuck;
-            self.finish();
-        } else if self.stats.frames >= self.max_frames() {
-            self.outcome = Outcome::TimedOut;
-            self.finish();
+        // A playtest clears this clock: a person may stand and think, or backtrack, for as long
+        // as they like, and the only endings their run owes are the flag and a death.
+        if self.timed {
+            if self.stats.no_progress_frames >= NO_PROGRESS_FRAMES {
+                self.outcome = Outcome::Stuck;
+                self.finish();
+            } else if self.stats.frames >= self.max_frames() {
+                self.outcome = Outcome::TimedOut;
+                self.finish();
+            }
         }
     }
 

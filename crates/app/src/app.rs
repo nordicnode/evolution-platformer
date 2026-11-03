@@ -880,7 +880,11 @@ impl EvoApp {
         // or an abandoned run writes nothing, because a demonstration has to reach the flag to be
         // one. The directory is a working-directory sibling of `champions/` so a checkout's demos
         // are inspectable without knowing an app-internal path.
-        let mut session = play::Session::new(&self.editor.level, 1);
+        // **Play has no clock but the player's.** The level's frame budget is a scored
+        // episode's allowance; a person looking around, lining up a jump or backtracking is
+        // not an agent running out of time, so the session is untimed and ends only at the
+        // flag or on a death (which restarts).
+        let mut session = play::Session::untimed(&self.editor.level, 1);
         session.capture_demos("demos");
         self.session = Some(session);
         self.driver = None;
@@ -5212,6 +5216,23 @@ mod tests {
             session.sim().outcome(),
             sim::Outcome::Won,
             "the deliberate controller reached the gap level's flag"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The window's play mode is the untimed session: this is the seam where the level's
+    /// scored budget used to come back, one constructor call before any of the session's own
+    /// tests could notice.
+    #[test]
+    fn entering_play_opens_an_untimed_session() {
+        let ctx = Context::default();
+        let root = scratch("play-untimed");
+        let mut app = app_on(&ctx, &root.join("levels/l2-first-gap.json"));
+        app.enter_play();
+        let session = app.session.as_ref().expect("a playtest session");
+        assert!(
+            !session.sim().is_timed(),
+            "play mode must not run under the scored episode's clock"
         );
         let _ = std::fs::remove_dir_all(root);
     }

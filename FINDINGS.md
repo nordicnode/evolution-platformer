@@ -7853,3 +7853,95 @@ which is the report, in an assertion.
 --all-targets -- -D warnings` clean, `cargo fmt --check` clean, and two scripted screenshots with a
 platform and a spiked ball in hand — the palette at 190 points in both, with every control inside
 its column.
+
+## Audit pass: seeded solutions and frontier accounting
+
+The default GA remains the limiting path on `l11-the-elements`: release, pop 200, seed 1 and 300
+generations reached best `x 54.4` but won **0/3** training phases and **0/12** held-out episodes.
+The timed planner found a spawn-started route in 183 blocks and 731 frames, and its fitted clone
+won that route. Before this pass, `--from-plan` inserted that clone into generation zero but did not
+install it as `BestEver`; after evolution replaced it, the run could report no solve despite having
+proved one before training began.
+
+The terminal and desktop timed-plan warm starts now retain a verified closed-loop clone as the run
+record, seed the run clock from that episode, and validate seeded records on patrol levels before a
+strict validated-stop claim. Snapshot exploration now rejects deaths and wins as archive frontiers,
+and snapshot safety guards cover the remaining absolute frame budget rather than the full budget.
+Regression tests cover plan retention, seeded validation, terminal snapshot rejection and the
+remaining-budget guard. These fixes improve evidence retention and correctness; they do not claim
+that the default GA has learned the timed level.
+
+## Solver, robustness and showcase pass, 2026-11-02
+
+This pass turns the next-stage pieces into callable contracts rather than implicit claims:
+
+- `sim::plan` now has an adaptive depth/beam ladder, explicit braking macros, state-hash
+  transposition filtering, and replay-verified timed-plan cache artifacts. `train-cli routeplan
+  --cache-dir` reuses a cache only when the level hash, seed, planner knobs and replay all match.
+- `evo::certify` reports four distinct readings: physics reachability, a timed planner certificate,
+  held-out learned-policy wins, and action-fault robustness. `train-cli certify` writes that report;
+  a planner certificate is sufficient as the solver of record when a learned policy is not.
+- `train --auto-plan` is now the terminal counterpart to the desktop lab's fresh-run warm start;
+  it selects the timed-plan clone automatically, while explicit `--from-plan` remains available for
+  named measurement arms. A one-generation L2 smoke run began with a 369-frame closed-loop win.
+- `evo::hybrid` runs a learned policy until a predicted death, unexpected fall or stall, then plans
+  from the live snapshot. On the shipped first-gap regression, an always-run zero policy was
+  recovered before the pit and won with the planner blocks; this is a controller test, not a claim
+  that the zero policy learned the level.
+- `sim::challenge` generates decorated candidates only after planner certification, a minimum
+  timing margin and held-out phase replays. The checked release smoke run used two candidates,
+  one phase seed and a one-frame minimum: it produced a 409-frame route with 2,231 frames of
+  timing slack and a 1/1 phase replay. The generator's unit gate uses a stronger 12-candidate,
+  two-phase configuration and passes.
+- `evo::variants` keeps a Pareto archive of winning routes across time, divergence, technique,
+  shortcut percentage, jump count and action changes. `evo::showcase` records the intended plan,
+  learned tick route, exact divergence decision moments, discoveries and variants in one replayable
+  artifact. The deterministic showcase and variant replays are covered by unit tests.
+
+### Equal-budget 24-seed gate
+
+The existing `bench` protocol was run on `L9-wait-and-climb`, pop 200, 400 generations, seeds 1–24,
+with the same episode budget in both arms:
+
+| Arm | Solved | Median first win | Mean first win |
+|---|---:|---:|---:|
+| default | 22/24 | 74.0 | 104.3 |
+| jump-timing share 0.5 | 22/24 | 149.5 | 159.5 |
+
+The paired result was 15 default wins versus 9 timing-arm wins, exact two-sided sign-test `p = 0.3075`.
+The timing arm remains experimental and the default stays unchanged. This is an equal-budget gate,
+not evidence that targeted timing is universally harmful; it is the current measurement on the chain
+protocol.
+
+The release adversarial planner battery also passes **9/9** levels. The hardest current case is
+`bat-pit-bait` at 26 planner expansions; every battery plan replayed successfully. A 24-seed robust
+score of the current L1 champion was **24/24**; the older stale L2 champion was deliberately not
+treated as a current policy certificate and scored 0/24 under today's version trio.
+
+Verification for this pass: `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo fmt --all -- --check`, `git diff --check`, and `cargo build --release --workspace`
+all pass. These results certify the new mechanics and artifacts; they do not turn the difficult
+L9/L11 evolution plateau into a solved learned-policy result.
+
+## Audit pass: evaluation boundaries and cadence honesty, 2026-11-02
+
+The follow-up audit found four correctness boundaries worth making explicit:
+
+- Raced patrol evaluation can cull a genome after trial 0. Partial tallies now remain useful for
+  selection but cannot report `solved` or a suite win until the configured trial budget was actually
+  judged and won.
+- A seeded stochastic record now arms the mastery league only when its held-out validation is also
+  solved. One lucky seed can remain the replayable record without silently switching the run to the
+  speed objective.
+- Timed-plan warm starts and plan-proximity shaping now refuse non-4-tick `--action-repeat` values,
+  matching the planner's fixed decision cadence instead of compiling one control grid and replaying
+  another. The commitment-head imitation path also refuses action-only demonstrations until cadence
+  labels exist.
+- Adversarial fault cases choose boundaries from a clean rollout and count only faults that were
+  actually injected. Short levels therefore cannot receive free disturbed wins; TAS/showcase and
+  hybrid replay paths also honor commitment-head durations.
+
+Verification after this audit: all 230 `evo` unit tests, `cargo test --workspace`, clippy with
+`-D warnings`, formatting, diff checks, and the release workspace build pass. These fixes improve
+the honesty of the measurements; they do not make the bounded planner universal or make the
+default learned policy optimal on arbitrary authored levels.

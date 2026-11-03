@@ -88,6 +88,12 @@ enum Macro {
         jump: bool,
         blocks: u32,
     },
+    /// Release horizontal input to shed speed without changing the route direction. This is
+    /// essential for narrow pads and timing windows: a planner that can only run or walk tends to
+    /// arrive at the right place with the wrong velocity.
+    Brake {
+        blocks: u32,
+    },
     Jump {
         dir: i8,
         sprint: bool,
@@ -271,6 +277,45 @@ pub struct PlanOutcome {
     pub expanded: u32,
 }
 
+/// Deterministic budget ladder for an anytime solve. Depth grows the route horizon; beam grows the
+/// number of alternatives retained at each horizon. Keeping the ladder explicit makes a CLI run
+/// reproducible and lets an editor choose a small first answer without committing to the cost of
+/// the widest search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdaptivePlanConfig {
+    pub initial_depth: u32,
+    pub max_depth: u32,
+    pub depth_step: u32,
+    pub initial_beam: usize,
+    pub max_beam: usize,
+    pub beam_step: usize,
+}
+
+impl Default for AdaptivePlanConfig {
+    fn default() -> Self {
+        AdaptivePlanConfig {
+            initial_depth: 32,
+            max_depth: 128,
+            depth_step: 16,
+            initial_beam: 64,
+            max_beam: 256,
+            beam_step: 32,
+        }
+    }
+}
+
+impl AdaptivePlanConfig {
+    pub fn sanitized(mut self) -> Self {
+        self.initial_depth = self.initial_depth.clamp(1, 512);
+        self.max_depth = self.max_depth.clamp(self.initial_depth, 512);
+        self.depth_step = self.depth_step.clamp(1, 512);
+        self.initial_beam = self.initial_beam.clamp(1, 2048);
+        self.max_beam = self.max_beam.clamp(self.initial_beam, 2048);
+        self.beam_step = self.beam_step.clamp(1, 2048);
+        self
+    }
+}
+
 /// Solve `level` from the episode's spawn, against `seed`.
 pub fn solve(level: &Level, seed: u64, cfg: PlanConfig) -> Option<TimedRoute> {
     plan_level(level, seed, cfg).route
@@ -279,12 +324,9 @@ pub fn solve(level: &Level, seed: u64, cfg: PlanConfig) -> Option<TimedRoute> {
 /// **Anytime planning:** deepen the same search until a route appears or the cap is reached.
 ///
 /// The planner's cost is a beam and a depth, and a level that needs one long crossing can be
-/// solved at depth 64 after depth 32 has run out of frontier. Restarting with a larger depth is
-/// deliberate rather than wasteful: the frontier at depth 32 is already the best 32 blocks the
-/// beam kept, and the deterministic tie-breaks make a second pass extend that answer rather than
-/// search a different one. Each pass is a complete `plan_from`, so every returned route is a
-/// route a single fixed configuration would have returned at that depth — the "anytime" part is
-/// the budget, not the semantics.
+/// solved at depth 64 after depth 32 has run out of frontier. Each rung is a complete deterministic
+/// search, which keeps a route's semantics tied to one fixed configuration while the caller widens
+/// the budget only when the cheaper rung did not certify.
 ///
 /// `step` is the depth increment and `max_depth` the cap; both are clamped to the planner's own
 /// limits. The loop is deterministic for a given `(level, seed, cfg, step, max_depth)`, which is
@@ -296,9 +338,32 @@ pub fn solve_anytime(
     step: u32,
     max_depth: u32,
 ) -> PlanOutcome {
+    solve_adaptive(
+        level,
+        seed,
+        cfg,
+        AdaptivePlanConfig {
+            initial_depth: step,
+            max_depth,
+            depth_step: step.max(1),
+            initial_beam: cfg.beam,
+            max_beam: cfg.beam,
+            beam_step: 1,
+        },
+    )
+}
+
+/// Anytime planning with a widening beam. A route is returned at the first rung that certifies;
+/// failed rungs are retained only as diagnostics, so a wider later search cannot replace a valid
+/// earlier route with a slower one.
+pub fn solve_adaptive(
+    level: &Level,
+    seed: u64,
+    cfg: PlanConfig,
+    budget: AdaptivePlanConfig,
+) -> PlanOutcome {
     let cfg = cfg.sanitized();
-    let step = step.max(1);
-    let max_depth = max_depth.clamp(step, 512);
+    let budget = budget.sanitized();
     let mut deepest = PlanOutcome {
         route: None,
         note: "the planner ran no expansion".into(),
@@ -307,9 +372,10 @@ pub fn solve_anytime(
         frames: 0,
         expanded: 0,
     };
-    let mut depth = step.min(max_depth);
+    let mut depth = budget.initial_depth;
+    let mut beam = budget.initial_beam;
     loop {
-        let outcome = plan_level(level, seed, PlanConfig { depth, ..cfg });
+        let outcome = plan_level(level, seed, PlanConfig { depth, beam, ..cfg });
         if outcome.route.is_some() {
             return outcome;
         }
@@ -318,15 +384,26 @@ pub fn solve_anytime(
         {
             deepest = outcome;
         }
-        if depth >= max_depth {
+        if depth >= budget.max_depth {
             let mut note = deepest.note.clone();
             note.push_str(&format!(
-                " (anytime search stopped at depth {max_depth}; raise --plan-max-depth to widen it)"
+                " (anytime search stopped at depth {} / beam {}; raise the plan budget to widen it)",
+                budget.max_depth,
+                budget.max_beam
             ));
             deepest.note = note;
             return deepest;
         }
-        depth = (depth + step).min(max_depth);
+        let next_depth = (depth + budget.depth_step).min(budget.max_depth);
+        let next_beam = (beam + budget.beam_step).min(budget.max_beam);
+        if next_depth == depth && next_beam == beam {
+            let mut note = deepest.note.clone();
+            note.push_str(" (anytime search exhausted its depth and beam budgets)");
+            deepest.note = note;
+            return deepest;
+        }
+        depth = next_depth;
+        beam = next_beam;
     }
 }
 
@@ -661,7 +738,22 @@ fn select(children: Vec<Node>, cfg: PlanConfig) -> Vec<Node> {
     if children.is_empty() {
         return children;
     }
-    let mut ranked = children;
+    // A macro can reach the same simulator state through several scripts (for example, a short
+    // run followed by a brake versus a longer walk). Keep one deterministic representative before
+    // spending beam slots on it. This is a small transposition table: the full state hash includes
+    // the world clock, hazards and episode accounting, so states with different timing are not
+    // accidentally merged.
+    let mut unique = std::collections::BTreeMap::<u64, Node>::new();
+    for node in children {
+        let hash = node.sim.state_hash();
+        let replace = unique
+            .get(&hash)
+            .is_none_or(|held| score(&node) < score(held));
+        if replace {
+            unique.insert(hash, node);
+        }
+    }
+    let mut ranked: Vec<Node> = unique.into_values().collect();
     ranked.sort_by_key(score);
     let mut kept: Vec<Node> = Vec::new();
     let mut buckets: std::collections::BTreeMap<(u32, u32), usize> =
@@ -721,6 +813,12 @@ fn macros_for(_sim: &Sim) -> Vec<Macro> {
             }
         }
     }
+    // Braking is directionless and therefore belongs outside the direction loop. Keep several
+    // durations because a one-block velocity correction and a full landing wait are different
+    // decisions, and the transposition table removes duplicates after simulation.
+    for blocks in [1, 2, 4, 8] {
+        out.push(Macro::Brake { blocks });
+    }
     out
 }
 
@@ -766,6 +864,15 @@ fn apply(mut sim: Sim, m: Macro, max_flight_blocks: u32) -> Option<Node> {
                 }
                 step_block(&mut sim, action);
                 actions.push(action);
+            }
+        }
+        Macro::Brake { blocks } => {
+            for _ in 0..blocks {
+                if sim.outcome().is_finished() {
+                    break;
+                }
+                step_block(&mut sim, AgentAction::Brake);
+                actions.push(AgentAction::Brake);
             }
         }
         Macro::Jump {

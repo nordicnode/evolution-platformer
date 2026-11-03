@@ -80,6 +80,12 @@ impl SnapshotArchive {
     /// is what makes the archive a frontier rather than a museum: a late state with two seconds
     /// left is worse to explore from than an early one with ten, even though it is further along.
     pub fn observe(&mut self, sim: &Sim, generation: u32) -> bool {
+        // A death or a flag is an episode result, not an explorable frontier. Restarting one would
+        // deliberately turn a terminal state back into `Running`, handing probes a free position
+        // at the end of the level (and, at a goal, a free win on the next tick).
+        if sim.outcome().is_finished() {
+            return false;
+        }
         let key = SnapshotKey::of(sim);
         let remaining = sim.max_frames().saturating_sub(sim.stats().frames);
         let better = match self.cells.get(&key) {
@@ -197,6 +203,23 @@ mod tests {
             restarted.outcome(),
             sim::Outcome::Running,
             "a snapshot starts a new episode"
+        );
+    }
+
+    #[test]
+    fn terminal_states_are_not_frontiers() {
+        let level = level();
+        let mut sim = Sim::new(&level, 1);
+        while !sim.outcome().is_finished() {
+            sim.step(sim::physics::AgentAction::Run);
+        }
+        assert_eq!(sim.outcome(), sim::Outcome::Won);
+
+        let mut archive = SnapshotArchive::new();
+        assert!(!archive.observe(&sim, 0));
+        assert!(
+            archive.is_empty(),
+            "a finished episode is not a probe start"
         );
     }
 }

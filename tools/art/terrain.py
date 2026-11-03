@@ -893,54 +893,199 @@ def blend(look: str, side: str) -> Image.Image:
 #: statement, and `REVIEW.md` §2.12 is where the cost of letting the two drift was measured.
 SPRING_AIR_ROWS = 4
 
-#: The deep shade at the heart of a crack, and the dark one along its shoulders, per material.
-#: A crack is a shadow a material throws on itself, so it is drawn in that material's own tones:
-#: a grey fissure across a beach is the kind of detail that stops the eye reading sand.
+#: How many crack pictures each material has. The view chooses one from the tile's
+#: coordinates (`crate::view::cracked_overlay`), so a long brittle bridge is not the same
+#: stamp repeated end to end.
+CRACK_VARIANTS = 3
+
+#: The shadow at the heart of every crack. A near-black shared by all four materials rather
+#: than each material's own deepest tone: a crack is where the light does not reach, and the
+#: old per-material heart was the mistake this pass fixes — a sand crack in sand's deep tone
+#: is one more speckle of sand, not a warning that the tile is about to leave the level.
+CRACK_INK = (40, 28, 24, 255)
+
+#: `(shoulder, highlight)` per material. The shoulder is the chipped edge beside the ink and
+#: the highlight is the lit lip on the other side; both are the material's own tones, which is
+#: what keeps a fracture in a beach reading as *damaged sand* rather than as a black line pasted
+#: over it.
 CRACK_TONES = {
-    "ground": (DIRT_DEEP, DIRT_DARK),
-    "sand": (SAND_DEEP, SAND_DARK),
-    "brick": (BRICK_DEEP, BRICK_DARK),
-    "wood": (WOOD_DEEP, WOOD_DARK),
+    "ground": (DIRT_DARK, DIRT_LIGHT),
+    "sand": (SAND_DARK, SAND_LIGHT),
+    "brick": (BRICK_DARK, BRICK_LIGHT),
+    "wood": (WOOD_DARK, WOOD_LIGHT),
 }
 
 
-def crack_overlay(look: str) -> Image.Image:
+def _crack_pixel(px, x: int, y: int, colour: RGB) -> None:
+    """Set one crack pixel, if it lands inside the cell.
+
+    The motifs below deliberately walk off an edge: a branch that reaches the tile boundary is
+    what lets the mark join the crack in the tile beside it. Clipping here keeps that intent out
+    of every loop that draws one.
+    """
+    if 0 <= x < 16 and 0 <= y < 16:
+        px[x, y] = colour
+
+
+def _crack_long(px, seed: int, shoulder: RGB, highlight: RGB) -> None:
+    """A fault from the top of the cell to the bottom, with one branch and a chipped corner.
+
+    The vertical read is the one a bridge needs: the crack crosses the surface a body runs on,
+    so the tile looks broken rather than decorated.
+    """
+    x = 4
+    path = []
+    for y in range(16):
+        path.append(x)
+        _crack_pixel(px, x, y, CRACK_INK)
+        # The shoulder changes sides in short bands, so the fissure has a chipped edge rather
+        # than a perfectly parallel outline.
+        side = 1 if (y // 3) % 2 == 0 else -1
+        _crack_pixel(px, x + side, y, shoulder)
+        if y % 3 == 0:
+            _crack_pixel(px, x - side, y, highlight)
+        roll = h(x, y, seed + 7)
+        if roll < 0.28:
+            x -= 1
+        elif roll > 0.72:
+            x += 1
+        x = max(2, min(13, x))
+    # A second fracture leaves the main one at the shoulder and runs off the left edge. Where it
+    # lands in the neighbouring cell is not its business: the overlay in that cell puts a crack
+    # there, and the two meeting at the boundary is the point.
+    bx, by = path[5], 5
+    for step in range(8):
+        _crack_pixel(px, bx, by, CRACK_INK)
+        _crack_pixel(px, bx, by + 1, shoulder)
+        if step % 2 == 0:
+            _crack_pixel(px, bx, by - 1, highlight)
+        bx -= 1
+        if h(bx, by, seed + 3) < 0.4:
+            by += 1
+        if bx < 0:
+            break
+    # A chip off the top-right corner. It is the one mark that changes the *silhouette* of the
+    # damage rather than adding another line, which is what makes a tile read as damaged from a
+    # glance instead of as textured.
+    for x, y in ((15, 0), (14, 0), (15, 1), (13, 1)):
+        _crack_pixel(px, x, y, shoulder)
+    _crack_pixel(px, 14, 1, highlight)
+
+
+def _crack_cross(px, seed: int, shoulder: RGB, highlight: RGB) -> None:
+    """A horizontal fault across the cell, with a branch down and a chipped corner.
+
+    The horizontal read is the bridge's other axis: laid side by side, the fault in one tile
+    meets the fault in the next, so a span of brittle blocks carries one continuous seam.
+    """
+    y = 8
+    path = []
+    for x in range(16):
+        path.append(y)
+        _crack_pixel(px, x, y, CRACK_INK)
+        side = 1 if (x // 4) % 2 == 0 else -1
+        _crack_pixel(px, x, y + side, shoulder)
+        if x % 4 == 0:
+            _crack_pixel(px, x, y - side, highlight)
+        roll = h(x, y, seed + 7)
+        if roll < 0.28:
+            y -= 1
+        elif roll > 0.72:
+            y += 1
+        y = max(6, min(12, y))
+    bx, by = 6, path[6]
+    for step in range(8):
+        _crack_pixel(px, bx, by, CRACK_INK)
+        _crack_pixel(px, bx + 1, by, shoulder)
+        if step % 2 == 0:
+            _crack_pixel(px, bx - 1, by, highlight)
+        by += 1
+        if h(bx, by, seed + 5) < 0.4:
+            bx += 1
+        if by > 15:
+            break
+    for x, y in ((15, 15), (14, 15), (15, 14), (13, 15)):
+        _crack_pixel(px, x, y, shoulder)
+    _crack_pixel(px, 14, 14, highlight)
+
+
+def _crack_corner(px, seed: int, shoulder: RGB, highlight: RGB) -> None:
+    """A corner broken away, with two fractures running out of it.
+
+    The third shape exists so a row of cracked tiles does not alternate between two stamps: a
+    missing corner is read before any of the lines are, and the two cracks leaving it want a
+    different silhouette from the other two motifs.
+    """
+    for x, y in ((0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2)):
+        _crack_pixel(px, x, y, shoulder)
+    _crack_pixel(px, 1, 2, highlight)
+    _crack_pixel(px, 2, 1, highlight)
+    # One fracture down the cell, one across it, both leaving the broken corner.
+    x, y = 2, 2
+    for step in range(13):
+        _crack_pixel(px, x, y, CRACK_INK)
+        _crack_pixel(px, x + 1, y, shoulder)
+        if step % 2 == 0:
+            _crack_pixel(px, x - 1, y, highlight)
+        if h(x, y, seed + 3) < 0.45:
+            x += 1
+        y += 1
+    x, y = 2, 3
+    for step in range(12):
+        _crack_pixel(px, x, y, CRACK_INK)
+        _crack_pixel(px, x, y + 1, shoulder)
+        if step % 3 == 0:
+            _crack_pixel(px, x, y - 1, highlight)
+        if h(x, y, seed + 9) < 0.55:
+            y += 1
+        x += 1
+
+
+def crack_overlay(look: str, variant: int = 0) -> Image.Image:
     """One material's crack, on a transparent cell, for the renderer to lay over its autotile.
 
-    A fissure rather than a scratch, and **one pixel wide**: it walks down the cell drifting one
-    pixel sideways every couple of rows, its heart is the material's deepest shade, and a shoulder
-    pixel of the dark tone appears beside it now and then so the line has grain. The width is the
-    whole measurement — on brick or decking, whose own texture is a busy grid of mortar and plank
-    seams, a two-pixel crack stops being a crack and becomes a smudge that hides the material.
+    **A fracture, not a scratch.** The first version was a single one-pixel line in the material's
+    deepest tone; against brick's mortar grid, dirt's speckle or timber's plank seams it read as
+    one more piece of texture, and a cracked floor looked like a sound one until it disappeared
+    underfoot. This version gives the mark the three tones a cut needs — a near-black heart, a
+    darker shoulder and a lighter lip — and makes it two pixels wide at the heart, so the damage
+    survives the busy material underneath. Every motif reaches at least one cell edge: a crack
+    that stops in the middle of a tile reads as a drawn symbol, while one running off the edge
+    joins its neighbour and reads as a fault through the whole bridge.
 
-    One branch leaves the fissure partway down and drifts away from it, which is what makes the
-    mark read as something that *happened* to the ground rather than something drawn on it.
+    Three motifs per material ([`CRACK_VARIANTS`]), selected by tile coordinate in the view. One
+    stamp repeated end to end is the other way a crack stops looking like damage and starts
+    looking like wallpaper, and the extra pictures cost eight atlas cells.
+
+    The result is deliberately still a *mark*: each variant is kept under the sixty-four opaque
+    pixels `crate::atlas`'s art test allows, because an overlay that covered the cell would be a
+    fifth material rather than a warning on the fourth.
     """
-    heart, shoulder = CRACK_TONES[look]
+    if look not in CRACK_TONES:
+        raise KeyError(f"no crack tones for material {look!r}")
+    if not 0 <= variant < CRACK_VARIANTS:
+        raise ValueError(f"crack variant {variant} outside 0..{CRACK_VARIANTS}")
+    shoulder, highlight = CRACK_TONES[look]
     img = cell()
     px = img.load()
-    seed = 197 + sorted(CRACK_TONES).index(look) * 13
-    for start in (3, 10):
-        if h(start, 0, seed) < 0.25:
-            continue
-        x = start
-        drift = 1 if h(start, 9, seed + 23) < 0.5 else -1
-        for y in range(3, 15):
-            px[x, y] = heart
-            if h(x, y, seed + 7) < 0.18:
-                px[x + drift, y] = shoulder
-            if h(x, y, seed + 5) < 0.45:
-                x += drift
-            if h(x, y, seed + 29) < 0.12:
-                drift = -drift
-            x = max(1, min(14, x))
-        bx, by = start, 7 + int(h(start, 2, seed) * 4)
-        for step in range(2 + int(h(start, 3, seed) * 3)):
-            bx -= drift
-            by += 1
-            if 0 <= bx < 16 and by < 15:
-                px[bx, by] = heart if step == 0 else shoulder
+    seed = 197 + sorted(CRACK_TONES).index(look) * 13 + variant * 97
+    motif = (_crack_long, _crack_cross, _crack_corner)[variant]
+    motif(px, seed, shoulder, highlight)
     return img
+
+
+def crack_variant_sprites() -> list[tuple[str, Image.Image]]:
+    """The second and third crack of each material, as a family of their own.
+
+    Appended after every family that was here before it (see `gen_tileset.FAMILIES`): these are
+    variants of optional art, and a family at the end of the manifest moves no cell that any
+    sprite already in the atlas points at.
+    """
+    out: list[tuple[str, Image.Image]] = []
+    for variant, suffix in enumerate(("_b", "_c"), start=1):
+        for look in ("ground", "sand", "brick", "wood"):
+            out.append((f"cracked_{look}{suffix}", crack_overlay(look, variant)))
+    return out
 
 
 def spring() -> Image.Image:

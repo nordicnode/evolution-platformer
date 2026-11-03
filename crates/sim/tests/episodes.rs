@@ -258,6 +258,54 @@ fn an_agent_that_never_moves_is_stopped_by_the_anti_camper_rule() {
     );
 }
 
+/// A human playtest is not on either of the clocks that end a scored episode.
+///
+/// The frame cap and the anti-camper rule are how an agent is asked to solve a level *in
+/// time*; a person exploring one is not a candidate. `Sim::untimed` has to keep running past
+/// both, while `Sim::new` on the same fixture still stops exactly as it did — otherwise this
+/// would be a test that the caps were deleted rather than reserved for scored episodes.
+#[test]
+fn an_untimed_sim_has_no_frame_cap_and_no_camper_clock() {
+    let level = common::fixture("untimed", &["......", "...G..", "######"], (1, 1), &[]);
+    let budget = sim::frame_budget(&level);
+    assert!(
+        budget < sim::NO_PROGRESS_FRAMES,
+        "the fixture should hit its frame cap before the camper rule, so the first half of this \
+         test is about the cap: budget {budget}"
+    );
+
+    // The scored episode stops on its frame budget, as every model in training does.
+    let mut timed = sim::Sim::new(&level, 3);
+    for _ in 0..=budget {
+        timed.step(AgentAction::Brake);
+    }
+    assert_eq!(timed.outcome(), sim::Outcome::TimedOut);
+    assert_eq!(timed.stats().frames, budget);
+
+    // The playtest keeps going past both clocks. The body stands still, so this also crosses
+    // the no-progress threshold; neither may end the run.
+    let mut play = sim::Sim::untimed(&level, 3);
+    assert!(!play.is_timed());
+    let frames = sim::NO_PROGRESS_FRAMES + 100;
+    for _ in 0..frames {
+        play.step(AgentAction::Brake);
+    }
+    assert_eq!(
+        play.outcome(),
+        sim::Outcome::Running,
+        "a playtest has no clock to run out of, at frame {}",
+        play.stats().frames
+    );
+    assert_eq!(play.stats().frames, frames);
+    assert!(
+        play.stats().no_progress_frames > sim::NO_PROGRESS_FRAMES,
+        "the fixture must actually cross the anti-camper threshold"
+    );
+    // The budget is still reported: it is a fact about the level, and a consumer that asks how
+    // much allowance an episode had must get the same number wherever it runs.
+    assert_eq!(play.stats().budget_frames, budget);
+}
+
 #[test]
 fn a_finished_episode_is_frozen() {
     let level = common::long_runway();

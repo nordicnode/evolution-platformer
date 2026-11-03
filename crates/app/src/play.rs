@@ -205,8 +205,23 @@ pub struct Session {
 
 impl Session {
     pub fn new(level: &Level, seed: u64) -> Session {
+        Session::with_sim(Sim::new(level, seed), seed)
+    }
+
+    /// A playtest with **no clock but the player's own**: the level's frame budget and the
+    /// anti-camper rule do not apply, so the run ends only when the flag is touched or the body
+    /// dies (and a death is a retry, not the end of the session).
+    ///
+    /// The play mode is the one session built this way. A scored episode still runs under
+    /// [`Sim::new`], which is the whole point of the budget: an agent is asked to solve the
+    /// level *in time*, while a person is asked to solve it.
+    pub fn untimed(level: &Level, seed: u64) -> Session {
+        Session::with_sim(Sim::untimed(level, seed), seed)
+    }
+
+    fn with_sim(sim: Sim, seed: u64) -> Session {
         Session {
-            sim: Sim::new(level, seed),
+            sim,
             seed,
             accumulator: 0.0,
             clock: 0.0,
@@ -331,7 +346,14 @@ impl Session {
         let demo_dir = self.demo_dir.clone();
         let spec = self.ghost.as_ref().map(|g| g.spec.clone());
         let visible = self.ghost.as_ref().map(|g| g.visible).unwrap_or(true);
-        *self = Session::new(level, self.seed);
+        // A retry is the same kind of run: a playtest that could take as long as it liked before
+        // the death must not come back with the scored episode's clock running.
+        let timed = self.sim.is_timed();
+        *self = if timed {
+            Session::new(level, self.seed)
+        } else {
+            Session::untimed(level, self.seed)
+        };
         self.clock = clock;
         self.best = best;
         self.audible = audible;
@@ -349,9 +371,9 @@ impl Session {
     /// Is an automatic restart due: the episode died more than [`AUTO_RESTART_DELAY`]
     /// of wall clock ago?
     ///
-    /// Deaths only, not wins or time-outs: a win is stood behind to be looked at, and
-    /// a time-out is already the whole allowance spent, while a death is a retry —
-    /// which is why `R` still restarts at once from any of them.
+    /// Deaths only, not wins: a win is stood behind to be looked at, while a death is a retry —
+    /// which is why `R` still restarts at once from either. A playtest has no other ending to
+    /// wait out: it is [`Session::untimed`], so there is no time-out and no camper cut.
     pub fn restart_due(&self) -> bool {
         self.sim.outcome() == Outcome::Died
             && self
@@ -675,10 +697,19 @@ impl Session {
         } else {
             100.0
         };
-        // The clock is the frame count, written the one way this project writes a time, and the
-        // budget beside it is the same cap the AI is scored against — so the line says how much of a
-        // level's allowance this attempt has spent, which the frame count alone left the reader to
-        // work out from `FRAMES_PER_TILE`.
+        // The clock is the frame count, written the one way this project writes a time. A timed
+        // episode also names the budget it is spending — the same cap the AI is scored against —
+        // but the playtest is untimed, and printing an allowance beside it would claim a deadline
+        // the run does not have (see [`Session::untimed`]).
+        let clock = if self.sim.is_timed() {
+            format!(
+                "{} of {}",
+                sim::format_time(stats.frames),
+                sim::format_time(self.sim.max_frames())
+            )
+        } else {
+            sim::format_time(stats.frames)
+        };
         let best = match self.best() {
             Some(frames) => format!("  your best {}", sim::format_time(frames)),
             None => String::new(),
@@ -692,10 +723,9 @@ impl Session {
             None => "",
         };
         format!(
-            "{}  {} of {}  x {:.1}  flag {:.1} tiles  progress {:.0}%  stomps {}  jumps {}{best}{ghost}  {}",
+            "{}  {}  x {:.1}  flag {:.1} tiles  progress {:.0}%  stomps {}  jumps {}{best}{ghost}  {}",
             self.sim.outcome().as_str(),
-            sim::format_time(stats.frames),
-            sim::format_time(self.sim.max_frames()),
+            clock,
             stats.best_x,
             stats.closest_approach,
             progress,
@@ -894,6 +924,54 @@ mod tests {
             session.sim().outcome(),
             sim::Outcome::Won,
             "{}",
+            session.summary()
+        );
+    }
+
+    /// **The playtest has no clock but the player's own.**
+    ///
+    /// A level's frame budget is the allowance a scored episode gets, not a deadline a person
+    /// is playing against: this session stands still for longer than both the fixture's budget
+    /// and the anti-camper window and must still be running. The restart is part of the test
+    /// because a retry that quietly came back timed would reintroduce the cut one death later.
+    #[test]
+    fn a_play_session_is_untimed_and_stays_untimed_across_a_restart() {
+        let level = Level::starter("untimed-play", 8, 5);
+        let budget = sim::frame_budget(&level);
+        assert!(budget < sim::NO_PROGRESS_FRAMES, "budget {budget}");
+        let standing = Keys {
+            brake: true,
+            ..Keys::default()
+        };
+
+        let mut session = Session::untimed(&level, 1);
+        assert!(!session.sim().is_timed());
+        for _ in 0..sim::NO_PROGRESS_FRAMES + 60 {
+            session.advance(1.0 / 60.0, standing);
+        }
+        assert_eq!(
+            session.sim().outcome(),
+            sim::Outcome::Running,
+            "a standing playtest is not timed out or cut for camping: {}",
+            session.summary()
+        );
+        assert!(session.frames() > budget);
+        assert!(
+            !session.summary().contains(" of "),
+            "the status line must not quote an allowance the playtest does not have: {}",
+            session.summary()
+        );
+
+        // A retry is the same kind of run: untimed before the restart, untimed after it.
+        session.restart(&level);
+        assert!(!session.sim().is_timed());
+        for _ in 0..budget + 10 {
+            session.advance(1.0 / 60.0, standing);
+        }
+        assert_eq!(
+            session.sim().outcome(),
+            sim::Outcome::Running,
+            "the retry must not come back with the scored clock running: {}",
             session.summary()
         );
     }

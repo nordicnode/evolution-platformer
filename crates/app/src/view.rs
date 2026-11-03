@@ -1047,21 +1047,30 @@ fn tile_sprite(sprites: &Sprites, tiling: Tiling, tx: i32, ty: i32) -> Rect {
 /// before cracked ground existed draws a brittle tile as the material it is made of, and the only
 /// thing lost is the warning that it is about to go — which is a real loss, and still not a reason
 /// for somebody else's atlas to stop starting. The palette's cracked brushes lean on the same
-/// four sprites, so a tileset without them paints a cracked floor the colour of its material.
+/// base sprites, so a tileset without them paints a cracked floor the colour of its material.
 ///
-/// One overlay per **material** rather than one crack for all four, because a crack is the
-/// material's own darkest tone: a grey fissure across a beach is the kind of detail that makes the
-/// eye stop reading the tile as sand, and the layers here already exist for exactly this reason
-/// (`_with_detail(ground(1), _crack)` in `tools/art/terrain.py`).
-fn cracked_overlay(sprites: &Sprites, tile: Tile) -> Option<Rect> {
-    let name = match tile {
-        Tile::Cracked => "cracked_ground",
-        Tile::CrackedSand => "cracked_sand",
-        Tile::CrackedBrick => "cracked_brick",
-        Tile::CrackedPlank => "cracked_wood",
+/// One overlay per **material** rather than one crack for all four, because a crack is drawn in
+/// the material's own chipped and lit tones: a grey fissure across a beach is the kind of detail
+/// that makes the eye stop reading the tile as sand, and the layers here already exist for exactly
+/// this reason (`_with_detail(ground(1), _crack)` in `tools/art/terrain.py`).
+///
+/// **Three pictures per material, chosen by the tile's coordinates.** The base crack used to be
+/// stamped over every brittle tile of a material, so a bridge was the same scratch repeated end
+/// to end; the `_b` and `_c` variants break that up, and a hash with a salt of its own keeps the
+/// choice from moving in step with the tile's decoration variants. The base sprite is the
+/// fallback for every variant, so a tileset that ships one crack still marks every brittle tile
+/// with it rather than refusing to load.
+fn cracked_overlay(sprites: &Sprites, tile: Tile, tx: i32, ty: i32) -> Option<Rect> {
+    let names = match tile {
+        Tile::Cracked => ["cracked_ground", "cracked_ground_b", "cracked_ground_c"],
+        Tile::CrackedSand => ["cracked_sand", "cracked_sand_b", "cracked_sand_c"],
+        Tile::CrackedBrick => ["cracked_brick", "cracked_brick_b", "cracked_brick_c"],
+        Tile::CrackedPlank => ["cracked_wood", "cracked_wood_b", "cracked_wood_c"],
         _ => return None,
     };
-    sprites.try_get(name)
+    let base = sprites.try_get(names[0])?;
+    let index = (tile_hash(tx, ty, 23) % names.len() as u32) as usize;
+    Some(sprites.try_get(names[index]).unwrap_or(base))
 }
 
 /// Draw the seams where this tile's material meets another one.
@@ -3355,7 +3364,9 @@ pub fn draw_level_held(
                     let tiling = autotile(level, tx, ty);
                     sheet.image(rect, tile_sprite(sheet.sprites, tiling, tx, ty));
                     draw_seams(sheet, level, tx, ty, rect, tiling.look);
-                    if let Some(crack) = tile.and_then(|t| cracked_overlay(sheet.sprites, t)) {
+                    if let Some(crack) =
+                        tile.and_then(|t| cracked_overlay(sheet.sprites, t, tx, ty))
+                    {
                         sheet.image(rect, crack);
                     }
                 }
@@ -7766,6 +7777,36 @@ mod tests {
         assert!(
             seen.contains(&0) && seen.contains(&1),
             "all three states occur"
+        );
+    }
+
+    /// **The three cracks are a property of the tile, and a run uses all of them.**
+    ///
+    /// The variant is picked from the same coordinates on every frame, so a bridge looks the
+    /// same after a reload; and the pick has to actually reach all three pictures, or two of
+    /// them are dead art and the run is back to one stamp repeated. The sound-tile half is the
+    /// other bound: a tile that is not brittle has no overlay at all.
+    #[test]
+    fn cracked_tiles_use_all_three_variants_and_nothing_else_gets_a_crack() {
+        let sprites = Sprites::load(&atlas()).expect("the shipped tileset has every sprite");
+        let mut seen = std::collections::BTreeSet::new();
+        for tx in 0..40 {
+            let first = cracked_overlay(&sprites, Tile::CrackedBrick, tx, 9)
+                .expect("a brittle tile has a crack");
+            let again = cracked_overlay(&sprites, Tile::CrackedBrick, tx, 9)
+                .expect("and asking twice gives the same tile the same crack");
+            assert_eq!(first, again, "the crack is stable at x={tx}");
+            seen.insert((first.min.x.to_bits(), first.min.y.to_bits()));
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "all three cracks should occur along a forty-tile run, saw {}",
+            seen.len()
+        );
+        assert!(
+            cracked_overlay(&sprites, Tile::Brick, 4, 9).is_none(),
+            "a sound brick is not cracked"
         );
     }
 

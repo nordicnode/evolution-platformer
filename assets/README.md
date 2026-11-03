@@ -29,10 +29,12 @@ The rest of the fluid
 family — the extra body textures, the beds and the walls — is optional on the same terms as the
 tile variants: a tileset without them draws a plain, seamless pool, and the only thing lost is
 the variation and the edges. The tile variants, the last eight props, every material seam and the
-four `cracked_*` overlays are *optional* — a tileset that omits them draws the plainer
-equivalent instead (a hard edge, for a missing seam; a brittle tile as the material it is made
-of, for a missing crack), and the fallbacks are in `crate::view::scenery_sprite`,
-`crate::view::draw_seams` and `crate::view::cracked_overlay`. The `ui_*` glyphs are optional in the same way and for a stronger
+`cracked_*` overlays are *optional* — a tileset that omits them draws the plainer equivalent
+instead (a hard edge, for a missing seam; a brittle tile as the material it is made of, for a
+missing crack), and the fallbacks are in `crate::view::scenery_sprite`,
+`crate::view::draw_seams` and `crate::view::cracked_overlay`. A tileset with only the four base
+cracks still marks every brittle tile; the `_b` and `_c` variants are the extra pictures that
+keep a bridge from repeating one stamp, and each of them falls back to its material's base. The `ui_*` glyphs are optional in the same way and for a stronger
 reason: they are the one family the *game* never draws, so a tileset drawn before the window's
 tool bar grew pictures still runs — its buttons carry their names instead of an icon
 (`crate::ui::icon_button`).
@@ -74,7 +76,8 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `belt_r`, `belt_l` | one cell of conveyor belt (`Tile::BeltRight` `>`, `Tile::BeltLeft` `<`): a timber tread along the **top** of the cell, because the top is the surface a body stands on, with an iron chevron in the chassis below saying which way it carries. The left belt is the right one mirrored, so the two directions cannot drift into looking like two different machines |
 | `boulder` | a falling rock (`RockSpec`) for the `rock` entity and the palette's brush: one cell of natural stone, a round silhouette with a flattened base and the light from above-left, inset by a pixel at the corners. The cell is still its hitbox, and the round shape is an exaggeration in the player's favour — a squared slab read as a press, and this element is a boulder |
 | `block` | a crate (`BlockSpec`): a one-tile box a body can shove along a floor and stand on. Drawn to fill its cell and fully opaque, again because the cell is its hitbox — a crate with air drawn round it would promise a gap a body cannot walk through. Timber planks with two seams and a cross batten, bound by an iron frame with four corner brackets: the wood says what it is made of, the iron is the pack's way of saying *brought here and put down* rather than *part of the ground*. The bottom row has no lit pixel, so a resting crate reads as resting |
-| `cracked_ground`, `cracked_sand`, `cracked_brick`, `cracked_wood` | one material's crack, on an otherwise transparent cell, drawn **over** that material's own tile by `crate::view`. The tile it marks is ordinary solid ground until a body stands on it, and then it leaves the level (`sim::physics::CRUMBLE_TICKS`) |
+| `cracked_ground`, `cracked_sand`, `cracked_brick`, `cracked_wood` | one material's crack, on an otherwise transparent cell, drawn **over** that material's own tile by `crate::view`. A wide, three-tone fracture — dark heart, chipped shoulder, lit lip — with a branch or a broken corner, so it reads as damage rather than as more texture. The tile it marks is ordinary solid ground until a body stands on it, and then it leaves the level (`sim::physics::CRUMBLE_TICKS`) |
+| `cracked_ground_b`, `cracked_ground_c`, `cracked_sand_b`, `cracked_sand_c`, `cracked_brick_b`, `cracked_brick_c`, `cracked_wood_b`, `cracked_wood_c` | the second and third crack for each material, so a run of brittle tiles is not one stamp repeated. `crate::view::cracked_overlay` picks one from the tile's coordinates and falls back to the base crack when a tileset ships only that |
 | `player_idle_a`, `player_idle_b` | the runner at rest, breathing |
 | `player_run_1`, `player_run_2`, `player_run_3`, `player_run_4`, `player_run_5`, `player_run_6` | the six-frame run cycle |
 | `player_jump`, `player_fall`, `player_land`, `player_hurt` | rising, falling, the landing frame, and the pose a dead agent is left in |

@@ -1254,8 +1254,12 @@ fn evaluate_suite_raced(
     let mut results = Vec::with_capacity(tallies.len());
     let mut per_level: Vec<Vec<EpisodeResult>> =
         vec![Vec::with_capacity(tallies.len()); levels.len()];
+    let required_trials: Vec<u32> = levels
+        .iter()
+        .map(|level| cfg.effective_trials(level))
+        .collect();
     for tally in tallies {
-        let (row, level_rows) = tally.into_parts(levels.len());
+        let (row, level_rows) = tally.into_parts(levels.len(), &required_trials);
         results.push(row);
         for (li, episode) in level_rows.into_iter().enumerate() {
             per_level[li].push(episode);
@@ -1355,9 +1359,9 @@ struct SuiteTally {
     sums: Vec<f32>,
     /// Episodes folded in per level.
     counts: Vec<u32>,
-    /// Levels whose every episode so far won. A level with no episode yet counts as won, which is
-    /// the conservative reading: it is credited only once something has actually won it, and
-    /// [`SuiteTally::result`] reads the flag rather than the absence of evidence.
+    /// Levels whose recorded episodes have all won. Completion against the configured trial budget
+    /// is checked separately in [`SuiteTally::result`], because a raced genome may have only its
+    /// first episode recorded when it is culled.
     won: Vec<bool>,
     /// The lowest single episode, over every level and every trial.
     worst: f32,
@@ -1423,7 +1427,11 @@ impl SuiteTally {
     /// The ranked row, and trial 0 of every level in suite order. A level that was never played
     /// cannot happen on a flat pass — every level is played — so its absence is a bug rather than
     /// a case, and the representative stands in with the same "nothing ran" reading.
-    fn into_parts(mut self, levels: usize) -> (EpisodeResult, Vec<EpisodeResult>) {
+    fn into_parts(
+        mut self,
+        levels: usize,
+        required_trials: &[u32],
+    ) -> (EpisodeResult, Vec<EpisodeResult>) {
         let per_level: Vec<EpisodeResult> = self
             .first_trial
             .iter_mut()
@@ -1433,28 +1441,36 @@ impl SuiteTally {
                     .unwrap_or_else(|| panic!("level {li} of {levels} was never played on trial 0"))
             })
             .collect();
-        (self.result(levels), per_level)
+        (self.result(levels, required_trials), per_level)
     }
 
-    fn result(mut self, levels: usize) -> EpisodeResult {
+    fn result(mut self, levels: usize, required_trials: &[u32]) -> EpisodeResult {
         let mut result = self
             .representative
             .take()
             .expect("a suite has at least one level and one trial of it");
-        // **The conservative reading of "solved": every recorded episode reached the flag.**
+        // **The conservative reading of "solved": every required episode reached the flag.**
         // `won` (already set from the representative) answers a narrower question, and this is the
         // one a run's success signal reads. On a deterministic level the two are the same value by
         // construction — one episode is its own whole — so nothing about a walker-free run moves.
         //
-        // `won` is folded per level and per trial as the episodes arrive, so a level counts only
-        // when **every** trial of it won; a culled genome was never judged on the trials it did
-        // not run, and its flag describes the episodes that exist. A trial-0 winner scores the goal
-        // bonus, so a cull (which ranks on score) never removes one.
-        result.all_trials_won = self.won.iter().all(|w| *w);
+        // `won` is folded per level and per trial as the episodes arrive. A raced genome can be
+        // culled after trial 0, so the count must also reach the level's required budget before
+        // this becomes evidence of a solve. A trial-0 winner scores the goal bonus, so a cull
+        // (which ranks on score) never removes one.
+        let solved_levels = self
+            .won
+            .iter()
+            .enumerate()
+            .filter(|(level, won)| {
+                **won && self.counts[*level] == required_trials.get(*level).copied().unwrap_or(0)
+            })
+            .count();
+        result.all_trials_won = solved_levels == self.won.len();
         // One level is not a suite: `suite_wins` stays 0, so a single-level run's report cannot be
         // misread as "this genome solved the suite".
         if levels > 1 {
-            result.suite_wins = self.won.iter().filter(|w| **w).count() as u32;
+            result.suite_wins = solved_levels as u32;
         }
         result.mean_fitness = self.aggregate();
         result.worst_trial = self.worst;
@@ -1515,7 +1531,11 @@ pub fn suite_score(
     }
 
     let level_means = tally.level_means();
-    let (row, per_level) = tally.into_parts(levels.len());
+    let required_trials: Vec<u32> = levels
+        .iter()
+        .map(|level| cfg.effective_trials(level))
+        .collect();
+    let (row, per_level) = tally.into_parts(levels.len(), &required_trials);
     (row, level_means, per_level)
 }
 
@@ -2173,16 +2193,45 @@ impl Trainer {
         }
         let eval = self.config.eval_config();
         let result = fitness::run_episode(level, &genome, &eval, seed);
+        // A seeded winning episode is already part of this run's evidence. Keep the run-level
+        // clock beside the policy record too; otherwise a champion-seeded or plan-seeded run can
+        // save a win while its final report incorrectly says that no winning episode existed.
+        if result.won()
+            && self
+                .fastest
+                .as_ref()
+                .is_none_or(|held| result.frames < held.frames)
+        {
+            self.fastest = Some(FastWin {
+                generation: self.generation,
+                genome_id: genome.id,
+                frames: result.frames,
+                budget_frames: sim::frame_budget(level),
+            });
+            self.fastest_agent = Some(BestEver {
+                generation: self.generation,
+                result: result.clone(),
+                genome: genome.clone(),
+                validated: None,
+            });
+        }
         let better = self
             .best_ever
             .as_ref()
             .is_none_or(|held| result.mean_fitness > held.result.mean_fitness);
         if better {
+            // A seeded record did not come through `advance`, so it has no generation pass to
+            // trigger the ordinary held-out check. Give stochastic levels the same validation
+            // reading here; otherwise `--stop-on-validated` could treat one lucky seed from a
+            // champion or plan clone as a validated solve.
+            let validates =
+                self.config.validation_episodes > 0 && GaConfig::recommended_trials_for(level) > 1;
+            let validated = validates.then(|| self.validate(level, &genome));
             self.best_ever = Some(BestEver {
                 generation: self.generation,
                 result,
                 genome,
-                validated: None,
+                validated,
             });
         }
         Ok(())
@@ -2726,6 +2775,19 @@ impl Trainer {
         }
     }
 
+    /// Whether the current record has met the run's conservative solve contract. Stochastic
+    /// records carry a held-out reading, and that reading must arm the mastery league just as it
+    /// must arm `--stop-on-validated`; one lucky seeded episode is not enough to switch the
+    /// objective to speed.
+    fn record_is_solved(&self) -> bool {
+        self.best_ever.as_ref().is_some_and(|record| {
+            record
+                .validated
+                .map(|validation| validation.solved())
+                .unwrap_or_else(|| record.result.solved())
+        })
+    }
+
     fn advance(
         &mut self,
         levels: &[Level],
@@ -2838,8 +2900,7 @@ impl Trainer {
         // optimising for — the plan's "enter a second phase instead of stopping". Winners are then
         // ranked by frames; the crowned fitness in `results` is untouched, which is what keeps the
         // champion a claim about the level rather than about the league.
-        let league =
-            self.config.mastery && self.best_ever.as_ref().is_some_and(|b| b.result.solved());
+        let league = self.config.mastery && self.record_is_solved();
         self.mastery_active = league;
         let mut selection: Vec<f32> = if league {
             results
@@ -2948,7 +3009,7 @@ impl Trainer {
         // high-scoring genome that fell over on the last patrol would otherwise never consider the
         // genome that actually solved the level — and since `--stop-on-win` saves the record, that
         // is the difference between shipping a champion and shipping a near-miss.
-        let record_solved = self.best_ever.as_ref().is_some_and(|b| b.result.solved());
+        let record_solved = self.record_is_solved();
         // Under the league the record is challenged on the clock, not on the crowned score: a
         // faster winner with a couple more jumps is a better league genome even when v9 likes it
         // less. Validation still decides whether it may be recorded (`keep` below).
@@ -3149,11 +3210,7 @@ impl Trainer {
         // The champion-shaped reading: held-out when there is one, its own episode otherwise. A
         // record that is still `None` (an empty population cannot be, but a suite run reports before
         // it breeds) is not solved.
-        let record_solved = self.best_ever.as_ref().is_some_and(|b| {
-            b.validated
-                .map(|v| v.solved())
-                .unwrap_or_else(|| b.result.solved())
-        });
+        let record_solved = self.record_is_solved();
 
         let row = GenRow {
             generation: self.generation,
@@ -5150,6 +5207,30 @@ mod tests {
         assert_eq!(record.result.seed, best.result.seed);
         assert!(same_genes(&record.genome, &best.genome));
         assert_eq!(record.result.outcome, best.result.outcome);
+        let fastest = seeded
+            .fastest()
+            .expect("a seeded winning episode is also the run's first clock");
+        assert_eq!(fastest.frames, record.result.frames);
+    }
+
+    #[test]
+    fn a_seeded_stochastic_record_gets_the_same_held_out_reading_as_a_generation_record() {
+        let level = crate::fixture::walker_runway("seeded-validation", 24, 22, 12);
+        let cfg = GaConfig {
+            pop_size: 8,
+            elite: 2,
+            master_seed: 19,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg.clone());
+        trainer
+            .seed_record(&level, Genome::zeros(0, default_shape()), 1)
+            .expect("the seeded genome is valid");
+        let validation = trainer
+            .best_ever()
+            .and_then(|record| record.validated)
+            .expect("a patrol phase needs held-out validation even when it was seeded");
+        assert_eq!(validation.episodes, cfg.validation_episodes);
     }
 
     /// **`won` is one episode; `solved` is all of them.** The distinction the trial rule exists for,
@@ -5178,7 +5259,7 @@ mod tests {
         split.record(0, 0, win());
         split.record(0, 1, loss());
         split.record(0, 2, win());
-        let r = split.result(1);
+        let r = split.result(1, &[3]);
         assert!(
             r.won(),
             "the representative episode (trial 0) did reach the flag"
@@ -5191,15 +5272,23 @@ mod tests {
         for trial in 0..3 {
             clean.record(0, trial, win());
         }
-        let r = clean.result(1);
+        let r = clean.result(1, &[3]);
         assert!(r.won() && r.solved());
 
         // And a single-episode evaluation is its own whole — the case every shipped level is.
         let mut single = SuiteTally::new(1);
         single.record(0, 0, win());
-        let r = single.result(1);
+        let r = single.result(1, &[1]);
         assert!(r.won() && r.solved());
         assert_eq!(r.suite_wins, 0, "one level is not a suite");
+
+        // Racing may return a partial tally after the genome is culled. A winning trial 0 is still
+        // a representative win, but it is not a solved three-trial reading.
+        let mut partial = SuiteTally::new(1);
+        partial.record(0, 0, win());
+        let r = partial.result(1, &[3]);
+        assert!(r.won());
+        assert!(!r.solved());
     }
 
     /// **A solved reading beats a higher-scoring unsolved one** — the rule that keeps the champion

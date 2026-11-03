@@ -11,6 +11,7 @@
 //! no rendering and no terminal I/O.
 
 pub mod autoshape;
+pub mod certify;
 pub mod champion;
 pub mod committee;
 pub mod curriculum;
@@ -20,21 +21,29 @@ pub mod es;
 pub mod fitness;
 pub mod ga;
 pub mod genome;
+pub mod hybrid;
 pub mod imitate;
 pub mod islands;
 pub mod mistakes;
 pub mod navigate;
 pub mod polish;
 pub mod population;
+pub mod robust;
 pub mod route_play;
 pub mod shortcut;
+pub mod showcase;
 pub mod snapshots;
 pub mod style;
 pub mod tas;
 pub mod technique;
 pub mod telemetry;
+pub mod variants;
 
 pub use autoshape::{apply as apply_auto_shape, scan as scan_level_shape, AutoShape};
+pub use certify::{
+    certify, AdversarialCertificate, CertifyConfig, PlanCertificate, PolicyCertificate,
+    SolverContract, SolverStatus, CONTRACT_FORMAT, CONTRACT_VERSION,
+};
 pub use champion::{
     check_reproducibility, measure_phase_gap, ChampionFile, ChampionMetadata, NetworkSpec,
     PhaseGap, TrainingSummary, CHAMPION_FORMAT, CHAMPION_VERSION,
@@ -65,6 +74,7 @@ pub use ga::{
     ARCHIVE_TIME_BINS, ARCHIVE_TIME_SLOTS, MUTATION_RATES,
 };
 pub use genome::{default_shape, ActScratch, Genome, NetShape, N_INPUTS, N_OUTPUTS};
+pub use hybrid::{play as hybrid_play, HybridConfig, HybridReport};
 pub use imitate::{
     clone_from_play, from_certified_plan, from_plan, from_route, measure_mastery, warm_population,
     warm_set, ImitateConfig, ImitationReport, LegMastery, LegSkill,
@@ -74,8 +84,13 @@ pub use mistakes::{find_mistake, find_mistakes, learn as learn_from_mistake, Mis
 pub use navigate::{aim_point, planned_actions, play as think, Driver, ThinkConfig, ThinkReport};
 pub use polish::{output_slots, polish, PolishConfig, PolishReport};
 pub use population::{PopulationFile, POPULATION_FORMAT, POPULATION_VERSION};
+pub use robust::{
+    evaluate as robust_evaluate, evaluate_adversarial, AdversarialCase, AdversarialConfig,
+    AdversarialReport, Disturbance, RobustConfig, RobustReport,
+};
 pub use route_play::{replay, timed_play, Decision, RoutePlay};
 pub use shortcut::{intended_route, trace as trace_shortcut, ShortcutReport};
+pub use showcase::{build as build_showcase, DecisionMoment, ShowcaseConfig, ShowcaseReport};
 pub use snapshots::{SnapshotArchive, SnapshotCell, SnapshotKey};
 pub use style::{Style, StyleCheck, StyleTitle};
 pub use tas::{
@@ -84,6 +99,10 @@ pub use tas::{
 };
 pub use technique::{TechniqueArchive, TechniqueEntry, TechniqueFirst, TechniqueSignature};
 pub use telemetry::Telemetry;
+pub use variants::{
+    explore as explore_variants, ParetoArchive, VariantConfig, VariantObjectives, VariantReport,
+    WinningVariant, VARIANTS_FORMAT, VARIANTS_VERSION,
+};
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///

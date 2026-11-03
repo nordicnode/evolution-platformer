@@ -77,6 +77,7 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "from-champion",
     "from-route",
     "from-plan",
+    "auto-plan",
     "from-demo",
     "plan-depth",
     "plan-beam",
@@ -132,12 +133,53 @@ const REACH_OPTS: &[&str] = &["level", "all", "levels-dir", "verbose", "timed", 
 const FUZZ_OPTS: &[&str] = &["out"];
 
 /// `routeplan`: the Phase 1 route compiler. One level, or `--all` over a directory of them.
-const ROUTEPLAN_OPTS: &[&str] = &["level", "all", "levels-dir", "seed", "plan-depth", "out"];
+const ROUTEPLAN_OPTS: &[&str] = &[
+    "level",
+    "all",
+    "levels-dir",
+    "seed",
+    "plan-depth",
+    "plan-step",
+    "plan-max-depth",
+    "cache-dir",
+    "out",
+];
+const CERTIFY_OPTS: &[&str] = &[
+    "level",
+    "champion",
+    "levels-dir",
+    "seed",
+    "plan-depth",
+    "plan-beam",
+    "robust",
+    "adversarial",
+    "out",
+];
+const CHALLENGE_OPTS: &[&str] = &[
+    "seed",
+    "candidates",
+    "tier",
+    "min-margin",
+    "phase-seeds",
+    "plan-depth",
+    "plan-beam",
+    "out",
+];
+const SHOWCASE_OPTS: &[&str] = &[
+    "champion",
+    "level",
+    "levels-dir",
+    "seed",
+    "plan-depth",
+    "plan-beam",
+    "variants",
+    "out",
+];
 const REPLAY_OPTS: &[&str] = &["champion", "level", "levels-dir"];
 /// `committee`: the Item 10 gate as a command. It validates a saved committee against the run's
 /// own fixed validation episodes and fails the shell if the vote loses to its best member.
 const COMMITTEE_OPTS: &[&str] = &["file", "level", "levels-dir"];
-const SCORE_OPTS: &[&str] = &["champion", "level", "suite", "levels-dir", "seed"];
+const SCORE_OPTS: &[&str] = &["champion", "level", "suite", "levels-dir", "seed", "robust"];
 const SHORTCUT_OPTS: &[&str] = &["champion", "level", "levels-dir", "seed"];
 const HUNT_OPTS: &[&str] = &["level", "seed", "depth", "beam", "objective", "out"];
 const SEGMENTS_OPTS: &[&str] = &["level", "seed", "depth", "beam", "out"];
@@ -157,12 +199,14 @@ const CAMPAIGN_OPTS: &[&str] = &[
 const STYLES_OPTS: &[&str] = &["champion", "level", "levels-dir", "seed"];
 const THINK_OPTS: &[&str] = &[
     "level",
+    "champion",
     "seed",
     "horizon",
     "beam",
     "out",
     "trace",
     "plan",
+    "hybrid",
     "plan-depth",
     "plan-beam",
 ];
@@ -1299,16 +1343,26 @@ fn seeded_trainer_core(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
     let from_champion = a.opt("from-champion");
     let from_route = a.has_flag("from-route");
     let from_plan = a.has_flag("from-plan");
+    let auto_plan = a.has_flag("auto-plan");
     let from_demo = a.opt("from-demo");
     let named = usize::from(resume.is_some())
         + usize::from(from_champion.is_some())
         + usize::from(from_route)
         + usize::from(from_plan)
+        + usize::from(auto_plan)
         + usize::from(from_demo.is_some());
     if named > 1 {
         return Err(
-            "usage: --resume, --from-champion, --from-route, --from-plan and --from-demo are \
+            "usage: --resume, --from-champion, --from-route, --from-plan, --auto-plan and --from-demo are \
              alternatives: they are five answers to \"where does this run start from\""
+                .into(),
+        );
+    }
+    if cfg.shape.commitment && (from_route || from_plan || auto_plan || from_demo.is_some()) {
+        return Err(
+            "usage: cadence-head genomes cannot use --from-route, --from-plan, --auto-plan or \
+             --from-demo because those demonstrations contain actions but no learned hold \
+             durations; use a fixed-cadence shape for imitation"
                 .into(),
         );
     }
@@ -1318,7 +1372,7 @@ fn seeded_trainer_core(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
     if let Some(path) = from_demo {
         return demo_seeded_trainer(cfg, level, a, path.to_string());
     }
-    if from_plan {
+    if from_plan || auto_plan {
         return plan_seeded_trainer(cfg, level, a);
     }
     if let Some(path) = resume {
@@ -1374,11 +1428,17 @@ pub(crate) fn attach_plan(
     if cfg.plan_bonus <= 0.0 {
         return Ok(None);
     }
+    if cfg.action_repeat != sim::DECISION_TICKS {
+        return Err(format!(
+            "usage: --plan-bonus currently requires --action-repeat {} because timed plans are \
+             compiled on that cadence (got {})",
+            sim::DECISION_TICKS,
+            cfg.action_repeat
+        ));
+    }
+    let default_plan_depth = if a.has_flag("auto-plan") { 64 } else { 32 };
     let plan_cfg = sim::plan::PlanConfig {
-        depth: usage(a.usize_opt(
-            "plan-depth",
-            sim::plan::PlanConfig::default().depth as usize,
-        ))? as u32,
+        depth: usage(a.usize_opt("plan-depth", default_plan_depth))? as u32,
         beam: usage(a.usize_opt("plan-beam", sim::plan::PlanConfig::default().beam))?,
         ..sim::plan::PlanConfig::default()
     };
@@ -1561,6 +1621,14 @@ fn demo_seeded_trainer(
 /// will actually use. The planner is offline: once the clone exists, the runtime is still the
 /// same 1 931-gene net.
 fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer, String> {
+    if cfg.action_repeat != sim::DECISION_TICKS {
+        return Err(format!(
+            "usage: --from-plan/--auto-plan currently requires --action-repeat {} because the \
+             timed planner and its replay use that cadence (got {})",
+            sim::DECISION_TICKS,
+            cfg.action_repeat
+        ));
+    }
     let default_warm = (cfg.pop_size / 4).max(1);
     let warm = usage(a.usize_opt("warm", default_warm))?.clamp(1, cfg.pop_size);
     // **Ten times the route clone's budget, because one press is the whole plan.** A walk clone is a
@@ -1605,7 +1673,11 @@ fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
     let plan_cfg = sim::plan::PlanConfig {
         depth: usage(a.usize_opt(
             "plan-depth",
-            sim::plan::PlanConfig::default().depth as usize,
+            if a.has_flag("auto-plan") {
+                64
+            } else {
+                sim::plan::PlanConfig::default().depth as usize
+            },
         ))? as u32,
         beam: usage(a.usize_opt("plan-beam", sim::plan::PlanConfig::default().beam))?,
         ..sim::plan::PlanConfig::default()
@@ -1647,7 +1719,15 @@ fn plan_seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
         warm - 1,
         cfg.pop_size.saturating_sub(warm)
     );
-    Trainer::resume(cfg, pop, 0)
+    let mut trainer = Trainer::resume(cfg, pop, 0)?;
+    // The closed-loop clone is a verified spawn-started win. Keep it as the run's record before
+    // the first generation can replace it with an unsolved member of the random remainder. This
+    // is the same retention rule used by --from-champion and checkpoints; a planned warm start
+    // must not throw away the solution it just proved.
+    if solo.won() {
+        trainer.seed_record(level, report.genome, route_seed)?;
+    }
+    Ok(trainer)
 }
 
 /// The GA configuration a `train` invocation asks for.
@@ -2284,6 +2364,11 @@ pub fn routeplan(a: &Args) -> Result<(), String> {
         depth,
         ..sim::plan::PlanConfig::default()
     };
+    let step = usage(a.usize_opt("plan-step", depth as usize))? as u32;
+    let max_depth = usage(a.usize_opt("plan-max-depth", depth as usize))? as u32;
+    if max_depth < depth {
+        return Err("usage: --plan-max-depth must be at least --plan-depth".into());
+    }
     let paths: Vec<PathBuf> = if a.has_flag("all") {
         let dir = a.string("levels-dir", "levels");
         let mut found = pack_levels(&dir)?;
@@ -2296,6 +2381,7 @@ pub fn routeplan(a: &Args) -> Result<(), String> {
         vec![PathBuf::from(usage(a.required_path("level"))?)]
     };
     let out = a.opt("out").map(PathBuf::from);
+    let cache_dir = a.opt("cache-dir").map(PathBuf::from);
     if let Some(dir) = &out {
         fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
@@ -2304,7 +2390,30 @@ pub fn routeplan(a: &Args) -> Result<(), String> {
     for path in &paths {
         let level = load_level(&path.to_string_lossy())?;
         let started = Instant::now();
-        match sim::route_plan::compile(&level, seed, cfg) {
+        let cache_path = (max_depth == depth)
+            .then(|| {
+                cache_dir
+                    .as_ref()
+                    .map(|dir| sim::route_plan::cache_path(dir, &level, seed, cfg))
+            })
+            .flatten();
+        let cached = cache_path
+            .as_ref()
+            .and_then(|path| sim::route_plan::load_cached(&level, path, seed, cfg));
+        if let Some(plan) = cached {
+            println!("CACHED  {} ({})", level.name, path.display());
+            println!("  {}", plan.line());
+            if let Some(dir) = &out {
+                write_route_plan(dir, path, &plan)?;
+            }
+            continue;
+        }
+        let compiled = if max_depth > depth {
+            sim::route_plan::compile_anytime(&level, seed, cfg, step, max_depth)
+        } else {
+            sim::route_plan::compile(&level, seed, cfg)
+        };
+        match compiled {
             Ok(plan) => {
                 println!(
                     "PLANNED {} ({}) in {:.2}s",
@@ -2326,14 +2435,10 @@ pub fn routeplan(a: &Args) -> Result<(), String> {
                     );
                 }
                 if let Some(dir) = &out {
-                    let stem = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "level".into());
-                    let json = serde_json::to_string_pretty(&plan)
-                        .map_err(|e| format!("cannot serialize the plan: {e}"))?;
-                    std::fs::write(dir.join(format!("{stem}.routeplan.json")), json)
-                        .map_err(|e| format!("cannot write {stem}.routeplan.json: {e}"))?;
+                    write_route_plan(dir, path, &plan)?;
+                }
+                if let Some(cache_path) = cache_path {
+                    sim::route_plan::save_cached(&level, cache_path, seed, cfg, &plan)?;
                 }
             }
             Err(err) => {
@@ -2358,6 +2463,257 @@ pub fn routeplan(a: &Args) -> Result<(), String> {
     if let Some(dir) = &out {
         println!("wrote   {} route plans to {}", paths.len(), dir.display());
     }
+    Ok(())
+}
+
+fn write_route_plan(
+    out: &Path,
+    level_path: &Path,
+    plan: &sim::route_plan::RoutePlan,
+) -> Result<(), String> {
+    let stem = level_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "level".into());
+    let json = serde_json::to_string_pretty(plan)
+        .map_err(|e| format!("cannot serialize the plan: {e}"))?;
+    std::fs::write(
+        out.join(format!("{stem}.routeplan.json")),
+        format!("{json}\n"),
+    )
+    .map_err(|e| format!("cannot write {stem}.routeplan.json: {e}"))
+}
+
+/// Print the explicit solver contract: reachability, timed-plan certification, learned-policy
+/// certification, and held-out/adversarial robustness are separate claims.
+pub fn certify(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(CERTIFY_OPTS))?;
+    let champion_path = a.opt("champion").map(PathBuf::from);
+    let (level, genome, action_repeat) = if let Some(path) = champion_path.as_ref() {
+        let raw =
+            fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let champion =
+            ChampionFile::from_json_str(&raw).map_err(|e| format!("{}: {e}", path.display()))?;
+        let level = match a.opt("level") {
+            Some(level) => load_level(level)?,
+            None => find_level_by_hash(
+                &a.string("levels-dir", "levels"),
+                &champion.metadata.level_hash,
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "no level in {} matches champion hash {}",
+                    a.string("levels-dir", "levels"),
+                    champion.metadata.level_hash
+                )
+            })?,
+        };
+        (
+            level,
+            Some((champion.to_genome()?, champion.metadata.action_repeat)),
+            champion.metadata.action_repeat,
+        )
+    } else {
+        (
+            {
+                let path = usage(a.required_path("level"))?;
+                load_level(&path)?
+            },
+            None,
+            evo::ACTION_REPEAT,
+        )
+    };
+    let seed = usage(a.u64_opt("seed", 1))?;
+    let robust_episodes = usage(a.usize_opt("robust", 24))? as u32;
+    let adversarial_episodes = usage(a.usize_opt("adversarial", 8))? as u32;
+    let plan_cfg = sim::plan::PlanConfig {
+        depth: usage(a.usize_opt("plan-depth", 64))? as u32,
+        beam: usage(a.usize_opt("plan-beam", 64))?,
+        ..sim::plan::PlanConfig::default()
+    };
+    let contract = evo::certify(
+        &level,
+        genome.as_ref().map(|(genome, _)| genome),
+        seed,
+        evo::CertifyConfig {
+            planner: plan_cfg,
+            robust_episodes,
+            adversarial_episodes,
+            action_repeat,
+            ..evo::CertifyConfig::default()
+        },
+    );
+    println!("level    {} ({})", level.name, level.content_hash_string());
+    println!("contract {}", contract.line());
+    println!(
+        "reach    {} ({} reachable platforms)",
+        if contract.physics_reachable {
+            "yes"
+        } else {
+            "no"
+        },
+        contract.reachable_hops
+    );
+    if let Some(plan) = &contract.planner {
+        println!(
+            "plan     {} blocks, {} frames, tightest margin {}",
+            plan.blocks, plan.frames, plan.tightest_margin
+        );
+    } else if let Some(error) = &contract.planner_error {
+        println!("plan     {error}");
+    }
+    if let Some(policy) = &contract.robust_validation {
+        println!(
+            "policy   {:.0}% ({}/{}) held-out wins, worst_x {:.1}",
+            policy.win_rate * 100.0,
+            policy.wins,
+            policy.episodes,
+            policy.worst_best_x
+        );
+    }
+    if let Some(adversarial) = &contract.adversarial_validation {
+        println!(
+            "faults   {:.0}% ({}/{}) disturbed wins, required {:.0}%",
+            adversarial.win_rate * 100.0,
+            adversarial.wins,
+            adversarial.cases,
+            adversarial.required_win_rate * 100.0
+        );
+    }
+    if let Some(path) = a.opt("out") {
+        let json = serde_json::to_string_pretty(&contract)
+            .map_err(|e| format!("cannot serialize solver contract: {e}"))?;
+        fs::write(path, format!("{json}\n")).map_err(|e| format!("cannot write {path}: {e}"))?;
+        println!("wrote    {path}");
+    }
+    if contract.complete() {
+        Ok(())
+    } else {
+        Err(format!(
+            "solver contract incomplete: {}",
+            contract.status.label()
+        ))
+    }
+}
+
+/// Generate a hard-but-fair level and write both the level and its replay-certified route plan.
+pub fn challenge(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(CHALLENGE_OPTS))?;
+    let config = sim::challenge::ChallengeConfig {
+        seed: usage(a.u64_opt("seed", sim::challenge::ChallengeConfig::default().seed))?,
+        candidates: usage(a.usize_opt(
+            "candidates",
+            sim::challenge::ChallengeConfig::default().candidates,
+        ))?,
+        base_tier: usage(
+            a.usize_opt("tier", sim::challenge::ChallengeConfig::default().base_tier),
+        )?,
+        min_margin_frames: usage(a.u64_opt(
+            "min-margin",
+            sim::challenge::ChallengeConfig::default().min_margin_frames as u64,
+        ))? as u32,
+        phase_seeds: usage(a.usize_opt(
+            "phase-seeds",
+            sim::challenge::ChallengeConfig::default().phase_seeds as usize,
+        ))? as u32,
+        planner: sim::plan::PlanConfig {
+            depth: usage(a.usize_opt("plan-depth", 64))? as u32,
+            beam: usage(a.usize_opt("plan-beam", 64))?,
+            ..sim::plan::PlanConfig::default()
+        },
+    };
+    let generated = sim::challenge::generate(config)?;
+    let out_dir = PathBuf::from(a.string("out", "levels/generated"));
+    fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
+    let stem = generated.level.name.clone();
+    let level_path = out_dir.join(format!("{stem}.json"));
+    let plan_path = out_dir.join(format!("{stem}.routeplan.json"));
+    generated.level.to_json_file(&level_path)?;
+    let plan = serde_json::to_string_pretty(&generated.plan)
+        .map_err(|e| format!("cannot serialize challenge plan: {e}"))?;
+    fs::write(&plan_path, format!("{plan}\n"))
+        .map_err(|e| format!("cannot write {}: {e}", plan_path.display()))?;
+    println!(
+        "challenge {}: {} frames, margin {}, difficulty {:.3}, {} phase wins",
+        generated.level.name,
+        generated.fairness.planner_frames,
+        generated.fairness.tightest_margin_frames,
+        generated.fairness.difficulty(),
+        generated.fairness.phase_wins
+    );
+    println!("wrote    {}", level_path.display());
+    println!("wrote    {}", plan_path.display());
+    Ok(())
+}
+
+/// Build the replay showcase artifact for a champion: intended route, learned route, divergence
+/// moments, codex discoveries, and Pareto winning variants.
+pub fn showcase(a: &Args) -> Result<(), String> {
+    usage(a.reject_unknown(SHOWCASE_OPTS))?;
+    let champion_path = usage(a.required_path("champion"))?;
+    let raw = fs::read_to_string(&champion_path)
+        .map_err(|e| format!("cannot read {champion_path}: {e}"))?;
+    let champion =
+        ChampionFile::from_json_str(&raw).map_err(|e| format!("{champion_path}: {e}"))?;
+    let genome = champion.to_genome()?;
+    let level = match a.opt("level") {
+        Some(path) => load_level(path)?,
+        None => find_level_by_hash(
+            &a.string("levels-dir", "levels"),
+            &champion.metadata.level_hash,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "no level in {} matches champion hash {}",
+                a.string("levels-dir", "levels"),
+                champion.metadata.level_hash
+            )
+        })?,
+    };
+    let seed = usage(a.u64_opt("seed", champion.metadata.episode_seed))?;
+    let report = evo::build_showcase(
+        &level,
+        &genome,
+        &EvalConfig {
+            action_repeat: champion.metadata.action_repeat,
+            cut_stuck_frames: 0,
+        },
+        seed,
+        evo::ShowcaseConfig {
+            planner: sim::plan::PlanConfig {
+                depth: usage(a.usize_opt("plan-depth", 64))? as u32,
+                beam: usage(a.usize_opt("plan-beam", 64))?,
+                ..sim::plan::PlanConfig::default()
+            },
+            variants: evo::VariantConfig {
+                candidates: usage(a.usize_opt("variants", 2000))?,
+                ..evo::VariantConfig::default()
+            },
+        },
+    );
+    println!(
+        "showcase {}: learned {} in {} frames, {} divergence moments, {} discoveries, {} variants",
+        report.level_name,
+        if report.won() { "won" } else { "did not win" },
+        report.learned.frames,
+        report.moments.len(),
+        report.discoveries.len(),
+        report.variants.variants.len()
+    );
+    for moment in report.moments.iter().take(8) {
+        println!(
+            "  moment block {} frame {} x {:.1}: {}",
+            moment.block, moment.frame, moment.x, moment.reason
+        );
+    }
+    let out = a
+        .opt("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("{}-showcase.json", level.name)));
+    fs::write(&out, report.to_json_pretty()? + "\n")
+        .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    println!("wrote    {}", out.display());
     Ok(())
 }
 
@@ -2926,12 +3282,54 @@ pub fn think(a: &Args) -> Result<(), String> {
     let seed = usage(a.u64_opt("seed", 1))?;
     println!("level   {} ({})", level.name, level.content_hash_string());
     let started = Instant::now();
-    // **Two kinds of deliberation, one command.** The default is the local controller:
+    if a.has_flag("hybrid") && a.has_flag("plan") {
+        return Err("usage: --hybrid and --plan are alternatives".into());
+    }
+    // **Three kinds of deliberation, one command.** The default is the local controller:
     // cheap enough to run while a window is open, and it discovers waits and jump
     // timings from the physics. `--plan` is the timed planner, which searches whole
     // routes and therefore sees a deck's whole schedule; it costs seconds to a minute
     // and is the answer of record on a level the local horizon cannot untangle.
-    let (report, actions, searched) = if a.has_flag("plan") {
+    let (report, actions, searched) = if a.has_flag("hybrid") {
+        let champion_path = usage(a.required_path("champion"))?;
+        let champion = ChampionFile::load_for_level(&champion_path, &level)?;
+        let genome = champion.to_genome()?;
+        let eval = EvalConfig {
+            action_repeat: champion.metadata.action_repeat,
+            cut_stuck_frames: 0,
+        };
+        let plan_cfg = sim::plan::PlanConfig {
+            depth: usage(a.usize_opt(
+                "plan-depth",
+                evo::HybridConfig::default().plan.depth as usize,
+            ))? as u32,
+            beam: usage(a.usize_opt("plan-beam", evo::HybridConfig::default().plan.beam))?,
+            ..sim::plan::PlanConfig::default()
+        };
+        let hybrid_cfg = evo::HybridConfig {
+            plan: plan_cfg,
+            ..evo::HybridConfig::default()
+        };
+        let hybrid = evo::hybrid_play(&level, &genome, &eval, seed, hybrid_cfg);
+        println!("hybrid  {}", hybrid.note);
+        let actions = hybrid.actions.clone();
+        let report = evo::ThinkReport {
+            actions: actions.clone(),
+            outcome: hybrid.outcome,
+            frames: hybrid.frames,
+            best_x: hybrid.best_x,
+            route_hops_closed: hybrid.route_hops_closed,
+            replans: hybrid.replans,
+            trail: Vec::new(),
+            death_cause: hybrid.death_cause,
+            note: hybrid.note,
+        };
+        (
+            report,
+            actions,
+            Some(("hybrid", plan_cfg.depth, plan_cfg.beam)),
+        )
+    } else if a.has_flag("plan") {
         let plan_cfg = sim::plan::PlanConfig {
             depth: usage(a.usize_opt(
                 "plan-depth",
@@ -3871,6 +4269,7 @@ pub fn score(a: &Args) -> Result<(), String> {
         cut_stuck_frames: 0,
     };
     let master = usage(a.u64_opt("seed", champion.metadata.training_config.master_seed))?;
+    let robust_episodes = usage(a.usize_opt("robust", 0))? as u32;
     // The episode policy this command asks the trainer for, and the only thing it takes from the
     // default configuration: which episodes generation 0 of a default run would have used.
     let policy = GaConfig {
@@ -3963,6 +4362,30 @@ pub fn score(a: &Args) -> Result<(), String> {
             wins,
             trials
         );
+        if robust_episodes > 0 {
+            let robust = evo::robust_evaluate(
+                level,
+                &genome,
+                master,
+                evo::RobustConfig {
+                    episodes: robust_episodes,
+                    action_repeat: eval.action_repeat,
+                },
+            );
+            println!(
+                "          robust  {:.0}% ({}/{})  mean {:>9.2}  worst {:>9.2}  worst_x {:>5.1}{}",
+                robust.win_rate() * 100.0,
+                robust.wins,
+                robust.episodes,
+                robust.mean_fitness,
+                robust.worst_fitness,
+                robust.worst_best_x,
+                robust
+                    .slowest_win
+                    .map(|frames| format!("  slowest_win {frames}f"))
+                    .unwrap_or_default()
+            );
+        }
     }
 
     if levels.len() > 1 {
@@ -4398,6 +4821,40 @@ mod tests {
         .expect("training runs");
         let champion = dir.join("l1-flat-run.json");
         (load_level(&level_path).expect("level"), champion, dir)
+    }
+
+    /// A plan clone is a verified spawn-started solution, so the warm-start constructor must
+    /// install it as the run's record before any random remainder is evaluated. Otherwise the
+    /// first generation can replace the solution with a near-miss and a plan-seeded run ends with
+    /// no champion despite having proved one before training began.
+    #[test]
+    fn a_planned_warm_start_keeps_its_verified_clone_as_the_record() {
+        let level_path = wpath("levels/l1-flat-run.json");
+        let level = load_level(&level_path).expect("level loads");
+        let args = a(&[
+            "train",
+            "--level",
+            &level_path,
+            "--from-plan",
+            "--pop",
+            "8",
+            "--seed",
+            "1",
+            "--clone-epochs",
+            "10",
+            "--dagger-rounds",
+            "0",
+            "--leg-rounds",
+            "0",
+        ]);
+        let mut cfg = train_config(&args).expect("training config parses");
+        evo::apply_auto_shape(&mut cfg, std::slice::from_ref(&level), false, false);
+        let trainer = seeded_trainer_core(cfg, &level, &args).expect("the plan warm start runs");
+        let record = trainer
+            .best_ever()
+            .expect("the verified clone is installed before generation zero");
+        assert_eq!(record.result.outcome, sim::Outcome::Won);
+        assert_eq!(record.result.seed, 1);
     }
 
     /// The stricter stop is a *refinement* of `--stop-on-win`, not a second way to stop, and it

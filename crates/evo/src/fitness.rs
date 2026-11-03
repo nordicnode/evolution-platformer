@@ -489,10 +489,10 @@ pub struct EpisodeResult {
     /// folds every recorded episode's outcome — a suite's `won` is level 0, trial 0, while this is
     /// every level and every trial.
     ///
-    /// One caveat, and it is a property of racing rather than a bug: a genome culled before its
-    /// second trial was never judged on one, so its flag describes the episodes that exist. Racing
-    /// culls on the score, and a trial-0 winner scores the goal bonus, so a winner is never the
-    /// genome a cull removes.
+    /// Racing may cull a genome before its full trial budget is spent. Such a partial reading is
+    /// useful for selection, but the evaluator leaves this flag false until every required trial
+    /// has actually been judged and won. Racing culls on the score, and a trial-0 winner scores the
+    /// goal bonus, so a winner is never the genome a cull removes.
     pub all_trials_won: bool,
     pub death_pos: Option<(f32, f32)>,
     /// What ended a dying episode, when the stepper recorded one. Diagnostics only: it is not
@@ -590,7 +590,7 @@ impl EpisodeRunner {
         let sim = Sim::new(level, seed);
         // `max_frames` is the sim's own cap; the extra slack is a belt-and-braces
         // guard against a future change that forgets to terminate.
-        let guard = sim.max_frames() + repeat + 8;
+        let guard = sim.max_frames().saturating_add(repeat).saturating_add(8);
         EpisodeRunner {
             genome,
             sim,
@@ -615,7 +615,11 @@ impl EpisodeRunner {
     /// snapshot's start state.
     pub fn from_snapshot(genome: Genome, cfg: &EvalConfig, seed: u64, sim: Sim) -> Self {
         let repeat = cfg.action_repeat.max(1);
-        let guard = sim.max_frames() + repeat + 8;
+        // `iterations` starts at zero for a restarted snapshot, while the sim keeps its absolute
+        // world clock. The defensive loop guard therefore has to cover only the budget left from
+        // this frontier; the sim's own absolute cap remains the authoritative termination rule.
+        let remaining = sim.max_frames().saturating_sub(sim.stats().frames);
+        let guard = remaining.saturating_add(repeat).saturating_add(8);
         EpisodeRunner {
             genome,
             sim,
@@ -677,22 +681,34 @@ impl EpisodeRunner {
     /// chooses how long it holds, and 4 — the shipped cadence — is what the head's zero value
     /// encodes, which is what makes the migrated policy bit-identical before it is trained.
     pub fn step(&mut self) {
+        self.step_with_override(None);
+    }
+
+    /// One physics tick, optionally replacing the action chosen at the next decision boundary.
+    ///
+    /// The override is for adversarial certification and replay tooling. It does not alter the
+    /// genome, and it still consumes the same commitment duration the policy selected, so a
+    /// disturbed episode is a real near-miss rather than a second controller with a different
+    /// cadence. The return value says whether this tick opened a decision boundary.
+    pub fn step_with_override(&mut self, override_action: Option<AgentAction>) -> bool {
         if self.is_finished() {
-            return;
+            return false;
         }
         let frames = self.sim.stats().frames;
-        if frames >= self.next_decision {
+        let decision = frames >= self.next_decision;
+        if decision {
             let observation = self.sim.observation_into(&mut self.obs);
-            if self.genome.shape.commitment {
-                let (action, ticks) = self
-                    .genome
-                    .act_with_commitment(&observation, &mut self.scratch);
-                self.action = action;
-                self.next_decision = frames + ticks.max(1);
+            let (chosen, ticks) = if self.genome.shape.commitment {
+                self.genome
+                    .act_with_commitment(&observation, &mut self.scratch)
             } else {
-                self.action = self.genome.act(&observation, &mut self.scratch);
-                self.next_decision = frames + self.repeat;
-            }
+                (
+                    self.genome.act(&observation, &mut self.scratch),
+                    self.repeat,
+                )
+            };
+            self.action = override_action.unwrap_or(chosen);
+            self.next_decision = frames + ticks.max(1);
             self.trace.u32(frames);
             self.trace.u8(self.action.index() as u8);
             if self.capture {
@@ -719,6 +735,7 @@ impl EpisodeRunner {
         {
             self.cut = true;
         }
+        decision
     }
 
     /// The episode ended, was cut short, or the safety guard fired.
@@ -948,6 +965,30 @@ mod tests {
             }
             assert_eq!(runner.result(), whole, "action_repeat {repeat}");
         }
+    }
+
+    #[test]
+    fn a_snapshot_runner_guard_covers_only_the_remaining_budget() {
+        let level = level();
+        let mut snapshot = sim::Sim::new(&level, 11);
+        for _ in 0..100 {
+            snapshot.step(AgentAction::Run);
+        }
+        let start = snapshot.restart_from_snapshot();
+        let cfg = EvalConfig {
+            action_repeat: 4,
+            cut_stuck_frames: 0,
+        };
+        let runner = EpisodeRunner::from_snapshot(
+            Genome::zeros(0, default_shape()),
+            &cfg,
+            11,
+            start.clone(),
+        );
+        assert_eq!(
+            runner.guard,
+            start.max_frames() - start.stats().frames + cfg.action_repeat + 8
+        );
     }
 
     #[test]

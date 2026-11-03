@@ -96,11 +96,12 @@ impl Drop for TerminalSession {
 
 /// Play `level` with the keyboard until the episode ends or the player quits.
 ///
-/// Controls: left/right arrows or A/D to move, shift to sprint, space/W/up to jump,
-/// down/S to brake, R to restart, Q/Esc to quit. Holding a direction while jumping gives
-/// the jump for that direction; jumping alone gives `JumpInPlace`; nothing gives `Walk`.
-/// Pressing into a wall while airborne slides down it, and a jump pressed there is a wall
-/// jump — no separate key, because the verb does not change.
+/// The simulation is [`Sim::untimed`]: a human playtest ends at the flag or on a death, never
+/// on the level's scored frame budget. Controls: left/right arrows or A/D to move, shift to
+/// sprint, space/W/up to jump, down/S to brake, R to restart, Q/Esc to quit. Holding a direction
+/// while jumping gives the jump for that direction; jumping alone gives `JumpInPlace`; nothing
+/// gives `Walk`. Pressing into a wall while airborne slides down it, and a jump pressed there is
+/// a wall jump — no separate key, because the verb does not change.
 pub fn play(level: &Level, seed: u64) -> io::Result<PlaySummary> {
     if !io::stdout().is_terminal() {
         return Err(io::Error::other(
@@ -110,7 +111,7 @@ pub fn play(level: &Level, seed: u64) -> io::Result<PlaySummary> {
 
     let session = TerminalSession::enter()?;
     let mut stdout = io::stdout();
-    let mut sim = Sim::new(level, seed);
+    let mut sim = Sim::untimed(level, seed);
     let mut keys = Keys::default();
 
     execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
@@ -123,7 +124,9 @@ pub fn play(level: &Level, seed: u64) -> io::Result<PlaySummary> {
             break;
         }
         if keys.take_restart() {
-            sim = Sim::new(level, seed);
+            // A retry is the same kind of run: it keeps the playtest's clock, not the scored
+            // episode's.
+            sim = Sim::untimed(level, seed);
         }
 
         sim.step(keys.action(started));

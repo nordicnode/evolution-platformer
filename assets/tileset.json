@@ -1536,6 +1536,46 @@
       "name": "block",
       "col": 1,
       "row": 19
+    },
+    {
+      "name": "cracked_ground_b",
+      "col": 2,
+      "row": 19
+    },
+    {
+      "name": "cracked_sand_b",
+      "col": 3,
+      "row": 19
+    },
+    {
+      "name": "cracked_brick_b",
+      "col": 4,
+      "row": 19
+    },
+    {
+      "name": "cracked_wood_b",
+      "col": 5,
+      "row": 19
+    },
+    {
+      "name": "cracked_ground_c",
+      "col": 6,
+      "row": 19
+    },
+    {
+      "name": "cracked_sand_c",
+      "col": 7,
+      "row": 19
+    },
+    {
+      "name": "cracked_brick_c",
+      "col": 8,
+      "row": 19
+    },
+    {
+      "name": "cracked_wood_c",
+      "col": 9,
+      "row": 19
     }
   ]
 }

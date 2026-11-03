@@ -108,6 +108,10 @@ FAMILIES = (
     # tile, so it is a sprite family, and a family at the end of the manifest moves no cell that
     # any sprite already in the atlas points at.
     ("block", terrain.block_sprites),
+    # The second and third crack of each material, appended for the rope's reason: they are
+    # variants of existing optional art, and adding them at the end leaves every base crack — and
+    # every other cell in the atlas — exactly where it was.
+    ("crack_variants", terrain.crack_variant_sprites),
 )
 
 

@@ -35,7 +35,7 @@
 use serde::{Deserialize, Serialize};
 use sim::hash::StateHasher;
 use sim::physics::AgentAction;
-use sim::{Level, Outcome, Sim};
+use sim::{Level, ObservationScratch, Outcome, Sim};
 
 use crate::fitness::EvalConfig;
 use crate::genome::{ActScratch, Genome};
@@ -131,6 +131,15 @@ pub struct TasPlay {
     pub frames: u32,
     pub final_state_hash: u64,
     pub death_pos: Option<(f32, f32)>,
+    pub jumps: u32,
+    pub stomps: u32,
+    pub wall_jumps: u32,
+    pub springs: u32,
+    pub max_stomp_chain: u32,
+    pub max_air_ticks: u32,
+    pub peak_speed: f32,
+    pub route_hops_closed: u32,
+    pub action_changes: u32,
 }
 
 impl TasPlay {
@@ -145,17 +154,33 @@ impl TasPlay {
 /// so a candidate cannot be credited for actions after a win or a death.
 pub fn play(level: &Level, seed: u64, actions: &[AgentAction]) -> TasPlay {
     let mut sim = Sim::new(level, seed);
+    let mut action_changes = 0u32;
+    let mut previous = None;
     for action in actions {
         if sim.outcome().is_finished() {
             break;
         }
+        if previous.is_some_and(|held| held != *action) {
+            action_changes += 1;
+        }
+        previous = Some(*action);
         sim.step(*action);
     }
+    let stats = sim.stats();
     TasPlay {
         outcome: sim.outcome(),
-        frames: sim.stats().frames,
+        frames: stats.frames,
         final_state_hash: sim.state_hash(),
-        death_pos: sim.stats().death_pos,
+        death_pos: stats.death_pos,
+        jumps: stats.jumps,
+        stomps: stats.stomps,
+        wall_jumps: stats.wall_jumps,
+        springs: stats.springs,
+        max_stomp_chain: stats.max_stomp_chain,
+        max_air_ticks: stats.max_air_ticks,
+        peak_speed: stats.peak_speed,
+        route_hops_closed: stats.route_hops_closed,
+        action_changes,
     }
 }
 
@@ -196,13 +221,23 @@ pub fn route_from_genome(level: &Level, genome: &Genome, cfg: &EvalConfig, seed:
     let repeat = cfg.action_repeat.max(1);
     let mut sim = Sim::new(level, seed);
     let mut scratch = ActScratch::new();
+    let mut observation = ObservationScratch::new();
     let mut actions: Vec<AgentAction> = Vec::new();
     let mut held = AgentAction::Walk;
+    let mut next_decision = 0u32;
     let mut trace = StateHasher::new();
     while !sim.outcome().is_finished() {
         let frames = sim.stats().frames;
-        if frames % repeat == 0 {
-            held = genome.act(&sim.observation(), &mut scratch);
+        if frames >= next_decision {
+            let obs = sim.observation_into(&mut observation);
+            let (action, ticks) = genome.act_with_commitment(&obs, &mut scratch);
+            held = action;
+            let hold = if genome.shape.commitment {
+                ticks.max(1)
+            } else {
+                repeat
+            };
+            next_decision = frames.saturating_add(hold);
             trace.u32(frames);
             trace.u8(held.index() as u8);
         }

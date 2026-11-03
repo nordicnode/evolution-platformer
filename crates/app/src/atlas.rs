@@ -1094,22 +1094,34 @@ mod tests {
     }
 
     /// A crack is an **overlay**: ink and transparency, drawn over a material's own autotile, and
-    /// one per material rather than one picture reused four times.
+    /// three pictures per material rather than one picture reused four times.
     ///
-    /// Both the renderer and the editor's palette depend on that (`view::cracked_overlay` lays it
-    /// over the tile, `Brush::base_sprite` puts the material under the palette's cell). The failure
-    /// it guards is a crack drawn as a *whole tile*: every brittle tile in every level would lose
-    /// its crown, its edges and its seams with the ground beside it — a floor of cracked tiles would
-    /// read as a row of loose blocks, which is exactly the reason the cracked tile is a variant plus
-    /// a mark rather than a fifth set of sixteen autotiles.
+    /// Both the renderer and the editor's palette depend on that (`view::cracked_overlay` lays one
+    /// of the three over the tile, `Brush::base_sprite` puts the material under the palette's
+    /// cell). The failure it guards is a crack drawn as a *whole tile*: every brittle tile in every
+    /// level would lose its crown, its edges and its seams with the ground beside it — a floor of
+    /// cracked tiles would read as a row of loose blocks, which is exactly the reason the cracked
+    /// tile is a variant plus a mark rather than a fifth set of sixteen autotiles.
+    ///
+    /// It also guards the two ways the mark can stop being one: a variant that grew into a tile
+    /// wash (`drawn < 64`), and a variant of one material that is the same picture as another
+    /// (`one != other`). The latter catches a copied motif whose per-material tones never landed.
     #[test]
     fn a_crack_is_a_mark_on_its_material_and_not_a_tile() {
         let pixels = Pixels::load();
         let names = [
             "cracked_ground",
+            "cracked_ground_b",
+            "cracked_ground_c",
             "cracked_sand",
+            "cracked_sand_b",
+            "cracked_sand_c",
             "cracked_brick",
+            "cracked_brick_b",
+            "cracked_brick_c",
             "cracked_wood",
+            "cracked_wood_b",
+            "cracked_wood_c",
         ];
         let mut art = Vec::new();
         for name in names {

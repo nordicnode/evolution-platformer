@@ -47,6 +47,7 @@
 //! own replay, which is a disagreement worth surfacing, not a level to train on).
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 use crate::level::Level;
 use crate::physics::AgentAction;
@@ -56,6 +57,10 @@ use crate::{reach, Sim, DECISION_TICKS};
 /// The artifact's own shape version. Bump when a field's meaning changes, not when a level does:
 /// a plan is a derived artifact of one level and one planner configuration.
 pub const ROUTE_PLAN_VERSION: u32 = 1;
+/// Cache wrapper version. The wrapper records the planner knobs separately from the route so a
+/// route produced with a narrow search is never silently reused as the result of a wider one.
+pub const PLAN_CACHE_VERSION: u32 = 1;
+pub const PLAN_CACHE_FORMAT: &str = "evo-timed-route-cache";
 
 /// One span of the route: the blocks that carry the body from the previous crossing (or the
 /// spawn) to the **next** crossing — or, on a route that reaches the flag before closing every
@@ -122,6 +127,117 @@ pub struct RoutePlan {
     pub legs: Vec<Leg>,
     /// The planner's own account of the search, carried so a plan says how it was found.
     pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CachedRoutePlan {
+    format: String,
+    version: u32,
+    sim_version: String,
+    level_hash: String,
+    seed: u64,
+    depth: u32,
+    beam: usize,
+    per_bucket: usize,
+    max_flight_blocks: u32,
+    plan: RoutePlan,
+}
+
+/// A deterministic path for a timed-plan cache entry. The level hash, seed and every search knob
+/// are in the name as well as in the payload, which keeps a directory useful to several commands
+/// without relying on a mutable index file.
+pub fn cache_path(
+    cache_dir: impl AsRef<Path>,
+    level: &Level,
+    seed: u64,
+    cfg: PlanConfig,
+) -> PathBuf {
+    let cfg = cfg.sanitized();
+    cache_dir.as_ref().join(format!(
+        "{:016x}-seed{}-d{}-b{}-p{}-f{}.routeplan.json",
+        level.content_hash(),
+        seed,
+        cfg.depth,
+        cfg.beam,
+        cfg.per_bucket,
+        cfg.max_flight_blocks
+    ))
+}
+
+/// Read a cached plan only when it still belongs to this level, seed and planner configuration.
+/// Malformed or stale cache files are misses; the caller can recompute without treating a derived
+/// artifact as an input error.
+pub fn load_cached(
+    level: &Level,
+    path: impl AsRef<Path>,
+    seed: u64,
+    cfg: PlanConfig,
+) -> Option<RoutePlan> {
+    let cfg = cfg.sanitized();
+    let raw = std::fs::read_to_string(path).ok()?;
+    let cached: CachedRoutePlan = serde_json::from_str(&raw).ok()?;
+    if cached.format != PLAN_CACHE_FORMAT
+        || cached.version != PLAN_CACHE_VERSION
+        || cached.sim_version != crate::SIM_VERSION
+        || cached.level_hash != level.content_hash_string()
+        || cached.seed != seed
+        || cached.depth != cfg.depth
+        || cached.beam != cfg.beam
+        || cached.per_bucket != cfg.per_bucket
+        || cached.max_flight_blocks != cfg.max_flight_blocks
+        || cached.plan.version != ROUTE_PLAN_VERSION
+        || cached.plan.level_hash != level.content_hash_string()
+        || cached.plan.seed != seed
+    {
+        return None;
+    }
+    replay_wins(level, &cached.plan)
+        .ok()
+        .filter(|(frames, _)| *frames == cached.plan.frames)
+        .map(|_| cached.plan)
+}
+
+/// Save a certified plan as a best-effort cache artifact. The write is atomic on ordinary local
+/// filesystems, so a second process sees either the old complete file or the new complete file.
+pub fn save_cached(
+    level: &Level,
+    path: impl AsRef<Path>,
+    seed: u64,
+    cfg: PlanConfig,
+    plan: &RoutePlan,
+) -> Result<(), String> {
+    let cfg = cfg.sanitized();
+    let path = path.as_ref();
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("route cache path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "cannot create route cache directory {}: {e}",
+            parent.display()
+        )
+    })?;
+    let cached = CachedRoutePlan {
+        format: PLAN_CACHE_FORMAT.into(),
+        version: PLAN_CACHE_VERSION,
+        sim_version: crate::SIM_VERSION.into(),
+        level_hash: level.content_hash_string(),
+        seed,
+        depth: cfg.depth,
+        beam: cfg.beam,
+        per_bucket: cfg.per_bucket,
+        max_flight_blocks: cfg.max_flight_blocks,
+        plan: plan.clone(),
+    };
+    let json = serde_json::to_string_pretty(&cached)
+        .map_err(|e| format!("cannot encode route cache: {e}"))?;
+    let tmp = path.with_extension(format!("routeplan.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, format!("{json}\n"))
+        .map_err(|e| format!("cannot write route cache {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot install route cache {}: {e}", path.display())
+    })
 }
 
 impl RoutePlan {
@@ -239,6 +355,44 @@ pub fn compile(level: &Level, seed: u64, cfg: PlanConfig) -> Result<RoutePlan, C
     compile_route(level, seed, cfg)
 }
 
+/// Compile through the planner's anytime budget. The returned plan is still replay-certified by
+/// this module; widening the search never weakens the solver contract.
+pub fn compile_anytime(
+    level: &Level,
+    seed: u64,
+    cfg: PlanConfig,
+    step: u32,
+    max_depth: u32,
+) -> Result<RoutePlan, CompileError> {
+    let report = reach::report(level);
+    if !report.goal_reached {
+        return Err(CompileError::Unbeatable {
+            why: report
+                .diagnosis
+                .unwrap_or_else(|| "the flag cannot be reached".into()),
+        });
+    }
+    let cfg = cfg.sanitized();
+    let beam_cap = cfg.beam.saturating_mul(4).min(2048);
+    compile_outcome(
+        level,
+        seed,
+        plan::solve_adaptive(
+            level,
+            seed,
+            cfg,
+            plan::AdaptivePlanConfig {
+                initial_depth: step,
+                max_depth,
+                depth_step: step.max(1),
+                initial_beam: cfg.beam,
+                max_beam: beam_cap.max(cfg.beam),
+                beam_step: cfg.beam.max(1),
+            },
+        ),
+    )
+}
+
 /// [`compile`] without the oracle: plan, replay the route through the real stepper, and cut it.
 ///
 /// The oracle is the authority on impossibility, and its verdict is what a warm start reports. It
@@ -247,7 +401,14 @@ pub fn compile(level: &Level, seed: u64, cfg: PlanConfig) -> Result<RoutePlan, C
 /// hand-built fixture with a lip the sweep never stands on) can still be planned and won. `from_plan`
 /// uses this so a demonstration is not refused for a reason the demonstration itself disproves.
 pub fn compile_route(level: &Level, seed: u64, cfg: PlanConfig) -> Result<RoutePlan, CompileError> {
-    let outcome = plan::plan_level(level, seed, cfg);
+    compile_outcome(level, seed, plan::plan_level(level, seed, cfg))
+}
+
+fn compile_outcome(
+    level: &Level,
+    seed: u64,
+    outcome: plan::PlanOutcome,
+) -> Result<RoutePlan, CompileError> {
     let Some(route) = outcome.route else {
         return Err(CompileError::Unroutable {
             note: outcome.note,
@@ -315,6 +476,36 @@ pub fn compile_route(level: &Level, seed: u64, cfg: PlanConfig) -> Result<RouteP
         legs,
         note: route.note,
     })
+}
+
+/// Replay a plan through the real fixed-step simulator and return its terminal state hash and
+/// frame count. Cache readers use this as an integrity check, and callers can use it when they
+/// accept a plan artifact from outside the current process.
+pub fn replay_wins(level: &Level, plan: &RoutePlan) -> Result<(u32, u64), String> {
+    if plan.level_hash != level.content_hash_string() {
+        return Err("route plan belongs to a different level".into());
+    }
+    let mut sim = Sim::new(level, plan.seed);
+    for action in &plan.actions {
+        for _ in 0..DECISION_TICKS {
+            if sim.outcome().is_finished() {
+                break;
+            }
+            sim.step(*action);
+        }
+        if sim.outcome().is_finished() {
+            break;
+        }
+    }
+    if sim.outcome() != crate::Outcome::Won {
+        return Err(format!(
+            "route ended as {:?} at x {:.2}, y {:.2}",
+            sim.outcome(),
+            sim.player().x,
+            sim.player().y
+        ));
+    }
+    Ok((sim.stats().frames, sim.state_hash()))
 }
 
 /// Cut a certified replay into legs: one per span, contiguous in blocks, with the tail after the
@@ -560,5 +751,37 @@ mod tests {
             leg_count(&level) >= 1,
             "a gap level has at least one crossing"
         );
+    }
+
+    #[test]
+    fn a_cached_plan_is_reused_only_for_the_same_search_contract() {
+        let (level, _) = crate::practice::generate(0);
+        let cfg = PlanConfig {
+            depth: 48,
+            ..PlanConfig::default()
+        };
+        let plan = compile_route(&level, 7, cfg).expect("the flat route compiles");
+        let dir = std::env::temp_dir().join(format!(
+            "evo-route-cache-{}-{}",
+            std::process::id(),
+            plan.frames
+        ));
+        let path = cache_path(&dir, &level, 7, cfg);
+        save_cached(&level, &path, 7, cfg, &plan).expect("the cache writes");
+        assert_eq!(load_cached(&level, &path, 7, cfg), Some(plan.clone()));
+        assert!(
+            load_cached(
+                &level,
+                &path,
+                7,
+                PlanConfig {
+                    beam: cfg.beam + 1,
+                    ..cfg
+                }
+            )
+            .is_none(),
+            "a wider search must not silently reuse the narrow cache"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

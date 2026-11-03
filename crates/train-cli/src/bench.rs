@@ -207,6 +207,8 @@ fn start_of(a: &Args) -> String {
         "route clone".to_string()
     } else if a.has_flag("from-plan") {
         "timed plan".to_string()
+    } else if a.has_flag("auto-plan") {
+        "automatic timed plan".to_string()
     } else if let Some(path) = a.opt("from-demo") {
         format!("demonstration {path}")
     } else {

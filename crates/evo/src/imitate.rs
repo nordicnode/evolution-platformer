@@ -558,6 +558,13 @@ pub fn clone_from_play_init(
     init: Option<&Genome>,
 ) -> Result<ImitationReport, String> {
     shape.validate()?;
+    if shape.commitment {
+        return Err(
+            "cannot clone a commitment-head policy from action-only demonstrations: the fit has \
+             no cadence labels; train the cadence arm directly or use a fixed-cadence shape"
+                .into(),
+        );
+    }
     if shape.inputs != N_INPUTS {
         return Err(format!(
             "a clone reads the {} -wide observation, but the shape wants {} inputs",
@@ -750,6 +757,14 @@ pub fn from_plan(
     cfg: &ImitateConfig,
     plan: sim::plan::PlanConfig,
 ) -> Result<(RoutePlay, ImitationReport, sim::plan::TimedRoute), String> {
+    if eval.action_repeat.max(1) != sim::DECISION_TICKS {
+        return Err(format!(
+            "timed-plan imitation requires action_repeat {} because the planner is compiled on \
+             that cadence (got {})",
+            sim::DECISION_TICKS,
+            eval.action_repeat.max(1)
+        ));
+    }
     // **A plan is the only admissible demonstration, and it has to cover the whole level.** A
     // route walk is not block-aligned: the oracle changes its held action on the tick a press comes
     // due, while a policy only decides on a block boundary, so a prefix recorded from a walk can be
@@ -786,6 +801,14 @@ pub fn from_certified_plan(
     shape: NetShape,
     cfg: &ImitateConfig,
 ) -> Result<(RoutePlay, ImitationReport), String> {
+    if eval.action_repeat.max(1) != sim::DECISION_TICKS {
+        return Err(format!(
+            "timed-plan imitation requires action_repeat {} because the certified route uses \
+             that cadence (got {})",
+            sim::DECISION_TICKS,
+            eval.action_repeat.max(1)
+        ));
+    }
     let route = plan.timed_route();
     // **The demonstration is the meta-controller's play when it wins.** The controller follows
     // the plan's blocks and overrides only what the plan has no answer for (a shot closing with no
