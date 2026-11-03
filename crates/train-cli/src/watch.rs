@@ -42,8 +42,8 @@ use crossterm::terminal::{
 };
 use evo::{
     curriculum_step, practice_level_for_stall, practice_step, save_practice_level, ChampionFile,
-    EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, PopulationFile, ShowcaseLane, Trainer,
-    DEFAULT_CURRICULUM_GENERATIONS, MUTATION_RATES,
+    DetourGate, EpisodeRunner, EvalConfig, GaConfig, Genome, LaneKind, PopulationFile,
+    ShowcaseLane, Trainer, DEFAULT_CURRICULUM_GENERATIONS, MUTATION_RATES,
 };
 use render::ascii::{GLYPH_WALKER_ALIVE, GLYPH_WALKER_DEAD};
 use render::chart::{
@@ -326,6 +326,14 @@ pub fn watch(a: &Args) -> Result<(), String> {
             if let Some(note) = checkpoint.level_note(&level) {
                 println!("note    {note}");
             }
+            // **The checkpoint's seed is part of the checkpoint.** Episode seeds are a function
+            // of the master seed, so continuing the cohort under a different one would re-roll
+            // every world it is judged on while keeping its ids and generation. An explicit
+            // `--seed` is the operator's override; otherwise the file's own seed wins.
+            if a.opt("seed").is_none() {
+                cfg.master_seed = checkpoint.master_seed();
+                println!("seed    {} (from the checkpoint)", cfg.master_seed);
+            }
             let mut trainer =
                 Trainer::resume(cfg.clone(), checkpoint.to_genomes()?, checkpoint.generation)?;
             if let Some(record) = checkpoint.best_genome()? {
@@ -339,10 +347,9 @@ pub fn watch(a: &Args) -> Result<(), String> {
     let pop_size = trainer.config.pop_size;
     let mut history: Vec<HistoryPoint> = Vec::new();
     let mut curriculum_taken: Option<String> = None;
-    // The run's standing best when the last derived practice step fired: the gate that
-    // lets a practice run take a step per *stall spell* rather than one per run, and
-    // never two in the same spell.
-    let mut detour_best = f32::NEG_INFINITY;
+    // Bounded retries for a derived practice step: one attempt per stall spell, two more after a
+    // cooldown, reset by any real improvement. See `evo::DetourGate`.
+    let mut detour_arm = DetourGate::new();
     let mut deaths: Vec<(f32, f32, u32)> = Vec::new();
     let mut traces = TraceLog::new();
     let mut note: Option<String> = None;
@@ -487,12 +494,18 @@ pub fn watch(a: &Args) -> Result<(), String> {
         // derived practice re-arms on every *new* stall spell — a practice run has to
         // work through a spot, keep the gain, and meet the next spot — and never
         // twice within one, so a detour that learns nothing cannot loop (finding 50).
-        let armed = match &curriculum_level {
-            Some(_) => curriculum_taken.is_none(),
-            None => report.max_fitness > detour_best,
-        };
+        // A solved record is not a stalled run: the mastery league is optimising the clock, and
+        // stepping away to practise a crossing it has already won spends the excursion on the
+        // wrong objective.
+        detour_arm.observe(report.max_fitness, report.generation);
+        let armed = !report.record_solved
+            && match &curriculum_level {
+                Some(_) => curriculum_taken.is_none(),
+                None => detour_arm.armed(report.generation),
+            };
         if armed {
             if let Some(stall) = fitness_stall(&history) {
+                detour_arm.fire(report.generation);
                 // The authored easier level is the run's first choice. Without one,
                 // the run practises *where it is stuck* instead (finding 50): its own
                 // level from the furthest stand its best genome has made, so every
@@ -506,9 +519,8 @@ pub fn watch(a: &Args) -> Result<(), String> {
                             Err(reason) => {
                                 // Nowhere to practise from is said out loud too: the
                                 // stall line says the search stopped, this says why it
-                                // is not stepping back. Once per stall spell — the arm
-                                // closes until the run finds something better.
-                                detour_best = report.max_fitness;
+                                // is not stepping back. The attempt is spent; the gate
+                                // retries after its cooldown if the stall persists.
                                 note = Some(format!(
                                     "curriculum: {reason}; the run stays where it is ({})",
                                     stall.label()
@@ -547,7 +559,6 @@ pub fn watch(a: &Args) -> Result<(), String> {
                         &stall.label(),
                     )?
                 };
-                detour_best = report.max_fitness;
                 let summary = step.note(&level.name);
                 note = Some(summary.clone());
                 // Every step keeps its line: a run that practised its way past three

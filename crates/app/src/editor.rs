@@ -181,11 +181,11 @@ pub enum Brush {
     Rope,
     /// Hangs a spiked ball on a chain: a pendulum that sleeps until a body comes near it.
     ///
-    /// Stamped a **ball** at a time rather than a cell at a time, which is the one way it differs
-    /// from the rope beside it: a click under a ceiling hangs the default chain, and dragging past
-    /// the ball lengthens *that* chain a cell per row (`Level::add_spike_ball_cell`). The ceiling
-    /// rule is the rope's — a pendulum tied to nothing is a floating hazard — and the room rule is
-    /// its own, because the ball has a hitbox that must not hang through the floor.
+    /// Painted a **cell at a time**, like the vine and the rope: a click under a ceiling hangs a
+    /// ball one link down, and dragging down lengthens that chain a cell per row with the ball at
+    /// the end of the stroke (`Level::add_spike_ball_cell`). The ceiling rule is the rope's — a
+    /// pendulum tied to nothing is a floating hazard — and the room rule is its own, because the
+    /// ball has a hitbox that must not hang through the floor.
     SpikeBall,
     /// Places a **crate**: a one-tile solid a body can stand on and shove along by walking
     /// into it.
@@ -732,10 +732,10 @@ impl Brush {
             }
             Brush::SpikeBall => {
                 "A spiked ball on a chain: hangs asleep until a body comes near, then swings. \n\
-                Click under a ceiling to hang it; drag down from the ball to lengthen the chain. \
-                The chain's length and the trigger's radius are the two numbers under the \
-                palette, and the ghost shows where the ball will hang. Contact kills — there is \
-                no stomping it."
+                Painted a cell at a time under a ceiling: each row you drag adds a link, and the \
+                ball hangs at the end of the chain. The trigger's radius is the one number under \
+                the palette, and the ghost shows where the ball will hang. Contact kills — there \
+                is no stomping it."
             }
             Brush::Erase => "Removes the entity under the cursor, then the tile.",
         }
@@ -779,16 +779,12 @@ pub struct Editor {
     /// from the right is a different course from one that leaves. Kept across placements so a
     /// pair of shelves going the same way is one decision.
     pub platform_dir: i8,
-    /// How many tiles of chain a placed spiked ball hangs on, and how near a body has to come to
-    /// wake it.
+    /// How near a body has to come to a placed spiked ball to wake it, in tiles.
     ///
-    /// The loader's own defaults ([`sim::level::DEFAULT_SPIKE_BALL_TILES`],
-    /// [`sim::level::DEFAULT_SPIKE_BALL_REACH`]), for [`Self::enemy_span`]'s reason: a ball placed
-    /// in the window and one written by hand are the same hazard, and the two numbers should not
-    /// depend on who wrote the level. Kept as a pair because they are the ball's two design
-    /// decisions — how wide the arc is, and how much warning the body gets — and a person tuning
-    /// one is looking at the other.
-    pub spike_ball_length: i32,
+    /// The loader's own default ([`sim::level::DEFAULT_SPIKE_BALL_REACH`]), for
+    /// [`Self::enemy_span`]'s reason: a ball placed in the window and one written by hand are the
+    /// same hazard, and the number should not depend on who wrote the level. The chain has no
+    /// number here: its length is the painted stroke, the way a rope's is.
     pub spike_ball_reach: i32,
 
     /// How a drag lays tiles down: freehand, a rectangle or a line.
@@ -844,7 +840,6 @@ impl Editor {
             platform_tiles: sim::level::DEFAULT_PLATFORM_TILES,
             platform_vertical: false,
             platform_dir: 1,
-            spike_ball_length: sim::level::DEFAULT_SPIKE_BALL_TILES,
             spike_ball_reach: sim::level::DEFAULT_SPIKE_BALL_REACH,
             shape: Shape::Free,
             line: false,
@@ -948,30 +943,20 @@ impl Editor {
         }
     }
 
-    /// Where the spiked-ball brush would put its **ball** if it were clicked at `(tx, ty)`.
+    /// Where the spiked-ball brush would put its **ball** if it were painted at `(tx, ty)`.
     ///
-    /// The click is the chain's first cell, so the ball lands a chain-length below it — four tiles
-    /// on the default, shortened to the room there is. The drop ghost asks this so it can promise
-    /// the hazard that will exist rather than the tile under the pointer, the same way the
-    /// platform's ghost draws the whole shelf instead of one cell of it.
+    /// A cell of the brush is one link of chain, so the ball hangs in the cell directly below the
+    /// one under the pointer — whether this paint starts a chain or lengthens the chain the ball
+    /// already hangs from. The drop ghost asks this so it can promise the hazard that will exist
+    /// rather than the tile under the pointer, the same way the platform's ghost draws the whole
+    /// shelf instead of one cell of it.
     ///
     /// Returns `None` when the cell is refused, which is what colours the ghost's outline bad.
     pub fn spike_ball_drop(&self, tx: i32, ty: i32) -> Option<(i32, i32)> {
         if !self.can_place(Brush::SpikeBall, tx, ty) {
             return None;
         }
-        // A cell under a hanging chain lengthens that chain: the ball moves one row down.
-        if self
-            .level
-            .spike_balls
-            .iter()
-            .any(|b| b.col == tx && ty == b.last_row() + 1)
-        {
-            return Some((tx, ty));
-        }
-        let room = (self.level.height - ty - 1).max(1);
-        let length = self.spike_ball_length.max(1).min(room);
-        Some((tx, ty + length))
+        Some((tx, ty + 1))
     }
 
     /// Apply the active brush at a tile. Returns whether the document changed.
@@ -1243,17 +1228,16 @@ impl Editor {
             }
             Brush::SpikeBall => {
                 if !self.can_place(Brush::SpikeBall, tx, ty) {
-                    self.message =
-                        "a spiked ball needs a ceiling, air to hang through and room below"
-                            .to_string();
+                    self.message = if self.level.spike_ball_at(tx, ty).is_some() {
+                        "this cell is already part of a chain".to_string()
+                    } else {
+                        "a spiked ball cell needs air, and the first one needs a ceiling"
+                            .to_string()
+                    };
                     return false;
                 }
-                self.level.add_spike_ball_cell(
-                    tx,
-                    ty,
-                    self.spike_ball_length,
-                    self.spike_ball_reach,
-                )
+                self.level
+                    .add_spike_ball_cell(tx, ty, self.spike_ball_reach)
             }
             Brush::Scenery => {
                 if !self.can_place(Brush::Scenery, tx, ty) {
@@ -1365,8 +1349,9 @@ impl Editor {
             }
             Some("rope") => self.brush = Some(Brush::Rope),
             Some("spiked_ball") => {
-                // A pick brings the ball's own numbers, like a turret's facing or a platform's
-                // width: placing a second one should swing the way the first one did.
+                // A pick brings the ball's trigger, like a turret's facing or a platform's width:
+                // placing a second one should give a body the same warning as the first. The
+                // chain's length is not adopted — it is painted, not a brush setting.
                 if let Some(i) = self
                     .level
                     .spike_balls
@@ -1374,7 +1359,6 @@ impl Editor {
                     .position(|b| b.col == tx && (b.row..=b.last_row()).contains(&ty))
                 {
                     if let Some(b) = self.level.spike_balls.get(i) {
-                        self.spike_ball_length = b.length.round().max(1.0) as i32;
                         self.spike_ball_reach = b.reach.round().max(1.0) as i32;
                     }
                 }
@@ -2789,69 +2773,70 @@ mod tests {
         assert_eq!(ed.brush, Some(Brush::Rope));
     }
 
-    /// **The brush's two numbers are the ball's own, and a pick adopts them.**
+    /// **The trigger is the brush's one number, and a pick adopts it.**
     ///
-    /// A ball is a shape, not a cell: the chain sets the radius of the arc and the trigger sets
-    /// how much warning a body gets, so both are properties of the *brush* the way a platform's
-    /// width is. Placing a second ball should swing like the first one, which is what the pick
-    /// half of this test says.
+    /// How near a body has to come for the ball to wake is a property of the *brush*, like a
+    /// platform's width: placing a second ball should give a body the same warning as the first.
+    /// The chain is not a number any more — it is the painted stroke — so a pick leaves the
+    /// chain length alone.
     #[test]
-    fn the_spiked_ball_brush_places_the_chain_and_trigger_it_carries() {
+    fn the_spiked_ball_brush_paints_the_trigger_it_carries() {
         let mut ed = doc();
         for tx in 0..40 {
             ed.level.set_tile(tx, 2, Tile::Solid);
         }
-        ed.spike_ball_length = 2;
         ed.spike_ball_reach = 8;
         ed.brush = Some(Brush::SpikeBall);
+        assert_eq!(
+            ed.spike_ball_drop(8, 3),
+            Some((8, 4)),
+            "the ghost promises the ball one link below the paint"
+        );
         ed.begin_stroke();
         assert!(ed.paint(8, 3));
         ed.end_stroke();
 
         let ball = ed.level.spike_balls[0];
-        assert_eq!(ball.length, 2.0, "the chain is the number that was set");
-        assert_eq!(ball.reach, 8.0, "and so is the trigger");
+        assert_eq!(ball.length, 1.0, "a painted cell is one link");
+        assert_eq!(ball.reach, 8.0, "the trigger is the number that was set");
         assert_eq!(
-            ed.spike_ball_drop(8, 3),
+            ed.spike_ball_drop(8, 4),
             Some((8, 5)),
-            "the ghost promises the shorter chain the stepper would hang"
+            "the ball's own cell is the next link, so the ghost carries it a row down"
         );
 
-        // A pick brings the numbers it found, so a row of balls is one decision.
-        ed.spike_ball_length = 4;
+        // A pick brings the trigger it found, so a row of balls is one decision.
         ed.spike_ball_reach = 3;
         ed.brush = Some(Brush::Erase);
-        assert!(ed.pick_at(8, 5), "the ball is picked where it is drawn");
+        assert!(ed.pick_at(8, 4), "the ball is picked where it is drawn");
         assert_eq!(ed.brush, Some(Brush::SpikeBall));
-        assert_eq!(ed.spike_ball_length, 2, "the pick adopts the chain");
-        assert_eq!(ed.spike_ball_reach, 8, "and the trigger");
+        assert_eq!(ed.spike_ball_reach, 8, "the pick adopts the trigger");
     }
 
-    /// **A spiked ball is stamped whole, and a drag down grows its chain.**
+    /// **A spiked ball is painted a cell at a time, and the stroke is the chain.**
     ///
-    /// The one way the brush differs from the rope beside it: a click is a *ball*, not a cell, so
-    /// a person gets something that swings without having to drag four rows first. Everything
-    /// below the ball belongs to it, so the next cell down lengthens that chain rather than
-    /// stacking a second ball on top of the first, and the eraser takes the ball from the cell it
-    /// is drawn in rather than from the tie above it.
+    /// The rope's gesture: one click is one link, and dragging down lengthens that chain rather
+    /// than stacking a second ball on top of the first. The ball is carried at the end of the
+    /// stroke, so a chain is as long as the cells painted, and the whole drag is one undo step.
     #[test]
-    fn the_spiked_ball_brush_hangs_one_ball_and_grows_its_chain() {
+    fn the_spiked_ball_brush_paints_one_link_and_grows_its_chain() {
         let mut ed = doc();
         for tx in 0..40 {
             ed.level.set_tile(tx, 2, Tile::Solid);
         }
         ed.brush = Some(Brush::SpikeBall);
 
-        ed.begin_stroke();
-        assert!(ed.paint(8, 3));
+        // One stroke down four cells: one ball on a four-link chain, not four balls.
+        for ty in 3..=6 {
+            assert!(ed.paint(8, ty), "cell ({}, {ty}) paints", 8);
+        }
         ed.end_stroke();
-        assert_eq!(ed.level.spike_balls.len(), 1);
+        assert_eq!(ed.level.spike_balls.len(), 1, "one ball, not four");
         let placed = ed.level.spike_balls[0];
         assert_eq!((placed.col, placed.row), (8, 3));
         assert_eq!(
-            placed.length,
-            sim::level::DEFAULT_SPIKE_BALL_TILES as f32,
-            "a click hangs the default chain, not a one-tile hinge"
+            placed.length, 4.0,
+            "a four-cell stroke is a four-link chain"
         );
         assert_eq!(
             placed.reach,
@@ -2864,35 +2849,48 @@ mod tests {
             "tied to the underside of the ceiling"
         );
         assert_eq!(
-            ed.spike_ball_drop(8, 3),
-            Some((8, 3 + placed.length as i32)),
+            ed.spike_ball_drop(8, placed.last_row()),
+            Some((8, placed.last_row() + 1)),
             "the ghost promises the ball at the end of the chain, not at the pointer"
         );
+        assert_eq!(
+            ed.spike_ball_drop(8, 6),
+            None,
+            "a cell in the middle of the chain has no next ball to promise"
+        );
 
-        // The cell below the ball is a longer chain, not a second ball.
-        let below = placed.last_row() + 1;
+        // The whole drag is one undo step, however many links it painted.
+        assert!(ed.undo());
+        assert!(ed.level.spike_balls.is_empty(), "the chain came back whole");
+        assert!(ed.redo());
+        assert_eq!(ed.level.spike_balls[0].length, 4.0);
+
+        // The cell the ball hangs in is the next link: painting it carries the ball a row down.
+        let ball_cell = ed.level.spike_balls[0].last_row();
         ed.begin_stroke();
-        assert!(ed.paint(8, below));
+        assert!(ed.paint(8, ball_cell));
         ed.end_stroke();
         assert_eq!(ed.level.spike_balls.len(), 1, "one ball, not two");
-        assert_eq!(ed.level.spike_balls[0].length, placed.length + 1.0);
+        assert_eq!(ed.level.spike_balls[0].length, 5.0);
+        let next = ed.level.spike_balls[0].last_row();
         assert_eq!(
-            ed.spike_ball_drop(8, below + 1),
-            Some((8, below + 1)),
+            ed.spike_ball_drop(8, next),
+            Some((8, next + 1)),
             "and the ghost moves the ball down with the chain it is growing"
         );
-        assert_eq!(
-            ed.spike_ball_drop(8, below),
-            None,
-            "the cell the ball now hangs in is part of the chain, not a new one"
-        );
 
-        // A cell in the middle of the chain is the ball already: refused, and said so.
+        // A cell in the middle of the chain is the chain already: refused, and said so.
         assert!(!ed.can_place(Brush::SpikeBall, 8, 5));
         ed.begin_stroke();
         assert!(!ed.paint(8, 5));
         ed.end_stroke();
-        assert_eq!(ed.level.spike_balls[0].length, placed.length + 1.0);
+        assert_eq!(ed.level.spike_balls[0].length, 5.0);
+        assert!(ed.message.contains("already"), "{:?}", ed.message);
+
+        // The ball hangs in the cell below the paint, so a floor there refuses the link rather
+        // than burying the hazard in it.
+        ed.level.set_tile(30, 4, Tile::Solid);
+        assert!(!ed.can_place(Brush::SpikeBall, 30, 3));
 
         // Without a ceiling there is nothing to tie the pendulum to.
         assert_eq!(
@@ -2918,8 +2916,8 @@ mod tests {
         ed.end_stroke();
         ed.brush = Some(Brush::Erase);
         assert!(
-            ed.pick_at(8, 3 + 2),
-            "the chain hangs, so the mid-cell picks it"
+            ed.pick_at(8, 4),
+            "the ball hangs there, so its cell picks it"
         );
         assert_eq!(ed.brush, Some(Brush::SpikeBall));
     }

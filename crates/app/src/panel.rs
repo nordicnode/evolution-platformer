@@ -224,6 +224,9 @@ pub struct RunSummary {
     /// pressing Save and then Continue in the same generation has to work, and a reading
     /// taken one generation earlier would leave the second control disabled for no reason.
     pub champion_saved: bool,
+    /// Whether this level has a population checkpoint the *Resume checkpoint* control can read.
+    /// Set by the window at draw time for the same reason as [`RunSummary::champion_saved`].
+    pub checkpoint_saved: bool,
     pub finished: bool,
     /// Tile the population is dying in, when a stall makes that the interesting
     /// question. `None` before a stall, and `None` until a level width is supplied.
@@ -286,6 +289,7 @@ impl RunSummary {
             curriculum: packet.curriculum.clone(),
             telemetry: packet.telemetry.clone(),
             champion_saved: false,
+            checkpoint_saved: false,
             finished: packet.finished,
             deaths_at: None,
             deaths_count: 0,
@@ -388,6 +392,8 @@ pub enum Command {
     Save,
     /// Start a new population from the champion saved for this level, when there is one.
     ContinueChampion,
+    /// Continue the population checkpoint this level's run autosaved, when there is one.
+    ResumeCheckpoint,
     /// Leave the scrubbed view and follow the live run again.
     Live,
     /// Follow the leading agent's camera, or go back to the whole level.
@@ -412,6 +418,8 @@ pub struct Actions {
     pub save: bool,
     /// Start a new population from the champion saved for this level.
     pub continue_champion: bool,
+    /// Continue the population checkpoint autosaved for this level.
+    pub resume_checkpoint: bool,
     /// Leave the scrubbed view and follow the live run again.
     pub resume: bool,
     /// The follow checkbox was clicked. The window owns the state, as it does for pause:
@@ -1080,6 +1088,28 @@ pub fn lab_panel(
     .clicked()
     {
         actions.continue_champion = true;
+    }
+    // **Continue the cohort, not one genome.** The run autosaves its whole population at every
+    // generation boundary and when it stops; this is the way back into that population without a
+    // terminal or a `--resume` flag. Disabled rather than hidden when no checkpoint exists, for the
+    // same reason as the champion row above.
+    if ui::menu_row(
+        ui,
+        atlas,
+        Some(ui::GLYPH_RESTART),
+        "Resume checkpoint",
+        width,
+        false,
+        summary.checkpoint_saved,
+    )
+    .on_hover_text(if summary.checkpoint_saved {
+        "continue the population this level autosaved, with the planner's route in its weakest slots"
+    } else {
+        "no population checkpoint for this level yet — one is written as the run trains and when it stops"
+    })
+    .clicked()
+    {
+        actions.resume_checkpoint = true;
     }
     if ui::menu_row(
         ui,

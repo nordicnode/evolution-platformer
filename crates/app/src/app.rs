@@ -175,6 +175,12 @@ pub struct LabOptions {
     pub ghosts: bool,
     pub pop_size: usize,
     pub seed: u64,
+    /// Whether `--seed` named the run's master seed rather than leaving it at the default.
+    ///
+    /// It matters only for a resume: a checkpoint records the seed that produced its episode
+    /// seeds, and continuing it under the default would silently re-roll every world the
+    /// population is judged on. An explicit seed is the operator's override.
+    pub seed_explicit: bool,
     /// Stop after this many generations. `None` runs until the window is closed.
     pub generations: Option<u32>,
     /// Where `Save champion` writes, and where a curriculum step's checkpoint goes.
@@ -204,6 +210,7 @@ impl Default for LabOptions {
             ghosts: true,
             pop_size: GaConfig::default().pop_size,
             seed: GaConfig::default().master_seed,
+            seed_explicit: false,
             generations: None,
             champions: PathBuf::from("champions"),
             resume: None,
@@ -1113,24 +1120,6 @@ impl EvoApp {
             return;
         }
         if self.lab.is_none() {
-            let cfg = GaConfig {
-                pop_size: self.options.pop_size,
-                master_seed: self.seed,
-                // **The window is a mastery league by default** (WP11). A watched run's whole
-                // promise is that it keeps getting better after it solves the level, and before
-                // this the window had no way to ask for that: a run that found the flag once
-                // went on optimising the crowned fitness, which barely notices the clock. The
-                // league arms only after the record wins, so learning the level is unchanged.
-                mastery: true,
-                // **Item 14 in the window.** A watched run is where a mistake is legible: the
-                // stall, the pit, the frame the body died. Three repair children per generation
-                // are bred from the best genome's own losing decisions, so the population spends
-                // part of each generation fixing what it just got wrong instead of waiting for a
-                // random mutation upstream of the failure to come good. `--repair-children` is
-                // the same knob in the terminal, and `GaConfig::default()` keeps it off.
-                repair_children: 3,
-                ..GaConfig::default()
-            };
             let plan = match self.run_plan() {
                 Ok(plan) => plan,
                 Err(err) => {
@@ -1138,27 +1127,8 @@ impl EvoApp {
                     return;
                 }
             };
-            let stem = self.run_stem();
-            match Lab::start(
-                &self.editor.level,
-                cfg,
-                lab::DEFAULT_BEST_LANES,
-                lab::DEFAULT_RANDOM_LANES,
-                plan,
-                self.options.champions.clone(),
-                stem,
-            ) {
-                Ok(lab) => {
-                    // A run handed a population from somewhere else says so once: the
-                    // numbers on screen are a claim about a level, and a checkpoint from
-                    // a different one is exactly the thing a viewer must not have to
-                    // guess.
-                    if let Some(origin) = lab.origin() {
-                        self.note = Some((origin.to_string(), 12.0));
-                    }
-                    self.lab = Some(lab);
-                    self.saved_end = false;
-                }
+            match self.make_lab(plan) {
+                Ok(lab) => self.install_lab(lab),
                 Err(err) => {
                     // A worker that cannot start is a status message, not a lost window.
                     self.editor.message = err;
@@ -1173,6 +1143,147 @@ impl EvoApp {
             // The numbers on screen are a claim about a level that no longer exists.
             self.restart_run("the level changed, so this is a fresh run on the edit");
         }
+        self.mode = Mode::Evolve;
+        self.fit_pending = true;
+    }
+
+    /// Build the run's worker.
+    ///
+    /// A failed start — a checkpoint this build cannot read, a worker that cannot spawn — returns
+    /// the error to the caller; [`Self::install_lab`] is the swap, and it happens only after this
+    /// succeeds. The resume path stops its old run before calling this (see
+    /// [`Self::resume_checkpoint`]), so that caller's old run is already parked; a fresh start
+    /// has no old run to disturb.
+    fn make_lab(&self, plan: lab::RunPlan) -> Result<Lab, String> {
+        let mut cfg = GaConfig {
+            pop_size: self.options.pop_size,
+            master_seed: self.seed,
+            // **The window is a mastery league by default** (WP11). A watched run's whole
+            // promise is that it keeps getting better after it solves the level, and before
+            // this the window had no way to ask for that: a run that found the flag once
+            // went on optimising the crowned fitness, which barely notices the clock. The
+            // league arms only after the record wins, so learning the level is unchanged.
+            mastery: true,
+            // **Item 14 in the window.** A watched run is where a mistake is legible: the
+            // stall, the pit, the frame the body died. Three repair children per generation
+            // are bred from the best genome's own losing decisions, so the population spends
+            // part of each generation fixing what it just got wrong instead of waiting for a
+            // random mutation upstream of the failure to come good. `--repair-children` is
+            // the same knob in the terminal, and `GaConfig::default()` keeps it off.
+            repair_children: 3,
+            ..GaConfig::default()
+        };
+        // **A checkpoint is a seed as much as a cohort.** Every episode a genome meets is
+        // derived from `(master_seed, generation, genome id, trial)`, so resuming under the
+        // window's default seed would continue the ids and the generation while silently
+        // re-rolling every world they are judged on. Read the seed the checkpoint was trained
+        // with unless the operator named one. `--resume` is the only path this applies to:
+        // a fresh run, or one seeded from a champion, has no checkpoint seed to continue.
+        if !self.options.seed_explicit {
+            if let Some(path) = plan.resume.as_deref() {
+                let checkpoint = evo::PopulationFile::load(path)?;
+                cfg.master_seed = checkpoint.training_config.master_seed;
+            }
+        }
+        Lab::start(
+            &self.editor.level,
+            cfg,
+            lab::DEFAULT_BEST_LANES,
+            lab::DEFAULT_RANDOM_LANES,
+            plan,
+            self.options.champions.clone(),
+            self.run_stem(),
+        )
+    }
+
+    /// Put a started run on screen and say where it came from, once.
+    fn install_lab(&mut self, lab: Lab) {
+        // The status bar's seed and the next Restart's seed must be the seed the run is actually
+        // using. A resumed checkpoint adopts its recorded seed (see [`Self::make_lab`]), so
+        // leaving the old number on screen would make the run irreproducible from what it says.
+        self.seed = lab.config().master_seed;
+        if let Some(origin) = lab.origin() {
+            // The numbers on screen are a claim about a level, and a checkpoint from another one
+            // is exactly the thing a viewer must not have to guess.
+            self.note = Some((origin.to_string(), 12.0));
+        }
+        self.lab = Some(lab);
+        self.saved_end = false;
+    }
+
+    /// Continue the population checkpoint this level's run autosaved.
+    ///
+    /// The CLI's `--resume`, reachable from the Evolve panel: the cohort, its genome ids and its
+    /// generation continue, and [`lab::RunPlan::warm_from_plan`] puts the planner's clone in its
+    /// weakest slots.
+    ///
+    /// The live run is parked before the file is read for two reasons: the plan warm-up is slow and
+    /// must not compete with a training worker, and reading while it trained could open an autosave
+    /// older than the cohort the window is showing. **What happens to that run's own artifacts
+    /// depends on whether the checkpoint is its.** A run that was itself resumed from this file may
+    /// flush its newest cohort into it on the way out. A fresh run — which is what an Evolve view
+    /// that has just opened always holds — must leave the file alone, or it would replace yesterday's
+    /// checkpoint with its generation-zero cohort at the exact moment the viewer asked to continue
+    /// it.
+    fn resume_checkpoint(&mut self) {
+        let (path, same_run) = {
+            let Some(lab) = self.lab.as_mut() else {
+                self.note = Some((
+                    "start a run first: there is no checkpoint to resume yet".into(),
+                    6.0,
+                ));
+                return;
+            };
+            let path = lab.checkpoint_path();
+            if !path.is_file() {
+                self.note = Some((
+                    format!(
+                        "no population checkpoint at {} yet — one is written as the run trains and when it stops",
+                        path.display()
+                    ),
+                    8.0,
+                ));
+                return;
+            }
+            let same_run = lab.resumed_from() == Some(path.as_path());
+            (path, same_run)
+        };
+        let mut plan = match self.run_plan() {
+            Ok(plan) => plan,
+            Err(err) => {
+                // The run is still live: a curriculum the command line named but that has moved
+                // since is an error at the editor, not a reason to stop training.
+                self.editor.message = err;
+                return;
+            }
+        };
+        // Stop and join. A run that owns this checkpoint writes its newest cohort as it leaves, so
+        // the successor reads exactly the run the viewer pressed Resume on; a fresh run must not
+        // write one, because the file being resumed belongs to the run before it. This happens
+        // after the plan has been built, so a bad `--curriculum` path cannot take the run down
+        // first.
+        if let Some(lab) = &mut self.lab {
+            if same_run {
+                lab.stop();
+            } else {
+                lab.stop_without_checkpoint();
+            }
+        }
+        plan.resume = Some(path);
+        plan.seed_from_champion = None;
+        plan.warm_from_plan = true;
+        let next = match self.make_lab(plan) {
+            Ok(lab) => lab,
+            Err(err) => {
+                self.note = Some((format!("cannot resume the checkpoint: {err}"), 10.0));
+                return;
+            }
+        };
+        // The old worker is stopped and its final checkpoint is already on disk, so the
+        // successor is the only writer left. Installing it replaces (and drops) the stopped run;
+        // its `Drop` calls `stop` again, which is a join of an already-finished thread.
+        self.install_lab(next);
+        self.reset_run_view();
         self.mode = Mode::Evolve;
         self.fit_pending = true;
     }
@@ -1198,10 +1309,11 @@ impl EvoApp {
             resume: self.options.resume.clone(),
             seed_from_champion: self.options.from_champion.clone(),
             curriculum,
-            // A fresh run on a level somebody has just drawn starts from a walk of it; a run
-            // handed a population or a champion already has the better starting point. See
+            // A fresh run on a level somebody has just drawn starts from the plan; a resumed
+            // checkpoint keeps its cohort and gets the plan's clone in the weakest slots; only a
+            // champion start ignores it, because its reheated shell is the population. See
             // `lab::RunPlan::warm_from_plan`.
-            warm_from_plan: self.options.resume.is_none() && self.options.from_champion.is_none(),
+            warm_from_plan: self.options.from_champion.is_none(),
         })
     }
 
@@ -1872,6 +1984,10 @@ impl EvoApp {
             .lab
             .as_ref()
             .is_some_and(|lab| lab.champion_path().is_file());
+        summary.checkpoint_saved = self
+            .lab
+            .as_ref()
+            .is_some_and(|lab| lab.checkpoint_path().is_file());
         let actions = panel::lab_panel(ui, Some(&self.atlas), &summary, &mut self.view, changed);
         self.summary = Some(summary);
         self.apply_actions(actions);
@@ -1912,6 +2028,9 @@ impl EvoApp {
         }
         if actions.continue_champion {
             self.apply(Command::ContinueChampion);
+        }
+        if actions.resume_checkpoint {
+            self.apply(Command::ResumeCheckpoint);
         }
         if actions.resume {
             self.apply(Command::Live);
@@ -1976,6 +2095,7 @@ impl EvoApp {
             }
             Command::Save => self.save_champion(),
             Command::ContinueChampion => self.continue_from_champion(),
+            Command::ResumeCheckpoint => self.resume_checkpoint(),
             Command::Live => self.view.scrub = None,
             Command::ToggleFollow => {
                 self.view.follow = !self.view.follow;
@@ -3056,8 +3176,8 @@ impl EvoApp {
     /// The controls that belong to the brush in hand, pinned under the parts rather than scrolling
     /// with them.
     ///
-    /// The stroke's shape, a flyer's beat, a platform's travel and width, a spiked ball's chain and
-    /// trigger, and the scenery picker: what a person reaches for *while painting*, which is why
+    /// The stroke's shape, a flyer's beat, a platform's travel and width, a spiked ball's trigger,
+    /// and the scenery picker: what a person reaches for *while painting*, which is why
     /// they live at a fixed place instead of at the end of a list that moves. They are added as a
     /// bottom panel above the note, so a short window gives the room to them and scrolls the parts —
     /// the opposite (a list with a fixed height and the tools pushed off the panel) is what a window
@@ -3098,10 +3218,10 @@ impl EvoApp {
         // The brushes that carry a number, and the numbers, shown only while one of them is in
         // hand: a flyer's beat and a platform's travel are the same knob (how far it goes), a
         // platform also has a width, a turret has a direction instead, and a spiked ball has the
-        // two numbers that are its whole design shape — how long the chain is and how near a body
-        // has to come to wake it. The row is conditional for the scenery picker's own reason — a
-        // control that belongs to one brush is noise in front of the other twenty-one. A rock has
-        // no number at all: it falls as far as the room under it.
+        // trigger radius that says how near a body has to come to wake it. Its chain has no
+        // number: it is painted a cell at a time, like a rope. The row is conditional for the
+        // scenery picker's own reason — a control that belongs to one brush is noise in front of
+        // the other twenty-one. A rock has no number at all: it falls as far as the room under it.
         if matches!(
             self.editor.brush,
             Some(Brush::Flyer | Brush::Turret | Brush::Platform | Brush::SpikeBall)
@@ -3144,18 +3264,6 @@ impl EvoApp {
                     });
                 }
                 Some(Brush::SpikeBall) => {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("chain").small().color(theme::TEXT_DIM));
-                        ui.add(
-                            egui::DragValue::new(&mut self.editor.spike_ball_length).range(1..=16),
-                        )
-                        .on_hover_text(
-                            "How many tiles of chain the ball hangs on. The ball swings on that \
-                             radius, so a long chain is a wide arc and a slow one. Shortened to the \
-                             room below the click; drag down from a placed ball to lengthen its \
-                             chain a cell at a time.",
-                        );
-                    });
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("trigger")
@@ -3696,7 +3804,12 @@ impl EvoApp {
         });
         ui.horizontal(|ui| {
             ui.label("seed");
-            ui.add(egui::DragValue::new(&mut self.seed));
+            // A seed typed here is as explicit as `--seed`: the operator has named the run's
+            // RNG, so a later *Resume checkpoint* must not quietly replace it with the file's
+            // own. Left alone, a resume continues the checkpoint's recorded seed.
+            if ui.add(egui::DragValue::new(&mut self.seed)).changed() {
+                self.options.seed_explicit = true;
+            }
         });
         // The cap is a *choice* rather than a number, because "run until I close the window" is
         // the default and has no number that means it.
@@ -3762,6 +3875,13 @@ impl EvoApp {
     /// only place that knows how a run is made, and a second one here would be a second answer to
     /// what a run is.
     fn apply_run_settings(&mut self) {
+        // **This button starts a fresh run, so the command line's starting point is spent.**
+        // `--resume` and `--from-champion` describe the run the window opened with; leaving them
+        // in `options` would make "Apply — starts a new run" build another copy of that seed (or
+        // resume the same checkpoint again) instead of the run the settings describe. The panel's
+        // own *Resume checkpoint* and *Continue champion* rows are the way back to either.
+        self.options.resume = None;
+        self.options.from_champion = None;
         self.lab = None;
         self.lanes = None;
         self.packet = None;
@@ -4544,10 +4664,11 @@ impl EvoApp {
             }
             span
         } else if brush == Brush::SpikeBall {
-            // The ball does not land in the cell that was clicked: the click is the chain's first
-            // cell, and the weight hangs a chain-length below it. A ghost that drew the ball under
-            // the pointer would promise a hazard in the wrong place — the platform's own reason for
-            // drawing its full width — and the chain between the tie and the ball is the promise.
+            // The ball does not land in the cell that was clicked: each painted cell is one link
+            // of chain, and the weight hangs in the cell directly below the pointer. A ghost that
+            // drew the ball under the pointer would promise a hazard in the wrong place — the
+            // platform's own reason for drawing its full width — and the link between the paint
+            // and the ball is the promise.
             let mut span = target;
             if let Some((_, ball_y)) = self.editor.spike_ball_drop(tx, ty) {
                 let ball = self.camera.tile_rect(tx, ball_y, rect);
@@ -5778,6 +5899,114 @@ mod tests {
         assert!(note.0.contains("(seed "), "{}", note.0);
         assert_eq!(lab.stem(), "l1-flat-run");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Resume the cohort the Evolve panel autosaved.** The CLI's `--resume` used to be the only
+    /// way back into a population; this drives the panel's own command and checks the new run's
+    /// origin says it resumed that file and received the planner's clone.
+    #[test]
+    fn resume_checkpoint_continues_the_autosaved_population() {
+        let ctx = Context::default();
+        let root = scratch("resume-checkpoint");
+        let mut app = app_on(&ctx, &root.join("levels/l1-flat-run.json"));
+        app.options.pop_size = 8;
+        app.seed = 2;
+        app.enter_evolve();
+        let lab = app.lab.as_mut().expect("the evolution view starts a run");
+        lab.stop();
+        let checkpoint = lab.checkpoint_path();
+        assert!(
+            checkpoint.is_file(),
+            "stopping the run wrote its checkpoint"
+        );
+
+        // Resuming is continuing a run, not adopting its cohort under a new RNG. The seed on
+        // screen is stale (as it would be after a relaunch), and the checkpoint's own seed has to
+        // win: episode seeds are derived from it, so the default would re-roll every world.
+        app.seed = 99;
+        app.resume_checkpoint();
+        let resumed = app.lab.as_ref().expect("the resumed run is on screen");
+        assert_eq!(
+            app.seed, 2,
+            "the window adopted the checkpoint's master seed"
+        );
+        assert_eq!(
+            resumed.config().master_seed,
+            2,
+            "the resumed trainer kept the seed its ids were trained under"
+        );
+        let origin = resumed
+            .origin()
+            .expect("a resumed run says where it came from");
+        assert!(origin.contains("resumed"), "{origin}");
+        assert!(
+            origin.contains("warmed from this level's timed plan"),
+            "the resumed cohort gets the planner's clone: {origin}"
+        );
+        let note = app.note.as_ref().expect("the resume is reported on screen");
+        assert!(note.0.contains("resumed"), "{}", note.0);
+        assert!(resumed.checkpoint_path().is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Resuming from a relaunch must not erase the run being resumed.**
+    ///
+    /// The Evolve view auto-starts a fresh population when it opens, so the ordinary way into
+    /// *Resume checkpoint* is: open the window, go to Evolve, press the button. Stopping that fresh
+    /// run the ordinary way used to write its generation-zero cohort over the older checkpoint
+    /// first, and the button then resumed the fresh run instead of the file it named. The file on
+    /// disk is the artifact the control is about, so a run that did not come from it leaves it
+    /// alone.
+    #[test]
+    fn resuming_the_previous_sessions_checkpoint_does_not_replace_it_with_the_fresh_run() {
+        let ctx = Context::default();
+        let root = scratch("resume-relaunch");
+        let mut app = app_on(&ctx, &root.join("levels/l1-flat-run.json"));
+        app.options.pop_size = 8;
+        app.seed = 2;
+        app.enter_evolve();
+        let lab = app.lab.as_mut().expect("the evolution view starts a run");
+        lab.wait_for_first(Duration::from_secs(30))
+            .expect("the run scores a generation");
+        lab.stop();
+        let path = lab.checkpoint_path();
+
+        // A checkpoint from a *previous session*: an older run's generation and note, made
+        // distinguishable from the one generation a freshly opened window can have written.
+        let mut saved =
+            evo::PopulationFile::load(&path).expect("the stopped run wrote a checkpoint");
+        saved.generation = 40;
+        saved.note = "the run from yesterday".into();
+        saved.save(&path).expect("the checkpoint is editable");
+
+        // A relaunch: the window auto-starts a fresh run on the same level. It has no checkpoint
+        // of its own yet, and the file *Resume checkpoint* reads is yesterday's.
+        app.lab = None;
+        app.enter_evolve();
+        app.lab
+            .as_mut()
+            .expect("the relaunched window starts a fresh run")
+            .wait_for_first(Duration::from_secs(30))
+            .expect("the fresh run scores a generation");
+        app.resume_checkpoint();
+
+        let resumed = app.lab.as_ref().expect("the resumed run is on screen");
+        assert!(
+            resumed.origin().is_some_and(|o| o.contains("resumed")),
+            "the window resumed a checkpoint: {:?}",
+            resumed.origin()
+        );
+        let after = evo::PopulationFile::load(&path).expect("the checkpoint is still readable");
+        assert_eq!(
+            after.generation, 40,
+            "the fresh run overwrote the checkpoint it replaced"
+        );
+        assert_eq!(after.note, "the run from yesterday");
+
+        // Park the successor before deleting its directory: a live worker would otherwise
+        // recreate the directory on its own way out.
+        app.lab = None;
         let _ = std::fs::remove_dir_all(&root);
     }
 

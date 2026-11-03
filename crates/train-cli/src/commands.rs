@@ -10,8 +10,8 @@ use evo::ga::MUTATION_SIGMA_RANGE;
 use evo::{
     curriculum_step, fit_demo, from_plan, from_route, fused_seeding, polish,
     practice_level_for_stall, practice_step, run_episode, save_practice_level, warm_population,
-    ChampionFile, CommitteeFile, EsConfig, EsTrainer, EvalConfig, FuseConfig, GaConfig, HumanDemo,
-    ImitateConfig, ImitationReport, PolishConfig, PopulationFile, RoutePlay, Trainer,
+    ChampionFile, CommitteeFile, DetourGate, EsConfig, EsTrainer, EvalConfig, FuseConfig, GaConfig,
+    HumanDemo, ImitateConfig, ImitationReport, PolishConfig, PopulationFile, RoutePlay, Trainer,
     DEFAULT_CURRICULUM_GENERATIONS, FITNESS_VERSION,
 };
 use render::chart::{fitness_stall, HistoryPoint};
@@ -638,10 +638,9 @@ pub fn train(a: &Args) -> Result<(), String> {
     let mut generation_secs: Vec<f64> = Vec::with_capacity(generations);
     let mut history: Vec<HistoryPoint> = Vec::with_capacity(generations);
     let mut curriculum_taken: Option<String> = None;
-    // The run's standing best when the last derived practice step fired: the gate that
-    // lets a practice run take a step per *stall spell* rather than one per run, and
-    // never two in the same spell.
-    let mut detour_best = f32::NEG_INFINITY;
+    // Bounded retries for a derived practice step: one attempt per stall spell, two more after a
+    // cooldown, reset by any real improvement. See `evo::DetourGate`.
+    let mut detour_arm = DetourGate::new();
 
     if suite && !quiet {
         println!(
@@ -790,12 +789,17 @@ pub fn train(a: &Args) -> Result<(), String> {
         // (finding 50) — one step per *stall spell*, so a run can work through a spot,
         // keep the gain, and meet the next. The detour's landscape is written beside
         // the checkpoint so it can be opened and played.
-        let armed = match &curriculum_level {
-            Some(_) => curriculum_taken.is_none(),
-            None => report.max_fitness > detour_best,
-        };
+        // A solved record is not stalled: step back only while the run still has the level to
+        // learn, never while the mastery league is optimising a clock.
+        detour_arm.observe(report.max_fitness, report.generation);
+        let armed = !report.record_solved
+            && match &curriculum_level {
+                Some(_) => curriculum_taken.is_none(),
+                None => detour_arm.armed(report.generation),
+            };
         if armed && curriculum_generations > 0 && !suite {
             if let Some(stall) = fitness_stall(&history) {
+                detour_arm.fire(report.generation);
                 let practice;
                 let easier: &Level = match &curriculum_level {
                     Some(easier) => easier,
@@ -807,8 +811,8 @@ pub fn train(a: &Args) -> Result<(), String> {
                                 // not a missing line: a silent skip is indistinguishable
                                 // from a dead stall chain. Said once per stall spell —
                                 // the arm closes until the run finds something better —
-                                // and kept in the checkpoint note like any step.
-                                detour_best = report.max_fitness;
+                                // and kept in the checkpoint note like any step. The attempt is
+                                // spent, so the gate retries after its cooldown.
                                 let summary = format!(
                                     "curriculum: {reason}; the run stays where it is ({})",
                                     stall.label()
@@ -852,7 +856,6 @@ pub fn train(a: &Args) -> Result<(), String> {
                         &stall.label(),
                     )?
                 };
-                detour_best = report.max_fitness;
                 let summary = step.note(&level.name);
                 if !quiet {
                     println!("{summary}");
@@ -917,12 +920,47 @@ pub fn train(a: &Args) -> Result<(), String> {
     // directory — the default path *is* the seed's own path, so the run would replace the evidence
     // it started from with the result it produced, at the moment that evidence is most wanted
     // (`REVIEW.md` §2.8's silent replacement, in the one directory this tool writes to unasked).
-    let champion_path = match a.opt("from-champion") {
+    let mut champion_path = match a.opt("from-champion") {
         Some(seed) if same_file(seed, &Path::new(&out_dir).join(format!("{stem}.json"))) => {
             Path::new(&out_dir).join(format!("{stem}-seeded.json"))
         }
         _ => Path::new(&out_dir).join(format!("{stem}.json")),
     };
+    // **A lower-scoring run does not overwrite a better champion.** The default path is the
+    // level's one champion, and a resume/continuation whose first generation has not caught up
+    // with the record beside it used to replace that better artifact at the moment it was most
+    // wanted. The run's result is still written, under a distinct name, and the printed path says
+    // which is which.
+    let better_exists = fs::read_to_string(&champion_path)
+        .ok()
+        .and_then(|src| ChampionFile::from_json_str(&src).ok())
+        .is_some_and(|existing| existing.fitness > champion.fitness);
+    if better_exists {
+        let base = champion_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| stem.clone());
+        let mut n = 1u32;
+        loop {
+            let candidate = Path::new(&out_dir).join(format!("{base}-new-{n}.json"));
+            if !candidate.exists() {
+                champion_path = candidate;
+                break;
+            }
+            n += 1;
+            if n > 10_000 {
+                return Err(format!(
+                    "cannot name a champion beside {}: too many stepped-aside copies",
+                    champion_path.display()
+                ));
+            }
+        }
+        println!(
+            "note    {} already holds a better champion; this run wrote {}",
+            Path::new(&out_dir).join(format!("{stem}.json")).display(),
+            champion_path.display()
+        );
+    }
     champion.save(&champion_path)?;
 
     // Item 10: the run's top `k` genomes as a committee, written beside the champion and gated
@@ -1339,6 +1377,7 @@ pub(crate) fn seeded_trainer(cfg: GaConfig, level: &Level, a: &Args) -> Result<T
 }
 
 fn seeded_trainer_core(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer, String> {
+    let mut cfg = cfg;
     let resume = a.opt("resume");
     let from_champion = a.opt("from-champion");
     let from_route = a.has_flag("from-route");
@@ -1380,6 +1419,14 @@ fn seeded_trainer_core(cfg: GaConfig, level: &Level, a: &Args) -> Result<Trainer
         println!("resuming {}", checkpoint.summary());
         if let Some(note) = checkpoint.level_note(level) {
             println!("note    {note}");
+        }
+        // A checkpoint stores the seed its episode seeds came from. Continuing it under
+        // `--seed`'s default would keep the cohort and its ids but re-roll every world it meets,
+        // which is a different run wearing the checkpoint's generation number. An explicit seed
+        // is the operator's override.
+        if a.opt("seed").is_none() {
+            cfg.master_seed = checkpoint.master_seed();
+            println!("seed    {} (from the checkpoint)", cfg.master_seed);
         }
         let mut trainer = Trainer::resume(cfg, checkpoint.to_genomes()?, checkpoint.generation)?;
         if let Some(record) = checkpoint.best_genome()? {

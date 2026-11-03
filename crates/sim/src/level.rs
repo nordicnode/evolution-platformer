@@ -844,7 +844,8 @@ pub struct SpikeBallSpec {
 
 /// A spiked ball's chain when the file does not say one: four tiles.
 ///
-/// Shared with the editor for the reason every default in this module is. Four tiles is long
+/// The default for hand-written level files and generated levels. The editor does not use it:
+/// a chain there is painted a cell at a time, so its length is the stroke's. Four tiles is long
 /// enough that the ball sweeps a corridor rather than guarding one cell, and short enough that
 /// its arc (about 2.3 tiles to each side at the speed the sim gives it) stays inside the room a
 /// person drew. A one-tile chain is a spike with a hinge; a ten-tile one is a wrecking ball with
@@ -2673,6 +2674,10 @@ impl Level {
             && ty + 2 <= self.height
             && self.is_opaque(tx, ty - 1)
             && self.tile(tx, ty) == Some(Tile::Empty)
+            // A second ball tied at the top of a chain already hanging here is not a longer
+            // chain: it is two balls in one column, and only one of them can be picked from
+            // the cell the person sees. The chain is lengthened by painting its ball.
+            && self.spike_ball_at(tx, ty).is_none()
     }
 
     /// Hang a spiked ball at `(tx, ty)` with an **authored** chain length and trigger radius.
@@ -2704,48 +2709,57 @@ impl Level {
 
     /// Whether a **cell** of spiked ball may be painted at `(tx, ty)`.
     ///
-    /// Two answers, the rope's two: a first cell hangs a ball (empty, with a ceiling above), and
-    /// the cell just below a chain extends that chain. The editor asks this for the drop ghost, so
-    /// a drag that has run out of room is refused before the mouse button comes up rather than
+    /// Two answers, the rope's two: a first cell starts a chain (empty, with a ceiling above),
+    /// and the cell its ball hangs in extends that chain. The editor asks this for the drop ghost,
+    /// so a drag that has run out of room is refused before the mouse button comes up rather than
     /// shortening a chain the person did not ask to change.
+    ///
+    /// **The ball's own cell is the next link.** A chain of one cell hangs its ball in the cell
+    /// below the paint, so painting that ball is what spends the next link and moves the ball a
+    /// row down. That is what makes a drag down a column one chain whose length is the number of
+    /// cells painted, rather than a fixed chain with a ball parked at its end.
     pub fn spike_ball_cell_placeable(&self, tx: i32, ty: i32) -> bool {
+        // The ball hangs one cell below the painted link, so that cell has to be air: a ball
+        // painted into a floor is a hazard nobody can see.
+        if self.tile(tx, ty + 1) != Some(Tile::Empty) {
+            return false;
+        }
         if self.spike_ball_placeable(tx, ty) {
             return true;
         }
-        self.tile(tx, ty) == Some(Tile::Empty)
+        ty + 2 <= self.height
+            && self.tile(tx, ty) == Some(Tile::Empty)
             && self
                 .spike_balls
                 .iter()
-                .any(|b| b.col == tx && ty == b.last_row() + 1)
+                .any(|b| b.col == tx && ty == b.last_row())
     }
 
-    /// Paint one cell of spiked ball at `(tx, ty)`: hang a whole ball there, or grow the chain of
-    /// the one above it by a cell.
+    /// Paint one cell of spiked ball at `(tx, ty)`: start a one-link chain there, or lengthen the
+    /// chain whose ball hangs in this cell by one link.
     ///
-    /// The rope's gesture, for the rope's reason: the thing a drag down a column should make is
-    /// **one** longer chain, not a stack of four-tile balls one row apart. A click on a ceiling
-    /// hangs the default chain ([`DEFAULT_SPIKE_BALL_TILES`], shortened to the room below it), and
-    /// dragging past the ball extends it a cell per row — which is how a person asks for a longer
-    /// arc without a number field to find.
+    /// The rope's gesture: a click under a ceiling hangs a ball one cell down, and dragging down
+    /// grows that chain a cell per row with the ball carried at the end of the stroke. A chain is
+    /// therefore as long as the cells painted, not a number in the palette.
     ///
     /// Growing is refused where the new ball would not fit: the chain's last cell plus the half
     /// tile its box reaches has to be inside the map, exactly as the loader checks.
     ///
-    /// `length` and `reach` are the **brush's** numbers and are used only when this cell starts a
-    /// new ball: a cell below an existing chain grows that chain by one, because the chain it is
-    /// growing already has a length and a stepper cannot be right about it from the outside.
-    pub fn add_spike_ball_cell(&mut self, tx: i32, ty: i32, length: i32, reach: i32) -> bool {
+    /// `reach` is the brush's trigger radius and is used only when this cell starts a new ball:
+    /// a cell that lengthens an existing chain leaves its trigger alone, because that chain
+    /// already has one.
+    pub fn add_spike_ball_cell(&mut self, tx: i32, ty: i32, reach: i32) -> bool {
         if !self.spike_ball_cell_placeable(tx, ty) {
             return false;
         }
         for b in &mut self.spike_balls {
-            if b.col == tx && ty == b.last_row() + 1 {
-                b.length += 1.0;
+            if b.col == tx && ty == b.last_row() {
+                b.length = (ty - b.row + 1) as f32;
                 self.forget_routes();
                 return true;
             }
         }
-        self.add_spike_ball(tx, ty, length, reach)
+        self.add_spike_ball(tx, ty, 1, reach)
     }
 
     /// The spiked ball whose chain or ball passes through `(tx, ty)`, if any.

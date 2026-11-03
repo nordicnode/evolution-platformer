@@ -175,7 +175,10 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
                 }
                 lab.pop_size = pop as usize;
             }
-            "--seed" => lab.seed = number("--seed")?,
+            "--seed" => {
+                lab.seed = number("--seed")?;
+                lab.seed_explicit = true;
+            }
             "--generations" => {
                 let generations = number("--generations")?;
                 if generations == 0 {

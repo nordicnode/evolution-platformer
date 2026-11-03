@@ -2342,6 +2342,66 @@ impl Trainer {
         Ok(())
     }
 
+    /// Put a **batch** of genomes into the population, replacing distinct weakest slots.
+    ///
+    /// [`Trainer::inject`] is the migration primitive and replaces one slot; calling it in a loop
+    /// cannot place a warm set, because each injected genome has `fitness = 0.0` and is therefore
+    /// the next call's weakest slot — the second migrant would overwrite the first. A warm start
+    /// is exactly that batch (a clone plus its mutated siblings), so it needs one operation that
+    /// chooses the slots before any of them is written.
+    ///
+    /// The run's record is not inserted here; the caller that has a verified winner seeds it with
+    /// [`Trainer::seed_record`]. Ids are renumbered when they collide, and the population's order
+    /// and all run-level state are otherwise untouched.
+    ///
+    /// **Ties go to the back.** A checkpoint stores no per-genome fitness — each member is
+    /// re-scored by the next generation — so every slot reads `0.0` when a resumed cohort is
+    /// warmed. Stable ordering would then fill the *front* (the elites `breed` puts there) and
+    /// throw away the strongest genomes the cohort has. The slot ordering therefore breaks a tie
+    /// by descending index: a population in the producer's order has its elites at the front and
+    /// its coarse children at the back, and a warm set belongs in the latter.
+    pub fn inject_batch(&mut self, genomes: Vec<Genome>) -> Result<(), String> {
+        if genomes.len() > self.genomes.len() {
+            return Err(format!(
+                "cannot inject {} genomes into a population of {}",
+                genomes.len(),
+                self.genomes.len()
+            ));
+        }
+        let mut used: std::collections::HashSet<u32> = self.genomes.iter().map(|g| g.id).collect();
+        let mut incoming = Vec::with_capacity(genomes.len());
+        for mut genome in genomes {
+            genome.validate()?;
+            if genome.shape != self.config.shape {
+                return Err(format!(
+                    "cannot inject a {} genome into a {} population",
+                    genome.shape.label(),
+                    self.config.shape.label()
+                ));
+            }
+            if used.contains(&genome.id) {
+                genome.id = self.next_id;
+                self.next_id += 1;
+            }
+            self.next_id = self.next_id.max(genome.id.saturating_add(1));
+            used.insert(genome.id);
+            genome.fitness = 0.0;
+            incoming.push(genome);
+        }
+        let mut slots: Vec<usize> = (0..self.genomes.len()).collect();
+        slots.sort_by(|a, b| {
+            self.genomes[*a]
+                .fitness
+                .total_cmp(&self.genomes[*b].fitness)
+                .then_with(|| b.cmp(a))
+        });
+        for (slot, genome) in slots.into_iter().zip(incoming) {
+            self.genomes[slot] = genome;
+            self.parent_fitness[slot] = NO_PARENT;
+        }
+        Ok(())
+    }
+
     /// The mutation size children are currently bred with.
     ///
     /// With [`GaConfig::adaptive_sigma`] this is a reading rather than a setting, which is
@@ -3925,6 +3985,48 @@ mod tests {
 
     fn flat_level() -> Level {
         crate::fixture::flat_runway("ga-fixture", 24, 22)
+    }
+
+    /// **A warm batch must not overwrite the elites of the cohort it joins.** A checkpoint strips
+    /// per-genome fitness (each member is re-scored next generation), so every slot ties at 0.0.
+    /// The slot search deliberately sends a tie to the back of the population, where `breed` puts
+    /// the coarse children, rather than to index zero, where it puts the elites.
+    #[test]
+    fn a_warm_batch_without_fitness_replaces_the_back_not_the_front() {
+        let cfg = GaConfig {
+            pop_size: 8,
+            ..GaConfig::default()
+        };
+        let mut rng = rng_from_seed(7);
+        let original: Vec<Genome> = (0..cfg.pop_size)
+            .map(|id| Genome::random(id as u32, cfg.shape.clone(), &mut rng))
+            .collect();
+        let mut trainer =
+            Trainer::resume(cfg.clone(), original.clone(), 5).expect("the cohort resumes");
+        let incoming = vec![
+            Genome::zeros(100, cfg.shape.clone()),
+            Genome::zeros(101, cfg.shape.clone()),
+        ];
+        trainer
+            .inject_batch(incoming)
+            .expect("the warm set fits the population");
+
+        assert_eq!(
+            trainer.genomes[0].id, original[0].id,
+            "the first elite survived"
+        );
+        assert_eq!(
+            trainer.genomes[1].id, original[1].id,
+            "the second elite survived"
+        );
+        assert_eq!(
+            trainer.genomes[6].id, 101,
+            "the second warm genome should take the second-to-last slot"
+        );
+        assert_eq!(
+            trainer.genomes[7].id, 100,
+            "the clone should take the last slot"
+        );
     }
 
     /// A 24-tile runway with a three-tile pit at columns 10-12. A constant `run`

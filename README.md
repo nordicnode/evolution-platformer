@@ -165,11 +165,12 @@ including the showcase level in the screenshot above, `levels/scratch-rope.json`
 spiked ball). The editor's palette has a rope brush that paints a **cell** at a time,
 like every other part of a level: a click hangs one cell of line from the ceiling above
 it, and dragging down grows that line a cell per row (a cell inside a line is refused,
-because it is already rope). The spiked-ball brush hangs a whole ball per click, and a
-drag down from the ball lengthens *its* chain the same way; the chain's length and the
-trigger's radius are the two steppers under the palette, the way a platform's travel
-and width are, and the drop ghost draws the ball at the end of the chain it will hang
-on rather than under the pointer.
+because it is already rope). The spiked-ball brush paints a chain the same way: each
+cell is one link, a click hangs the ball one link under the ceiling, and a drag down
+carries the ball at the end of the stroke. The trigger's radius is the one stepper
+under the palette, the way a platform's travel and width are two, and the drop ghost
+draws the ball one cell below the paint it will hang from rather than under the
+pointer.
 
 `levels/practice/` is a **generated, certified practice suite**: twenty-four
 levels, six mechanics at four tiers, every one checked by the reachability

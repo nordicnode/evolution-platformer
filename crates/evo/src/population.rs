@@ -221,6 +221,20 @@ impl PopulationFile {
         serde_json::from_str(src).map_err(|e| format!("invalid population JSON: {e}"))
     }
 
+    /// Write the checkpoint **atomically**.
+    ///
+    /// A checkpoint is read by a second process or a second run while the writer is still
+    /// training: `train-cli watch --resume` and the window's *Resume checkpoint* both open this
+    /// file while its owner may be autosaving or stopping. `fs::write` truncates the destination
+    /// first, so a reader can observe half a population and refuse a file that was never actually
+    /// broken. The JSON is written beside the destination and renamed over it instead, which on
+    /// Unix is one atomic directory operation; readers see the whole old file or the whole new
+    /// one, never a prefix.
+    ///
+    /// The temporary name carries the process and a sequence number so two writers in one process
+    /// (a stopping worker and a detour, before the detour is settled) cannot collide. A crash can
+    /// leave one `.tmp` file beside the checkpoint; that is a harmless orphan, not a broken
+    /// checkpoint.
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
         let path = path.as_ref();
         if let Some(dir) = path.parent() {
@@ -230,8 +244,7 @@ impl PopulationFile {
             }
         }
         let json = self.to_json_pretty()?;
-        std::fs::write(path, json + "\n")
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+        write_atomic(path, &(json + "\n"))
     }
 
     /// Load a checkpoint, refusing anything this build cannot train on.
@@ -246,6 +259,16 @@ impl PopulationFile {
         Ok(file)
     }
 
+    /// The master seed this checkpoint's episode seeds were derived from.
+    ///
+    /// A resume that keeps the population but changes the seed is not continuing the run: every
+    /// `episode_seed` is a function of `(master_seed, generation, genome id, trial)`, so the cohort
+    /// would meet a different world on every generation. The whole reason this is stored in the
+    /// file is so the next reader can continue it rather than re-roll it.
+    pub fn master_seed(&self) -> u64 {
+        self.training_config.master_seed
+    }
+
     /// One-line summary for CLI output.
     pub fn summary(&self) -> String {
         format!(
@@ -256,6 +279,35 @@ impl PopulationFile {
             self.note
         )
     }
+}
+
+/// Write `contents` to `path` through a sibling temporary file and a rename.
+///
+/// Kept private to the checkpoint format: it is the one artifact large enough for a reader to
+/// catch the writer mid-write, and the one a second run opens while the first is still training.
+fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "population".to_string());
+    let tmp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+    std::fs::write(&tmp, contents).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    // Windows refuses to rename over an existing file. Removing first is the only portable
+    // spelling available without a dependency, and the destination is still either complete or
+    // absent rather than half-written. Unix never takes this branch: rename replaces atomically.
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", path.display())
+    })
 }
 
 #[cfg(test)]
@@ -342,6 +394,42 @@ mod tests {
         // And through the text form, which is what a file actually is.
         let json = file.to_json_pretty().expect("serializes");
         assert_eq!(PopulationFile::from_json_str(&json).expect("parses"), file);
+    }
+
+    /// **A reader never sees half a checkpoint.** The writer used to truncate the destination
+    /// before writing, so a resume that opened the file while a worker autosaved could parse a
+    /// prefix and refuse a checkpoint that was about to be complete. The write now goes through a
+    /// sibling temporary and a rename, and this pins both halves: the new file is what a reader
+    /// gets, and the temporary does not remain beside it.
+    #[test]
+    fn a_checkpoint_write_replaces_the_file_in_one_step() {
+        let dir =
+            std::env::temp_dir().join(format!("evo-population-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("level.population.json");
+
+        checkpoint().save(&path).expect("the first write lands");
+        assert_eq!(PopulationFile::load(&path).expect("loads").generation, 38);
+
+        let mut newer = checkpoint();
+        newer.generation = 39;
+        newer.note = "autosave at generation 39".into();
+        newer.save(&path).expect("the replacement lands");
+        let loaded = PopulationFile::load(&path).expect("the replacement loads");
+        assert_eq!(loaded.generation, 39);
+        assert_eq!(loaded.note, "autosave at generation 39");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the directory is readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a completed write left temporary files behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -38,8 +38,9 @@ use std::time::{Duration, Instant};
 
 use evo::{
     curriculum_step, from_certified_plan, practice_level_for_stall, practice_step,
-    save_practice_level, warm_population, BestEver, ChampionFile, EpisodeResult, EpisodeRunner,
-    EvalConfig, GaConfig, Genome, ImitateConfig, LaneKind, PopulationFile, Trainer,
+    save_practice_level, warm_population, warm_set, BestEver, ChampionFile, DetourGate,
+    EpisodeResult, EpisodeRunner, EvalConfig, GaConfig, Genome, ImitateConfig, ImitationReport,
+    LaneKind, PopulationFile, RoutePlay, Trainer,
 };
 use render::chart::{fitness_stall, HistoryPoint};
 use render::trace::{ChampionTrace, TraceLog, TracePoint, TRACE_SAMPLE_FRAMES};
@@ -91,6 +92,15 @@ pub fn slug(name: &str) -> String {
     }
 }
 
+/// Generations between the run's own population checkpoints.
+///
+/// A checkpoint is the only artifact that can resume a *population* rather than one genome. The
+/// curriculum writes one when it fires, but a run that never stalls used to leave nothing behind
+/// until it reached its cap — closing the window after an hour of training lost the whole cohort.
+/// The file is a few megabytes and is rewritten, not accumulated, so a quarter-hour cadence costs
+/// less than the generation that triggers it.
+const AUTO_CHECKPOINT_GENERATIONS: u32 = 250;
+
 /// The planner budget the window's warm start compiles with.
 ///
 /// 64, not the planner's shipped default (32) and not the practice suite's certification depth
@@ -134,6 +144,102 @@ fn warm_seed_from_plan(level: &Level, cfg: &GaConfig) -> (Option<Vec<Genome>>, S
     )
 }
 
+/// One certified plan and the genome cloned from it, before either is placed in a population.
+///
+/// The split exists because two callers need the same clone for different populations: a fresh
+/// run swaps a quarter of generation zero for it, and a resumed run replaces its weakest quarter
+/// with the same set. Planning and fitting twice would also double the startup cost for the one
+/// answer both callers want.
+struct PlanWarm {
+    clone: Genome,
+    plan: sim::route_plan::RoutePlan,
+    report: ImitationReport,
+}
+
+impl PlanWarm {
+    /// The origin line for a population that has already been seeded from this clone.
+    fn note(&self, seeded: &str) -> String {
+        let coverage = if self.plan.covered == self.plan.hops {
+            format!("{} legs / {} rungs", self.plan.legs.len(), self.plan.hops)
+        } else {
+            format!(
+                "{} legs, but the flag is reached after {} of {} route rungs",
+                self.plan.legs.len(),
+                self.plan.covered,
+                self.plan.hops
+            )
+        };
+        // **What the clone can actually do**, on the window's own origin line. Agreement is the
+        // fit's number; mastery is the game's, and the weak leg is the one Phase 2's curriculum
+        // spent its budget on. A warm start that says only "84 % agreement" leaves the operator to
+        // discover on generation 0 that the policy cannot make the first spike.
+        let mastery = self
+            .report
+            .mastery
+            .as_ref()
+            .map(|m| format!("; {}", m.line()))
+            .unwrap_or_default();
+        // And what the *controller* did on the way: commit / wait / ride, with the leg and block
+        // each first fired on. Only printed when one fired — a note that always says "route 183" is
+        // noise.
+        let skills = self
+            .report
+            .skills
+            .as_ref()
+            .filter(|s| s.counts()[1..].iter().any(|n| *n > 0))
+            .map(|s| format!("; {}", s.line()))
+            .unwrap_or_default();
+        format!(
+            "warmed from this level's timed plan: {coverage} in {} blocks and {}; a genome was \
+             cloned from the plan ({:.0}% of the demonstrated decisions reproduced); {seeded}; \
+             {}{mastery}{skills}",
+            self.plan.actions.len(),
+            sim::format_time(self.plan.frames),
+            self.report.agreement * 100.0,
+            self.plan.line(),
+        )
+    }
+}
+
+/// Plan, certify and clone the level's timed route. `Err` is the origin note, not a run failure.
+///
+/// This is the one expensive warm-start step (the compiler plus the DAgger fit) and it is shared by
+/// a fresh run and a resumed one so the window can never offer two different answers about what the
+/// planner proved.
+fn plan_warm(
+    level: &Level,
+    cfg: &GaConfig,
+    plan_cfg: sim::plan::PlanConfig,
+    imit: &ImitateConfig,
+) -> Result<PlanWarm, String> {
+    let started = Instant::now();
+    let plan = sim::route_plan::compile(level, cfg.master_seed, plan_cfg)
+        .map_err(|err| format!("no warm start: {}", err.line()))?;
+    let eval = cfg.eval_config();
+    let (play, report): (RoutePlay, ImitationReport) =
+        from_certified_plan(level, &plan, &eval, cfg.shape.clone(), imit)
+            .map_err(|why| format!("no warm start: {why}"))?;
+    if profiling() {
+        eprintln!(
+            "lab warm plan+clone {:?} ({} decisions, {} legs, {:.0}% agreement{})",
+            started.elapsed(),
+            play.decisions.len(),
+            plan.legs.len(),
+            report.agreement * 100.0,
+            report
+                .mastery
+                .as_ref()
+                .map(|m| format!(", {}/{} legs cleared", m.cleared(), m.legs.len()))
+                .unwrap_or_default()
+        );
+    }
+    Ok(PlanWarm {
+        clone: report.genome.clone(),
+        plan,
+        report,
+    })
+}
+
 /// Turn the plan-warmed population into a trainer without throwing away a clone that already
 /// wins from spawn. The timed-plan fit is a warm-start mechanism, but a verified clone is also a
 /// legitimate run record; otherwise generation zero can replace it with an unsolved random member
@@ -162,98 +268,96 @@ fn warm_seed_from_plan_with(
     plan_cfg: sim::plan::PlanConfig,
     imit: &ImitateConfig,
 ) -> (Option<Vec<Genome>>, String) {
-    let started = Instant::now();
-    let plan = match sim::route_plan::compile(level, cfg.master_seed, plan_cfg) {
-        Ok(plan) => plan,
-        Err(err) => {
+    let warm = match plan_warm(level, cfg, plan_cfg, imit) {
+        Ok(warm) => warm,
+        Err(note) => {
             return (
                 None,
-                format!(
-                    "no warm start: {}. The population starts random rather than from a weaker \
-                     route",
-                    err.line()
-                ),
+                format!("{note}. The population starts random rather than from a weaker route"),
             )
         }
     };
-    let eval = cfg.eval_config();
-    let fit = match from_certified_plan(level, &plan, &eval, cfg.shape.clone(), imit) {
-        Ok((play, report)) => (play, report),
-        Err(why) => {
-            return (
-                None,
-                format!(
-                    "no warm start: {why}. The population starts random rather than from a \
-                     weaker route"
-                ),
-            )
-        }
-    };
-    let (play, report) = fit;
-    if profiling() {
-        eprintln!(
-            "lab warm plan+clone {:?} ({} decisions, {} legs, {:.0}% agreement{})",
-            started.elapsed(),
-            play.decisions.len(),
-            plan.legs.len(),
-            report.agreement * 100.0,
-            report
-                .mastery
-                .as_ref()
-                .map(|m| format!(", {}/{} legs cleared", m.cleared(), m.legs.len()))
-                .unwrap_or_default()
-        );
-    }
     let mut rng = sim::rng::rng_from_seed(cfg.master_seed ^ 0x2E5E_ED2E_5EED_2E5E);
-    let warm = (cfg.pop_size / 4).max(1);
+    let count = (cfg.pop_size / 4).max(1);
     let pop = warm_population(
-        &report.genome,
+        &warm.clone,
         cfg.pop_size,
-        warm - 1,
+        count - 1,
         cfg.mutation_sigma,
         cfg.mutation_rate,
         &mut rng,
     );
-    let coverage = if plan.covered == plan.hops {
-        format!("{} legs / {} rungs", plan.legs.len(), plan.hops)
-    } else {
-        format!(
-            "{} legs, but the flag is reached after {} of {} route rungs",
-            plan.legs.len(),
-            plan.covered,
-            plan.hops
-        )
+    let seeded = format!(
+        "{count} of {} genomes start from that clone, the rest are random",
+        cfg.pop_size
+    );
+    (Some(pop), warm.note(&seeded))
+}
+
+/// **Warm a resumed population from the plan without throwing the checkpoint away.**
+///
+/// A resumed run is the case the planner helps most: the population has already proved it can get
+/// somewhere and stopped there. The plan is a proven route from the spawn, so its clone — and a
+/// quarter-population of mutated relatives around it — enters the weakest slots and the rest of the
+/// checkpoint continues untouched. This is deliberately not [`warm_seed_from_plan`]: a resumed run's
+/// cohort is the run's history, and replacing it with a random remainder would be Restart wearing a
+/// checkpoint's name.
+///
+/// The returned note is appended to the resume's origin line. A level the planner cannot route
+/// leaves the checkpoint exactly as it was and says so; that is the honest outcome, not a reason to
+/// fail the resume.
+fn warm_resumed_from_plan(trainer: &mut Trainer, level: &Level, cfg: &GaConfig) -> String {
+    warm_resumed_from_plan_with(trainer, level, cfg, &ImitateConfig::default())
+}
+
+/// [`warm_resumed_from_plan`] with the fit under the caller's control, for tests that check the
+/// population swap without paying for the shipped epoch budget.
+fn warm_resumed_from_plan_with(
+    trainer: &mut Trainer,
+    level: &Level,
+    cfg: &GaConfig,
+    imit: &ImitateConfig,
+) -> String {
+    let warm = match plan_warm(
+        level,
+        cfg,
+        sim::plan::PlanConfig {
+            depth: WARM_PLAN_DEPTH,
+            ..sim::plan::PlanConfig::default()
+        },
+        imit,
+    ) {
+        Ok(warm) => warm,
+        Err(note) => {
+            return format!("{note}. The resumed population is unchanged");
+        }
     };
-    // **What the clone can actually do**, on the window's own origin line. Agreement is the fit's
-    // number; mastery is the game's, and the weak leg is the one Phase 2's curriculum spent its
-    // budget on. A warm start that says only "84 % agreement" leaves the operator to discover on
-    // generation 0 that the policy cannot make the first spike.
-    let mastery = report
-        .mastery
-        .as_ref()
-        .map(|m| format!("; {}", m.line()))
-        .unwrap_or_default();
-    // And what the *controller* did on the way: commit / wait / ride, with the leg and block each
-    // first fired on. Only printed when one fired — a note that always says "route 183" is noise.
-    let skills = report
-        .skills
-        .as_ref()
-        .filter(|s| s.counts()[1..].iter().any(|n| *n > 0))
-        .map(|s| format!("; {}", s.line()))
-        .unwrap_or_default();
-    (
-        Some(pop),
-        format!(
-            "warmed from this level's timed plan: {coverage} in {} blocks and {}; a genome was \
-             cloned from the plan ({:.0}% of the demonstrated decisions reproduced) and {warm} of \
-             {} genomes start from that clone, the rest are random; {}{mastery}{skills}",
-            plan.actions.len(),
-            sim::format_time(plan.frames),
-            report.agreement * 100.0,
-            cfg.pop_size,
-            plan.line()
-        ),
-    )
+    let count = (cfg.pop_size / 4).max(1).min(trainer.genomes.len());
+    let mut rng = sim::rng::rng_from_seed(cfg.master_seed ^ 0x5EED_2E5E_ED2E_5EED);
+    let set = warm_set(
+        &warm.clone,
+        count.saturating_sub(1),
+        cfg.mutation_sigma,
+        cfg.mutation_rate,
+        &mut rng,
+    );
+    if let Err(err) = trainer.inject_batch(set) {
+        return format!("no warm start: {err}. The resumed population is unchanged");
+    }
+    // A closed-loop clone that wins from the spawn is a legitimate record, exactly as it is on a
+    // fresh run. Seed it before generation zero can replace it with an unsolved member of the
+    // checkpoint's remainder.
+    let solo = evo::run_episode(level, &warm.clone, &cfg.eval_config(), cfg.master_seed);
+    if solo.won() {
+        if let Err(err) = trainer.seed_record(level, warm.clone.clone(), cfg.master_seed) {
+            eprintln!("resume warm record: {err}");
+        }
+    }
+    let seeded = format!(
+        "{count} of {} resumed genomes were replaced by that clone and its mutated relatives",
+        trainer.genomes.len()
+    );
+    warm.note(&seeded)
 }
 
 /// How a run was asked for: how long it may run, where it starts from, and what to do
@@ -284,16 +388,17 @@ pub struct RunPlan {
     pub seed_from_champion: Option<PathBuf>,
     /// The easier level to fall back to when the run stalls, and for how long.
     pub curriculum: Option<Curriculum>,
-    /// Warm a **fresh** population from the level's certified **timed plan** (Phase 1): compile a
-    /// [`sim::route_plan::RoutePlan`], clone its block-aligned demonstration with DAgger, and start
-    /// a quarter of generation 0 from that clone.
+    /// Warm the population from the level's certified **timed plan** (Phase 1): compile a
+    /// [`sim::route_plan::RoutePlan`], clone its block-aligned demonstration with DAgger, and seed
+    /// a quarter of the population from that clone.
     ///
     /// It is a *default* for the window rather than something to ask for, because the level the
     /// window trains on is usually one somebody has just drawn. It replaces the old tick-indexed
     /// route walk, whose clone could not place a press on the policy's own cadence. A level the
     /// planner cannot route starts **random** and says why in the run's origin note; it is never
-    /// warmed from the weaker route instead. Ignored when the run resumes a checkpoint, which
-    /// already *has* a population.
+    /// warmed from the weaker route instead. A **resumed** checkpoint keeps its cohort and receives
+    /// the clone in its weakest slots ([`warm_resumed_from_plan`]); only a run seeded from a champion
+    /// ignores this, because that champion's reheated shell is already the starting population.
     pub warm_from_plan: bool,
 }
 
@@ -383,8 +488,38 @@ pub fn save_champion(
     let champion = ChampionFile::new(&best.genome, &best.result, level, best.generation, config);
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let path = dir.join(format!("{stem}.json"));
+    // **A champion file is a high-water mark.** It used to be overwritten by whichever run
+    // stopped last, so resuming a checkpoint and closing before the record caught up replaced the
+    // better champion beside it with the checkpoint's older best. A save that cannot beat what is
+    // already there keeps the file (and the same genome saved twice is a no-op, not an error).
+    if let Some(existing) = read_champion(&path) {
+        if existing.fitness > champion.fitness {
+            return Err(format!(
+                "kept {}: it already holds a better champion (fitness {:.2} vs {:.2})",
+                path.display(),
+                existing.fitness,
+                champion.fitness
+            ));
+        }
+        if existing.fitness == champion.fitness
+            && existing.metadata.genome_id == champion.metadata.genome_id
+            && existing.metadata.generation == champion.metadata.generation
+        {
+            return Ok(path);
+        }
+    }
     champion.save(&path)?;
     Ok(path)
+}
+
+/// Read a champion file without making a claim about the level it belongs to.
+///
+/// This is a guard for the save above, not a loader: a file that cannot be parsed is replaced
+/// (the save is the only way to repair it), and a file that parses is compared on the one number
+/// its recording episode carries.
+fn read_champion(path: &Path) -> Option<ChampionFile> {
+    let src = std::fs::read_to_string(path).ok()?;
+    ChampionFile::from_json_str(&src).ok()
 }
 
 /// One agent of a generation, as it travels to the window.
@@ -715,10 +850,10 @@ pub struct Generator {
     /// One line per step — a run that practised its way past three spots says so three
     /// times.
     curriculum: Option<String>,
-    /// The run's standing best when the last derived practice step fired: the gate that
-    /// allows one step per *stall spell* rather than one per run, and never two in the
-    /// same spell.
-    detour_best: f32,
+    /// How many practice excursions this stall spell has spent, and when the next is due.
+    /// See [`evo::DetourGate`]: one attempt per stall, retried after a cooldown when the
+    /// excursion learns nothing, and reset by a real improvement.
+    detour_arm: DetourGate,
     /// The practice detour currently running, if any. See [`Detour`].
     detour: Option<Detour>,
     traces: TraceLog,
@@ -864,6 +999,14 @@ impl Generator {
                 if let Some(record) = record {
                     trainer.seed_record_from_checkpoint(&level, record)?;
                 }
+                // A checkpoint is a place the run stopped, and the planner is the one thing that
+                // can say what the next proven route from the spawn is. Injecting the plan's clone
+                // into the weakest quarter keeps the cohort and gives it the demonstration it did
+                // not have when it first started.
+                if plan.warm_from_plan {
+                    let note = warm_resumed_from_plan(&mut trainer, &level, &cfg);
+                    origin.push_str(&format!("; {note}"));
+                }
                 (trainer, Some(origin))
             }
             // A champion is the other artifact a run leaves behind. It is one genome rather
@@ -906,7 +1049,7 @@ impl Generator {
             out_dir,
             origin,
             curriculum: None,
-            detour_best: f32::NEG_INFINITY,
+            detour_arm: DetourGate::new(),
             detour: None,
             traces: TraceLog::new(),
             history: Vec::new(),
@@ -931,6 +1074,75 @@ impl Generator {
     /// The checkpoint this run was started from, as a note for the viewer.
     pub fn origin(&self) -> Option<&str> {
         self.origin.as_deref()
+    }
+
+    /// Where this run writes its population checkpoint.
+    pub fn checkpoint_path(&self) -> PathBuf {
+        self.out_dir.join(format!("{}.population.json", self.stem))
+    }
+
+    /// Snapshot the population with the run's record attached.
+    ///
+    /// A checkpoint without the record cannot resume a solved run that lost its winning lineage,
+    /// and the record is `PopulationFile`'s own field rather than a second file for exactly that
+    /// reason. The note is the front-end's words for why the file exists.
+    fn save_checkpoint(&self, note: impl Into<String>) -> Result<PathBuf, String> {
+        let path = self.checkpoint_path();
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        PopulationFile::new(
+            &self.trainer.genomes,
+            self.trainer.generation,
+            &self.level,
+            &self.cfg,
+            note,
+        )
+        .with_best(self.trainer.best_ever().map(|best| &best.genome))
+        .save(&path)?;
+        Ok(path)
+    }
+
+    /// **Write the run's artifacts before the worker leaves.**
+    ///
+    /// Closing the window is the ordinary way a run ends, and before this it wrote only a
+    /// champion when the generation cap was reached: a viewer who stopped after an hour kept no
+    /// champion and no cohort, and a resume button would have had nothing to resume. Both files
+    /// are written here, on the worker, while the trainer still owns the exact population the
+    /// last packet described.
+    ///
+    /// A detour in flight is settled first: it writes the same checkpoint path from its own
+    /// thread, and two writers racing over one file is how a resume reads a half-updated cohort.
+    /// Waiting is bounded by one practice detour and happens only as the run is ending.
+    ///
+    /// `checkpoint` is false when the window is leaving this run to resume a checkpoint that is
+    /// already on disk ([`Lab::stop_without_checkpoint`]); the champion is still written, since it
+    /// is a high-water mark and cannot replace a better file.
+    fn save_on_stop(&mut self, why: &str, checkpoint: bool) {
+        self.settle_detour(true);
+        if checkpoint {
+            let note = format!("{why} at generation {}", self.trainer.generation);
+            match self.save_checkpoint(&note) {
+                Ok(path) => {
+                    if profiling() {
+                        eprintln!("lab checkpoint {}", path.display());
+                    }
+                }
+                Err(err) => eprintln!("checkpoint: {err}"),
+            }
+        }
+        if let Some(best) = self.trainer.best_ever() {
+            let champion = save_champion(best, &self.level, &self.cfg, &self.out_dir, &self.stem);
+            match champion {
+                Ok(path) => {
+                    if profiling() {
+                        eprintln!("lab champion {}", path.display());
+                    }
+                }
+                Err(err) => eprintln!("champion: {err}"),
+            }
+        }
     }
 
     /// The level a generation is being evaluated on. The window reads the run's level
@@ -1025,6 +1237,7 @@ impl Generator {
         // Restart's own meaning — a fresh population — takes over again.
         self.plan.seed_from_champion = None;
         self.curriculum = None;
+        self.detour_arm = DetourGate::new();
         self.origin = origin;
         // The codex follows the *level*, not the population: a restart keeps what the level has
         // already produced (it is a journal of the geometry), and a restart onto another level
@@ -1064,11 +1277,9 @@ impl Generator {
 
     /// Start the stall's practice detour on its own thread. See [`Detour`].
     ///
-    /// The population is snapshotted, and the arm closes (`detour_best`) before the thread
-    /// starts, so a run that stalls again while the detour is in flight neither starts a second
-    /// one nor re-reports the same spell.
-    fn begin_detour(&mut self, label: String, best: f32) {
-        self.detour_best = best;
+    /// The attempt is consumed by the caller before the thread starts, so a run that stalls again
+    /// while the detour is in flight neither starts a second one nor re-reports the same spell.
+    fn begin_detour(&mut self, label: String) {
         let mut trainer = self.trainer.clone();
         let main = self.level.clone();
         let authored = self.plan.curriculum.clone();
@@ -1369,14 +1580,24 @@ impl Generator {
         // derived practice re-arms on every *new* stall spell — a practice run has to
         // work through a spot, keep the gain, and meet the next spot — and never twice
         // within one, so a detour that learns nothing cannot loop (finding 50).
+        // A run whose **record** has solved the level is not stalled, whatever the last
+        // generation's win count says: a walker level can hand the solved elite a patrol phase it
+        // fails, and the old rule then stepped back to practise a crossing the run has already
+        // won — spending forty generations away from the speed objective the mastery league is
+        // actually optimising. The history already keeps a per-generation win count; the record's
+        // solved state is the run-level reading the detour gate needs.
+        self.detour_arm
+            .observe(report.max_fitness, report.generation);
         let armed = self.detour.is_none()
+            && !report.record_solved
             && match &self.plan.curriculum {
                 Some(_) => self.curriculum.is_none(),
-                None => report.max_fitness > self.detour_best,
+                None => self.detour_arm.armed(report.generation),
             };
         if armed {
             if let Some(stall) = fitness_stall(&self.history) {
-                self.begin_detour(stall.label(), report.max_fitness);
+                self.detour_arm.fire(report.generation);
+                self.begin_detour(stall.label());
             }
         }
 
@@ -1388,6 +1609,20 @@ impl Generator {
         let finished = self.plan.cap.is_some_and(|t| run >= t);
         if finished {
             self.settle_detour(true);
+        } else if report.generation > 0
+            && report.generation % AUTO_CHECKPOINT_GENERATIONS == 0
+            && self.detour.is_none()
+        {
+            // A generation boundary is the only safe place to snapshot the cohort: the next
+            // generation has not been bred, so every genome in the file is one this run has
+            // actually scored. The detour is skipped because it writes the same file from its
+            // own thread.
+            if let Err(err) = self.save_checkpoint(format!(
+                "autosave at generation {} of a run on {}",
+                report.generation, self.level.name
+            )) {
+                eprintln!("checkpoint: {err}");
+            }
         }
 
         if profiling() {
@@ -1544,6 +1779,9 @@ struct State {
     restart: Option<Restart>,
     mutation_rate: Option<f32>,
     finished: bool,
+    /// The window is leaving this run to resume a checkpoint **that is already on disk**, so the
+    /// worker must not write its own on the way out. See [`Lab::stop_without_checkpoint`].
+    keep_checkpoint: bool,
     /// A worker thread died of a panic rather than of `quit`.
     ///
     /// Set by [`WorkerGuard`] as the stack unwinds, because a panic that is only joined-and-
@@ -1612,6 +1850,7 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon:
                 state = hub.cv.wait(state).unwrap();
             }
             if state.quit {
+                generator.save_on_stop("stopped by the viewer", !state.keep_checkpoint);
                 return;
             }
             state.want_next = false;
@@ -1650,6 +1889,7 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon:
             state = hub.cv.wait(state).unwrap();
         }
         if state.quit {
+            generator.save_on_stop("stopped by the viewer", !state.keep_checkpoint);
             return;
         }
         state.queued = Some(packet);
@@ -1658,6 +1898,7 @@ fn work(hub: Arc<Hub>, mut generator: Generator, initial_rate: f32, pool: rayon:
         }
         hub.cv.notify_all();
         if finished {
+            generator.save_on_stop("reached its generation cap", true);
             return;
         }
     }
@@ -1736,6 +1977,11 @@ pub struct Lab {
     /// fresh (`--resume`). The window shows it once, because a number on screen that came
     /// from another level deserves saying so.
     origin: Option<String>,
+    /// The file [`Self::origin`] describes. Kept separately because the origin is a sentence for
+    /// a person and this is the identity the window's *Resume checkpoint* control compares: a run
+    /// that already owns the checkpoint may flush its newest cohort into it, while a fresh run
+    /// replacing one must not.
+    resumed_from: Option<PathBuf>,
 }
 
 impl Lab {
@@ -1766,6 +2012,7 @@ impl Lab {
         // A checkpoint that cannot be loaded is a startup error, not a run that quietly
         // trains something else: it is the same refusal the terminal's `--resume` makes.
         let stem = stem.into();
+        let resumed_from = plan.resume.clone();
         let generator = Generator::new(
             level.clone(),
             cfg.clone(),
@@ -1813,6 +2060,7 @@ impl Lab {
             config: cfg,
             out_dir,
             origin,
+            resumed_from,
         })
     }
 
@@ -1827,6 +2075,14 @@ impl Lab {
     /// after the level it is actually training on rather than the one it opened with.
     pub fn stem(&self) -> String {
         self.stem.clone()
+    }
+
+    /// The checkpoint file this run was started from, when it was resumed rather than started
+    /// fresh. The window compares it with the file *Resume checkpoint* would read: a run that
+    /// already owns that file may flush its newest cohort into it, while a fresh run replacing one
+    /// must leave the file alone.
+    pub fn resumed_from(&self) -> Option<&Path> {
+        self.resumed_from.as_deref()
     }
 
     /// The checkpoint this run started from, when it was resumed rather than started
@@ -1983,6 +2239,11 @@ impl Lab {
         self.out_dir.join(format!("{}.json", self.stem))
     }
 
+    /// The population checkpoint this run autosaves, and the file *Resume checkpoint* reads.
+    pub fn checkpoint_path(&self) -> PathBuf {
+        self.out_dir.join(format!("{}.population.json", self.stem))
+    }
+
     /// Replace the population with a new run's on `level`, from `champion` when one was named.
     fn restart_with(
         &mut self,
@@ -1996,6 +2257,10 @@ impl Lab {
         self.level_name = level.name.clone();
         self.stem = stem.into();
         self.config.master_seed = seed;
+        // A restart is a fresh population, so this Lab no longer owns the checkpoint it may
+        // have been started from. Leaving the path here would let *Resume checkpoint* flush the
+        // restarted run into the old run's file on its way out.
+        self.resumed_from = None;
         if champion.is_none() {
             self.origin = None;
         }
@@ -2046,9 +2311,30 @@ impl Lab {
 
     /// Stop the worker and wait for it. A run that outlived its window would keep
     /// training with nobody watching, which is exactly what this design forbids.
+    ///
+    /// The worker writes the run's champion and population checkpoint on its way out, because a
+    /// stop is the ordinary end of a run.
     pub fn stop(&mut self) {
+        self.stop_with(false);
+    }
+
+    /// Stop the worker **without letting it replace the checkpoint already on disk.**
+    ///
+    /// The window's *Resume checkpoint* control is for a population saved by an earlier run, and
+    /// an Evolve view that has just been opened always has a fresh run in it. Stopping that fresh
+    /// run the ordinary way would write its generation-zero cohort over the very file the button
+    /// is about to resume.
+    ///
+    /// The champion is still written: it is a high-water mark ([`save_champion`]), so a fresh
+    /// run's weaker genome cannot replace a better one beside it.
+    pub fn stop_without_checkpoint(&mut self) {
+        self.stop_with(true);
+    }
+
+    fn stop_with(&mut self, keep_checkpoint: bool) {
         {
             let mut state = self.hub.state.lock().unwrap();
+            state.keep_checkpoint = keep_checkpoint;
             state.quit = true;
             self.hub.cv.notify_all();
         }
@@ -2670,6 +2956,97 @@ mod tests {
         assert!(second.packet().finished, "the cap was two");
     }
 
+    /// **Closing a run is a stop, and a stop has to leave the two artifacts that make the work
+    /// resumable.** The window used to save only a champion, and only when a generation cap was
+    /// reached; a run stopped at the keyboard kept nothing but a stall detour's checkpoint. Both
+    /// files are written by the worker on the way out.
+    #[test]
+    fn stopping_a_run_writes_its_champion_and_population_checkpoint() {
+        let level = shipped("l1-flat-run");
+        let dir = scratch("lab-stop-artifacts");
+        let mut lab = Lab::start(
+            &level,
+            tiny_config(),
+            2,
+            2,
+            RunPlan::default(),
+            dir,
+            "lab-stop",
+        )
+        .expect("thread starts");
+        let first = lab
+            .wait_for_first(Duration::from_secs(30))
+            .expect("the first generation arrives");
+        assert!(
+            first.packet().best.is_some(),
+            "a scored generation has a best-ever genome to save"
+        );
+        assert!(!lab.champion_path().is_file());
+        assert!(!lab.checkpoint_path().is_file());
+
+        lab.stop();
+
+        let champion = ChampionFile::load_for_level(lab.champion_path(), &level)
+            .expect("the stopped run left a readable champion");
+        let checkpoint = PopulationFile::load(lab.checkpoint_path())
+            .expect("the stopped run left a readable population checkpoint");
+        assert_eq!(
+            champion.metadata.generation,
+            first.packet().generation,
+            "the champion is the record of the generation on screen ({}); checkpoint note: {}",
+            first.packet().generation,
+            checkpoint.note
+        );
+        assert_eq!(
+            checkpoint.generation,
+            first.packet().generation + 1,
+            "a checkpoint records the generation its population is ready to evaluate"
+        );
+        assert_eq!(checkpoint.networks.len(), tiny_config().pop_size);
+        assert!(
+            checkpoint.note.contains("stopped by the viewer"),
+            "the checkpoint says why it exists: {:?}",
+            checkpoint.note
+        );
+    }
+
+    /// Closing the window is `Lab` being dropped, not an explicit stop: the ordinary way a run
+    /// ends has to leave the same artifacts as the keyboard one. This is the close-path regression
+    /// the stop test above cannot see because it calls `stop()` by hand.
+    #[test]
+    fn dropping_a_run_writes_its_champion_and_population_checkpoint() {
+        let level = shipped("l1-flat-run");
+        let dir = scratch("lab-drop-artifacts");
+        let mut lab = Lab::start(
+            &level,
+            tiny_config(),
+            2,
+            2,
+            RunPlan::default(),
+            dir,
+            "lab-drop",
+        )
+        .expect("thread starts");
+        lab.wait_for_first(Duration::from_secs(30))
+            .expect("the first generation arrives");
+        let champion = lab.champion_path();
+        let checkpoint = lab.checkpoint_path();
+        assert!(!champion.is_file());
+        assert!(!checkpoint.is_file());
+
+        drop(lab);
+
+        ChampionFile::load_for_level(&champion, &level)
+            .expect("the dropped run left a readable champion");
+        let checkpoint = PopulationFile::load(&checkpoint)
+            .expect("the dropped run left a readable population checkpoint");
+        assert!(
+            checkpoint.note.contains("stopped by the viewer"),
+            "the checkpoint says why it exists: {:?}",
+            checkpoint.note
+        );
+    }
+
     #[test]
     fn a_fresh_run_starts_on_the_level_it_was_asked_for() {
         let level = shipped("l1-flat-run");
@@ -2763,6 +3140,39 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// **A worse run must not overwrite the champion it was resumed from.** This is the artifact
+    /// failure a resume can produce on its first generation: the checkpoint's record is older than
+    /// the champion saved beside it, and the old save code wrote whichever stopped last. The file
+    /// is the better evidence and has to survive.
+    #[test]
+    fn a_lower_champion_does_not_replace_the_better_file() {
+        let level = shipped("l1-flat-run");
+        let dir = scratch("champion-high-water");
+        let mut generator = new_generator("l1-flat-run", Some(1));
+        let packet = generator.next_packet();
+        let better = packet.best.clone().expect("a scored generation has a best");
+        let path = save_champion(&better, &level, &tiny_config(), &dir, "l1-flat-run")
+            .expect("the first champion writes");
+        let before = std::fs::read_to_string(&path).expect("the file is readable");
+
+        let mut worse = better.clone();
+        worse.result.fitness = better.result.fitness * 0.5;
+        worse.genome.id = worse.genome.id.wrapping_add(1);
+        let err = save_champion(&worse, &level, &tiny_config(), &dir, "l1-flat-run")
+            .expect_err("a lower score must not overwrite the record");
+        assert!(
+            err.contains("already holds a better champion"),
+            "the refusal names the reason: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file is still readable"),
+            before,
+            "the better champion file changed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A real run's best-ever genome, written to a scratch champion file.
@@ -3297,6 +3707,60 @@ mod tests {
                 && note.contains("cloned")
                 && note.contains("mastery"),
             "the note names the plan's legs, the clone and which leg the clone stops on: {note}"
+        );
+    }
+
+    /// **A resumed cohort gets the plan's clone without becoming a new run.** The checkpoint's
+    /// generation, ids and remaining genomes stay; the weakest quarter is replaced by the clone
+    /// and its mutated relatives, which is the one thing a stalled population could not give
+    /// itself.
+    #[test]
+    fn a_resumed_population_keeps_its_generation_and_gets_the_plan_clone() {
+        let level = shipped("l2-first-gap");
+        let cfg = tiny_config();
+        let mut rng = sim::rng::rng_from_seed(9);
+        let pop: Vec<Genome> = (0..cfg.pop_size)
+            .map(|i| Genome::random(i as u32, cfg.shape.clone(), &mut rng))
+            .collect();
+        let mut trainer =
+            Trainer::resume(cfg.clone(), pop.clone(), 7).expect("a population resumes");
+        let imit = ImitateConfig {
+            epochs: 20,
+            ..ImitateConfig::default()
+        };
+        let note = warm_resumed_from_plan_with(&mut trainer, &level, &cfg, &imit);
+
+        assert_eq!(
+            trainer.generation, 7,
+            "resuming is not restarting: the epoch clock continues"
+        );
+        assert_eq!(trainer.genomes.len(), cfg.pop_size);
+        assert_eq!(
+            trainer.genomes[0].id, pop[0].id,
+            "the cohort's leading genome was overwritten by the warm set"
+        );
+        assert_eq!(
+            trainer.genomes[1].id, pop[1].id,
+            "the cohort's second leading genome was overwritten by the warm set"
+        );
+        assert!(
+            note.starts_with("warmed from this level's timed plan")
+                && note.contains("resumed genomes were replaced"),
+            "the origin note says what was replaced: {note}"
+        );
+        // The checkpoint's own members are still there: only the quarter the planner replaces
+        // has zero fitness, and the rest are the genomes that were handed over.
+        assert!(
+            trainer.genomes.iter().filter(|g| g.fitness == 0.0).count()
+                >= (cfg.pop_size / 4).max(1),
+            "the plan's clone and relatives occupy the weakest slots"
+        );
+        assert!(
+            pop.iter()
+                .filter(|g| trainer.genomes.iter().any(|n| n.weights == g.weights))
+                .count()
+                > 0,
+            "the resumed cohort is not thrown away"
         );
     }
 

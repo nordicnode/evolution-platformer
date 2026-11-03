@@ -78,6 +78,88 @@ use crate::genome::{crossover, Genome};
 /// what a curriculum step costs.
 pub const DEFAULT_CURRICULUM_GENERATIONS: u32 = 40;
 
+/// Attempts a derived practice detour gets at one stall spell before the arm stops retrying.
+///
+/// Three, not one. The first version disarmed after a single step and only re-armed if the run's
+/// best *improved* — but a detour exists for the case where forty generations on the next crossing
+/// did not move the main level at all, so the arm closed permanently on exactly the run that needed
+/// another attempt. Two retries are enough to give a stochastic crossing a different draw (the
+/// population has moved on, even though the practice level has not) without turning a search that
+/// cannot learn a move into an infinite loop.
+pub const DETOUR_MAX_ATTEMPTS: u32 = 3;
+
+/// Generations between retries of a detour that did not move the main level.
+///
+/// The population needs time to breed on the main level after the excursion returns; retrying on
+/// the next generation would run the same lesson against the same cohort. Two hundred generations
+/// is eight ordinary stall windows, and it is still short enough that a long afternoon's run
+/// reaches its third attempt. A number rather than "whenever the stall rule fires again", because
+/// that rule stays true for the rest of a stalled run.
+pub const DETOUR_RETRY_GENERATIONS: u32 = 200;
+
+/// **How often a run may step back to practise where it is stuck.**
+///
+/// The one owner of the retry policy for both front-ends. It is a small state machine rather than
+/// two fields in each caller because the app and `train-cli watch` used to implement the same
+/// gate with different code, and one of them counted attempts while the other could not retry at
+/// all. A run observes its best every generation; an improvement reopens the arm, and a detour
+/// consumes one attempt and schedules the next.
+#[derive(Clone, Debug)]
+pub struct DetourGate {
+    best: f32,
+    attempts: u32,
+    retry_at: Option<u32>,
+}
+
+impl Default for DetourGate {
+    fn default() -> Self {
+        Self {
+            best: f32::NEG_INFINITY,
+            attempts: 0,
+            retry_at: None,
+        }
+    }
+}
+
+impl DetourGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read this generation's best. A real improvement means the last excursion (or the search
+    /// itself) found something: the stall is over, so the attempt budget resets.
+    pub fn observe(&mut self, best: f32, _generation: u32) {
+        if best > self.best {
+            self.best = best;
+            self.attempts = 0;
+            self.retry_at = None;
+        }
+    }
+
+    /// May a detour start on this generation?
+    pub fn armed(&self, generation: u32) -> bool {
+        self.attempts < DETOUR_MAX_ATTEMPTS && self.retry_at.is_none_or(|at| generation >= at)
+    }
+
+    /// Consume one attempt and schedule the next. Returns the attempt index, zero-based.
+    ///
+    /// Called when the detour is *started*, not when it finishes: an attempt that panics, finds
+    /// nowhere to practise or cannot write its checkpoint is still an attempt, and counting it
+    /// only on success is how a failed step becomes a loop.
+    pub fn fire(&mut self, generation: u32) -> u32 {
+        let attempt = self.attempts;
+        self.attempts = self.attempts.saturating_add(1);
+        self.retry_at = (self.attempts < DETOUR_MAX_ATTEMPTS)
+            .then(|| generation.saturating_add(DETOUR_RETRY_GENERATIONS));
+        attempt
+    }
+
+    /// Attempts consumed since the last improvement.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
 /// What one curriculum step did, as numbers rather than as a sentence.
 ///
 /// The numbers are here and the phrasing is below so that the terminal's log line and
@@ -471,12 +553,43 @@ fn standable_spawn(main: &Level, col: i32, ty: i32) -> Option<(i32, i32)> {
 /// * **Then the straight line**, which only has to break ties between stands that share a
 ///   rung — and on a single-level floor, where every stand shares one rung, it *is* the rule,
 ///   which is what keeps a flat fixture's answer unchanged.
-fn route_rank(routes: &sim::reach::GoalRoutes, stand: usize, approach: f32) -> StandRank {
+///
+/// A crossing that **keeps** the hop count is still a crossing ahead when it lands closer to
+/// the flag. That is the last step off a shuttle: the deck and the ground past it are both one
+/// jump from the flag, so the route's count cannot fall, but the jump is the move the run died
+/// on. Counting only strictly-fewer crossings marked that deck "nothing ahead" and ranked the
+/// platform behind it — two rungs back — as the frontier, so the practice level ended *behind*
+/// the champion. The same forward rule [`next_after`] uses is applied here: fewer crossings, or
+/// the same count and a landing that reads closer.
+fn route_rank(
+    routes: &sim::reach::GoalRoutes,
+    stand: usize,
+    approach: f32,
+    goal: &Rect,
+) -> StandRank {
     let hops = routes.hops_to_flag(stand).unwrap_or(u32::MAX);
+    // The same reading `next_after` takes: a stand's own approach is measured from its centre,
+    // so "lands closer" means the same thing here as it does when the practice flag is chosen.
+    let (from_surface, from_x0, from_x1) = routes.zone_bounds(stand);
+    let from_approach = stand_approach(
+        goal,
+        ((from_x0 + from_x1) as f32 * 0.5).floor() as i32,
+        from_surface,
+    );
     let crossing_ahead = hops > 0
-        && routes
-            .crossing_stands_from(stand)
-            .any(|j| routes.hops_to_flag(j).is_some_and(|hj| hj < hops));
+        && routes.crossing_stands_from(stand).any(|j| {
+            let Some(hj) = routes.hops_to_flag(j) else {
+                return false;
+            };
+            if hj < hops {
+                return true;
+            }
+            if hj > hops {
+                return false;
+            }
+            let (surface, x0, x1) = routes.zone_bounds(j);
+            (x0..=x1).any(|c| stand_approach(goal, c, surface) < from_approach)
+        });
     StandRank {
         nothing_ahead: u8::from(!crossing_ahead),
         hops,
@@ -552,6 +665,7 @@ fn stall_spots(
 ) -> Option<(Option<usize>, (i32, i32))> {
     let mut runner = EpisodeRunner::new(level, genome.clone(), eval, seed);
     let routes = level.routes();
+    let goal = level.goals.first()?;
     // The episode opens on the spawn, so the first reading is the spawn's own: the
     // baseline the deepest stand has to beat.
     let start_approach = runner.sim().goal_approach();
@@ -561,7 +675,7 @@ fn stall_spots(
         .zone_at(spawn_col, spawn_surface)
         .or_else(|| routes.zone_at(spawn_col - 1, spawn_surface))
         .or_else(|| routes.zone_at(spawn_col + 1, spawn_surface))
-        .map(|s| route_rank(routes, s, start_approach))
+        .map(|s| route_rank(routes, s, start_approach, goal))
         // A spawn that is not on a route stand at all: nothing to compare against, so any
         // stand the body reaches is an improvement.
         .unwrap_or(StandRank {
@@ -588,7 +702,7 @@ fn stall_spots(
         let Some(stand) = routes.zone_at(col, surface) else {
             continue;
         };
-        let rank = route_rank(routes, stand, sim.goal_approach());
+        let rank = route_rank(routes, stand, sim.goal_approach(), goal);
         if rank >= start {
             continue;
         }
@@ -1387,6 +1501,33 @@ mod tests {
         }
     }
 
+    /// **A detour that learns nothing is not the end of the stall chain.** The old gate only
+    /// re-armed when the run's best improved, so the first failed excursion disabled practice for
+    /// the rest of the run — exactly the case the excursion exists for. The gate now retries twice
+    /// after a bounded cooldown, and a real improvement resets the budget.
+    #[test]
+    fn a_failed_detour_retries_after_its_cooldown_and_an_improvement_resets_it() {
+        let mut gate = DetourGate::new();
+        gate.observe(100.0, 0);
+        assert!(gate.armed(0), "the first stall may practise");
+        assert_eq!(gate.fire(25), 0);
+        assert!(!gate.armed(25 + DETOUR_RETRY_GENERATIONS - 1));
+        assert!(gate.armed(25 + DETOUR_RETRY_GENERATIONS));
+
+        assert_eq!(gate.fire(225), 1);
+        assert!(gate.armed(425));
+        assert_eq!(gate.fire(425), 2);
+        assert!(
+            !gate.armed(10_000),
+            "three attempts is the budget for one stall spell"
+        );
+
+        // A real improvement is a new spell: the attempt budget starts over.
+        gate.observe(101.0, 426);
+        assert!(gate.armed(426));
+        assert_eq!(gate.attempts(), 0);
+    }
+
     /// A directory of this run's own, so two tests running at once cannot write over
     /// one another's checkpoint.
     fn temp_dir(tag: &str) -> PathBuf {
@@ -2022,6 +2163,43 @@ mod tests {
             next_stand_from(&main, deck),
             Some((16, 5)),
             "and the crossing is read off the deck's own route, not the spawn's"
+        );
+    }
+
+    #[test]
+    fn a_deck_one_jump_from_the_flag_outranks_the_platform_behind_it() {
+        // The L11 frontier, as the saved champion stands it: a shuttle deck at columns 60..62
+        // whose next crossing lands at 63..66. Both stands are one route step from the flag, so
+        // the hop count cannot fall; only the landing's distance can. The old rank called that
+        // deck "nothing ahead" and chose the platform at 53..55, two rungs back, as the place the
+        // run was stuck — the practice level ended at 56, behind the champion's death at x 61.
+        // This pins the ordering that makes the practice flag land at 63.
+        let level = Level::from_json_str(include_str!("../../../levels/l11-the-elements.json"))
+            .expect("the shipped l11 level loads");
+        let routes = level.routes();
+        let goal = level.goals.first().expect("l11 has a flag");
+        let deck = (0..routes.len())
+            .find(|&s| routes.zone_bounds(s) == (8, 60, 62))
+            .expect("the shuttle's far deck is a stand");
+        let behind = (0..routes.len())
+            .find(|&s| routes.zone_bounds(s) == (8, 53, 55))
+            .expect("the platform behind the deck is a stand");
+        let approach = 8.0;
+        assert!(
+            route_rank(routes, deck, approach, goal) < route_rank(routes, behind, approach, goal),
+            "the deck the champion died on must rank ahead of the platform it already crossed"
+        );
+        assert_eq!(
+            next_stand_from(&level, deck),
+            Some((63, 7)),
+            "the crossing off the deck is the one the practice level has to teach"
+        );
+        let practice = practice_level_from(&level, (40, 8), Some(deck))
+            .expect("the deck's crossing can be practised from the ground behind it");
+        assert_eq!(
+            practice.goal_tiles(),
+            vec![(63, 7)],
+            "the practice flag is past the champion, not behind it"
         );
     }
 

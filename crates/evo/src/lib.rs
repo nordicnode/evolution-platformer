@@ -54,8 +54,8 @@ pub use committee::{
 pub use curriculum::{
     curriculum_step, fuse_specialists, fused_seeding, next_stand, plan_segments, practice_level,
     practice_level_between, practice_level_for_stall, practice_step, save_practice_level,
-    segment_campaign, stuck_point, CurriculumStep, FuseConfig, PlanSegment, SegmentCampaign,
-    DEFAULT_CURRICULUM_GENERATIONS,
+    segment_campaign, stuck_point, CurriculumStep, DetourGate, FuseConfig, PlanSegment,
+    SegmentCampaign, DEFAULT_CURRICULUM_GENERATIONS, DETOUR_MAX_ATTEMPTS, DETOUR_RETRY_GENERATIONS,
 };
 pub use demos::{fit as fit_demo, DemoDecision, HumanDemo, DEMO_FORMAT, DEMO_VERSION};
 pub use discovery::{
