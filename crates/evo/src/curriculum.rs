@@ -932,7 +932,25 @@ pub fn practice_level_from(
         "{} practice at tile ({tx}, {ty}) to tile ({gx}, {gy})",
         main.name
     );
+    clear_spawn_and_goal(&mut practice);
     Ok(practice)
+}
+
+/// **An enemy already standing where the practice episode opens or ends is removed.**
+///
+/// A derived level starts the body where the segment began, and an enemy authored over that tile
+/// kills every episode on its first tick: the detour then spends its generations learning that
+/// the spawn is lethal, reports a best of `-20`, and comes back without ever attempting the
+/// crossing it was sent to practise. The same is true of a chaser parked on the flag — touching
+/// it is the only way to win. The terrain is untouched, and so are the patrols the crossing has
+/// to be timed against: only the boxes that overlap the two ends are removed.
+fn clear_spawn_and_goal(practice: &mut Level) {
+    let body = practice.spawn;
+    let goal = practice.goals.first().copied();
+    let occupied = |r: &sim::Rect| r.overlaps(&body) || goal.is_some_and(|g| r.overlaps(&g));
+    practice.walkers.retain(|w| !occupied(w));
+    practice.chasers.retain(|c| !occupied(c));
+    practice.flyers.retain(|f| !occupied(&f.rect));
 }
 
 /// Write a derived practice level beside the run's checkpoint
@@ -983,7 +1001,187 @@ pub fn practice_level_for_stall(trainer: &Trainer, main: &Level) -> Result<Level
         stall_spots(main, &best.genome, &eval, best.result.seed).ok_or_else(|| {
             "the best genome has never stood anywhere it did not start from".to_string()
         })?;
+    // **A stand the route cannot reach is a lesson at the wrong place.** The best genome is one
+    // draw of the search, and on a level whose crossing the canonical sweep has no edge for (a pad
+    // bounce, a steered launch, a rope chain) the one genome that crossed it stands somewhere the
+    // route graph cannot. Practising from there teaches the *tail* after the barrier — on
+    // `untitled-5` the detour was built from x=50 to x=55 while the population could not get past
+    // x=39 — so forty generations polish a walk instead of the crossing that is actually blocking
+    // the run. When that happens the lesson moves to the barrier: spawn on the last stand the route
+    // can reach, and put the flag on the stand the genome crossed to. The move is then one
+    // decision boundary away from the spawn, which is the whole of what a practice level is for.
+    if let Some(start) = sim::spawn_route_stand(main) {
+        let routes = main.routes();
+        let reachable = routes.reachable_from(start);
+        let far = stand.filter(|&s| s < reachable.len() && !reachable[s]);
+        if let Some(far) = far {
+            if let Some(practice) = barrier_lesson(main, routes, &reachable, far)? {
+                return Ok(practice);
+            }
+        }
+        // **A stall the route graph calls "already there".** The coarse platform table keeps one
+        // surface across a spike run (a policy may pad over it), so the stand the run is stuck on
+        // can read as the flag's own ground and still have no canonical crossing at all —
+        // `untitled-5` is exactly this: the body dies at x=39 in front of a six-tile run with a
+        // spring at its lip, and `hops_to_flag` for that stand is `None`. There is no crossing to
+        // practise, so the ordinary lesson refuses, and the detour spends its generation on a note
+        // instead of on the crossing. The lesson belongs at the barrier the closure stops at: the
+        // furthest stand the route reaches on the near side, and the nearest stand to its right
+        // that a jump could land on.
+        if stand.is_some_and(|stand| routes.hops_to_flag(stand).is_none()) {
+            if let Some(far) = barrier_target(routes, &reachable) {
+                if let Some(practice) = barrier_lesson(main, routes, &reachable, far)? {
+                    return Ok(practice);
+                }
+            }
+        }
+    }
     practice_level_from(main, spot, stand)
+}
+
+/// **The lesson at the barrier**: spawn on the last stand the route can reach, flag on the stand
+/// the run's best genome crossed to.
+///
+/// `None` when the barrier cannot be expressed as a level — no ground tile on the near side (the
+/// frontier is a deck, and a spawn needs a tile), or no ground tile on the far stand (the far side
+/// is a deck too, and a flag placed in mid-air is not a crossing). The caller then falls back to the
+/// ordinary stall lesson; a barrier that cannot be taught is not an error, it is simply not a
+/// practice level.
+fn barrier_lesson(
+    main: &Level,
+    routes: &sim::reach::GoalRoutes,
+    reachable: &[bool],
+    far: usize,
+) -> Result<Option<Level>, String> {
+    let (Some((sx, sy)), Some((gx, gy))) = (
+        frontier_spawn(main, routes, reachable),
+        first_ground_tile(main, routes, far),
+    ) else {
+        return Ok(None);
+    };
+    let mut practice = practice_level_between(main, (sx, sy), (gx, gy)).map_err(|e| {
+        format!("the barrier lesson at tile ({sx}, {sy}) to ({gx}, {gy}) failed: {e}")
+    })?;
+    practice.name = format!(
+        "{} practice at tile ({sx}, {sy}) to tile ({gx}, {gy})",
+        main.name
+    );
+    Ok(Some(practice))
+}
+
+/// The rightmost **ground** stand the canonical route can reach, and the tile a lesson at the
+/// barrier starts from on it: [`run_up_tiles`] before its lip.
+///
+/// The rightmost stand in the closure is the frontier, and the barrier is off its right-hand
+/// edge. The spawn is deliberately **not** on that lip: a lesson that opens at the lip asks for
+/// the standing jump, and a barrier worth a detour is one a standing jump cannot make. `untitled-5`
+/// is the measured case — a spring pad at the lip of a six-tile spike run, which a body must land on
+/// *descending* to be thrown across, so the body has to arrive at speed rather than appear on it.
+/// A run-up is what makes the lesson the same move the level asks for.
+///
+/// Stands that are moving-platform decks are skipped because there is no tile a spawn can be
+/// placed on; the lesson is still built, one stand further back, rather than dropped.
+fn frontier_spawn(
+    main: &Level,
+    routes: &sim::reach::GoalRoutes,
+    reachable: &[bool],
+) -> Option<(i32, i32)> {
+    // The rightmost reachable stand whose length holds at least one standable tile.
+    let mut frontier: Option<(i32, i32, i32, i32)> = None;
+    for stand in 0..routes.len() {
+        if !reachable.get(stand).copied().unwrap_or(false) {
+            continue;
+        }
+        let (surface, x0, x1) = routes.zone_bounds(stand);
+        if frontier.is_none_or(|(bx1, _, _, _)| x1 > bx1) {
+            frontier = Some((x1, surface, x0, x1));
+        }
+    }
+    let (_, surface, x0, x1) = frontier?;
+    let lip = (x0..=x1)
+        .rev()
+        .filter_map(|col| standable_spawn(main, col, surface - 1))
+        .max()?;
+    let from = (lip.0 - run_up_tiles()).max(x0);
+    (from..=lip.0)
+        .find_map(|col| standable_spawn(main, col, surface - 1))
+        .or(Some(lip))
+}
+
+/// Tiles of run-up a barrier lesson gives the body before the crossing.
+///
+/// The sprint ramp's own runway, rounded up, plus two tiles of approach: `Physics::runway_to_speed`
+/// is what the physics says a body needs to be at sprint speed, and the two tiles are what a person
+/// would call "a step back". Derived rather than written down so a change to acceleration moves the
+/// lesson with it.
+fn run_up_tiles() -> i32 {
+    (sim::PHYSICS
+        .runway_to_speed(sim::PHYSICS.sprint_speed)
+        .ceil() as i32
+        + 2)
+    .max(2)
+}
+
+/// The stand a lesson at the barrier should end on: the nearest stand to the right of the closure's
+/// frontier that a jump could actually land on.
+///
+/// The nearest stand to the right is not always the one to teach. On `untitled-5` a plank hangs
+/// eight rows above the spike run, nearer in x than the far floor and far above a jump's peak; a
+/// flag placed there asks for a crossing no body can make, and the practice run spends its
+/// generations on a wall. A stand more than a full jump above the frontier is therefore skipped and
+/// the search walks on to the next one, which on that level is the floor where the crossing lands.
+fn barrier_target(routes: &sim::reach::GoalRoutes, reachable: &[bool]) -> Option<usize> {
+    let max_rise = sim::PHYSICS.max_jump_height();
+    let mut frontier_x1 = i32::MIN;
+    let mut frontier_row = 0;
+    for stand in 0..routes.len() {
+        if !reachable.get(stand).copied().unwrap_or(false) {
+            continue;
+        }
+        let (row, _, x1) = routes.zone_bounds(stand);
+        if x1 > frontier_x1 {
+            frontier_x1 = x1;
+            frontier_row = row;
+        }
+    }
+    if frontier_x1 == i32::MIN {
+        return None;
+    }
+    let mut best: Option<(i32, usize)> = None;
+    for stand in 0..routes.len() {
+        if reachable.get(stand).copied().unwrap_or(false) {
+            continue;
+        }
+        let (row, x0, _) = routes.zone_bounds(stand);
+        if x0 <= frontier_x1 {
+            continue;
+        }
+        // Rows count downward, so a stand *above* the frontier has the smaller row.
+        if (frontier_row - row) as f32 > max_rise {
+            continue;
+        }
+        if best.is_none_or(|(bx0, _)| x0 < bx0) {
+            best = Some((x0, stand));
+        }
+    }
+    best.map(|(_, stand)| stand)
+}
+
+/// The leftmost tile of a stand a flag can stand on: the near edge of the place the run has to
+/// cross **to**.
+///
+/// The leftmost column is deliberate. The lesson ends as soon as the body arrives, so the flag
+/// belongs where the crossing lands rather than at the stand's far end; a flag placed at x=59 on
+/// `untitled-5`'s far floor would ask for a walk across the stand as well as the crossing.
+fn first_ground_tile(
+    main: &Level,
+    routes: &sim::reach::GoalRoutes,
+    stand: usize,
+) -> Option<(i32, i32)> {
+    let (surface, x0, x1) = routes.zone_bounds(stand);
+    (x0..=x1)
+        .filter_map(|col| standable_spawn(main, col, surface - 1))
+        .min()
 }
 
 /// **One leg of a planned route, as a level that can be practised (WP4).**
@@ -1055,6 +1253,7 @@ pub fn practice_level_between(
         "{} segment ({tx}, {ty}) to ({}, {})",
         main.name, goal_tile.0, goal_tile.1
     );
+    clear_spawn_and_goal(&mut practice);
     Ok(practice)
 }
 
@@ -1930,6 +2129,26 @@ mod tests {
         );
     }
 
+    /// **A patrol authored on the practice spawn is cleared, not inherited.**
+    ///
+    /// The derived level is the run's own level with two ends moved. When an enemy already stood
+    /// on either end, the practice episode opened inside it (or ended by touching it) and every
+    /// generation died on the first tick: the detour's best was the death penalty and the
+    /// crossing it was meant to teach was never attempted. Clearing those boxes is the whole
+    /// fix; the rest of the patrols stay, because they are what the crossing is timed against.
+    #[test]
+    fn a_practice_level_clears_an_enemy_standing_on_its_spawn() {
+        let mut main = gap_runway("ambush", 24, 22, &[(8, 3)]);
+        main.walkers.push(sim::Rect::new(5.0, 5.0, 0.6, 0.6));
+        let practice = practice_level(&main, (5, 5)).expect("tile 5,5 stands on ground");
+        assert!(
+            practice.walkers.is_empty(),
+            "the spawn ambush is still there: {:?}",
+            practice.walkers
+        );
+        assert_eq!(main.walkers.len(), 1, "the source level keeps its walker");
+    }
+
     #[test]
     fn a_practice_level_moves_the_spawn_and_the_flag_and_touches_nothing_else() {
         let main = gap_runway("hard", 24, 22, &[(8, 3)]);
@@ -2282,6 +2501,144 @@ mod tests {
             main.content_hash_string(),
             "a different spawn is a different level"
         );
+    }
+
+    /// **The barrier lesson.** A lucky genome is not a frontier: when the best-ever run stands on
+    /// a side of a crossing the canonical route has no edge across, a practice level built from
+    /// that stand starts *past* the wall and teaches the easy tail. The lesson belongs at the wall
+    /// — and a run-up before it, because the pad that crosses this wall only throws a body that
+    /// lands on it while descending, which a body spawned on the pad cannot do.
+    #[test]
+    fn a_lesson_beyond_a_barrier_is_rebuilt_at_the_barrier() {
+        // Near floor, a nine-tile spike run with a pad at its lip, far floor. Nine is past even a
+        // sprint jump, and the canonical sweep cannot use the pad (a pad only throws a body
+        // descending onto it), so the far floor is exactly the stand a lucky genome reaches and the
+        // route cannot.
+        let mut rows: Vec<String> = (0..8)
+            .map(|y| {
+                if y >= 6 {
+                    "#".repeat(30)
+                } else {
+                    ".".repeat(30)
+                }
+            })
+            .collect();
+        let mut hazard: Vec<char> = ".".repeat(30).chars().collect();
+        hazard[9] = 'v';
+        for cell in hazard.iter_mut().take(20).skip(10) {
+            *cell = '^';
+        }
+        rows[5] = hazard.into_iter().collect();
+        let refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
+        let main = crate::fixture::level("barrier", &refs, (1, 5), &[("goal", 28, 5)]);
+        let routes = main.routes();
+        let start = sim::spawn_route_stand(&main).expect("the spawn stands");
+        let reachable = routes.reachable_from(start);
+        let far = (0..routes.len())
+            .find(|&s| routes.zone_bounds(s).1 >= 20)
+            .expect("a stand past the spikes");
+        assert!(!reachable[far], "the spike run must seal the far floor off");
+
+        let practice = barrier_lesson(&main, routes, &reachable, far)
+            .expect("the lesson builds")
+            .expect("both ends have a ground tile");
+        // The lip is x=9 (the pad) and the spawn is a run-up before it: the lesson has to hand the
+        // body the same approach the level does, or it practises a standing jump at a pad that
+        // only fires on a descending body.
+        assert_eq!(
+            practice.spawn_tile(),
+            (9 - run_up_tiles(), 5),
+            "the body starts a run-up before the pad it has to land on"
+        );
+        assert!(
+            practice.spawn_tile().0 < 9 && run_up_tiles() >= 3,
+            "a run-up of {} tile(s) is no run-up at all",
+            run_up_tiles()
+        );
+        assert_eq!(
+            practice.goal_tiles(),
+            vec![(20, 5)],
+            "the flag is where the crossing lands, not at the level's far end"
+        );
+        let (sx, _) = practice.spawn_tile();
+        assert!(
+            practice
+                .name
+                .contains(&format!("practice at tile ({sx}, 5)")),
+            "the file names both ends: {}",
+            practice.name
+        );
+        // The crossing is really in the level the lesson hands over: spawn on one side of the
+        // spike run, flag on the other.
+        let (sx, _) = practice.spawn_tile();
+        let (gx, _) = practice.goal_tiles()[0];
+        assert!(gx > sx, "the lesson must point the way the run was going");
+    }
+
+    /// **A stall the route graph calls "already there" is still a barrier.**
+    ///
+    /// The coarse platform table keeps one surface across a spike run, so the stand a run dies on
+    /// can have no canonical crossing at all — `untitled-5` at x=39 is the measured case — and the
+    /// ordinary lesson refuses: there is no crossing from here to practise. The detour then spends
+    /// its generation on a note while the population sits in front of the wall. The lesson belongs
+    /// at the edge of the closure: a run-up on the near floor, the flag on the far one.
+    #[test]
+    fn a_stall_before_a_wall_with_no_crossing_is_taught_at_the_wall() {
+        // The spawn's floor at row 6 (x 0..9), a step down to the long floor at row 7, and a
+        // six-tile spike run at row 6, x 22..27. Six is past a jump's four-tile reach, so the far
+        // floor is sealed off while the near one is where the body gets to.
+        let width = 36;
+        let mut rows: Vec<String> = (0..7).map(|_| ".".repeat(width)).collect();
+        let mut near: Vec<char> = ".".repeat(width).chars().collect();
+        for cell in near.iter_mut().take(10) {
+            *cell = '#';
+        }
+        for cell in near.iter_mut().take(28).skip(22) {
+            *cell = '^';
+        }
+        rows[6] = near.into_iter().collect();
+        let far: String = ".".repeat(10) + &"#".repeat(width - 10);
+        rows.push(far);
+        let refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
+        let main = crate::fixture::level("wall", &refs, (1, 5), &[("goal", 33, 6)]);
+        let routes = main.routes();
+        let start = sim::spawn_route_stand(&main).expect("the spawn stands");
+        let reachable = routes.reachable_from(start);
+        let near_stand = routes.zone_at(21, 7).expect("the long floor is a stand");
+        let far_stand = routes.zone_at(33, 7).expect("the far floor is a stand");
+        assert!(reachable[near_stand], "the run gets to the long floor");
+        assert!(!reachable[far_stand], "six spikes seal the far floor off");
+        assert_eq!(
+            routes.hops_to_flag(near_stand),
+            None,
+            "there is no canonical crossing over the spike run"
+        );
+        assert_eq!(
+            barrier_target(routes, &reachable),
+            Some(far_stand),
+            "the lesson ends on the floor the crossing lands on"
+        );
+
+        // A population that can only run: it drops onto the long floor and dies at the spikes, so
+        // its best stand is the one in front of the wall.
+        let zeros = crate::genome::Genome::zeros(1, crate::genome::default_shape());
+        let cfg = GaConfig {
+            mutation_rate: 0.0,
+            master_seed: 7,
+            ..tiny()
+        };
+        let mut trainer = crate::ga::Trainer::resume(cfg, vec![zeros], 0).expect("a population");
+        trainer.step(&main);
+        let practice = practice_level_for_stall(&trainer, &main)
+            .expect("the wall is a lesson even though the stand has no crossing");
+        let (sx, sy) = practice.spawn_tile();
+        assert_eq!((sx, sy), (21 - run_up_tiles(), 6));
+        assert_eq!(
+            practice.goal_tiles(),
+            vec![(28, 6)],
+            "the flag stands where the crossing lands"
+        );
+        assert!(sx < 21, "the body starts before the spikes, not on them");
     }
 
     #[test]

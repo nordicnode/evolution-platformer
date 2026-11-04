@@ -41,23 +41,23 @@ use egui::{
 /// and the readings on them are the brightest things on the screen. A single dark surface
 /// everywhere was what made the window read as a tool: an editor's panels and a game's menu
 /// are the same *shape* but not the same material, and saying so is most of the look.
-pub const SHELL: Color32 = Color32::from_rgb(20, 26, 38);
+pub const SHELL: Color32 = Color32::from_rgb(23, 50, 77);
 /// A panel of chrome — one step up from the frame, and the surface most of the window is made of.
-pub const PANEL: Color32 = Color32::from_rgb(255, 249, 235);
+pub const PANEL: Color32 = Color32::from_rgb(255, 243, 211);
 /// A card, a resting button, an input: a thing lying *on* a panel.
-pub const CARD: Color32 = Color32::from_rgb(255, 255, 250);
+pub const CARD: Color32 = Color32::from_rgb(255, 250, 240);
 /// A raised card: what the pointer is over, or a selected entry.
 pub const CARD_HOVER: Color32 = Color32::from_rgb(255, 255, 255);
 /// A card that cannot be used: quieter than a resting one, and *paler* rather than darker —
 /// a disabled control on a light panel should recede into it, not punch a hole in it.
-pub const CARD_OFF: Color32 = Color32::from_rgb(226, 221, 206);
+pub const CARD_OFF: Color32 = Color32::from_rgb(211, 216, 214);
 /// A well cut into a panel: the switch's socket, the status bar. Recessed, not dark — the
 /// dark surfaces in this window are the two screens ([`SHELL`]) and nothing else.
-pub const SUNKEN: Color32 = Color32::from_rgb(216, 209, 191);
+pub const SUNKEN: Color32 = Color32::from_rgb(215, 244, 233);
 /// A well cut into a *screen*: the chart's plot inside its frame. The one place where the dark
 /// material needs a second depth of its own, so a plot reads as data set into a display rather
 /// than as the display itself.
-pub const SCREEN_WELL: Color32 = Color32::from_rgb(24, 32, 48);
+pub const SCREEN_WELL: Color32 = Color32::from_rgb(32, 71, 96);
 /// The hairline that separates two surfaces.
 ///
 /// Decorative: it divides a panel from a card, and 1.5:1 is the right weight for a line whose job
@@ -76,7 +76,7 @@ pub const EDGE: Color32 = Color32::from_rgb(198, 190, 170);
 /// 3.0:1 on the sunken well and 4.4:1 on a card, which is the WCAG floor for a non-text boundary
 /// (1.4.11), and it is deliberately *not* used for decorative rules: the window has two kinds of
 /// line and now says which is which.
-pub const CONTROL_EDGE: Color32 = Color32::from_rgb(123, 117, 105);
+pub const CONTROL_EDGE: Color32 = Color32::from_rgb(49, 83, 107);
 
 /// The chunky gold outline a piece of chrome wears: the dock along its bottom edge, a panel
 /// frame, the ring around the selected tool.
@@ -87,7 +87,7 @@ pub const CONTROL_EDGE: Color32 = Color32::from_rgb(123, 117, 105);
 /// than two accents.
 pub const GOLD_EDGE: Color32 = Color32::from_rgb(238, 186, 58);
 /// Ink for type *on* [`ACCENT`]: dark, warm, and the only colour that is readable on gold.
-pub const INK_ON_ACCENT: Color32 = Color32::from_rgb(58, 42, 12);
+pub const INK_ON_ACCENT: Color32 = Color32::from_rgb(23, 50, 77);
 
 /// The dock: the bar across the top, one step *up* from a panel and warmer than it.
 ///
@@ -95,7 +95,7 @@ pub const INK_ON_ACCENT: Color32 = Color32::from_rgb(58, 42, 12);
 /// the panels behind it are recessed, and the difference between them is what tells the eye
 /// where the *controls* are. This is the plank's own colour — brighter than a panel, because
 /// it is the surface the light reaches first.
-pub const DOCK: Color32 = Color32::from_rgb(255, 244, 214);
+pub const DOCK: Color32 = Color32::from_rgb(255, 243, 211);
 /// The soft drop shadow a raised surface casts on what is behind it.
 ///
 /// It is also, since the plates lost their bevel lines, the *only* thing that says a control is
@@ -103,10 +103,10 @@ pub const DOCK: Color32 = Color32::from_rgb(255, 244, 214);
 pub const SHADOW: Color32 = Color32::from_rgba_premultiplied(60, 50, 30, 60);
 /// The plate a label sits on when it has to read as a *sign*: the level's name in the dock,
 /// a banner over the canvas. The brightest surface in the window, so the type on it leads.
-pub const PLATE: Color32 = Color32::from_rgb(255, 253, 245);
+pub const PLATE: Color32 = Color32::from_rgb(255, 250, 240);
 
 /// Body text, on chrome: dark ink, because the panels are cream.
-pub const TEXT: Color32 = Color32::from_rgb(48, 45, 38);
+pub const TEXT: Color32 = Color32::from_rgb(23, 50, 77);
 /// Secondary text: units, hints, the small print under a heading.
 ///
 /// **Measured against every chrome surface, not chosen by eye.** The window's panels are cream and
@@ -116,7 +116,7 @@ pub const TEXT: Color32 = Color32::from_rgb(48, 45, 38);
 /// a panel and 3.58 on the well — a hair under the line on one surface and well under it on the
 /// other, which is exactly the kind of miss that a palette review catches and a screenshot does
 /// not.
-pub const TEXT_DIM: Color32 = Color32::from_rgb(94, 88, 75);
+pub const TEXT_DIM: Color32 = Color32::from_rgb(64, 89, 106);
 /// The quietest *active* text: metadata, a material list, the key hint in the status bar.
 ///
 /// 5.07:1 on a panel and 5.89:1 on a card, so it is still readable small — a caption nobody can
@@ -124,21 +124,21 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(94, 88, 75);
 /// floor there): the status bar's own readouts take [`TEXT_DIM`]. A *disabled* label is the one
 /// place the contrast rule relaxes, and it is still drawn in this ink on [`CARD_OFF`] (4.53:1)
 /// rather than in a grey that disappears.
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(103, 97, 84);
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(64, 89, 106);
 
 /// Text *on a dark screen*: the chart's labels and the canvas' readouts, which are drawn on
 /// [`SHELL`] rather than on chrome. Two ink scales rather than one, because a colour that is
 /// legible on cream is invisible on the dark, and the window has both materials in it.
-pub const SCREEN_INK: Color32 = Color32::from_rgb(226, 231, 238);
+pub const SCREEN_INK: Color32 = Color32::from_rgb(255, 243, 211);
 /// Secondary ink on a dark screen.
-pub const SCREEN_INK_DIM: Color32 = Color32::from_rgb(158, 168, 180);
+pub const SCREEN_INK_DIM: Color32 = Color32::from_rgb(143, 217, 238);
 /// The hairline between two surfaces *on* a dark screen: the chart's axes.
 ///
 /// 3.0:1 on the plot's own well and 3.38:1 on the shell around it, which is the floor a chart's
 /// frame and axes have to clear to be *readable* rather than decorative. The old value (74, 84, 98)
 /// measured 2.16:1 on the plot — a gridline that vanished on a bright monitor and a baseline that
 /// was not there at all on a dim one.
-pub const SCREEN_EDGE: Color32 = Color32::from_rgb(104, 118, 136);
+pub const SCREEN_EDGE: Color32 = Color32::from_rgb(96, 165, 188);
 
 /// The *interior* rule of a chart: a gridline, deliberately quieter than [`SCREEN_EDGE`].
 ///
@@ -146,7 +146,7 @@ pub const SCREEN_EDGE: Color32 = Color32::from_rgb(104, 118, 136);
 /// the edge of the display and has to be found, a gridline is a scale a reader consults after the
 /// data has been found. 2.2:1 on the plot is the value the frame had before it was brightened —
 /// right for a rule *inside* a chart, too quiet for the chart's own outline.
-pub const SCREEN_GRID: Color32 = Color32::from_rgb(74, 84, 98);
+pub const SCREEN_GRID: Color32 = Color32::from_rgb(49, 104, 133);
 
 /// The sun's face: the window's accent, and the colour a thing worth looking at gets.
 ///
@@ -154,17 +154,17 @@ pub const SCREEN_GRID: Color32 = Color32::from_rgb(74, 84, 98);
 /// below: this one *fills* something (a selected tool, a lamp on a banner, a curve on the dark
 /// chart), and the inks are for type. Gold type on a cream panel is a smudge, which is why the
 /// window does not have any.
-pub const ACCENT: Color32 = Color32::from_rgb(251, 197, 49);
+pub const ACCENT: Color32 = Color32::from_rgb(255, 204, 66);
 /// The runner's vermilion: an action taken, or a thing currently being done.
-pub const RUN: Color32 = Color32::from_rgb(228, 87, 61);
+pub const RUN: Color32 = Color32::from_rgb(242, 107, 94);
 /// Growth, a win, a good reading.
-pub const GOOD: Color32 = Color32::from_rgb(120, 216, 120);
+pub const GOOD: Color32 = Color32::from_rgb(86, 189, 100);
 /// A warning that is not yet a failure: a stall, a level that needs attention.
-pub const WARN: Color32 = Color32::from_rgb(240, 150, 90);
+pub const WARN: Color32 = Color32::from_rgb(244, 155, 86);
 /// A failure: an unreachable goal, a level that will not load.
-pub const BAD: Color32 = Color32::from_rgb(226, 106, 106);
+pub const BAD: Color32 = Color32::from_rgb(239, 106, 104);
 /// Distance, history, a second series: the cool end of the palette.
-pub const COOL: Color32 = Color32::from_rgb(120, 170, 230);
+pub const COOL: Color32 = Color32::from_rgb(64, 183, 223);
 
 /// The accent as *type* on chrome: dark amber, for a count or a state that is worth looking at.
 ///
@@ -229,7 +229,7 @@ pub fn drop_shadow() -> egui::epaint::Shadow {
 /// than as a beige tool: cream is paper, gold is the accent, and blue is the board a heading is
 /// chalked on — the colour every menu screen in the games this one follows puts its tabs and
 /// titles on. White type goes on it, and nothing else does.
-pub const RIBBON: Color32 = Color32::from_rgb(43, 133, 214);
+pub const RIBBON: Color32 = Color32::from_rgb(34, 121, 171);
 
 /// The size of a press: how far a button's face sinks into its socket.
 ///
@@ -347,7 +347,10 @@ pub fn visuals() -> Visuals {
 
     v.panel_fill = PANEL;
     v.window_fill = PANEL;
-    v.window_stroke = Stroke::new(3.0_f32, OUTLINE);
+    // Two points, not three. The outline is the look; its *weight* was what made a cream menu read
+    // as an outlined prototype. Two still reads as a printed boundary at the size these panels are
+    // drawn and leaves the gold lip and the type to carry the rest.
+    v.window_stroke = Stroke::new(2.0_f32, OUTLINE);
     v.window_corner_radius = CornerRadius::same(RADIUS_LG);
     // A window and a menu float *over* the canvas, and a floating thing with no shadow is a
     // rectangle of paint: the level's shelf and the Open menu are the only surfaces in the
@@ -429,7 +432,7 @@ pub fn card_frame() -> egui::Frame {
         // A card is often *clickable* — the shelf's entries and the canvas' floating readouts — so
         // its outline is the control boundary's weight rather than the hairline's: a plate you
         // cannot find is a plate you cannot press.
-        .stroke(Stroke::new(2.0_f32, OUTLINE))
+        .stroke(Stroke::new(1.5_f32, OUTLINE))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .corner_radius(CornerRadius::same(RADIUS))
 }
@@ -444,7 +447,7 @@ pub fn card_frame() -> egui::Frame {
 pub fn panel_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL)
-        .stroke(Stroke::new(3.0_f32, OUTLINE))
+        .stroke(Stroke::new(2.0_f32, OUTLINE))
         .shadow(drop_shadow())
         .inner_margin(egui::Margin::symmetric(10, 10))
         .corner_radius(CornerRadius::same(RADIUS_LG))
@@ -458,7 +461,7 @@ pub fn panel_frame() -> egui::Frame {
 pub fn dock_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(DOCK)
-        .stroke(Stroke::new(3.0_f32, OUTLINE))
+        .stroke(Stroke::new(2.0_f32, OUTLINE))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .corner_radius(CornerRadius::same(RADIUS_LG))
 }
@@ -472,7 +475,7 @@ pub fn dock_frame() -> egui::Frame {
 pub fn hud_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(DOCK)
-        .stroke(Stroke::new(3.0_f32, OUTLINE))
+        .stroke(Stroke::new(2.0_f32, OUTLINE))
         .inner_margin(egui::Margin::symmetric(10, 5))
         .corner_radius(CornerRadius::ZERO)
 }

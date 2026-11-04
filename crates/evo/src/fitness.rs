@@ -173,6 +173,7 @@ use sim::physics::AgentAction;
 use sim::{EpisodeStats, Level, ObservationScratch, Outcome, Sim};
 
 use crate::genome::{ActScratch, Genome};
+use crate::route_play::{Decision as PlayDecision, RoutePlay};
 
 /// Fitness layout version. Bump on *any* change below (§8).
 ///
@@ -580,8 +581,22 @@ pub struct EpisodeRunner {
     /// Whether this episode keeps its recent decisions (see [`EpisodeRunner::capture_decisions`]).
     /// Off on every ordinary evaluation: the capture clones the world once per decision.
     capture: bool,
-    /// The most recent decisions, oldest first, capped at [`CAPTURED_DECISIONS`].
+    /// How many decisions the capture keeps. [`CAPTURED_DECISIONS`] for the one-decision repair;
+    /// a counterfactual branch search asks for a longer window because the move it needs may be
+    /// several decisions before the fatal one.
+    capture_limit: usize,
+    /// The most recent decisions, oldest first, capped at [`EpisodeRunner::capture_limit`].
     decisions: Vec<Decision>,
+    /// Whether every decision is being kept as a **demonstration** rather than as the short
+    /// capture the mistake repair reads. Off on every ordinary evaluation.
+    record: bool,
+    /// The decisions recorded so far, oldest first. Unlike `decisions`, this is the whole episode.
+    play: Vec<PlayDecision>,
+    /// The recorded decision at which `best_x` was last raised, for [`RoutePlay::best_block`].
+    best_play_block: usize,
+    /// The furthest x the recorded episode has reached, so a new best can be noticed without
+    /// asking the statistics every tick.
+    best_play_x: f32,
 }
 
 impl EpisodeRunner {
@@ -606,7 +621,12 @@ impl EpisodeRunner {
             cut_stuck_frames: cfg.cut_stuck_frames,
             cut: false,
             capture: false,
+            capture_limit: CAPTURED_DECISIONS,
             decisions: Vec::new(),
+            record: false,
+            play: Vec::new(),
+            best_play_block: 0,
+            best_play_x: 0.0,
         }
     }
 
@@ -635,8 +655,26 @@ impl EpisodeRunner {
             cut_stuck_frames: cfg.cut_stuck_frames,
             cut: false,
             capture: false,
+            capture_limit: CAPTURED_DECISIONS,
             decisions: Vec::new(),
+            record: false,
+            play: Vec::new(),
+            best_play_block: 0,
+            best_play_x: 0.0,
         }
+    }
+
+    /// Record **every** decision as a demonstration (`observation`, action), for
+    /// [`crate::route_play::record_genome`] and the trainer's win lesson.
+    ///
+    /// Separate from [`EpisodeRunner::capture_decisions`], which keeps a short tail of whole
+    /// simulation snapshots for the mistake repair. A demonstration is the whole episode, and
+    /// what it needs from each decision is the observation and the action — nothing else.
+    pub fn record_play(&mut self) {
+        self.record = true;
+        self.play.clear();
+        self.best_play_block = 0;
+        self.best_play_x = 0.0;
     }
 
     /// Keep the world and the observation at each of the last [`CAPTURED_DECISIONS`] decisions.
@@ -646,7 +684,22 @@ impl EpisodeRunner {
     /// evaluation that scored it.
     pub fn capture_decisions(&mut self, on: bool) {
         self.capture = on;
+        self.capture_limit = CAPTURED_DECISIONS;
         if !on {
+            self.decisions.clear();
+        }
+    }
+
+    /// Keep a **longer** history than the one-decision repair needs.
+    ///
+    /// A branch search has to be able to fork before the fatal decision, because the move it is
+    /// looking for can be a sequence — run, wait, then jump — whose first action is several
+    /// decisions earlier. The cap is the caller's: an ordinary capture pays for eight clones, and
+    /// only the counterfactual search asks for the twenty-four a useful lookback needs.
+    pub fn capture_decisions_window(&mut self, limit: usize) {
+        self.capture = limit > 0;
+        self.capture_limit = limit.max(1);
+        if !self.capture {
             self.decisions.clear();
         }
     }
@@ -711,6 +764,14 @@ impl EpisodeRunner {
             self.next_decision = frames + ticks.max(1);
             self.trace.u32(frames);
             self.trace.u8(self.action.index() as u8);
+            if self.record {
+                let mut senses = [0.0f32; sim::sensors::N_INPUTS];
+                senses.copy_from_slice(&observation);
+                self.play.push(PlayDecision {
+                    observation: senses,
+                    action: self.action,
+                });
+            }
             if self.capture {
                 self.decisions.push(Decision {
                     sim: self.sim.clone(),
@@ -719,7 +780,7 @@ impl EpisodeRunner {
                     action: self.action,
                     frame: frames,
                 });
-                if self.decisions.len() > CAPTURED_DECISIONS {
+                if self.decisions.len() > self.capture_limit {
                     self.decisions.remove(0);
                 }
             }
@@ -727,6 +788,13 @@ impl EpisodeRunner {
 
         self.sim.step(self.action);
         self.iterations += 1;
+        if self.record {
+            let x = self.sim.stats().best_x;
+            if x > self.best_play_x {
+                self.best_play_x = x;
+                self.best_play_block = self.play.len();
+            }
+        }
         // Item 5: the sim's own no-progress counter is the timer the plan names, and the cut is
         // read from it so "stuck" has one definition. A finished outcome is never overridden.
         if self.cut_stuck_frames > 0
@@ -749,12 +817,29 @@ impl EpisodeRunner {
     }
 
     /// Finish the episode and score it.
-    pub fn result(mut self) -> EpisodeResult {
+    pub fn result(self) -> EpisodeResult {
+        self.finish().0
+    }
+
+    /// Finish the episode, score it, and hand back the demonstration it recorded.
+    ///
+    /// Only a runner whose [`EpisodeRunner::record_play`] was switched on has one; calling
+    /// this on an ordinary evaluation is a bug in the caller rather than an empty demonstration.
+    pub fn result_and_play(self) -> (EpisodeResult, RoutePlay) {
+        let (result, play) = self.finish();
+        (
+            result,
+            play.expect("result_and_play needs record_play to have been switched on"),
+        )
+    }
+
+    fn finish(mut self) -> (EpisodeResult, Option<RoutePlay>) {
         self.trace.u64(self.sim.state_hash());
         let outcome = self.sim.outcome();
         let stats = self.sim.stats();
+        let frames = stats.frames;
         let fitness = score(stats, outcome);
-        EpisodeResult {
+        let result = EpisodeResult {
             genome_id: self.genome.id,
             fitness,
             mean_fitness: fitness,
@@ -788,7 +873,40 @@ impl EpisodeRunner {
             cut_early: self.cut,
             seed: self.seed,
             trajectory_hash: self.trace.finish(),
-        }
+        };
+        let play = if self.record {
+            let decisions = std::mem::take(&mut self.play);
+            let note = if outcome == Outcome::Won {
+                format!(
+                    "a winning episode recorded in {} decisions over {frames} frames",
+                    decisions.len()
+                )
+            } else {
+                format!(
+                    "a {outcome:?} episode recorded in {} decisions over {frames} frames",
+                    decisions.len()
+                )
+            };
+            let route_hops = stats
+                .best_stand
+                .and_then(|stand| self.sim.level().routes().hops_to_flag(stand));
+            Some(RoutePlay {
+                decisions,
+                outcome,
+                frames,
+                seed: self.seed,
+                hops_closed: stats.route_hops_closed,
+                segments: vec![0],
+                best_block: self.best_play_block,
+                best_stand: stats.best_stand,
+                route_hops,
+                note: note.clone(),
+                trace: vec![note],
+            })
+        } else {
+            None
+        };
+        (result, play)
     }
 }
 

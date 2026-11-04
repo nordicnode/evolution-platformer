@@ -20,8 +20,8 @@
 //! twice.
 //!
 //! **It gets out of the way, and it leads where its sign says.** Any key or any click after
-//! the first [`ARMED`] seconds dismisses it ([`Action`]): `P` opens the playtest and `E`
-//! starts a run, and every other key — or a click — opens the editor. Those shortcuts *do*
+//! the first [`ARMED`] seconds dismisses it ([`Action`]): the four activity shortcuts open
+//! their matching doors, and every other key — or a click — opens Build. Those shortcuts *do*
 //! what they say, rather than being hints for a screen that would consume the press and drop
 //! the viewer into the editor anyway. The window is playable from
 //! the frame after that, and nothing about the splash is reachable again except by restarting
@@ -100,7 +100,7 @@ const MENU_HINT: &str = "UP / DOWN   CHOOSE      ENTER   GO";
 /// What a person asked for by dismissing the screen.
 ///
 /// The splash is a doorway, and a doorway should lead where the sign says. Every key
-/// opens the editor except the two the hint names, which enter the activity they name
+/// opens the editor except the activity keys, which enter the activity they name
 /// directly — so the keys printed on the front door do what they say rather than dropping
 /// the viewer into the editor to press the same key again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +111,8 @@ pub enum Action {
     Play,
     /// Open the evolution view and start training.
     Evolve,
+    /// Open the latest training run's highlight reel when one exists.
+    Replay,
 }
 
 /// Seconds for the camera to go from close on the runner to the whole level.
@@ -170,16 +172,16 @@ const DOORS_LAG: f32 = 0.20;
 ///
 /// Wide enough for the longest option at the size it is set, and no wider. A menu is an
 /// object, not a toolbar stretched across the window.
-const MENU_W: f32 = 430.0;
+const MENU_W: f32 = 460.0;
 /// One option line's height.
-const LINE_H: f32 = 56.0;
+const LINE_H: f32 = 45.0;
 /// The panel's padding.
 const PANEL_PAD: f32 = 12.0;
 /// The square a door's icon is drawn in, and how far it sits from the plate's left edge.
-const MENU_ICON: f32 = 26.0;
-const MENU_ICON_LEFT: f32 = 26.0;
+const MENU_ICON: f32 = 24.0;
+const MENU_ICON_LEFT: f32 = 30.0;
 /// Where a door's word starts, measured from the plate's left edge: past the icon and its gap.
-const MENU_LABEL_LEFT: f32 = 58.0;
+const MENU_LABEL_LEFT: f32 = 78.0;
 /// Padding from the window's bottom edge, for the box and the prompt under it.
 const MENU_BOTTOM_PAD: f32 = 56.0;
 /// The prompt's baseline above the window's bottom edge.
@@ -190,37 +192,47 @@ const CREDIT_BOTTOM: f32 = 24.0;
 
 /// One door: what it is called and where it leads.
 ///
-/// Edit first because it is what most launches want, then play it yourself, then teach the
-/// population. The descriptions, colour chips and key caps the screen used to carry are gone:
-/// three verbs are enough to say what the three activities are.
+/// Build first because it is what most launches want, then play it yourself, teach the
+/// population, and watch its star run. Each door keeps a short explanation so the pictures
+/// reinforce the words rather than becoming a memory test.
 struct Door {
     name: &'static str,
+    subtitle: &'static str,
     action: Action,
     /// The sprite that stands for the activity, out of the shipped atlas.
     ///
-    /// The same four pictures the window's own mode switch uses (`ground_1`, `player_run_1`,
-    /// `walker_a`), because the front door and the dock are the same menu seen from two sides:
+    /// The same pictures the window's own mode switch uses (`ground_1`, `player_run_1`,
+    /// `walker_a`, `goal_flag_2`), because the front door and the dock are the same menu seen from two sides:
     /// a person who learned "the ground tile is Edit" on this screen should not have to learn
     /// it again one keypress later. The icons are the reason the rows read as a game's menu
-    /// rather than as three words in a box.
+    /// rather than as four words in a box.
     icon: &'static str,
 }
 
-const DOORS: [Door; 3] = [
+const DOORS: [Door; 4] = [
     Door {
-        name: "EDIT",
+        name: "BUILD",
+        subtitle: "make a course",
         action: Action::Edit,
         icon: "ground_1",
     },
     Door {
         name: "PLAY",
+        subtitle: "try it yourself",
         action: Action::Play,
         icon: "player_run_1",
     },
     Door {
-        name: "EVOLVE",
+        name: "TRAIN",
+        subtitle: "teach the AI",
         action: Action::Evolve,
         icon: "walker_a",
+    },
+    Door {
+        name: "REPLAY",
+        subtitle: "watch the star",
+        action: Action::Replay,
+        icon: "goal_flag_2",
     },
 ];
 
@@ -246,6 +258,11 @@ pub struct Splash {
     /// go. Two cursors that could disagree would be a menu that shows one thing and does
     /// another.
     selected: usize,
+    /// Whether the title has a scored run it can hand to the Replay door.
+    /// A fresh window has no population packet yet, so Replay is visibly disabled.
+    replay_available: bool,
+    /// Whether the document behind the title has a goal for training to score.
+    train_available: bool,
 }
 
 /// What is running the level in the picture.
@@ -358,6 +375,8 @@ impl Splash {
                 clock: 0.0,
                 hold: 0.0,
                 selected: 0,
+                replay_available: false,
+                train_available: true,
             };
         }
         let Some(run) = champion_run(level, champions, level_path) else {
@@ -377,6 +396,8 @@ impl Splash {
             clock: 0.0,
             hold: 0.0,
             selected: 0,
+            replay_available: false,
+            train_available: true,
         }
     }
 
@@ -392,6 +413,24 @@ impl Splash {
             clock: 0.0,
             hold: 0.0,
             selected: 0,
+            replay_available: false,
+            train_available: true,
+        }
+    }
+
+    /// Enable the Replay door when a scored run is available to this title screen.
+    pub(crate) fn set_replay_available(&mut self, available: bool) {
+        self.replay_available = available;
+        if !door_available(self.selected, available, self.train_available) {
+            self.selected = 0;
+        }
+    }
+
+    /// Disable the Train door when the document has no flag to reach.
+    pub(crate) fn set_train_available(&mut self, available: bool) {
+        self.train_available = available;
+        if !door_available(self.selected, self.replay_available, available) {
+            self.selected = 0;
         }
     }
 
@@ -489,12 +528,12 @@ impl Splash {
     /// and everything drawn over it is furniture arranged around it.
     ///
     /// Any key press or any click counts, once the screen has been up for [`ARMED`] seconds: a
-    /// splash is a doorway, and a doorway that argues is a wall. Two keys open the activity they
-    /// name ([`Action::Play`], [`Action::Evolve`]); everything else opens the editor, which is
-    /// what most launches want. **The arrows and enter are the exception**: a menu that shows a
-    /// selection has to be drivable by the keys that move a selection, so up/down move the gold
-    /// bar and enter takes it — and the bar is the same one the pointer sets, so the two ways in
-    /// cannot disagree about which door is chosen.
+    /// splash is a doorway, and a doorway that argues is a wall. The four activity keys open the
+    /// activity they name; unavailable activities keep the title on screen and explain why. An
+    /// unnamed key still opens Build, which is what most launches want. **The arrows and enter are
+    /// the exception**: a menu that shows a selection has to be drivable by the keys that move a
+    /// selection, so up/down move the gold bar and enter takes it — and the bar is the same one the
+    /// pointer sets, so the two ways cannot disagree about which door is chosen.
     ///
     /// The one press that is not a decision is a press on the rows themselves ([`menu`]): those
     /// are widgets, they answer on the release, and a press that took the screen down on its way
@@ -560,6 +599,8 @@ impl Splash {
             &mut self.selected,
             self.clock,
             atlas,
+            self.replay_available,
+            self.train_available,
         );
         champion_credit(&painter, rect, self.credit());
         // The sound switch belongs on the front door too: the music is already
@@ -576,7 +617,6 @@ impl Splash {
             Move(usize),
             Go(Action),
         }
-        let count = DOORS.len();
         let pressed = ctx.input(|i| {
             for event in &i.events {
                 match event {
@@ -586,16 +626,46 @@ impl Splash {
                     } => {
                         return match key {
                             egui::Key::ArrowDown | egui::Key::ArrowRight | egui::Key::Tab => {
-                                Pressed::Move((self.selected + 1) % count)
+                                Pressed::Move(next_door(
+                                    self.selected,
+                                    1,
+                                    self.replay_available,
+                                    self.train_available,
+                                ))
                             }
-                            egui::Key::ArrowUp | egui::Key::ArrowLeft => {
-                                Pressed::Move((self.selected + count - 1) % count)
-                            }
+                            egui::Key::ArrowUp | egui::Key::ArrowLeft => Pressed::Move(next_door(
+                                self.selected,
+                                -1,
+                                self.replay_available,
+                                self.train_available,
+                            )),
                             egui::Key::Enter | egui::Key::Space => {
-                                Pressed::Go(DOORS[self.selected].action)
+                                if door_available(
+                                    self.selected,
+                                    self.replay_available,
+                                    self.train_available,
+                                ) {
+                                    Pressed::Go(DOORS[self.selected].action)
+                                } else {
+                                    Pressed::None
+                                }
                             }
+                            egui::Key::B | egui::Key::V => Pressed::Go(Action::Edit),
                             egui::Key::P => Pressed::Go(Action::Play),
-                            egui::Key::E => Pressed::Go(Action::Evolve),
+                            egui::Key::E | egui::Key::T => {
+                                if self.train_available {
+                                    Pressed::Go(Action::Evolve)
+                                } else {
+                                    Pressed::None
+                                }
+                            }
+                            egui::Key::R => {
+                                if self.replay_available {
+                                    Pressed::Go(Action::Replay)
+                                } else {
+                                    Pressed::None
+                                }
+                            }
                             // One key that does not start the game: the music
                             // is already playing, and muting it should not
                             // cost the viewer the title screen.
@@ -909,7 +979,7 @@ fn champion_run(level: &Level, champions: &Path, level_path: Option<&Path>) -> O
 /// Each candidate is loaded *and validated against the level* — which is what
 /// [`ChampionFile::load_for_level`] means — and the first that validates wins, so a stale
 /// file under one name cannot hide a good one under the other.
-fn champion_file(
+pub(crate) fn champion_file(
     level: &Level,
     champions: &Path,
     level_path: Option<&Path>,
@@ -1466,6 +1536,37 @@ fn line_rect(panel: Rect, index: usize) -> Rect {
     )
 }
 
+/// Whether a door can actually lead somewhere in the current window state.
+///
+/// Replay needs a saved champion or a scored in-memory run. A fresh launch with
+/// neither keeps its row visible as a disabled destination instead of accepting
+/// a click and then falling through to an error in the editor.
+fn door_available(index: usize, replay_available: bool, train_available: bool) -> bool {
+    index < DOORS.len() && (index != 2 || train_available) && (index != 3 || replay_available)
+}
+
+/// Move one selection step while skipping destinations that are not available.
+fn next_door(
+    current: usize,
+    direction: isize,
+    replay_available: bool,
+    train_available: bool,
+) -> usize {
+    let count = DOORS.len() as isize;
+    if count == 0 {
+        return 0;
+    }
+    let mut candidate = current.min(DOORS.len() - 1) as isize;
+    for _ in 0..DOORS.len() {
+        candidate = (candidate + direction).rem_euclid(count);
+        let index = candidate as usize;
+        if door_available(index, replay_available, train_available) {
+            return index;
+        }
+    }
+    current.min(DOORS.len() - 1)
+}
+
 /// Draw the menu, and report the door that was clicked, if any.
 ///
 /// Real widgets (`Ui::interact`) for the hit test, hand-painted for the look: a framed list,
@@ -1479,6 +1580,8 @@ fn menu(
     selected: &mut usize,
     clock: f32,
     atlas: &Atlas,
+    replay_available: bool,
+    train_available: bool,
 ) -> Option<Action> {
     if !menu_is_up(clock) {
         return None;
@@ -1496,32 +1599,53 @@ fn menu(
             // under every panel the window might put up.
             ui.set_min_size(rect.size());
             for (index, door) in DOORS.iter().enumerate() {
+                let available = door_available(index, replay_available, train_available);
                 let response = ui.interact(
                     line_rect(panel, index),
                     egui::Id::new(("splash-door", index)),
-                    egui::Sense::click(),
+                    if available {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    },
                 );
-                if response.hovered() {
+                if response.hovered() && available {
                     *selected = index;
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                if response.clicked() {
+                if response.clicked() && available {
                     action = Some(door.action);
                 }
             }
         });
     if arrived > 0.0 {
-        paint_menu(painter, panel, *selected, arrived, atlas);
+        paint_menu(
+            painter,
+            panel,
+            *selected,
+            arrived,
+            atlas,
+            replay_available,
+            train_available,
+        );
         prompt(painter, rect, clock);
     }
     action
 }
 
-/// The menu panel and its three rows.
+/// The menu panel and its four activity rows.
 ///
 /// One surface, one accent, no decoration: a warm plate with a dark outline, the chosen row
 /// filled in the window's gold, and the verbs themselves as the only labels.
-fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, atlas: &Atlas) {
+fn paint_menu(
+    painter: &Painter,
+    panel: Rect,
+    selected: usize,
+    arrived: f32,
+    atlas: &Atlas,
+    replay_available: bool,
+    train_available: bool,
+) {
     let ink = |colour: Color32| colour.gamma_multiply(arrived);
     let radius = CornerRadius::same(theme::RADIUS_LG);
     // A drop shadow under the box, then the plate: the menu is an object standing on the stage
@@ -1540,7 +1664,8 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, atl
     );
     for (index, door) in DOORS.iter().enumerate() {
         let line = line_rect(panel, index);
-        let chosen = index == selected;
+        let available = door_available(index, replay_available, train_available);
+        let chosen = available && index == selected;
         let plate = line.shrink2(Vec2::new(8.0, 4.0));
         if chosen {
             // The chosen row is a *plate*, not a tint: the same gold the dock gives the mode
@@ -1554,7 +1679,7 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, atl
                 egui::StrokeKind::Inside,
             );
         } else if index + 1 < DOORS.len() {
-            // A hairline between the rows, so the list reads as a list rather than as three
+            // A hairline between the rows, so the list reads as a list rather than as loose
             // words floating in a box.
             let y = line.bottom();
             painter.rect_filled(
@@ -1567,23 +1692,48 @@ fn paint_menu(painter: &Painter, panel: Rect, selected: usize, arrived: f32, atl
             );
         }
         // The icon, on the same left margin as the word it belongs to, in the game's own art:
-        // the ground tile for Edit, the runner for Play, a walker for Evolve.
+        // the ground tile for Build, the runner for Play, a walker for Train, and the flag for Replay.
         let icon = Rect::from_center_size(
             Pos2::new(plate.left() + MENU_ICON_LEFT, plate.center().y),
             Vec2::splat(MENU_ICON),
         );
         if let Ok(uv) = atlas.uv(door.icon) {
-            painter.image(atlas.texture_id(), icon, uv, ink(Color32::WHITE));
+            let icon_ink = if available {
+                Color32::WHITE
+            } else {
+                theme::TEXT_DIM
+            };
+            painter.image(atlas.texture_id(), icon, uv, ink(icon_ink));
         }
+        let label_colour = ink(if chosen {
+            theme::INK_ON_ACCENT
+        } else if available {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM.gamma_multiply(0.65)
+        });
         painter.text(
-            Pos2::new(plate.left() + MENU_LABEL_LEFT, plate.center().y),
+            Pos2::new(plate.left() + MENU_LABEL_LEFT, plate.center().y - 8.0),
             Align2::LEFT_CENTER,
             door.name,
-            theme::pixel_font(18.0),
-            ink(if chosen {
-                theme::INK_ON_ACCENT
+            theme::pixel_font(15.0),
+            label_colour,
+        );
+        painter.text(
+            Pos2::new(plate.left() + MENU_LABEL_LEFT, plate.center().y + 13.0),
+            Align2::LEFT_CENTER,
+            if available {
+                door.subtitle
+            } else if index == 2 || !train_available {
+                "place a flag first"
             } else {
-                theme::TEXT
+                "train first"
+            },
+            theme::pixel_font(8.0),
+            ink(if available {
+                theme::TEXT_DIM
+            } else {
+                theme::TEXT_DIM.gamma_multiply(0.65)
             }),
         );
     }
@@ -1710,8 +1860,8 @@ mod tests {
         let (ctx, atlas, sprites, rect) = screen();
         let mut splash = armed();
         let panel = band_of(&splash, rect);
-        // The middle line is Play: three lines of one height, so the second one is the middle
-        // of the box.
+        // The second line is Play: each line has the same height, so this is the
+        // row beneath Build.
         let pos = line_rect(panel, 1).center();
 
         // Two frames with no events first, and the count is not padding. An `egui::Area`
@@ -2205,6 +2355,262 @@ mod tests {
         assert_eq!(press(egui::Key::P), Some(Action::Play));
         assert_eq!(press(egui::Key::E), Some(Action::Evolve));
         assert_eq!(press(egui::Key::V), Some(Action::Edit));
+    }
+
+    /// Every visible main-menu door has a real pointer target, while a replay
+    /// without a saved run is visibly inert instead of falling through to Edit.
+    #[test]
+    fn every_main_menu_door_routes_or_stays_disabled() {
+        for (index, expected) in [
+            (0, Some(Action::Edit)),
+            (1, Some(Action::Play)),
+            (2, Some(Action::Evolve)),
+            (3, None),
+        ] {
+            let (ctx, atlas, sprites, rect) = screen();
+            let mut splash = armed();
+            splash.set_replay_available(false);
+            let panel = band_of(&splash, rect);
+            let pos = line_rect(panel, index).center();
+            // Give the foreground area the warm-up frames it needs before a
+            // pointer release can be answered by the row widget.
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+                None
+            );
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+                None
+            );
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, at(pos, true)),
+                None,
+                "pressing door {index} dismissed the title before the row handled it"
+            );
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, at(pos, false)),
+                expected,
+                "door {index} did not route to its advertised action"
+            );
+        }
+
+        // A saved champion supplies a replayable episode even before a new lab
+        // is started, so the same fourth row becomes a working destination.
+        let (ctx, atlas, sprites, rect) = screen();
+        let mut splash = armed();
+        splash.set_replay_available(true);
+        let pos = line_rect(band_of(&splash, rect), 3).center();
+        frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new());
+        frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new());
+        assert_eq!(
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, at(pos, true)),
+            None
+        );
+        assert_eq!(
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, at(pos, false)),
+            Some(Action::Replay)
+        );
+    }
+
+    /// Arrow navigation traverses every available door exactly once and skips
+    /// the disabled replay row; when replay is available, Enter can select it.
+    #[test]
+    fn main_menu_keyboard_navigation_is_complete() {
+        let (ctx, atlas, sprites, rect) = screen();
+        let mut splash = armed();
+        splash.set_replay_available(false);
+        for _ in 0..2 {
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+                None
+            );
+        }
+        for expected in [1, 2, 0] {
+            assert_eq!(
+                frame(
+                    &ctx,
+                    &mut splash,
+                    &atlas,
+                    &sprites,
+                    rect,
+                    vec![egui::Event::Key {
+                        key: egui::Key::ArrowDown,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    }],
+                ),
+                None
+            );
+            assert_eq!(splash.selected, expected);
+        }
+
+        splash.set_replay_available(true);
+        for _ in 0..2 {
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+                None
+            );
+        }
+        // The setter puts an invalid selection back on Build. Three moves land
+        // on Replay, and Enter takes that row rather than the editor fallback.
+        for expected in [1, 2, 3] {
+            assert_eq!(
+                frame(
+                    &ctx,
+                    &mut splash,
+                    &atlas,
+                    &sprites,
+                    rect,
+                    vec![egui::Event::Key {
+                        key: egui::Key::ArrowDown,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    }],
+                ),
+                None
+            );
+            assert_eq!(splash.selected, expected);
+        }
+        assert_eq!(
+            frame(
+                &ctx,
+                &mut splash,
+                &atlas,
+                &sprites,
+                rect,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            ),
+            Some(Action::Replay)
+        );
+    }
+
+    /// The short keys printed by the title screen are all handled by the
+    /// title itself, including the replay key when that door is available.
+    #[test]
+    fn main_menu_shortcuts_match_the_door_labels() {
+        let cases = [
+            (egui::Key::B, Action::Edit, false),
+            (egui::Key::P, Action::Play, false),
+            (egui::Key::T, Action::Evolve, false),
+            (egui::Key::R, Action::Replay, true),
+        ];
+        for (key, expected, replay_available) in cases {
+            let (ctx, atlas, sprites, rect) = screen();
+            let mut splash = armed();
+            splash.set_replay_available(replay_available);
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+                None
+            );
+            assert_eq!(
+                frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new()),
+                None
+            );
+            assert_eq!(
+                frame(
+                    &ctx,
+                    &mut splash,
+                    &atlas,
+                    &sprites,
+                    rect,
+                    vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    }],
+                ),
+                Some(expected),
+                "shortcut {key:?} did not open its title-menu action"
+            );
+        }
+
+        let (ctx, atlas, sprites, rect) = screen();
+        let mut splash = armed();
+        splash.set_replay_available(false);
+        for _ in 0..2 {
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new());
+        }
+        assert_eq!(
+            frame(
+                &ctx,
+                &mut splash,
+                &atlas,
+                &sprites,
+                rect,
+                vec![egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            ),
+            None,
+            "Replay's shortcut opened a dead destination"
+        );
+    }
+
+    /// Train is disabled for a document with no flag, and navigation skips it
+    /// just like Replay with no saved run.
+    #[test]
+    fn main_menu_does_not_offer_training_without_a_goal() {
+        let (ctx, atlas, sprites, rect) = screen();
+        let mut splash = armed();
+        splash.set_train_available(false);
+        splash.set_replay_available(false);
+        for _ in 0..2 {
+            frame(&ctx, &mut splash, &atlas, &sprites, rect, Vec::new());
+        }
+        for expected in [1, 0] {
+            assert_eq!(
+                frame(
+                    &ctx,
+                    &mut splash,
+                    &atlas,
+                    &sprites,
+                    rect,
+                    vec![egui::Event::Key {
+                        key: egui::Key::ArrowDown,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    }],
+                ),
+                None
+            );
+            assert_eq!(splash.selected, expected);
+        }
+        assert_eq!(
+            frame(
+                &ctx,
+                &mut splash,
+                &atlas,
+                &sprites,
+                rect,
+                vec![egui::Event::Key {
+                    key: egui::Key::T,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            ),
+            None,
+            "Train opened despite the document having no goal"
+        );
     }
 
     /// The champion on the title screen is the episode the file records, tick for tick.

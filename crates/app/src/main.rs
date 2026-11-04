@@ -61,7 +61,7 @@ USAGE:
 
 OPTIONS:
     --level <PATH>        Level to open.                       [default l1-flat-run]
-    --assets <DIR>        Directory holding tileset.json/png.  [default assets]
+    --assets <DIR>        Directory holding tileset.json/png.  [default repository assets]
     --splash              Show the title screen and wait for a key. It is the default
                           opening for an interactive launch; pass --no-splash to go
                           straight to the editor, or --splash to see it in front of
@@ -219,16 +219,12 @@ fn parse(raw: &[String]) -> Result<Option<Options>, String> {
     let level = level.unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../levels/l1-flat-run.json")
     });
-    let assets = assets
-        .or_else(|| {
-            let local = PathBuf::from("assets");
-            if local.is_dir() {
-                Some(local)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets"));
+    // Resolve the shipped atlas from the repository the binary was built from. A relative
+    // `assets/` lookup made launches from a desktop shortcut, IDE, or `target/release/` silently
+    // pick up an unrelated/stale atlas whenever that working directory happened to contain one.
+    // Custom art remains available through the explicit `--assets` option.
+    let assets =
+        assets.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets"));
 
     Ok(Some(Options {
         level,

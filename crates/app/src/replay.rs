@@ -237,6 +237,52 @@ pub struct Replay {
 }
 
 impl Replay {
+    /// Build a replay from a saved champion when no live training packet exists yet.
+    ///
+    /// The title screen is created before the window starts a lab, so a saved
+    /// champion is the only replay source available on a fresh launch. It has no
+    /// population behind it, but it is still the recorded episode and is better
+    /// than presenting a clickable door that immediately reports "no run".
+    pub fn from_champion(level: &Level, champion: &evo::ChampionFile) -> Result<Replay, String> {
+        let (genome, result) = evo::champion::replay(level, champion)?;
+        let eval = EvalConfig {
+            action_repeat: champion.metadata.action_repeat,
+            cut_stuck_frames: 0,
+        };
+        let runner = EpisodeRunner::new(level, genome, &eval, champion.metadata.episode_seed);
+        let star = Star {
+            genome_id: result.genome_id,
+            basis: if result.outcome == Outcome::Won {
+                StarBasis::QuickestWin
+            } else {
+                StarBasis::BestScore
+            },
+            generation: champion.metadata.generation,
+            seed: result.seed,
+            fitness: result.fitness,
+            outcome: result.outcome,
+            frames: result.frames,
+        };
+        Ok(Replay {
+            level: level.clone(),
+            eval,
+            level_name: level.name.clone(),
+            star,
+            population: Population {
+                generation: champion.metadata.generation,
+                size: 0,
+            },
+            runners: vec![runner],
+            anims: vec![AgentAnim::new()],
+            carry: 0.0,
+            ticks: 0,
+            ghosts: false,
+            paused: false,
+            speed: REAL_TIME,
+            star_ear: crate::sound::Ear::new(),
+        })
+    }
+
     /// A replay of the run's quickest win, with the last scored generation as ghosts.
     ///
     /// `None` only when the packet holds no episode at all — no record and no evaluated

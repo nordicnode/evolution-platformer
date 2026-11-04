@@ -260,6 +260,10 @@ TRAIN OPTIONS:
                           and moves that action's output row by the smallest step that flips
                           the choice at that state. The child is then judged on a full
                           episode like any other. 0 disables; the window runs 3.  [default 0]
+    --what-if-every <N>   Every N generations, fork the best genome's losing episode and search
+                          short whole-block deviations from the fork; a winning branch is
+                          distilled into one ordinary child. 0 disables; the window runs 8.
+                          [default 0]
     --growth-units <N>    Item 13: hidden units added to the first layer each time the record has
                           not improved for `--stagnation` generations. The new units have zero
                           outgoing weights, so the policy is bit-identical at the moment of
@@ -272,6 +276,11 @@ TRAIN OPTIONS:
                           2 solves each way, p = 1.0, and the lesson arm's pair arrive
                           more than a thousand generations later, so it stays off.
                                                                         [default 0]
+    --no-win-lesson       Turn off the run's first-win lesson. By default, the generation that
+                          first reaches the flag records that winning episode and fits a clone
+                          of the play into the population as one ordinary child, so the win is
+                          learned rather than only remembered. The one lesson that needs no
+                          plan — it is what the levels with no canonical route have.
     --plateau-window <N>  Item 4: generations without a record improvement before a bounded
                           full-net CEM phase is spent. 0 disables.             [default 0]
     --plateau-cem-generations <N>
@@ -553,7 +562,8 @@ WATCH OPTIONS:
                           (as for `train`): solved rate, clock, where the best genome ended,
                           the per-leg census and the first-action spread.
     --mut-rate, --mut-sigma, --adaptive-sigma, --fine-children, --jump-timing-share,
-    --repair-children, --commitment, --growth-units, --growth-events, --lesson-every,
+    --repair-children, --what-if-every, --commitment, --growth-units, --growth-events, --lesson-every,
+    --no-win-lesson,
     --plateau-window,
     --plateau-cem-generations, --plateau-cem-events, --generalist, --generalist-share,
     --mastery, --no-mastery, --stagnation,

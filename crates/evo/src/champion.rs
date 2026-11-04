@@ -336,6 +336,11 @@ pub struct TrainingSummary {
     /// a file written before the cut existed never trained with it.
     #[serde(default)]
     pub cut_stuck_frames: u32,
+    /// Whether the run was armed to **learn from its first win** (`GaConfig::win_lesson`).
+    /// Defaulted to `false` for a file written before the lesson existed: claiming it would credit
+    /// a search with a mechanism it did not have.
+    #[serde(default)]
+    pub win_lesson: bool,
 }
 
 /// The value a champion file written before `reheat_factor` existed is read with.
@@ -361,6 +366,7 @@ impl From<&GaConfig> for TrainingSummary {
             immigrants: c.immigrants,
             reheat_factor: c.reheat_factor,
             cut_stuck_frames: c.cut_stuck_frames,
+            win_lesson: c.win_lesson,
         }
     }
 }
@@ -469,6 +475,18 @@ impl ChampionFile {
                  shrink an observation",
                 self.network.n_inputs,
                 sensors::N_INPUTS
+            ));
+        }
+        if self.network.n_inputs == sensors::N_INPUTS {
+            // A same-width bump is a **re-reading**, not an append: `grown_to_inputs` would add
+            // nothing and relabel the file, leaving the old weights reading the new meaning.
+            // v11, v12 and v16 are that kind, and refusing them here is the difference between
+            // a migration and a lie.
+            return Err(format!(
+                "sensor_version {} vs {}: this bump re-reads the vector rather than growing it, \
+                 so the champion's policy cannot be carried across",
+                self.metadata.sensor_version,
+                sensors::VERSION
             ));
         }
         let old = self.to_genome()?;

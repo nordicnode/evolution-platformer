@@ -74,6 +74,7 @@ const WATCH_OPTS: &[&str] = &[
     "fine-children",
     "jump-timing-share",
     "repair-children",
+    "what-if-every",
     "commitment",
     "mastery",
     "no-mastery",
@@ -231,6 +232,10 @@ pub fn watch(a: &Args) -> Result<(), String> {
         repair_children: usage(
             a.usize_opt("repair-children", GaConfig::default().repair_children),
         )?,
+        // Counterfactual branch search, with the default in the config as for `train`.
+        what_if_every: usage(
+            a.usize_opt("what-if-every", GaConfig::default().what_if_every as usize),
+        )? as u32,
         // The same default as `train` and the window: after the record solves, the second phase
         // ranks winners by the clock. `--no-mastery` is the plain run.
         mastery: !a.has_flag("no-mastery"),

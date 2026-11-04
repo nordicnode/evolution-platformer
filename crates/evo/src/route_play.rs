@@ -71,13 +71,14 @@
 
 use sim::physics::AgentAction;
 use sim::reach::{
-    climb_action, extract_platforms, simulate_jump_at, simulate_rope_swing, simulate_swim,
-    simulate_vine_climb, swim_action, trajectory_action, vine_action, vine_run, GoalRoutes,
-    JumpHold, LaunchSpeed, Platform, RopeSwing, RouteMove, Takeoff,
+    arm, climb_action, extract_platforms, simulate_jump_at, simulate_rope_swing, simulate_swim,
+    simulate_vine_climb, swim_action, trajectory_action, vine_action, vine_target, GoalRoutes,
+    JumpHold, LaunchSpeed, Platform, RopeSwing, RouteMove, Takeoff, TakeoffDir,
 };
 use sim::{spawn_route_stand, Level, ObservationScratch, Outcome, Rect, Sim, PHYSICS};
 
-use crate::fitness::EvalConfig;
+use crate::fitness::{EpisodeResult, EpisodeRunner, EvalConfig};
+use crate::genome::Genome;
 
 /// Decision blocks an approach may fail to close any distance before its plan is abandoned.
 ///
@@ -261,6 +262,9 @@ impl Plan {
             RouteMove::Jump(t) => trajectory_action(&t, self.holds_jump(), 0, ph),
             RouteMove::Climb { dir } => climb_action(dir, 0, ph),
             RouteMove::Swim { dir, dive } => swim_action(dir, dive, false, 0),
+            // The lean is not in the move: it is read from the body's column and the level
+            // when the plan is pressed (`vine_lean` below), because the sweep's vine is the
+            // nearest one and the route edge carries only the exit side.
             RouteMove::Vine { .. } => AgentAction::JumpInPlace,
             // The press that starts a swing is the jump the catch is made with; the swing's own
             // clock starts on the tick the line is held.
@@ -285,6 +289,9 @@ struct Active {
     vine_top: Option<i32>,
     /// A vine climb has reached its exit and is pressing off it.
     exiting: bool,
+    /// Which way the approach jump leans to meet the vine, when the vine is in a column beside
+    /// the take-off. `None` for a vine in the body's own column (the climb needs no press).
+    vine_lean: Option<TakeoffDir>,
     /// A rope swing's own clock: ticks held since the grab, and whether it has let go.
     rope: RopeSwing,
 }
@@ -601,6 +608,29 @@ pub fn timed_play(level: &Level, route: &sim::plan::TimedRoute, cfg: &EvalConfig
     timed_play_from(level, route, &Sim::new(level, route.seed), cfg)
 }
 
+/// Record a genome's own episode as a demonstration.
+///
+/// The runner that scores an episode also records it, so the demonstration is exactly the
+/// decisions the policy made — no second controller, no re-simulation, no cadence mismatch. It is
+/// what lets a trainer **learn from a win**: a genome that reached the flag once is copied into the
+/// population as a policy instead of being left to weight-space mutation.
+///
+/// The episode is played once more than the evaluation that found it; this is one extra episode,
+/// paid when a win is rare and worth keeping.
+pub fn record_genome(
+    level: &Level,
+    genome: &Genome,
+    cfg: &EvalConfig,
+    seed: u64,
+) -> (EpisodeResult, RoutePlay) {
+    let mut runner = EpisodeRunner::new(level, genome.clone(), cfg, seed);
+    runner.record_play();
+    while !runner.is_finished() {
+        runner.step();
+    }
+    runner.result_and_play()
+}
+
 /// [`timed_play`] from a **snapshot**: the plan is the suffix after a route walk, and the
 /// observations it is recorded against are the ones the full episode had at that point.
 pub fn timed_play_from(
@@ -768,9 +798,19 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                     }
                     RouteMove::Climb { dir } => climb_action(dir, a.ticks, ph),
                     RouteMove::Swim { dir, dive } => swim_action(dir, dive, in_water, a.ticks),
-                    RouteMove::Vine { exit } => {
-                        vine_action(exit, on_vine, feet, a.vine_top.unwrap_or(0), &mut a.exiting)
-                    }
+                    RouteMove::Vine { exit } => match a.vine_lean {
+                        // The grab is made by holding the direction into the vine; once the body
+                        // is on it, the same direction would walk it off, so `vine_action` owns
+                        // every tick after the grab.
+                        Some(lean) if !on_vine => arm(lean, true),
+                        _ => vine_action(
+                            exit,
+                            on_vine,
+                            feet,
+                            a.vine_top.unwrap_or(0),
+                            &mut a.exiting,
+                        ),
+                    },
                     // The swing's clock is the tick the *body* is on the line, not the tick
                     // since the press: the same release number is the same moment of the arc on
                     // every approach, which is what makes the swept plan a plan.
@@ -801,13 +841,20 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                 // hand clears the hop from where the body is. Both have to agree.
                 let row = routes.zone_bounds(p.stand).0;
                 if due && press_lands(level, &platforms, routes, p, x, row, vx) {
-                    let vine_top = match p.move_ {
-                        RouteMove::Vine { .. } => {
-                            let col = Level::tile_x(x + sim.player().w * 0.5);
-                            vine_run(level, col, row, ph).map(|(_, top)| top)
+                    let mut vine_top = None;
+                    let mut vine_lean = None;
+                    if matches!(p.move_, RouteMove::Vine { .. }) {
+                        let col = Level::tile_x(x + sim.player().w * 0.5);
+                        if let Some((vine_col, top)) = vine_target(level, col, row) {
+                            vine_top = Some(top);
+                            vine_lean = Some(match vine_col.cmp(&col) {
+                                std::cmp::Ordering::Less => TakeoffDir::Left,
+                                std::cmp::Ordering::Greater => TakeoffDir::Right,
+                                std::cmp::Ordering::Equal => TakeoffDir::Still,
+                            });
                         }
-                        _ => None,
-                    };
+                    }
+                    let active_lean = vine_lean.filter(|d| *d != TakeoffDir::Still);
                     active = Some(Active {
                         plan: p,
                         ticks: 0,
@@ -815,12 +862,18 @@ pub fn replay(level: &Level, seed: u64, cfg: &EvalConfig) -> RoutePlay {
                         airborne: false,
                         vine_top,
                         exiting: false,
+                        vine_lean: active_lean,
                         rope: RopeSwing::default(),
                     });
                     pending = None;
                     blocked_blocks = 0;
                     press_blocks = 0;
-                    held = p.press_action(ph);
+                    held = match (p.move_, vine_lean) {
+                        // The approach jump leans into the vine for the grab; the climb itself
+                        // starts on the next block, when the body is on the line.
+                        (RouteMove::Vine { .. }, Some(lean)) => arm(lean, true),
+                        _ => p.press_action(ph),
+                    };
                     trace.push(format!(
                         "  pressing {:?} from stand {} at x {:.2} (aimed {:.2}) with vx {vx:.2}",
                         p.move_, p.stand, x, p.target_x

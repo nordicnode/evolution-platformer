@@ -258,9 +258,9 @@ const REPLAY: &[Key] = &[
 /// The card for a view: its name, and its keys.
 pub fn rows(mode: Mode) -> (&'static str, &'static [Key]) {
     match mode {
-        Mode::Edit => ("Edit", EDIT),
+        Mode::Edit => ("Build", EDIT),
         Mode::Play => ("Play", PLAY),
-        Mode::Evolve => ("Evolve", EVOLVE),
+        Mode::Evolve => ("Train", EVOLVE),
         Mode::Replay => ("Replay", REPLAY),
     }
 }

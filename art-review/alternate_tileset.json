@@ -1,0 +1,199 @@
+{
+  "format": "one-two-hundred-review-atlas",
+  "cell": 16,
+  "cols": 10,
+  "rows": 4,
+  "purpose": "visual review only; not the live manifest",
+  "sprites": [
+    {
+      "name": "grass",
+      "col": 0,
+      "row": 0
+    },
+    {
+      "name": "sand",
+      "col": 1,
+      "row": 0
+    },
+    {
+      "name": "brick",
+      "col": 2,
+      "row": 0
+    },
+    {
+      "name": "wood",
+      "col": 3,
+      "row": 0
+    },
+    {
+      "name": "spike",
+      "col": 4,
+      "row": 0
+    },
+    {
+      "name": "spring",
+      "col": 5,
+      "row": 0
+    },
+    {
+      "name": "water",
+      "col": 6,
+      "row": 0
+    },
+    {
+      "name": "lava",
+      "col": 7,
+      "row": 0
+    },
+    {
+      "name": "vine",
+      "col": 8,
+      "row": 0
+    },
+    {
+      "name": "rope",
+      "col": 9,
+      "row": 0
+    },
+    {
+      "name": "spiked_ball",
+      "col": 0,
+      "row": 1
+    },
+    {
+      "name": "belt",
+      "col": 1,
+      "row": 1
+    },
+    {
+      "name": "boulder",
+      "col": 2,
+      "row": 1
+    },
+    {
+      "name": "crate",
+      "col": 3,
+      "row": 1
+    },
+    {
+      "name": "runner",
+      "col": 4,
+      "row": 1
+    },
+    {
+      "name": "runner_jump",
+      "col": 5,
+      "row": 1
+    },
+    {
+      "name": "walker",
+      "col": 6,
+      "row": 1
+    },
+    {
+      "name": "chaser",
+      "col": 7,
+      "row": 1
+    },
+    {
+      "name": "flyer",
+      "col": 8,
+      "row": 1
+    },
+    {
+      "name": "turret",
+      "col": 9,
+      "row": 1
+    },
+    {
+      "name": "goal",
+      "col": 0,
+      "row": 2
+    },
+    {
+      "name": "spawn",
+      "col": 1,
+      "row": 2
+    },
+    {
+      "name": "bush",
+      "col": 2,
+      "row": 2
+    },
+    {
+      "name": "tree",
+      "col": 3,
+      "row": 2
+    },
+    {
+      "name": "mushroom",
+      "col": 4,
+      "row": 2
+    },
+    {
+      "name": "cloud",
+      "col": 5,
+      "row": 2
+    },
+    {
+      "name": "dust",
+      "col": 6,
+      "row": 2
+    },
+    {
+      "name": "puff",
+      "col": 7,
+      "row": 2
+    },
+    {
+      "name": "spark",
+      "col": 8,
+      "row": 2
+    },
+    {
+      "name": "ui_undo",
+      "col": 9,
+      "row": 2
+    },
+    {
+      "name": "ui_redo",
+      "col": 0,
+      "row": 3
+    },
+    {
+      "name": "ui_fit",
+      "col": 1,
+      "row": 3
+    },
+    {
+      "name": "ui_search",
+      "col": 2,
+      "row": 3
+    },
+    {
+      "name": "ui_restart",
+      "col": 3,
+      "row": 3
+    },
+    {
+      "name": "ui_pause",
+      "col": 4,
+      "row": 3
+    },
+    {
+      "name": "ui_play",
+      "col": 5,
+      "row": 3
+    },
+    {
+      "name": "ui_step",
+      "col": 6,
+      "row": 3
+    },
+    {
+      "name": "ui_star",
+      "col": 7,
+      "row": 3
+    }
+  ]
+}

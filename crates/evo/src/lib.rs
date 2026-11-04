@@ -38,6 +38,7 @@ pub mod tas;
 pub mod technique;
 pub mod telemetry;
 pub mod variants;
+pub mod whatif;
 
 pub use autoshape::{apply as apply_auto_shape, scan as scan_level_shape, AutoShape};
 pub use certify::{
@@ -88,7 +89,7 @@ pub use robust::{
     evaluate as robust_evaluate, evaluate_adversarial, AdversarialCase, AdversarialConfig,
     AdversarialReport, Disturbance, RobustConfig, RobustReport,
 };
-pub use route_play::{replay, timed_play, Decision, RoutePlay};
+pub use route_play::{record_genome, replay, timed_play, Decision, RoutePlay};
 pub use shortcut::{intended_route, trace as trace_shortcut, ShortcutReport};
 pub use showcase::{build as build_showcase, DecisionMoment, ShowcaseConfig, ShowcaseReport};
 pub use snapshots::{SnapshotArchive, SnapshotCell, SnapshotKey};
@@ -103,6 +104,7 @@ pub use variants::{
     explore as explore_variants, ParetoArchive, VariantConfig, VariantObjectives, VariantReport,
     WinningVariant, VARIANTS_FORMAT, VARIANTS_VERSION,
 };
+pub use whatif::{search as what_if, Reading as WhatIfReading, WhatIf, WhatIfConfig, WhatIfReport};
 
 /// Test-only level construction, shared by this crate's unit tests.
 ///

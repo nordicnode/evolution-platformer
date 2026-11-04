@@ -4,19 +4,52 @@ Generated art. `tools/gen_tileset.py` rewrites everything in this directory:
 
     python3 tools/gen_tileset.py
 
+The shipped atlas is generated pixel art in the **production course-kit**
+direction: seamless terrain textures, one warm light from the upper left, and
+form carried by value rather than by ink — no object is wrapped in a black
+outline. `tools/gen_tileset.py` draws it from the modules in `tools/art/`:
+
+The player is a **cat blob**: a circle, two cat ears grown out of its crown, a
+two-tone ginger-and-cream coat, and a tail at the back. It replaced a humanoid
+runner for the reason the rest of the atlas is drawn the way it is — at sixteen
+pixels a limb is two pixels and a knee is a guess, so a person is an argument
+about anatomy nobody can see. A blob has one silhouette and an expression, and
+its animation lives where a player reads it: the bounce of the body, the swing of
+the tail, the step of the feet. Every cycle is a table of those parts, and no frame of a cycle is
+another one repeated.
+
+The shape is written as spans that are mirrored about the cell's centre line, so
+the cat cannot come out lopsided — an earlier hand-drawn mask was a pixel wider on
+one side, and at this size a pixel is a whole cheek. The face is the same idea
+with fewer parts: two eyes, a pink nose, a cream muzzle and a cream chest, all on
+the centre line, with nothing on the forehead. A tabby stripe or two up there puts
+three dark marks within two rows of the eyes, and then the sprite has four. The
+cat texture is where a player reads a cat's coat instead: the cream front, the
+cream feet, the tail's cream tip.
+
+| module | draws |
+|---|---|
+| `art/kit.py` | the palette, the seamless terrain autotiles, the material seams, the fluids and the mechanical tiles |
+| `art/kit_cast.py` | the cat's animation set, the enemies, the flag, the spawn, the butterflies |
+| `art/kit_props.py` | scenery, clouds, effects and the window's glyphs |
+| `art/kit_atlas.py` | the manifest's order: every named cell, once |
+
+The earlier per-family drawings (`art/terrain.py`, `characters.py`, `props.py`,
+`ui.py`, `common.py`) are the pre-kit reference implementation; the live atlas
+no longer imports them. `art-review/` holds the earlier visual study and its
+boards, not the shipped assets.
+
 | file | what it is |
 |---|---|
-| `tileset.png` | the atlas: 16x16 pixel cells, 16 columns by 20 rows (256x320) |
+| `tileset.png` | the atlas: 16x16 pixel cells, 16 columns by 22 rows (256x352) |
 | `tileset.json` | the manifest the game reads: cell size, grid, and where each named sprite lives |
-| `tileset_preview.png` | an 8x nearest-neighbour upscale on a checked background, for eyeballing |
+| `tileset_preview.png` | an 8x nearest-neighbour upscale on a sky background with a faint cell grid, for eyeballing |
 
 The game reads `tileset.json`, not hard-coded coordinates, so art can be replaced
 without touching Rust: draw a new atlas, list your sprites in the manifest, and any
 name the game asks for that is missing is a startup error naming what it found.
 
-The *drawing* code is one module per family under `tools/art/`, and every colour in
-the game comes from `tools/art/common.py`, so terrain, characters and effects cannot
-drift into three palettes. The table below is the manifest in words; it is checked
+The live art is the `kit_*` modules described above; the table below is the manifest in words; it is checked
 against the shipped manifest by
 `atlas::tests::the_assets_readme_lists_every_shipped_sprite`, so it cannot go stale
 quietly. Most names are **required** (`crate::atlas::REQUIRED`): the game refuses to
@@ -59,15 +92,15 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `wood_1_b`, `wood_1_c` | the timber deck plus wood knots, and plus countersunk iron rivets |
 | `spike` | a lethal non-solid tile: three spikes on a stone base, top row transparent so it never looks like part of the ceiling |
 | `spring` | a spring pad: a brass coil between two steel plates, standing in its cell with the top quarter of the cell left transparent (the launch zone follows that gap, `sim::physics::SPRING_TOP_CLEARANCE`). A body that *lands* on it is thrown upward and keeps the horizontal speed it arrived with |
-| `water_b0`, `water_b1`, `water_b2`, `water_b3`, `water_b4`, `water_b5`, `water_b6`, `water_b7`, `water_b8`, `water_b9`, `water_b10`, `water_b11`, `water_b12`, `water_b13`, `water_b14`, `water_b15` | a pool's body (`Tile::Water`, `~`), drawn as **one picture four tiles square and cut into sixteen cells**: cell `r * 4 + c` of the picture, indexed by the tile's own position modulo four (`crate::view::fluid_body_sprite`). The body has to be seamless — two stacked water cells are one body of water rather than two trays — so the cut is where the *index* changes and not where the picture does, and a pool repeats every four tiles instead of every one |
+| `water_b0`, `water_b1`, `water_b2`, `water_b3`, `water_b4`, `water_b5`, `water_b6`, `water_b7`, `water_b8`, `water_b9`, `water_b10`, `water_b11`, `water_b12`, `water_b13`, `water_b14`, `water_b15` | a pool's body (`Tile::Water`, `~`), drawn as **one picture four tiles square and cut into sixteen cells**: cell `r * 4 + c` of the picture, indexed by the tile's own position modulo four (`crate::view::fluid_body_sprite`). The body has to be seamless — two stacked water cells are one body of water rather than two trays — so the cut is where the *index* changes and not where the picture does, and a pool repeats every four tiles instead of every one. The picture is deliberately **flat**: a field of the body tone with thin, broken caustic lines over it and nothing with an outline, because anything with an outline is a shape the player meets again four tiles along. It is also what lets the body join the surface without a step — see `water_top_a` |
 | `water` | the plain body: cell 0 of that picture, for a tileset that has no block (the sixteen cells above are optional art) and for the two surfaces, which are a body with a crest drawn over it |
 | `water_top_a`, `water_top_b` | a pool's surface, the crest travelling along a row so a long pool's wave moves. The rows above the crest are transparent and the lit band under it fades back into the body tone, so the surface cell ends where the body cell below it begins. Not solid, and a body whose centre is in the water sinks and has to swim |
-| `water_bed` | a pool's bed, drawn **over** the body cell on the floor (`crate::view::draw_fluid_edges`): a shadow whose ragged top edge thickens downwards. An overlay, so it composes with every one of the sixteen body cells |
+| `water_bed` | a pool's bed, drawn **over** the body cell on the floor (`crate::view::draw_fluid_edges`): a shadow that deepens downwards as an ordered-dither gradient from nothing to the darkest tone. The gradient starts at zero density, so it joins the body above it without a line, and every cell draws the same one, so a pool's floor has no seam either. An overlay, so it composes with every one of the sixteen body cells |
 | `water_wall_l`, `water_wall_r` | the rim of a pool that meets **air** at that side: two or three pixels of dark water, uniform down the cell so the edge runs unbroken through a deep pool. The right wall is the left one mirrored, so the two cannot drift apart |
-| `lava_b0`, `lava_b1`, `lava_b2`, `lava_b3`, `lava_b4`, `lava_b5`, `lava_b6`, `lava_b7`, `lava_b8`, `lava_b9`, `lava_b10`, `lava_b11`, `lava_b12`, `lava_b13`, `lava_b14`, `lava_b15` | a lava pool's body (`Tile::Lava`, `L`) in the same sixteen-cell construction, drawn from the molten end of the palette: bright cells are molten, dark ones already cooled. Lethal on contact, and a cell open to the air is a **vent** that throws a ball |
+| `lava_b0`, `lava_b1`, `lava_b2`, `lava_b3`, `lava_b4`, `lava_b5`, `lava_b6`, `lava_b7`, `lava_b8`, `lava_b9`, `lava_b10`, `lava_b11`, `lava_b12`, `lava_b13`, `lava_b14`, `lava_b15` | a lava pool's body (`Tile::Lava`, `L`) in the same sixteen-cell construction: a field of molten orange with sparse, evenly spread embers over it. No line work at all — an earlier pass drew the crust as cracks, and cracks are closed shapes, so a wide pool showed the same rings three times. Even grain has nothing for the eye to catch on and the repeat disappears. Lethal on contact, and a cell open to the air is a **vent** that throws a ball |
 | `lava` | the plain lava body: cell 0 of the picture, for a tileset without the block |
 | `lava_top_a`, `lava_top_b` | a lava surface: a glowing crust line with two domes that break and re-form, fading into the body by the fourth row for the same reason water's does |
-| `lava_bed` | a lava pool's bed: crusted where it meets the ground, with a few cracks in the crust still glowing — the rock the pool sits on is being cooked |
+| `lava_bed` | a lava pool's bed: the same dithered shadow as water's, in the molten ramp, so the pool's floor is cooked darker rather than crusted |
 | `lava_wall_l`, `lava_wall_r` | the rim of a lava pool against open air: the crust that forms where the melt meets nothing. Another mirrored pair |
 | `lava_ball` | one ball of lava in flight, drawn to fill its cell because the cell *is* its hitbox: the thing that kills a body is the thing the player can see |
 | `vine` | one cell of climbable vine (`Tile::Vine`, `V`): a stem continuous from row 0 to row 15 so a shaft of them reads as one vine, with leaves alternating down it. Not solid; jump climbs it and releasing slides down it |
@@ -78,9 +111,12 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `block` | a crate (`BlockSpec`): a one-tile box a body can shove along a floor and stand on. Drawn to fill its cell and fully opaque, again because the cell is its hitbox — a crate with air drawn round it would promise a gap a body cannot walk through. Timber planks with two seams and a cross batten, bound by an iron frame with four corner brackets: the wood says what it is made of, the iron is the pack's way of saying *brought here and put down* rather than *part of the ground*. The bottom row has no lit pixel, so a resting crate reads as resting |
 | `cracked_ground`, `cracked_sand`, `cracked_brick`, `cracked_wood` | one material's crack, on an otherwise transparent cell, drawn **over** that material's own tile by `crate::view`. A wide, three-tone fracture — dark heart, chipped shoulder, lit lip — with a branch or a broken corner, so it reads as damage rather than as more texture. The tile it marks is ordinary solid ground until a body stands on it, and then it leaves the level (`sim::physics::CRUMBLE_TICKS`) |
 | `cracked_ground_b`, `cracked_ground_c`, `cracked_sand_b`, `cracked_sand_c`, `cracked_brick_b`, `cracked_brick_c`, `cracked_wood_b`, `cracked_wood_c` | the second and third crack for each material, so a run of brittle tiles is not one stamp repeated. `crate::view::cracked_overlay` picks one from the tile's coordinates and falls back to the base crack when a tileset ships only that |
-| `player_idle_a`, `player_idle_b` | the runner at rest, breathing |
-| `player_run_1`, `player_run_2`, `player_run_3`, `player_run_4`, `player_run_5`, `player_run_6` | the six-frame run cycle |
-| `player_jump`, `player_fall`, `player_land`, `player_hurt` | rising, falling, the landing frame, and the pose a dead agent is left in |
+| `player_idle_a`, `player_idle_b`, `player_idle_c`, `player_idle_d`, `player_idle_e`, `player_idle_f` | the cat at rest, six frames: a breath, a slow blink, and the tail drifting |
+| `player_run_1`, `player_run_2`, `player_run_3`, `player_run_4`, `player_run_5`, `player_run_6`, `player_run_7`, `player_run_8`, `player_run_9`, `player_run_10`, `player_run_11`, `player_run_12` | the twelve-frame gallop: the body bounces twice a cycle, the paws paddle half a cycle apart, and the tail streams out behind (`crate::view::RUN_FRAMES`). The cycle is driven by *distance* run, not by time, so the paws never skate |
+| `player_jump_1`, `player_jump_2`, `player_jump_3`, `player_jump_4`, `player_jump_5`, `player_jump_6` | the paws tucking and the tail hanging as the body rises, chosen by air time |
+| `player_fall_1`, `player_fall_2`, `player_fall_3`, `player_fall_4`, `player_fall_5`, `player_fall_6` | the tail up and the paws out to meet the floor, chosen by how fast the body is coming down |
+| `player_land_1`, `player_land_2`, `player_land_3`, `player_land_4` | the impact, the settle, the rise, and standing again |
+| `player_hurt` | the pose a dead agent is left in: on its side, eyes shut, feet in the air |
 | `walker_a`, `walker_b`, `walker_c`, `walker_d` | the patroller's four-frame walk |
 | `walker_dead` | a stomped walker |
 | `chaser_a`, `chaser_b`, `chaser_c`, `chaser_d` | the chaser's four-frame run: a leaner, red carapace with a forward horn, deliberately not a tint of the walker's art |
@@ -120,9 +156,9 @@ tool bar grew pictures still runs — its buttons carry their names instead of a
 | `blend_stone_l`, `blend_stone_r`, `blend_stone_t`, `blend_stone_b` | the rock under both, same four edges |
 | `blend_beach_l`, `blend_beach_r`, `blend_beach_t` | a beach's sand crossing three of the four edges — never the bottom: see below |
 | `blend_packed_l`, `blend_packed_r`, `blend_packed_t`, `blend_packed_b` | the packed sand three tiles into a dune, same four edges |
-| `ui_undo`, `ui_redo` | the window's tool bar and a run's record: a turn arrow each way — the same arc and head reflected about the vertical axis, so the two are mirrors by construction (`art/ui.py`) |
+| `ui_undo`, `ui_redo` | the window's tool bar and a run's record: a turn arrow each way — the same arc and head reflected about the vertical axis, so the two are mirrors by construction (`kit_props.ui_glyph`) |
 | `ui_fit` | four corner brackets around a block: *frame the whole level in the view* |
-| `ui_mirror` | two halves leaving a dashed axis: flip the whole level left to right — the one tool that acts on the document rather than on a tile (`art/ui.py`) |
+| `ui_mirror` | two halves leaving a dashed axis: flip the whole level left to right — the one tool that acts on the document rather than on a tile (`kit_props.ui_glyph`) |
 | `ui_info` | a magnifying glass: open the details window |
 | `ui_restart` | a nearly-closed ring with its head in the gap: put the runner back at the spawn, or run the episodes again |
 | `ui_pause`, `ui_play` | two upright bars, and the triangle they alternate with: hold a run or an episode where it is, or let it go on |
@@ -200,9 +236,16 @@ says nothing about a butterfly.
 
 ## Replacing the art
 
-The palette lives at the top of `tools/art/common.py`; each family is drawn in its own
-module there (`terrain.py`, `characters.py`, `props.py`, `ui.py`), mostly as 16-row string art
-or small drawing helpers, so editing a sprite means editing a picture. Texture comes
-from a hash-based value noise rather than `random`, so regenerating never produces a
-spurious diff. Tiles are picked by what surrounds them, which is why the grid, not the
-artist, decides which `ground_N` a given floor tile asks for.
+The palette lives at the top of `tools/art/kit.py`; each family is drawn in its own
+module there (`kit.py`, `kit_cast.py`, `kit_props.py`), as small drawing helpers over a
+16-pixel canvas, so editing a sprite means editing a picture. Texture comes from a
+hash-based value noise rather than `random`, so regenerating never produces a spurious
+diff. Tiles are picked by what surrounds them, which is why the grid, not the artist,
+decides which `ground_N` a given floor tile asks for.
+
+Every frame of every cycle is drawn, not repeated: the run has six distinct leg poses,
+the walker and the chaser four gaits each, and `atlas::tests::every_animation_actually_animates`
+compares the shipped pixels so a cycle cannot silently become one drawing. The art
+tests in `crates/app/src/atlas.rs` also pin the renderer's contracts — crown height,
+seam shape, sprite anchors, the spike's clearance — so a redraw cannot quietly break
+the level it draws.

@@ -475,6 +475,34 @@ pub struct GaConfig {
     /// route is function-preserving with respect to nothing — it is a *teacher*, not a migration —
     /// so a lesson that does not help is a cost, not a corruption.
     pub lesson_every: u32,
+    /// **Learn from the win, once.** When a genome first reaches the flag, record its own
+    /// episode and fit a behavioural clone of the play into the population as an ordinary child.
+    /// On — the default — because the alternative is what the owner watched: a run that solved a
+    /// spring-and-rope level once, kept the genome in the record, and never reproduced the win,
+    /// while every teaching mechanism the run had was pointed at a route the oracle could not
+    /// build (see [`GaConfig::lesson_every`]).
+    ///
+    /// This is the one lesson that does not need a plan: the demonstration is the winning episode
+    /// itself, recorded at the policy's own cadence, so the clone learns the timing the win
+    /// needed rather than a canonical script the level has no edge for. It is spent once per run
+    /// — a win is the event, not a cadence — and the clone enters through breeding like any other
+    /// child: it must earn its score on the next generation's episodes.
+    pub win_lesson: bool,
+    /// **Counterfactual branch search cadence.** Every N generations, fork the best genome's
+    /// own losing episode and search whole-block deviations from it ([`crate::whatif`]). 0 —
+    /// the default — disables the helper, so an ordinary run is bit-identical to one taken
+    /// before the mechanism existed.
+    ///
+    /// The one-decision repair ([`GaConfig::repair_children`]) can only ask "what if I had done
+    /// this *instead* for one block?". A deck, a patrol or a moving platform usually needs a
+    /// sequence — wait, then run, then jump — and that is the question this helper answers. A
+    /// branch that beats the episode from the fork is distilled into one child and injected as
+    /// an ordinary member of the next generation; its episodes are what accept or reject
+    /// it. The cost is one replay of the best genome plus a bounded beam of short policy
+    /// rollouts, paid only on the cadence. The window defaults it on at every eighth
+    /// generation because that is where a stalled run is watched; the terminal keeps it off so
+    /// the measured defaults do not move without an arm.
+    pub what_if_every: u32,
     /// **Plateau-triggered CEM phase (Item 4, step 2).** Generations without a record improvement
     /// before a bounded full-net CEM phase is spent; 0 disables it.
     pub plateau_window: u32,
@@ -560,6 +588,8 @@ impl Default for GaConfig {
             growth_units: 0,
             growth_events: 2,
             lesson_every: 0,
+            win_lesson: true,
+            what_if_every: 0,
             plateau_window: 0,
             plateau_cem_generations: 5,
             plateau_cem_events: 1,
@@ -745,6 +775,7 @@ impl GaConfig {
         // Lessons and CEM phases are bounded the same way: a cadence of 0 is off, and the phase
         // count is capped because each one spends episodes from the run's budget.
         self.lesson_every = self.lesson_every.min(10_000);
+        self.what_if_every = self.what_if_every.min(10_000);
         self.plateau_window = self.plateau_window.min(10_000);
         self.plateau_cem_generations = self.plateau_cem_generations.min(100);
         self.plateau_cem_events = self.plateau_cem_events.min(8);
@@ -1050,6 +1081,19 @@ pub struct GenerationReport {
     pub archive_children: usize,
     /// Children bred from a **mistake** into the generation that follows this one (Item 14).
     pub repairs: usize,
+    /// Children injected from a **counterfactual branch** this generation ([`crate::whatif`]).
+    /// Zero on a generation the helper did not run, or when it ran and no branch or child beat
+    /// the episode; `what_if_branches` distinguishes the two.
+    pub what_if_children: usize,
+    /// Branches the counterfactual helper scored this generation. Zero when the cadence is off
+    /// or this generation was not due.
+    pub what_if_branches: usize,
+    /// The helper's one-line reading of the branch it found, when it found one.
+    pub what_if_note: Option<String>,
+    /// **The win lesson's one-line reading**, on the generation it was taught: what the clone
+    /// reproduced, or why the lesson could not be fitted. `None` on every other generation
+    /// ([`GaConfig::win_lesson`]).
+    pub win_lesson: Option<String>,
     /// Behavioural niches occupied at the end of this generation (see [`GenRow`]).
     pub archive_bits: usize,
     /// Finish bands holding a winner at the end of this generation (see [`GenRow`]).
@@ -1909,6 +1953,14 @@ pub struct Trainer {
     growth_used: u32,
     /// Item 4's budget counters: lessons injected and CEM phases spent.
     lessons: usize,
+    /// **Win lessons taught** (see [`GaConfig::win_lesson`]): 0 until a genome reaches the flag,
+    /// 1 once its play has been cloned into the population. A count rather than a bool so a panel
+    /// can print the spend, and because a resumed run that has already spent its lesson starts at
+    /// 0 and earns a fresh one — the run it is continuing is not the run that solved.
+    win_lessons: usize,
+    /// The win lesson's one-line reading for the generation it fired on, like
+    /// [`Trainer::what_if_note`]. Cleared each generation.
+    win_lesson_note: Option<String>,
     cem_rounds: u32,
     /// Item 11's counter: children bred from technique-archive cells, reported per run so the
     /// arm's effect is separable from the ordinary search.
@@ -1924,6 +1976,12 @@ pub struct Trainer {
     mistakes: Vec<crate::mistakes::Mistake>,
     /// Children the last generation actually bred from a mistake.
     repairs: usize,
+    /// Children the last generation injected from a counterfactual branch, and the branches the
+    /// helper scored when it was due. Zero on a generation it did not run.
+    what_if_children: usize,
+    what_if_branches: usize,
+    /// The helper's one-line reading of the branch it found, when it found one.
+    what_if_note: Option<String>,
 }
 
 impl Trainer {
@@ -1959,12 +2017,17 @@ impl Trainer {
             snapshot_wins: 0,
             growth_used: 0,
             lessons: 0,
+            win_lessons: 0,
+            win_lesson_note: None,
             cem_rounds: 0,
             technique_bred: 0,
             cut_early: 0,
             cut_refunds: 0,
             mistakes: Vec::new(),
             repairs: 0,
+            what_if_children: 0,
+            what_if_branches: 0,
+            what_if_note: None,
         }
     }
 
@@ -2038,12 +2101,17 @@ impl Trainer {
             snapshot_wins: 0,
             growth_used: 0,
             lessons: 0,
+            win_lessons: 0,
+            win_lesson_note: None,
             cem_rounds: 0,
             technique_bred: 0,
             cut_early: 0,
             cut_refunds: 0,
             mistakes: Vec::new(),
             repairs: 0,
+            what_if_children: 0,
+            what_if_branches: 0,
+            what_if_note: None,
         })
     }
 
@@ -2514,6 +2582,13 @@ impl Trainer {
         self.lessons
     }
 
+    /// Win lessons this run taught: 0 until a genome reaches the flag, 1 once its play has been
+    /// cloned into the population (see [`GaConfig::win_lesson`]). The count, not a bool, because a
+    /// run that is resumed after a win starts with a fresh lesson to spend — it is a new run.
+    pub fn win_lessons(&self) -> usize {
+        self.win_lessons
+    }
+
     /// CEM phases this run spent on the plateau (Item 4, step 2), capped by
     /// [`GaConfig::plateau_cem_events`]. `0` when the trigger is off.
     pub fn cem_phases(&self) -> u32 {
@@ -2550,6 +2625,39 @@ impl Trainer {
             }
         }
         self.snapshots.len()
+    }
+
+    /// **Ask what a losing sequence would have done** ([`GaConfig::what_if_every`]).
+    ///
+    /// The generation's best genome replays its own representative episode, forks it near the
+    /// end, and searches whole-block deviations in the real simulator. A branch that beats the
+    /// episode from the fork is distilled into a child and injected into the population the next
+    /// generation evaluates; the trainer does not crown it or record it, so a branch that only
+    /// looked good at the fork is discarded by the ordinary objective like any other child.
+    ///
+    /// The seed is the genome's own trial-0 episode, the same one [`crate::mistakes`] repairs,
+    /// so the helper is reasoning about the episode the run actually judged this generation.
+    fn what_if_probe(&mut self, level: &Level, genome: &Genome) {
+        let seed = episode_seed_for(&self.config, self.generation, genome.id, 0);
+        let report = crate::whatif::search(
+            level,
+            genome,
+            &self.config.eval_config(),
+            seed,
+            crate::whatif::WhatIfConfig::default(),
+        );
+        self.what_if_branches = report.explored;
+        self.what_if_note = Some(report.note.clone());
+        let Some(mut child) = report.best.and_then(|best| best.refined) else {
+            return;
+        };
+        child.id = self.next_id;
+        self.next_id += 1;
+        child.shape = self.config.shape.clone();
+        child.fitness = 0.0;
+        if self.inject(child).is_ok() {
+            self.what_if_children = 1;
+        }
     }
 
     /// **Start a probe batch from the least-visited snapshot (WP8).**
@@ -3253,16 +3361,48 @@ impl Trainer {
             Vec::new()
         };
 
+        // ---- the run's first win, captured before breeding ------------------------------
+        //
+        // The genome is cloned here because `breed` replaces the population; the lesson itself is
+        // taught after every other injection, because each of them writes the weakest slot and the
+        // one win this run has is not the payload to lose to a what-if child.
+        // One level only: a suite's representative result is an aggregate, and a lesson recorded
+        // from `levels[0]` would be a policy for one level sold as the suite's win. A suite that
+        // solves gets its champion through the ordinary record, which is validated on every level.
+        let win_lesson_source = (self.config.win_lesson
+            && self.win_lessons == 0
+            && levels.len() == 1
+            && results[winner].won())
+        .then(|| (self.genomes[winner].clone(), results[winner].seed));
         let (immigrants, archive_children) = self.breed(&order, &selection);
         // ---- Item 4, step 1: a mid-run lesson, injected through breeding ----------
         if self.config.lesson_every > 0 && self.generation % self.config.lesson_every == 0 {
             self.inject_lesson(&levels[0]);
+        }
+        // ---- Counterfactual branch search: "what if the body had waited there?" ----------
+        // After breeding and after the lesson, which replaces the last slot; the what-if child
+        // therefore cannot be the slot a lesson throws away in the same generation. The snapshot
+        // probe runs after it for the same reason, and the branch search is the more specific
+        // helper of the two.
+        self.what_if_children = 0;
+        self.what_if_branches = 0;
+        self.what_if_note = None;
+        // The win lesson is spent later in this generation; last generation's reading does not carry.
+        self.win_lesson_note = None;
+        if self.config.what_if_every > 0 && self.generation % self.config.what_if_every == 0 {
+            self.what_if_probe(&levels[0], &best);
         }
         // Snapshot exploration happens *after* breeding, so a probe that wins from a frontier is
         // in the population the next generation evaluates rather than being overwritten by the
         // children this generation just made.
         if self.config.snapshot_every > 0 && self.generation % self.config.snapshot_every == 0 {
             self.snapshot_probe(&levels[0]);
+        }
+        // **The one win the run has is a teacher, not only a record** (see
+        // [`GaConfig::win_lesson`]). Taught last so the clone survives every other injection into
+        // this generation's weakest slot.
+        if let Some((genome, seed)) = win_lesson_source {
+            self.teach_win_lesson(&levels[0], &genome, seed);
         }
         let archive_bits = self.archive.occupied();
         let archive_time_bits = self.archive.time_bands();
@@ -3309,6 +3449,10 @@ impl Trainer {
                 immigrants: row.immigrants,
                 archive_children: row.archive_children,
                 repairs: self.repairs,
+                what_if_children: self.what_if_children,
+                what_if_branches: self.what_if_branches,
+                what_if_note: self.what_if_note.clone(),
+                win_lesson: self.win_lesson_note.clone(),
                 archive_bits: row.archive_bits,
                 archive_time_bits: row.archive_time_bits,
                 fastest: self.fastest,
@@ -3879,6 +4023,80 @@ impl Trainer {
             if let Some(last) = self.genomes.last_mut() {
                 *last = clone;
                 self.lessons += 1;
+            }
+        }
+    }
+
+    /// **Turn the first win into a lesson** (see [`GaConfig::win_lesson`]).
+    ///
+    /// The winning episode is recorded at the policy's own cadence — [`crate::route_play::record_genome`]
+    /// runs the same stepper the score did — and a behavioural clone of it is fitted and injected
+    /// into the next generation. No planner is involved, which is the point: the levels where a
+    /// win is rare enough to be worth this are the ones whose crossing the canonical move set has no
+    /// edge for (the spring-and-rope `untitled-5` in the owner's run), so a lesson from the route
+    /// graph cannot exist there. The play is the teacher.
+    ///
+    /// The fit is the plain supervised one: DAgger and the leg curriculum need a plan to correct
+    /// against, and there is none. Agreement is reported because it is the honest reading of what
+    /// the population was given — a clone that reproduces 40% of the decisions is a warm start, not
+    /// a solution, and the note says which one it is.
+    fn teach_win_lesson(&mut self, level: &Level, genome: &Genome, seed: u64) {
+        let eval = self.config.eval_config();
+        let (result, play) = crate::route_play::record_genome(level, genome, &eval, seed);
+        if !result.won() {
+            self.win_lesson_note = Some(format!(
+                "win lesson skipped: the recorded win did not replay on seed {seed} ({:?})",
+                result.outcome
+            ));
+            return;
+        }
+        let fit = crate::imitate::ImitateConfig {
+            // A win is rare, so the fit can afford more passes than a lesson that runs on a
+            // cadence — but not the default 300, which is a ceiling sized for a whole-route
+            // demonstration. A hundred and twenty already reproduces most of a win's decisions on
+            // the shipped levels, and the cost is paid once per run.
+            epochs: 120,
+            prefer_agreement: true,
+            // A win lesson has no plan to correct against, so the two passes that need one are
+            // off; this is a supervised fit of the recorded play and nothing else.
+            dagger_rounds: 0,
+            leg_rounds: 0,
+            ..Default::default()
+        };
+        let decisions = play.decisions.len();
+        let frames = play.frames;
+        match crate::imitate::clone_from_play(&play, self.config.shape.clone(), &fit) {
+            Ok(report) => {
+                let mut clone = report.genome;
+                clone.fitness = 0.0;
+                // The **last** breeding slot, and not `inject`: this runs after `breed`, whose
+                // population has every per-genome fitness cleared, so `inject`'s "replace the
+                // weakest" would find the first slot of all (the leading elite) and overwrite it.
+                // The tail is where every other teaching mechanism puts its child, and it is the
+                // slot whose next generation is a coarse child rather than an elite.
+                //
+                // The clone **takes the slot's id** rather than issuing a fresh one. The child
+                // that held it was bred a moment ago and never ran, so its id names no episode;
+                // reusing it keeps the id sequence dense (every issued id belongs to a genome that
+                // was actually evaluated), which is the invariant `genome_ids_are_unique_...`
+                // checks.
+                if let Some(last) = self.genomes.last_mut() {
+                    clone.id = last.id;
+                    *last = clone;
+                    if let Some(parent) = self.parent_fitness.last_mut() {
+                        *parent = NO_PARENT;
+                    }
+                    self.win_lessons += 1;
+                    self.win_lesson_note = Some(format!(
+                        "win lesson: the {:.2}s winning play cloned into the population \
+                         ({decisions} decisions, {:.0}% reproduced)",
+                        frames as f32 / 60.0,
+                        report.agreement * 100.0
+                    ));
+                }
+            }
+            Err(e) => {
+                self.win_lesson_note = Some(format!("win lesson could not be fitted: {e}"));
             }
         }
     }
@@ -5272,6 +5490,43 @@ mod tests {
         );
     }
 
+    /// **The first win becomes a lesson, once.** This is the owner's case in one test: a level a
+    /// policy solved once is a play worth keeping, and the population should be given a clone of it
+    /// rather than only a genome to mutate. The lesson is spent on the first win and never again.
+    #[test]
+    fn the_first_win_is_cloned_into_the_population_and_taught_once() {
+        let level = crate::fixture::flat_runway("win-lesson", 10, 8);
+        // The all-zeros genome is a constant run (finding 2), and a flat runway is solved by it.
+        let zeros = Genome::zeros(1, default_shape());
+        let cfg = GaConfig {
+            pop_size: 8,
+            master_seed: 5,
+            ..GaConfig::default()
+        };
+        let mut trainer = Trainer::resume(cfg, vec![zeros], 0).expect("a population resumes");
+        let report = trainer.step(&level);
+        assert!(report.wins > 0, "the zeros genome runs the flat level");
+        let note = report
+            .win_lesson
+            .as_deref()
+            .expect("the first win is taught");
+        assert!(note.starts_with("win lesson:"), "{note}");
+        assert_eq!(trainer.win_lessons(), 1);
+        assert!(
+            note.contains("reproduced"),
+            "the note must say what the population was given: {note}"
+        );
+
+        // Spent once: a second winning generation does not refit the same play.
+        let second = trainer.step(&level);
+        assert_eq!(trainer.win_lessons(), 1);
+        assert!(
+            second.win_lesson.is_none(),
+            "a lesson is an event, not a cadence: {:?}",
+            second.win_lesson
+        );
+    }
+
     /// **A run seeded from a champion starts with that champion's record.**
     ///
     /// `from_champion` builds the population and leaves the record empty, so the first
@@ -6273,6 +6528,44 @@ mod tests {
                 "slot {slot} must be a repaired child, not a copy of the elite"
             );
         }
+    }
+
+    #[test]
+    fn a_what_if_branch_is_injected_on_its_cadence() {
+        let level = crate::fixture::gap_runway("ga-what-if-fixture", 24, 22, &[(10, 2)]);
+        let cfg = GaConfig {
+            pop_size: 8,
+            elite: 2,
+            fine_children: 0,
+            mutation_rate: 0.0,
+            crossover_rate: 0.0,
+            adaptive_sigma: false,
+            stagnation_generations: 0,
+            immigrants: 0,
+            archive_children: 0,
+            technique_children: 0,
+            what_if_every: 1,
+            master_seed: 4,
+            ..GaConfig::default()
+        };
+        let zeros = Genome::zeros(0, cfg.shape.clone());
+        let mut t = Trainer::resume(cfg.clone(), vec![zeros.clone(); cfg.pop_size], 0)
+            .expect("a uniform population resumes");
+        let report = t.step(&level);
+        assert!(
+            report.what_if_branches > 0,
+            "the helper has to search when the cadence is due: {:?}",
+            report.what_if_note
+        );
+        assert_eq!(
+            report.what_if_children, 1,
+            "a pit branch should produce one child: {:?}",
+            report.what_if_note
+        );
+        assert!(
+            t.genomes.iter().any(|g| gene_distance(g, &zeros) > 0),
+            "the distilled branch must enter the population, not just the report"
+        );
     }
 
     /// **The timing share spends its fine slots on the jump boundary and nothing else.**

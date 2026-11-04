@@ -34,8 +34,8 @@ and enemy at once. The canvas is the game's own view; `G` adds the guides.*
 
 ![Evolve view: a run in progress on L3](docs/images/evolve.png)
 
-*Evolve view: twenty generations into a run on L3, with the fitness chart
-below.*
+*Evolve view: a run on L3 that has already found the flag, with the fitness
+chart below.*
 
 ![Replay view: the run's quickest win, with the population ghosted beside it](docs/images/replay.png)
 

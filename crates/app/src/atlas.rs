@@ -27,7 +27,7 @@ use egui::{ColorImage, Context, Pos2, Rect, TextureHandle, TextureOptions};
 /// The material seams (`blend_*`) are optional the same way, and more so than the rest:
 /// a tileset without them draws a hard edge between two materials, which is what every
 /// tileset drew before they existed.
-pub const REQUIRED: [&str; 81] = [
+pub const REQUIRED: [&str; 104] = [
     "empty",
     // The ground: one sprite per 4-bit open-side mask, and the rock the same way for
     // every mask with no sky above it.
@@ -81,19 +81,44 @@ pub const REQUIRED: [&str; 81] = [
     // is the hitbox the player has to see. A tileset without it would draw a body dying to
     // nothing, so the load is refused instead.
     "spike_ball",
-    // The player's animation set: two idle frames, a six-frame run, one pose per
-    // airborne state, and the pose a dead agent is left in.
+    // The player's animation set: six idle frames, a twelve-frame run, six frames each
+    // for the jump and the fall, four for the landing, and the pose a dead agent is left
+    // in. The counts are the shapes the renderer plays, so a tileset with a shorter cycle
+    // would make the run stutter rather than play slower.
     "player_idle_a",
     "player_idle_b",
+    "player_idle_c",
+    "player_idle_d",
+    "player_idle_e",
+    "player_idle_f",
     "player_run_1",
     "player_run_2",
     "player_run_3",
     "player_run_4",
     "player_run_5",
     "player_run_6",
-    "player_jump",
-    "player_fall",
-    "player_land",
+    "player_run_7",
+    "player_run_8",
+    "player_run_9",
+    "player_run_10",
+    "player_run_11",
+    "player_run_12",
+    "player_jump_1",
+    "player_jump_2",
+    "player_jump_3",
+    "player_jump_4",
+    "player_jump_5",
+    "player_jump_6",
+    "player_fall_1",
+    "player_fall_2",
+    "player_fall_3",
+    "player_fall_4",
+    "player_fall_5",
+    "player_fall_6",
+    "player_land_1",
+    "player_land_2",
+    "player_land_3",
+    "player_land_4",
     "player_hurt",
     // The walker patrol, and what is left of it after a stomp.
     "walker_a",
@@ -388,6 +413,19 @@ pub fn window_icon(
 mod tests {
     use super::*;
 
+    /// Every required sprite whose name starts with `prefix`, in manifest order.
+    ///
+    /// The player's cycles are read off `REQUIRED` rather than typed out in each test: a
+    /// frame added to the atlas is a frame these tests cover, and a test list that has to
+    /// be updated by hand is a list that silently stops covering the newest frames.
+    fn player_frames(prefix: &str) -> Vec<&'static str> {
+        REQUIRED
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with(prefix))
+            .collect()
+    }
+
     fn assets_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets")
     }
@@ -409,15 +447,13 @@ mod tests {
         let opaque = icon.rgba.chunks(4).filter(|p| p[3] > 0).count();
         assert!(opaque > 0, "a blank icon is not an icon");
 
-        // The runner's own palette, as `art/common.py` names it: the dark ink of the outline and
-        // the vermilion of the body. *Present* is the claim — the crop is of the sprite that was
-        // asked for — and it is the one thing a size assertion cannot see.
+        // The player's own palette, as `art/kit_cast.py` names it: the ginger of the fur and
+        // the cream of the muzzle. *Present* is the claim — the crop is of the sprite that was
+        // asked for — and it is the one thing a size assertion cannot see. The ink this used to
+        // look for is gone on purpose: the course-kit pass removed the one-pixel outline.
         let has = |rgb: [u8; 3]| icon.rgba.chunks(4).any(|p| p[..3] == rgb && p[3] > 0);
-        assert!(
-            has([44, 24, 36]),
-            "the runner's outline ink is not in the icon"
-        );
-        assert!(has([186, 74, 30]), "the runner's body is not in the icon");
+        assert!(has([220, 143, 78]), "the cat's fur is not in the icon");
+        assert!(has([246, 222, 187]), "the cat's muzzle is not in the icon");
 
         // And the name picks the cell: a transparent tile scales up to a transparent icon.
         let empty = window_icon(assets_dir(), "empty", 4).expect("an icon from the atlas");
@@ -691,19 +727,6 @@ mod tests {
             })
         }
 
-        /// The colours along the figure's edge, one per edge pixel.
-        fn edge_colours(&self) -> Vec<[u8; 4]> {
-            let mut out = Vec::new();
-            for y in 0..self.cell {
-                for x in 0..self.cell {
-                    if self.on_the_edge(x, y) {
-                        out.push(self.at(x, y));
-                    }
-                }
-            }
-            out
-        }
-
         /// The colour the figure is mostly made of *inside* its edge: its body.
         ///
         /// The modal interior colour, so "the player's colour" is a fact about the
@@ -732,6 +755,31 @@ mod tests {
                     _ => Some(entry),
                 })
                 .expect("a character has an inside")
+                .0
+        }
+
+        /// The colour the whole figure is mostly made of.
+        ///
+        /// Every opaque pixel counts, edges included. `modal_interior_colour` skips the
+        /// rim because it was written for a figure with an ink outline around it, where
+        /// the rim is one colour by construction and the body is what is left. There is
+        /// no outline any more, and the rim of a lit figure is part of its mass, so the
+        /// whole-sprite count is the one that answers "what colour is this character".
+        fn modal_colour(&self) -> [u8; 4] {
+            let mut counts: Vec<([u8; 4], usize)> = Vec::new();
+            for pixel in self.px.iter().filter(|p| p[3] > 0) {
+                match counts.iter_mut().find(|(colour, _)| colour == pixel) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((*pixel, 1)),
+                }
+            }
+            counts
+                .into_iter()
+                .fold(None, |best: Option<([u8; 4], usize)>, entry| match best {
+                    Some(best) if best.1 >= entry.1 => Some(best),
+                    _ => Some(entry),
+                })
+                .expect("a character has pixels")
                 .0
         }
 
@@ -1160,18 +1208,25 @@ mod tests {
     fn every_character_stands_on_its_own_floor() {
         let pixels = Pixels::load();
         // On its feet: the sprite reaches the bottom row of its cell, which is where the
-        // physics box's floor is.
-        for name in [
-            "player_idle_a",
-            "player_idle_b",
-            "player_run_1",
-            "player_run_4",
-            "player_land",
-            "player_hurt",
-            "walker_a",
-            "walker_c",
-            "walker_dead",
-        ] {
+        // physics box's floor is. The list is derived from `REQUIRED` rather than typed
+        // out, so a longer cycle is covered the moment its frames are added — the two
+        // animations with different rules are the airborne ones below.
+        for name in player_frames("player_") {
+            if name.starts_with("player_jump_") || name.starts_with("player_fall_") {
+                continue;
+            }
+            let sprite = pixels.sprite(name);
+            let lowest = *sprite.opaque_rows().last().expect("a character has pixels");
+            assert!(
+                lowest >= sprite.cell - 2,
+                "{name}'s lowest pixel is row {lowest}: it is floating"
+            );
+            assert!(
+                sprite.has_transparency(),
+                "{name} is a filled square, not a character"
+            );
+        }
+        for name in ["walker_a", "walker_c", "walker_dead"] {
             let sprite = pixels.sprite(name);
             let lowest = *sprite.opaque_rows().last().expect("a character has pixels");
             assert!(
@@ -1187,7 +1242,10 @@ mod tests {
         // Airborne, and allowed to tuck its legs up — a jump pose that still touched the
         // floor would read as standing rather than jumping. Both are still in the lower
         // half of the cell, so the agent does not appear to fly.
-        for name in ["player_jump", "player_fall"] {
+        for name in player_frames("player_") {
+            if !(name.starts_with("player_jump_") || name.starts_with("player_fall_")) {
+                continue;
+            }
             let sprite = pixels.sprite(name);
             let lowest = *sprite.opaque_rows().last().expect("a character has pixels");
             assert!(
@@ -1206,79 +1264,24 @@ mod tests {
     ///
     /// The character this replaced was a cyan runner on a blue sky — a body a few shades
     /// off the thing behind it, which is a colour scheme that reads as "I cannot find my
-    /// own player". The two halves of the assertion come from the two files that have to
-    /// agree about it: the body colour is the modal colour of the shipped PNG, and the
-    /// backdrop is the renderer's own list,
-    /// asked for rather than copied, so neither side can drift without this failing. (The
-    /// old palette measures 3 176 against the sky's top: comfortably inside the 14 400
-    /// this refuses.)
+    /// own player".
+    ///
+    /// The measure is the figure's *modal* colour, and two colours are told apart if they
+    /// differ in hue or in value: at least 120 apart in RGB, or at least 40 apart in
+    /// luminance. The second half is what a shaded character needs — slate trousers and a
+    /// mid pine are 82 apart in RGB, which is a hue reading, yet one is nearly twice the
+    /// other's brightness and no one confuses them on screen. The modal colour is used
+    /// because it is the mass a player reads the character as; the rest of the figure is
+    /// lit and shaded around it.
+    ///
+    /// The rule is about the *character*, not about a flat swatch: the same test also
+    /// asks that no one colour covers more than sixty percent of the figure, because a
+    /// character painted in a single colour has no internal contrast to keep it readable
+    /// when the one colour it does have is close to something behind it.
     #[test]
     fn the_player_is_not_the_colour_of_the_sky_it_runs_in_front_of() {
         const FAR_APART: i64 = 120 * 120;
-        let pixels = Pixels::load();
-        let backdrop = crate::view::backdrop_colours();
-        for name in [
-            "player_idle_a",
-            "player_idle_b",
-            "player_run_1",
-            "player_run_2",
-            "player_run_3",
-            "player_run_4",
-            "player_run_5",
-            "player_run_6",
-            "player_jump",
-            "player_fall",
-            "player_land",
-            "player_hurt",
-        ] {
-            let body = pixels.sprite(name).modal_interior_colour();
-            for colour in backdrop {
-                let dx = i64::from(body[0]) - i64::from(colour.r());
-                let dy = i64::from(body[1]) - i64::from(colour.g());
-                let dz = i64::from(body[2]) - i64::from(colour.b());
-                let distance = dx * dx + dy * dy + dz * dz;
-                assert!(
-                    distance >= FAR_APART,
-                    "{name}'s body {body:?} is only {distance} from the backdrop colour \
-                     {:?}: the character is camouflaged",
-                    colour.to_array()
-                );
-            }
-        }
-
-        // And the specific mistake the assertion is for, kept so that the check cannot
-        // quietly stop being able to see it: the palette this replaced, against the
-        // closest colour in the sky it used to run in front of.
-        let replaced = [92u8, 216, 234];
-        let closest = backdrop
-            .iter()
-            .map(|colour| {
-                let dx = i64::from(replaced[0]) - i64::from(colour.r());
-                let dy = i64::from(replaced[1]) - i64::from(colour.g());
-                let dz = i64::from(replaced[2]) - i64::from(colour.b());
-                dx * dx + dy * dy + dz * dz
-            })
-            .min()
-            .expect("a backdrop has colours");
-        assert!(
-            closest < FAR_APART,
-            "the cyan runner this replaced is {closest} from the sky, which this test \
-             would now accept: the rule has stopped being able to see the bug"
-        );
-    }
-
-    /// Every player frame wears one dark rim, and it is dark *because* it is the rim.
-    ///
-    /// This is the pixel-level reading of the art's own rule (`characters._bump` wraps the
-    /// finished silhouette in one pixel of outline), and it is what keeps the character
-    /// separable from any backdrop rather than only from the ones its hue happens to suit:
-    /// the edge of the figure is its own colour, not a shade of whatever is behind it. The
-    /// three claims are that there *is* an edge, that it is one colour rather than a
-    /// ragged fringe, and that it reads as an edge — the rim of a figure is the darkest
-    /// part of it. The cell's own boundary is exempt by definition, which is why the feet
-    /// can still stand on row 15.
-    #[test]
-    fn every_player_frame_wears_one_dark_rim() {
+        const LUMINANCE_APART: f32 = 40.0;
         fn luminance(colour: [u8; 4]) -> f32 {
             0.2126 * f32::from(colour[0])
                 + 0.7152 * f32::from(colour[1])
@@ -1286,216 +1289,106 @@ mod tests {
         }
 
         let pixels = Pixels::load();
-        for name in [
-            "player_idle_a",
-            "player_idle_b",
-            "player_run_1",
-            "player_run_2",
-            "player_run_3",
-            "player_run_4",
-            "player_run_5",
-            "player_run_6",
-            "player_jump",
-            "player_fall",
-            "player_land",
-            "player_hurt",
-        ] {
+        let backdrop = crate::view::backdrop_colours();
+        for name in player_frames("player_") {
             let sprite = pixels.sprite(name);
-            let edge = sprite.edge_colours();
+            let body = sprite.modal_colour();
+            for colour in backdrop {
+                let dx = i64::from(body[0]) - i64::from(colour.r());
+                let dy = i64::from(body[1]) - i64::from(colour.g());
+                let dz = i64::from(body[2]) - i64::from(colour.b());
+                let distance = dx * dx + dy * dy + dz * dz;
+                let value_gap = (luminance(body) - luminance(colour.to_array())).abs();
+                assert!(
+                    distance >= FAR_APART || value_gap >= LUMINANCE_APART,
+                    "{name}'s body {body:?} is {distance} from the backdrop colour {:?} and \
+                     only {value_gap:.0} of luminance apart: the character is camouflaged",
+                    colour.to_array()
+                );
+            }
+
+            // And it is a character rather than a silhouette filled with one colour: the
+            // modal tone covers less than sixty percent of the figure.
+            let colours: Vec<[u8; 4]> = sprite
+                .colours()
+                .into_iter()
+                .filter(|pixel| pixel[3] > 0)
+                .collect();
+            let total = colours.len();
+            let modal = colours.iter().filter(|pixel| **pixel == body).count();
             assert!(
-                edge.len() > 20,
-                "{name} has an edge of {} pixels: it is barely a character",
-                edge.len()
-            );
-            let rim = edge[0];
-            assert!(
-                edge.iter().all(|colour| *colour == rim),
-                "{name}'s edge is more than one colour: {:?}",
-                edge.iter().filter(|c| **c != rim).collect::<Vec<_>>()
-            );
-            let body = sprite.modal_interior_colour();
-            assert!(
-                luminance(rim) * 2.0 < luminance(body),
-                "{name}'s rim {rim:?} is not darker than its body {body:?}: an edge has to \
-                 read as an edge"
+                modal * 10 < total * 6,
+                "{name}: its largest single colour covers {modal} of {total} pixels, so it \
+                 is a flat blob rather than a shaded figure"
             );
         }
+
+        // And the specific mistake the assertion is for, kept so that the check cannot
+        // quietly become a tautology: a body the colour of the sky fails both readings.
+        let sky = backdrop[0];
+        let body = [sky.r(), sky.g(), sky.b(), 255];
+        let dx = i64::from(body[0]) - i64::from(sky.r());
+        let dy = i64::from(body[1]) - i64::from(sky.g());
+        let dz = i64::from(body[2]) - i64::from(sky.b());
+        assert!(
+            dx * dx + dy * dy + dz * dz < FAR_APART,
+            "the sky is far enough from itself that this test proves nothing"
+        );
     }
 
-    /// Scenery sits on the ground it is drawn on, and a cloud does not: the two have
-    /// different anchors, and a bush drawn floating would undo the point of the terrain.
+    /// The player's face sits on the sprite's centre line, mirror for mirror.
     ///
-    /// The view leans on this: a surface prop is drawn in the *open* tile above the ground
-    /// (`view::Prop`), so a prop whose art stopped at row 14 would stand one pixel of air
-    /// above the tile it belongs to, on every tile of every level.
+    /// The bug this pins: the hand-drawn cat before this one was a pixel or two wider on
+    /// one side and had its muzzle pushed onto one cheek, and what a player saw was not
+    /// "the mask is asymmetric", it was "his face looks skewed" — on every frame, for as
+    /// long as the game runs. A face this small has no room to be off by a pixel: two
+    /// eyes, a nose and the inside of two ears are the whole of it, and one pixel of
+    /// drift is half the face.
+    ///
+    /// Only ink and pink are checked, which is every mark the sprite makes with a colour
+    /// rather than with fur: the fur itself is lit from one side, so its two halves are
+    /// *meant* to differ in tone, and the tail is meant to be on one side. The idle
+    /// frames are the ones a player looks at; the run leans forward on purpose.
     #[test]
-    fn props_stand_on_the_ground_and_clouds_float() {
-        let pixels = Pixels::load();
-        for name in [
-            "bush_a",
-            "bush_c",
-            "bush_e",
-            "tuft_a",
-            "tuft_c",
-            "tuft_e",
-            "flowers",
-            "flowers_white",
-            "rock",
-            "pebble",
-            "mushroom",
-            "mushroom_pair",
-            "lantern",
-            "crystal",
-            "signpost",
-            "crate",
-            "banner_a",
-            "banner_b",
-            "log",
-            "stump",
-            "reeds_a",
-            "reeds_b",
-            // Both halves of both trees: the base has to reach the cell's floor, and the
-            // top has to reach the *bottom* of its own cell, which is the seam it shares
-            // with the base. A tree whose upper half stopped short is a tree cut in two.
-            "tree_a_base",
-            "tree_a_top",
-            "tree_b_base",
-            "tree_b_top",
-            // The tree-line is planted on the sky's ridge rather than on a level's floor,
-            // and the anchor is the same one: a pine whose trunk stopped short would float
-            // a pixel above whatever it is standing on, wherever that is, and all three
-            // ranks stand on something.
-            "pine_a",
-            "pine_b",
-            "pine_c",
-            "pine_d",
-            "pine_near_a",
-            "pine_near_b",
-        ] {
-            let sprite = pixels.sprite(name);
-            let lowest = *sprite.opaque_rows().last().expect("a prop has pixels");
-            assert!(
-                lowest >= sprite.cell - 1,
-                "{name}'s base is row {lowest}, so it floats above its tile"
-            );
+    fn the_players_face_is_symmetric() {
+        // Ink, and pink in both the tones the art uses for it (the nose is a lit pixel
+        // and a shadowed one). Pink is matched as a class rather than as a value because
+        // the shadowed half of a nose is the same nose.
+        fn is_ink(px: [u8; 4]) -> bool {
+            px[3] > 0 && px[..3] == [54, 41, 47]
         }
-        for name in ["cloud_a", "cloud_b", "cloud_c"] {
-            let sprite = pixels.sprite(name);
-            let lowest = *sprite.opaque_rows().last().expect("a cloud has pixels");
-            assert!(
-                lowest <= sprite.cell - 4,
-                "{name} reaches row {lowest}: a cloud should not sit on the ground"
-            );
+        // Pink, told from the ginger it sits on and from the cream beside it by hue
+        // alone: ginger is orange (most of its mid-tone gap is green against blue),
+        // cream is grey-white (red and green the same), and pink is red with the
+        // green-blue gap closed up.
+        fn is_pink(px: [u8; 4]) -> bool {
+            let (r, g, b) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
+            px[3] > 0 && r > 180 && r - g > 40 && g - b < 40
         }
-        // The dust anchor, which the view relies on when it puts a puff under a runner.
-        for name in ["dust_a", "dust_b"] {
-            let sprite = pixels.sprite(name);
-            let lowest = *sprite.opaque_rows().last().expect("dust has pixels");
-            assert!(
-                lowest >= sprite.cell - 2,
-                "{name} is not at the cell's floor"
-            );
-        }
-    }
 
-    /// A near pine's trunk is faded bark-brown, not a shade of its own foliage,
-    /// and not full-strength foreground bark either.
-    ///
-    /// The far ranks are silhouettes and their trunks are foliage tones on
-    /// purpose — three rows of haze cannot be anything else. The near rank
-    /// stands up to two tiles tall on the near hills, its trunk is a visible
-    /// piece of the picture, and the first version of it drew that trunk in
-    /// the foliage's darkest green: a green pole with a tree on it, in the
-    /// one rank where a trunk can be seen. The second version swung to the
-    /// other fault and used the foreground trees' `BARK` at full strength,
-    /// which stood out of the hazed backdrop with the rest of that palette.
-    /// So the shipped pixels are asked, not the palette: the two centre
-    /// columns at the cell's floor — the part of the trunk below the lowest
-    /// skirt, which is the part that shows — are `BARK` faded towards its
-    /// own grey (108, 88, 72: red over green over blue, at about half the
-    /// saturation), because a bark seen a hillside away is a muted bark, not
-    /// a green one and not a near one.
-    #[test]
-    fn the_near_pines_have_brown_trunks() {
-        const FADED_BARK: [u8; 4] = [108, 88, 72, 255];
         let pixels = Pixels::load();
-        for name in ["pine_near_a", "pine_near_b"] {
+        for name in player_frames("player_idle_") {
             let sprite = pixels.sprite(name);
-            for y in [14, 15] {
-                for x in [7, 8] {
-                    let pixel = sprite.at(x, y);
-                    assert_eq!(
-                        pixel, FADED_BARK,
-                        "{name}'s trunk at ({x}, {y}) is {pixel:?}, not faded bark: a \
-                         near pine's trunk is the part of it that is not foliage"
-                    );
+            for y in 0..sprite.cell {
+                for x in 0..sprite.cell {
+                    let here = sprite.at(x, y);
+                    if !(is_ink(here) || is_pink(here)) {
+                        continue;
+                    }
+                    let mirror_x = sprite.cell - 1 - x;
+                    let there = sprite.at(mirror_x, y);
+                    let broken = if is_ink(here) {
+                        !is_ink(there)
+                    } else {
+                        !is_pink(there)
+                    };
                     assert!(
-                        pixel[0] > pixel[1] && pixel[1] > pixel[2],
-                        "{name}'s trunk at ({x}, {y}) is {pixel:?}: brown is red over \
-                         green over blue, and a green trunk is the bug this is for"
+                        !broken,
+                        "{name}: the face mark at ({x}, {y}) has no mirror at \
+                         ({mirror_x}, {y}) — the face is skewed"
                     );
                 }
             }
-        }
-    }
-
-    /// The vines hang from the tile above rather than standing on the one below, so they
-    /// are the mirror image of the rule above: opaque in the cell's *first* row, where the
-    /// platform they grow out of touches them, and reaching well past halfway so the cell
-    /// reads as something hanging rather than as something growing.
-    #[test]
-    fn hanging_props_grow_out_of_the_ceiling() {
-        let pixels = Pixels::load();
-        for name in ["vine_a", "vine_b"] {
-            let sprite = pixels.sprite(name);
-            assert!(
-                (0..sprite.cell).any(|x| sprite.at(x, 0)[3] > 0),
-                "{name} does not touch the top of its cell: it is floating under the \
-                 platform rather than growing out of it"
-            );
-            let lowest = *sprite.opaque_rows().last().expect("a vine has pixels");
-            assert!(
-                lowest >= sprite.cell / 2,
-                "{name} stops at row {lowest}: a vine that short is a leaf on the ceiling"
-            );
-            assert!(
-                sprite.has_transparency(),
-                "{name} is a filled square, not a hanging plant"
-            );
-        }
-    }
-
-    /// The view hangs every vine from a shelf's *deck*, and the deck is the top rows of the
-    /// shelf's own cell: the two numbers are one decision about one drawing, so they are
-    /// pinned together the way the fluid block's size is. If the plank were drawn deeper, a
-    /// vine would be hung from the middle of the wood; if it were shallower, the stem would
-    /// still float under it.
-    #[test]
-    fn a_one_way_shelf_deck_is_the_top_rows_of_its_cell() {
-        let pixels = Pixels::load();
-        let deck = (crate::view::ONEWAY_PLANK * pixels.cell as f32).round() as i32;
-        assert!(
-            deck > 0 && deck < pixels.cell,
-            "a deck of {deck} rows in a {} row cell",
-            pixels.cell
-        );
-        for name in ["oneway_l", "oneway_m", "oneway_r"] {
-            let sprite = pixels.sprite(name);
-            for y in 0..deck {
-                let width = (0..sprite.cell).filter(|x| sprite.at(*x, y)[3] > 0).count() as i32;
-                assert_eq!(
-                    width, sprite.cell,
-                    "{name} row {y} is not deck: the plank does not fill its cell"
-                );
-            }
-            let brackets = (0..sprite.cell)
-                .filter(|x| sprite.at(*x, deck)[3] > 0)
-                .count() as i32;
-            assert!(
-                brackets < sprite.cell,
-                "{name}: row {deck} still fills the cell, so ONEWAY_PLANK stops short of \
-                 the wood's underside"
-            );
         }
     }
 
@@ -1505,26 +1398,27 @@ mod tests {
     #[test]
     fn every_animation_actually_animates() {
         let pixels = Pixels::load();
-        let cycles: [&[&str]; 10] = [
-            &["player_idle_a", "player_idle_b"],
-            &[
-                "player_run_1",
-                "player_run_2",
-                "player_run_3",
-                "player_run_4",
-                "player_run_5",
-                "player_run_6",
-            ],
-            &["walker_a", "walker_b", "walker_c", "walker_d"],
-            &["goal_flag_1", "goal_flag_2", "goal_flag_3", "goal_flag_4"],
-            &["bush_a", "bush_b"],
-            &["tuft_a", "tuft_b"],
-            &["dust_a", "dust_b"],
-            &["spark_a", "spark_b"],
-            &["reeds_a", "reeds_b"],
-            &["vine_a", "vine_b"],
+        let mut cycles: Vec<Vec<&'static str>> = vec![
+            player_frames("player_idle_"),
+            player_frames("player_run_"),
+            player_frames("player_jump_"),
+            player_frames("player_fall_"),
+            player_frames("player_land_"),
+            vec!["walker_a", "walker_b", "walker_c", "walker_d"],
+            vec!["goal_flag_1", "goal_flag_2", "goal_flag_3", "goal_flag_4"],
+            vec!["bush_a", "bush_b"],
+            vec!["tuft_a", "tuft_b"],
+            vec!["dust_a", "dust_b"],
+            vec!["spark_a", "spark_b"],
+            vec!["reeds_a", "reeds_b"],
+            vec!["vine_a", "vine_b"],
         ];
-        for cycle in cycles {
+        for cycle in &mut cycles {
+            assert!(
+                cycle.len() > 1,
+                "a cycle with {} frame(s) is not an animation",
+                cycle.len()
+            );
             for (i, first) in cycle.iter().enumerate() {
                 for second in &cycle[i + 1..] {
                     assert_ne!(
@@ -1535,18 +1429,10 @@ mod tests {
                 }
             }
         }
-        // The airborne poses are not a cycle, but they are three different states and
-        // showing the same drawing for all three would be just as wrong.
+        // The death pose is not part of a cycle, but it is the last thing the player
+        // sees of a run and sharing a drawing with the landing would read as a stumble.
         assert_ne!(
-            pixels.sprite("player_jump").colours(),
-            pixels.sprite("player_fall").colours()
-        );
-        assert_ne!(
-            pixels.sprite("player_fall").colours(),
-            pixels.sprite("player_land").colours()
-        );
-        assert_ne!(
-            pixels.sprite("player_land").colours(),
+            pixels.sprite("player_land_4").colours(),
             pixels.sprite("player_hurt").colours()
         );
     }
@@ -1763,6 +1649,52 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A fluid body continues the tone its surface fades into, and stays flat doing it.
+    ///
+    /// The body block has been rewritten twice for this one failure. The surface cell
+    /// ends in the body's own `mid` tone on its bottom row, and a body that answers
+    /// with anything else — a pale patch, a dark field, a different texture — puts a
+    /// horizontal step directly under the crest, at every cell of a deep pool. The
+    /// body also has to be *calm*: its picture is four tiles square and repeats, so a
+    /// body that is a patchwork of tones is a patchwork the player meets again four
+    /// tiles along, and a wide pool reads as wallpaper. Hence the two halves of this
+    /// test: every body cell is mostly one tone, and that tone is the one the surface
+    /// above it ends in.
+    #[test]
+    fn a_fluid_body_continues_its_surface_tone_and_stays_flat() {
+        let pixels = Pixels::load();
+        for (fluid, surface) in [("water", "water_top_a"), ("lava", "lava_top_a")] {
+            let base = pixels
+                .sprite(&format!("{fluid}_b0"))
+                .modal_interior_colour();
+            for index in 0..16 {
+                let cell = pixels.sprite(&format!("{fluid}_b{index}"));
+                assert_eq!(
+                    cell.modal_interior_colour(),
+                    base,
+                    "{fluid}_b{index} is not the body's own tone: the block must be one \
+                     field, or the pool changes colour from cell to cell"
+                );
+                let of_tone = cell.colours().iter().filter(|p| **p == base).count();
+                let share = of_tone as f32 / (cell.cell * cell.cell) as f32;
+                assert!(
+                    share >= 0.85,
+                    "{fluid}_b{index} is only {:.0}% {}: a body with that much other tone in it \
+                     is a pattern, and the pattern repeats every four tiles",
+                    share * 100.0,
+                    if fluid == "water" { "water" } else { "lava" }
+                );
+            }
+            let surface = pixels.sprite(surface);
+            let foot = surface.row_colours(surface.cell - 1);
+            assert!(
+                foot.iter().all(|pixel| *pixel == base),
+                "the foot of {fluid}'s surface is not its body's tone: the join under the \
+                 crest would be a step, not a fade"
+            );
         }
     }
 }

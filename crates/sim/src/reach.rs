@@ -34,6 +34,8 @@
 //! person swung across it in a second; `levels/scratch-rope.json` is that level, and its verdict is
 //! pinned by `the_oracle_crosses_the_scratch_pit_only_with_the_rope`.
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 
 use crate::level::{Level, Rect};
@@ -231,7 +233,7 @@ impl Default for ReachOptions {
 /// answer, so every cached verdict and route graph from v8 is a miss.
 /// v10: **a moving platform is a stand, and its travel is a ride.** The route graph now carries both
 /// ends of every shelf's travel as stands of its own, with a `ride` edge between them that the BFS
-/// counts and no replay can press. The nodes moved and every hop count on a level with a mover in it
+/// traverses and no replay can press. The nodes moved and every hop count on a level with a mover in it
 /// changed, which is exactly what a cached answer is keyed on — and the reason is not cosmetic: a
 /// stall at a shuttle's ledge used to answer "the flag cannot be reached from here", so the stall
 /// curriculum refused to derive a practice level and the run was left with nothing.
@@ -260,7 +262,26 @@ impl Default for ReachOptions {
 /// under it, so the band runs from its socket to that floor and a rock over a pit runs to the
 /// bottom of the level. No canonical move changed; what a level with one in it answers did, so
 /// every cached verdict and route graph from v13 is a miss.
-pub const MOVE_SET_VERSION: u32 = 14;
+///
+/// v15: **a vine is grabbed from the column beside it.** The climb script used to start only in the
+/// vine's own column, so a vine whose foot sat over a spike — a take-off no body can stand in —
+/// read as no vine at all, and a level whose only route was that grab was answered "unbeatable"
+/// while a player could climb it. The sweep now tries every stand within [`VINE_GRAB_SPAN`] and the
+/// approach jump leans into the vine's column until the grab. No physics changed; what a level
+/// with a vine in it answers did, so every cached verdict and route graph from v14 is a miss.
+///
+/// v16: **a waypoint aims at the near deck of a moving platform.** The graph carried both ends of a
+/// shelf's travel and the ride between them since v10, but the waypoint compared a landing's own
+/// rung: the near deck is one hop *worse* than the far one (the ride counts, which is what gives the
+/// ride its direction), so every approach was steered at the far end — a long leap at a deck that
+/// may be at the other end of its travel — instead of the one-tile step onto the near deck whose
+/// ride then carries the body away. [`GoalRoutes::aim`] now prices a landing on the near deck as the
+/// far deck's rung, because the ride is free. On `l11-the-elements` the old reading steered the
+/// body at x 46.5 from the ground at x 41 and at x 60.5 from the deck at x 55, the two places four
+/// seeds died; the new one aims at x 42.5 and x 56.5. No canonical move and no hop count changed —
+/// the graph's data is the same — but the answer read from it did, so every cached route graph from
+/// v15 is rebuilt rather than trusted.
+pub const MOVE_SET_VERSION: u32 = 16;
 
 /// Sub-tile take-off offsets tried at every column.
 ///
@@ -1251,7 +1272,7 @@ pub fn climb_action(dir: TakeoffDir, t: u32, ph: &Physics) -> AgentAction {
 /// One function so the swim, the vine and the jump sweep cannot disagree about which action
 /// "right, holding jump" is — the pick is the same one [`trajectory_action`] makes, and a gear
 /// added to [`AgentAction`] has one place to be read.
-fn arm(dir: TakeoffDir, jump: bool) -> AgentAction {
+pub fn arm(dir: TakeoffDir, jump: bool) -> AgentAction {
     match (dir, jump) {
         (TakeoffDir::Right, true) => AgentAction::SprintJump,
         (TakeoffDir::Right, false) => AgentAction::Sprint,
@@ -1427,6 +1448,14 @@ fn simulate_swim_with(
 /// rest and grabs the first vine it overlaps on the way up — and the run is the **contiguous**
 /// shaft above it, because a body hanging on a vine does not pass a gap: it leaves the vine, and
 /// the climb is over.
+/// How far sideways a jump may start from a vine and still catch it.
+///
+/// A vine does not have to be in the column the body jumps from: the grab is any overlap while
+/// airborne, so a body on the ledge beside a vine can jump and drift into it. Two tiles is the
+/// distance a running jump covers before its rise is spent — the same order as the grab box —
+/// and it is deliberately small, because every extra column is another swept climb.
+pub const VINE_GRAB_SPAN: i32 = 2;
+
 pub fn vine_run(level: &Level, col: i32, surface_row: i32, ph: &Physics) -> Option<(i32, i32)> {
     let reach = (ph.player_h + ph.discrete_max_jump_height()).ceil() as i32 + 1;
     for dy in 1..=reach {
@@ -1443,6 +1472,25 @@ pub fn vine_run(level: &Level, col: i32, surface_row: i32, ph: &Physics) -> Opti
     None
 }
 
+/// The vine a jump from `start_col` will meet: the nearest column within [`VINE_GRAB_SPAN`] that
+/// has a run inside jump reach above `surface_row`, preferring the take-off's own column.
+///
+/// **This is what makes a vine beside a blocked column a route.** The oracle used to sweep a
+/// climb only from the vine's own column, so a vine whose foot sits over a spike — the one case
+/// where the body *must* jump from the side and drift in — read as no vine at all. A level whose
+/// only way up was that grab was then answered "unbeatable", which is the false negative this
+/// function exists to remove; the jump script below presses toward the column it names.
+pub fn vine_target(level: &Level, start_col: i32, surface_row: i32) -> Option<(i32, i32)> {
+    for span in 0..=VINE_GRAB_SPAN {
+        for col in [start_col - span, start_col + span] {
+            if let Some((_, top)) = vine_run(level, col, surface_row, &PHYSICS) {
+                return Some((col, top));
+            }
+        }
+    }
+    None
+}
+
 /// Where a body can **grab a vine** from `p`: a take-off position under a reachable vine, and the
 /// top of that vine's run (what the exit is timed against).
 fn vine_starts(level: &Level, p: &Platform) -> Vec<f32> {
@@ -1452,9 +1500,9 @@ fn vine_starts(level: &Level, p: &Platform) -> Vec<f32> {
         if !takeoff_fits(level, x, p.surface_y, &PHYSICS) {
             continue;
         }
-        if let Some((_, top)) = vine_run(level, col, p.surface_row, &PHYSICS) {
+        if let Some((vine_col, top)) = vine_target(level, col, p.surface_row) {
             // Water wins the medium, so a vine in a flooded shaft is not a climb the game has.
-            let flooded = (top..=p.surface_row).any(|row| level.is_water(col, row));
+            let flooded = (top..=p.surface_row).any(|row| level.is_water(vine_col, row));
             if !flooded {
                 out.push(x);
             }
@@ -1533,9 +1581,9 @@ fn simulate_vine_climb_with(
     // The vine's top is a property of the level, so the caller names the position and this
     // function reads the run — one implementation of "where does this climb end" for the
     // sweep, the replay and the press check.
-    let col = Level::tile_x(start_x + ph.player_w * 0.5);
-    let top_row = match vine_run(level, col, surface_row, ph) {
-        Some((_, top)) => top,
+    let start_col = Level::tile_x(start_x + ph.player_w * 0.5);
+    let (vine_col, top_row) = match vine_target(level, start_col, surface_row) {
+        Some(found) => found,
         // Nothing to grab: the move is a jump that lands where it started, which the graph
         // drops. Reporting it as a death would blame the level for the sweep's mistake.
         None => {
@@ -1559,6 +1607,15 @@ fn simulate_vine_climb_with(
         return death;
     }
 
+    // **The approach jump leans toward the vine.** A vine in the body's own column needs no
+    // press — `Still` is exactly `JumpInPlace`, the script every direct climb has always used —
+    // while a vine beside a blocked column is reached by holding the direction into it until the
+    // grab, after which the climb owns the body's x and a direction would walk it off the vine.
+    let toward = match vine_col.cmp(&start_col) {
+        std::cmp::Ordering::Less => TakeoffDir::Left,
+        std::cmp::Ordering::Greater => TakeoffDir::Right,
+        std::cmp::Ordering::Equal => TakeoffDir::Still,
+    };
     let mut airborne = false;
     let mut exiting = false;
     // The crates the file puts on the level, as the boxes the body collides with. The
@@ -1566,7 +1623,11 @@ fn simulate_vine_climb_with(
     let solids = level.block_rects();
     for t in 0..MAX_CLIMB_TICKS {
         let feet = player.y + player.h;
-        let action = vine_action(exit, player.on_vine, feet, top_row, &mut exiting);
+        let action = if !player.on_vine && toward != TakeoffDir::Still {
+            arm(toward, true)
+        } else {
+            vine_action(exit, player.on_vine, feet, top_row, &mut exiting)
+        };
         let (contact, launched) = oracle_tick(level, &mut player, action, options, &solids);
         if !player.grounded {
             airborne = true;
@@ -2075,9 +2136,9 @@ fn edges_from_all_with(
                 // one-tile lid has no sideways exit at all, and the pull-up is the only way on.
                 // Swept from the same take-off only when the geometry answers yes, so the graph is
                 // not given a climb that ends nowhere on every ordinary vine.
-                let col = Level::tile_x(start_x + PHYSICS.player_w * 0.5);
-                let mantle = vine_run(level, col, p.surface_row, &PHYSICS)
-                    .and_then(|(_, top)| vine_mantle_anchor(level, &PHYSICS, col, top));
+                let start_col = Level::tile_x(start_x + PHYSICS.player_w * 0.5);
+                let mantle = vine_target(level, start_col, p.surface_row)
+                    .and_then(|(col, top)| vine_mantle_anchor(level, &PHYSICS, col, top));
                 if mantle.is_some() {
                     let traj = simulate_vine_climb_with(
                         level,
@@ -2275,6 +2336,181 @@ pub fn report_with(level: &Level, options: ReachOptions) -> ReachReport {
     let report = compute_report(level, options);
     level.remember_verdict(options, &report);
     report
+}
+
+/// **The route graph's answer to "can a body leave the spawn?"**, with the blocked gap named.
+///
+/// [`ReachReport`] is deliberately coarse about a continuous floor: it keeps one long platform
+/// across spikes because a policy can take a one-tile pad with air control that the canonical
+/// sweep cannot, and splitting it there once turned a solvable level into a false negative (see
+/// [`extract_platforms`]). The cost of that choice is the case this type exists for: a floor that
+/// is one platform for the verdict, but a **spike run wider than a jump** for the route graph. The
+/// verdict says "reachable"; the route graph cannot leave the spawn stand; and a training run can
+/// spend thousands of generations in front of the barrier before anyone notices.
+///
+/// This is a **warning, not a verdict**. `hops: None` means the canonical move set (and therefore
+/// the planner and every route-guided lesson) has no path from the spawn to the flag. A policy may
+/// still have one — the spike-tight level's air-control pad is the measured example — so callers
+/// must say "no canonical route" rather than "unbeatable". What it does say reliably is where the
+/// search stops: [`Self::frontier`] is the furthest stand the spawn can reach, and [`Self::next`]
+/// is the nearest stand to the right of it, with the empty columns between them in
+/// [`Self::gap_tiles`]. That is the sentence a level editing session and a stalled training run
+/// both need.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteGap {
+    /// The stand the spawn occupies, when it is on one.
+    pub start: Option<usize>,
+    /// Crossings from the spawn stand to the flag; `None` means the canonical route cannot get
+    /// there. `Some(0)` is the flag's own stand.
+    pub hops: Option<u32>,
+    /// The furthest-right stand the spawn can reach, when it cannot reach the flag.
+    pub frontier: Option<usize>,
+    /// The nearest stand to the right of [`Self::frontier`], when there is one.
+    pub next: Option<usize>,
+    /// Empty columns between the frontier stand and the next one, in tiles.
+    pub gap_tiles: Option<f32>,
+    /// One sentence naming the result, suitable for a status bar or a run's note.
+    pub note: String,
+}
+
+impl RouteGap {
+    /// The canonical route reaches the flag from the spawn.
+    pub fn routed(&self) -> bool {
+        self.hops.is_some()
+    }
+
+    /// The gap worth showing: a warning sentence only when the route does not reach the flag.
+    pub fn warning(&self) -> Option<&str> {
+        (!self.routed()).then_some(self.note.as_str())
+    }
+}
+
+/// Read the route graph from the spawn and name what blocks it, if anything.
+///
+/// The BFS walks the same [`GoalRoutes`] edges the route replay and the sensor waypoint use, so
+/// this cannot disagree with either about which stands are reachable: a ride is free, a crossing
+/// costs a press, and the frontier is the rightmost stand the closure contains. Building the graph
+/// is the cost — it is cached on the level — so a caller should ask once per edit or per run, not
+/// once per frame.
+pub fn route_gap(level: &Level) -> RouteGap {
+    let routes = level.routes();
+    let Some(start) = crate::spawn_route_stand(level) else {
+        return RouteGap {
+            start: None,
+            hops: None,
+            frontier: None,
+            next: None,
+            gap_tiles: None,
+            note: "the spawn is not on a standable surface, so no route can leave it".into(),
+        };
+    };
+    if let Some(hops) = routes.hops_to_flag(start) {
+        let note = if hops == 0 {
+            "the flag stands on the spawn's own stand".to_string()
+        } else {
+            format!("the flag is {hops} route crossing(s) from the spawn")
+        };
+        return RouteGap {
+            start: Some(start),
+            hops: Some(hops),
+            frontier: Some(start),
+            next: None,
+            gap_tiles: None,
+            note,
+        };
+    }
+
+    // The closure of the spawn over crossings and rides. A visited set rather than a distance
+    // field: only reachability and the rightmost stand are wanted here, and a route that circles
+    // a moving platform must not spin forever.
+    let seen = routes.reachable_from(start);
+    let mut frontier = start;
+    let mut frontier_x1 = routes.zone_bounds(start).2;
+    for stand in 0..routes.len() {
+        if !seen[stand] {
+            continue;
+        }
+        let (_, x0, x1) = routes.zone_bounds(stand);
+        if x1 > frontier_x1 || (x1 == frontier_x1 && x0 > routes.zone_bounds(frontier).1) {
+            frontier = stand;
+            frontier_x1 = x1;
+        }
+    }
+
+    // The next stand to the right of the frontier, whether or not it is reachable by another
+    // route: a gap is read against the terrain, not against what the spawn already reached.
+    //
+    // **A stand out of a jump's reach is not the barrier worth naming.** The nearest thing to the
+    // right is not always the one a body is being asked to cross to: `untitled-5` hangs a plank
+    // eight rows above its spike run, and naming it read "a 2-tile gap" about a leap no jump can
+    // make, while the floor the crossing actually lands on (seven tiles of hazard away) went
+    // unnamed. A stand more than a full jump above the frontier is skipped; when *nothing* to the
+    // right is within reach, the nearest one is still named, with its rise in the sentence.
+    let reachable_rise = crate::PHYSICS.max_jump_height();
+    let frontier_row = routes.zone_bounds(frontier).0;
+    let mut next = None;
+    let mut next_x0 = i32::MAX;
+    let mut fallback = None;
+    let mut fallback_x0 = i32::MAX;
+    for stand in 0..routes.len() {
+        if seen[stand] {
+            continue;
+        }
+        let (row, x0, _) = routes.zone_bounds(stand);
+        if x0 <= frontier_x1 {
+            continue;
+        }
+        if x0 < fallback_x0 {
+            fallback_x0 = x0;
+            fallback = Some(stand);
+        }
+        if (frontier_row - row) as f32 > reachable_rise {
+            continue;
+        }
+        if x0 < next_x0 {
+            next_x0 = x0;
+            next = Some(stand);
+        }
+    }
+    if next.is_none() {
+        next = fallback;
+    }
+    let gap_tiles = next.map(|stand| {
+        let (_, x0, _) = routes.zone_bounds(stand);
+        (x0 - frontier_x1 - 1).max(0) as f32
+    });
+    let note = match next {
+        Some(stand) => {
+            let (row, x0, _) = routes.zone_bounds(stand);
+            // A stand can be to the right and still be a different barrier: `untitled-5`'s nearest
+            // stand past the spike run is a plank eight rows up, so a note that named only the
+            // horizontal gap read "2-tile gap" about a crossing no jump can make. The rise is part
+            // of the same sentence because it is part of the same answer.
+            let (frontier_row, _, _) = routes.zone_bounds(frontier);
+            let rise = frontier_row - row;
+            let height = if rise > 0 {
+                format!(", {rise} rows higher")
+            } else {
+                String::new()
+            };
+            format!(
+                "no canonical route from the spawn to the flag: the furthest reachable stand ends \
+                 at x={frontier_x1}, the next stand begins at x={x0} (a {:.0}-tile gap{height})",
+                gap_tiles.unwrap_or(0.0)
+            )
+        }
+        None => "no canonical route from the spawn to the flag, and no stand to the right of \
+                 the frontier to cross to"
+            .into(),
+    };
+    RouteGap {
+        start: Some(start),
+        hops: None,
+        frontier: Some(frontier),
+        next,
+        gap_tiles,
+        note,
+    }
 }
 
 /// [`report_with`] with no cache in the way: the sweep, the BFS and the diagnosis.
@@ -2778,6 +3014,45 @@ impl GoalRoutes {
         &self.crossings[from]
     }
 
+    /// Every stand reachable from `from` over crossings and rides, in stand order.
+    ///
+    /// This is the graph's closure, and it is what [`route_gap`] reads to find the frontier.
+    /// Callers outside the oracle use it to ask a different question of the same edges: **is this
+    /// stand one the canonical route can reach at all?** A run whose unbeaten genome died on a
+    /// stand outside the closure crossed something the move set has no edge for — a pad bounce, a
+    /// steered launch, a rope chain — and a lesson built there would start past the barrier rather
+    /// than at it. See `evo::curriculum::practice_level_for_stall`.
+    ///
+    /// A visited set rather than a distance field: only reachability is asked, and a route that
+    /// circles a moving platform must not spin forever. A ride is free and is followed for the
+    /// same reason [`Self::hops_to_flag`] counts it: the far deck is a place the body can be.
+    pub fn reachable_from(&self, from: usize) -> Vec<bool> {
+        let mut seen = vec![false; self.len()];
+        if from >= self.len() {
+            return seen;
+        }
+        let mut queue = VecDeque::new();
+        seen[from] = true;
+        queue.push_back(from);
+        while let Some(stand) = queue.pop_front() {
+            for edge in self.crossings_from(stand) {
+                if let Some(to) = edge.to {
+                    if !seen[to] {
+                        seen[to] = true;
+                        queue.push_back(to);
+                    }
+                }
+            }
+            if let Some(ride) = self.ride_from(stand) {
+                if !seen[ride] {
+                    seen[ride] = true;
+                    queue.push_back(ride);
+                }
+            }
+        }
+        seen
+    }
+
     /// The stands one canonical crossing from `from` lands on.
     pub fn crossing_stands_from(&self, from: usize) -> impl Iterator<Item = usize> + '_ {
         self.crossings[from].iter().filter_map(|e| e.to)
@@ -2794,14 +3069,20 @@ impl GoalRoutes {
 
     /// Crossings from `stand` to the flag. `Some(0)` is the flag's own stand; `None`
     /// means no route to the flag from here at all.
+    ///
+    /// A ride counts as a hop in this count and that is deliberate (`MOVE_SET_VERSION` 10): it is
+    /// what gives a platform's travel its **direction**. The far deck is one hop closer than the
+    /// near one, so a body on the near deck waits and a body on the far deck jumps off. What the
+    /// count is *not* allowed to do is decide which end of a platform an approach aims at — that
+    /// cost is paid by [`Self::aim`], which credits the ride as free when the landing is the near
+    /// deck (`MOVE_SET_VERSION` 16).
     pub fn hops_to_flag(&self, stand: usize) -> Option<u32> {
         self.hops[stand]
     }
 
     /// The **move** the route makes next from `stand`, chosen exactly as
-    /// [`Self::next_waypoint`] chooses its landing: the next stand reachable in one canonical
-    /// crossing that strictly decreases `hops_to_flag`, tie-broken on proximity to `from_x` and then
-    /// to `goal`.
+    /// [`Self::next_waypoint`] chooses its landing: the next stand whose route cost from here is
+    /// no worse than this stand's, tie-broken on proximity to `from_x` and then to `goal`.
     ///
     /// `None` when the stand is the flag's own ground (`hops == 0`) or has no route at all.
     pub fn next_hop(&self, stand: usize, from_x: f32, goal: Option<Rect>) -> Option<&RouteEdge> {
@@ -2844,11 +3125,27 @@ impl GoalRoutes {
         if from_hops == 0 {
             return None;
         }
+        // A stand that can touch the flag from here is on its last move, and the flag is the aim —
+        // the goal vector's job, not a landing's. This is checked before the ride: a deck that can
+        // reach the flag must not be told to wait for a cycle that would carry it away.
+        if self.flag_edge(stand).is_some() {
+            return None;
+        }
         let (from_row, fx0, fx1) = self.zone_bounds(stand);
         let from_col = (from_x.floor() as i32).clamp(fx0, fx1);
-        // `(hops, distance from the body, distance to the goal, aim point, edge)`: the sort key is
+        // `(cost, distance from the body, distance to the goal, aim point, edge)`: the sort key is
         // the first three and the rest is what the caller asked for, kept together so the loop
         // updates one binding rather than three parallel ones.
+        //
+        // **`cost` is crossings left after this move, not the landing's own rung.** The two are the
+        // same for an ordinary jump (`1 + hops[landing]`), and they are deliberately not for a
+        // landing on the **near deck** of a moving platform: the ride from there is free, so the
+        // route cost is `1 + hops[far_deck]` even though the near deck itself is one rung worse.
+        // Without that credit every approach aimed at the far end of the platform — on
+        // `l11-the-elements` a five-tile leap at a deck that may be at the other end of its travel,
+        // where the one-tile step onto the near deck was available and the cycle would have carried
+        // the body the rest of the way. A body on the near deck has cost `hops[far_deck]` (no press
+        // at all), which is why the wait can win a tie by distance zero.
         type Aim<'a> = (u32, f32, f32, (f32, f32), Option<&'a RouteEdge>);
         // A free function rather than a closure: the aim point is a reference to an edge of
         // `self.crossings`, and a closure that stores one has to name the borrow it is storing.
@@ -2856,21 +3153,22 @@ impl GoalRoutes {
             best: &mut Option<Aim<'a>>,
             from_hops: u32,
             goal: Option<Rect>,
-            hops: u32,
+            cost: u32,
             d_from: f32,
             point: (f32, f32),
             edge: Option<&'a RouteEdge>,
         ) {
-            if hops >= from_hops {
+            // A move that leaves more crossings than the stand already has is backward.
+            if cost > from_hops {
                 return;
             }
             let d_goal = goal.map_or(0.0, |g| {
                 let (gx, gy) = g.center();
                 (point.0 - gx).hypot(point.1 - gy)
             });
-            let key = (hops, d_from, d_goal);
-            if best.is_none_or(|(bh, bf, bg, _, _)| key < (bh, bf, bg)) {
-                *best = Some((hops, d_from, d_goal, point, edge));
+            let key = (cost, d_from, d_goal);
+            if best.is_none_or(|(bc, bf, bg, _, _)| key < (bc, bf, bg)) {
+                *best = Some((cost, d_from, d_goal, point, edge));
             }
         }
         let mut best: Option<Aim> = None;
@@ -2881,28 +3179,49 @@ impl GoalRoutes {
             let Some(hops) = self.hops[j] else {
                 continue;
             };
+            // The ride is free, so landing on the near deck already puts the route at the far
+            // deck's rung. This is the one place a landing's own rung is not its route cost.
+            let landing_cost = match self.ride_from(j) {
+                Some(far) if self.hops[far].is_some_and(|h| h < hops) => self.hops[far],
+                _ => Some(hops),
+            };
+            let Some(landing_cost) = landing_cost else {
+                continue;
+            };
             let (row, x0, x1) = self.zone_bounds(j);
             let target_col = from_col.clamp(x0, x1);
             let point = (target_col as f32 + 0.5, self.zone_surface(j) - 0.5);
             let d_from = ((target_col - from_col) as f32).hypot((row - from_row) as f32);
-            consider(&mut best, from_hops, goal, hops, d_from, point, Some(edge));
+            consider(
+                &mut best,
+                from_hops,
+                goal,
+                landing_cost + 1,
+                d_from,
+                point,
+                Some(edge),
+            );
         }
         // The ride: a stand whose next step is being carried waits where it stands, so its aim
         // point is the body itself — a zero waypoint, which is the only honest way to say "hold
         // still" in a vector whose two waypoint slots are a direction. Distance zero also means a
-        // ride wins a tie against a crossing at the same hop count, which is right: a body that is
-        // already on the deck has nothing to press.
+        // ride wins a tie against a crossing at the same route cost, which is right: a body that is
+        // already on the deck has nothing to press. Only a ride **toward** the flag is considered:
+        // the partner must be a rung closer, so a body on the far deck jumps off instead of riding
+        // back, which is the direction the hop count gives the ride.
         if let Some(partner) = self.ride_from(stand) {
             if let Some(hops) = self.hops[partner] {
-                consider(
-                    &mut best,
-                    from_hops,
-                    goal,
-                    hops,
-                    0.0,
-                    (from_x, self.zone_surface(stand) - 0.5),
-                    None,
-                );
+                if hops < from_hops {
+                    consider(
+                        &mut best,
+                        from_hops,
+                        goal,
+                        hops,
+                        0.0,
+                        (from_x, self.zone_surface(stand) - 0.5),
+                        None,
+                    );
+                }
             }
         }
         best.map(|(_, _, _, pt, edge)| (pt, edge))
@@ -3099,7 +3418,9 @@ pub fn goal_routes(level: &Level) -> GoalRoutes {
     }
     // The rides are edges in this search and in nothing else: a stand you are carried to has one
     // fewer crossing left, exactly as if a move had put you there, so a shuttle's far deck is the
-    // next rung of the route rather than the end of it.
+    // next rung of the route rather than the end of it. The count is also what gives a ride its
+    // **direction**: the far deck has one fewer hop, so `aim` can tell a body on the near deck to
+    // wait (ride forward) from a body on the far deck that should jump off instead of riding back.
     for (i, s) in stands.iter().enumerate() {
         if let Some(j) = s.ride {
             reached_from[j].push(i);
@@ -3449,6 +3770,143 @@ mod tests {
     }
 
     #[test]
+    fn a_waypoint_aims_at_the_near_deck_and_the_ride_does_the_rest() {
+        // Ground x 0..3, a shuttle whose near deck is x 4..6 and far deck x 10..12, then the
+        // flag's ground x 15..23. The route is the one every mover level asks for: a one-tile
+        // step onto the near deck, wait for the cycle, jump off the far deck. The near deck is
+        // nine tiles from the flag's ground and cannot reach it in one crossing, so the ride is
+        // the **only** route off it — which is what makes the near/far hop counts differ and the
+        // ride directional. The *waypoint* must not charge for that: it used to steer at the far
+        // deck from the ground, a leap at a deck that may be at the other end of its travel, and
+        // `l11-the-elements` died at exactly those two edges for it.
+        let src = r#####"{
+            "format":"evo-platformer-level",
+            "level_format_version":1,
+            "name":"shuttle",
+            "width":24,
+            "height":8,
+            "spawn":{"x":1,"y":5},
+            "tiles":[
+                "........................",
+                "........................",
+                "........................",
+                "........................",
+                "........................",
+                "........................",
+                "####LLLLLLLLLLL#########",
+                "####LLLLLLLLLLL#########"
+            ],
+            "entities":[
+                {"type":"platform","x":4,"y":5,"span":6,"dir":1,"tiles":3,"axis":"x"},
+                {"type":"goal","x":22,"y":5}
+            ]
+        }"#####;
+        let level = Level::from_json_str(src).expect("the shuttle fixture parses");
+        let routes = goal_routes(&level);
+        let goal = level.goals.first().copied();
+        let start = routes.zone_at(1, 6).expect("the spawn's ground");
+        let near = routes.zone_at(5, 5).expect("the near deck");
+        let far = routes.zone_at(11, 5).expect("the far deck");
+        assert_eq!(routes.ride_from(near), Some(far));
+        assert_eq!(routes.ride_from(far), Some(near));
+        assert_eq!(
+            routes.hops_to_flag(near),
+            routes.hops_to_flag(far).map(|h| h + 1),
+            "the ride is one hop in the count: that is what gives it a direction"
+        );
+
+        // From the ground: the near deck, not the far one.
+        assert_eq!(
+            routes.next_waypoint(start, 1.5, goal),
+            Some((4.5, 5.0)),
+            "a waypoint from the approach must aim at the near deck"
+        );
+        // From the near deck: hold still and let the cycle carry the body.
+        assert_eq!(
+            routes.next_waypoint(near, 5.5, goal),
+            Some((5.5, 5.0)),
+            "a waypoint on the near deck is the body's own position: wait"
+        );
+        // From the far deck: jump off at the flag's ground, not ride back.
+        assert_eq!(
+            routes.next_waypoint(far, 11.5, goal),
+            Some((15.5, 5.5)),
+            "a waypoint on the far deck must aim past the ride, not back along it"
+        );
+    }
+
+    #[test]
+    fn a_sealed_floor_is_beatable_to_the_oracle_but_not_to_the_route() {
+        let lv = level("sealed-floor", SEALED_FLOOR, (1, 5), &[("goal", 20, 5)]);
+        // The coarse platform table keeps one surface across the spikes, so the flag's platform
+        // is in the spawn's own platform and the verdict says OK. That is the false reassurance
+        // the gap reading has to qualify rather than replace: a policy may still have air-control
+        // moves the canonical sweep does not, so this is a warning, not "unbeatable".
+        assert!(
+            report(&lv).goal_reached,
+            "the platform table is one surface here; that is the whole problem"
+        );
+        let gap = route_gap(&lv);
+        assert_eq!(gap.hops, None);
+        assert_eq!(gap.frontier.map(|s| lv.routes().zone_bounds(s).2), Some(7));
+        assert_eq!(gap.next.map(|s| lv.routes().zone_bounds(s).1), Some(15));
+        assert_eq!(gap.gap_tiles, Some(7.0));
+        assert!(gap.note.contains("7-tile gap"), "{}", gap.note);
+    }
+
+    #[test]
+    fn the_closure_stops_at_a_hazard_run_the_route_cannot_cross() {
+        let lv = level("sealed-floor", SEALED_FLOOR, (1, 5), &[("goal", 20, 5)]);
+        let routes = lv.routes();
+        let start = crate::spawn_route_stand(&lv).expect("the spawn stands on its own floor");
+        let reachable = routes.reachable_from(start);
+        assert!(reachable[start], "the spawn is always in its own closure");
+        // The far floor: the stand the spikes sealed off. It can see the flag, and the route
+        // cannot get to it — which is exactly the pair a caller has to be able to tell apart.
+        let far = (0..routes.len())
+            .find(|&s| routes.zone_bounds(s).1 >= 15)
+            .expect("a stand past the spikes");
+        assert!(!reachable[far], "the sealed run must stop the closure");
+        assert!(
+            routes.hops_to_flag(far).is_some(),
+            "the far floor still sees the flag; unreachable-from-spawn is not unreachable-to-flag"
+        );
+        // Nothing on the near side reaches it either: the closure is closed under crossings.
+        for stand in 0..routes.len() {
+            if !reachable[stand] {
+                continue;
+            }
+            for to in routes.crossing_stands_from(stand) {
+                assert!(
+                    reachable[to],
+                    "stand {stand} crosses to unreachable stand {to}"
+                );
+            }
+        }
+        // And on a routed level the flag's own stand is in the closure, so the reading is not
+        // simply "everything is unreachable".
+        let routed = level("gap", GAP, (1, 5), &[("goal", 19, 5)]);
+        let routes = routed.routes();
+        let start = crate::spawn_route_stand(&routed).expect("the spawn stands");
+        let reachable = routes.reachable_from(start);
+        assert!(
+            (0..routes.len()).any(|s| reachable[s] && routes.hops_to_flag(s) == Some(0)),
+            "the flag's stand must be reachable on a routed level"
+        );
+    }
+
+    #[test]
+    fn a_routed_floor_says_how_many_crossings_are_left() {
+        // Five-tile pit, inside a sprint jump: the route graph really does have a path, so the
+        // warning must not fire. This is the other side of the `hops: None` case above.
+        let lv = level("gap", GAP, (1, 5), &[("goal", 19, 5)]);
+        let gap = route_gap(&lv);
+        assert!(gap.routed(), "{}", gap.note);
+        assert!(gap.warning().is_none());
+        assert!(gap.hops.unwrap() >= 1);
+    }
+
+    #[test]
     fn a_move_cannot_start_inside_a_hazard_and_a_sealed_route_stays_sealed() {
         // The phantom edge: the take-off ledge's right column is spike-topped, so
         // sweeping take-off x across it authors a body standing *inside* the spike.
@@ -3570,6 +4028,22 @@ mod tests {
         "....................",
         "######.....#########",
         "######.....#########",
+    ];
+
+    // A continuous floor with a seven-tile spike run on it: one platform to the coarse
+    // verdict, two stands to the route graph. The verdict says the flag is reachable (it is
+    // standing on the same floor); the route graph cannot leave the spawn side. This is the
+    // shape `route_gap` exists to name, and the reason a training run can stall at x=7 with
+    // every other signal saying the level is beatable.
+    const SEALED_FLOOR: &[&str] = &[
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "........................",
+        "........^^^^^^^.........",
+        "########################",
+        "########################",
     ];
 
     // The same shape with a seven-tile pit: past even a sprint jump, so the diagnostic
@@ -4009,6 +4483,48 @@ mod tests {
         assert!(!without.goal_reached);
         let d = without.diagnosis.clone().expect("a diagnosis");
         assert!(d.contains("wall too tall"), "unexpected diagnosis: {d}");
+    }
+
+    /// **A vine whose foot is spiked is still a route, from the column beside it.**
+    ///
+    /// The oracle used to sweep a climb only from the vine's own column. When that column is the
+    /// one a body cannot stand in — a spike where the foot meets the floor — the vine read as no
+    /// vine, the level read as unbeatable, and the editor said so about a level a person could
+    /// climb in a second. The grab is any overlap while airborne, so the take-off beside the
+    /// spike and the drift into the column is the move; this pins both that it lands and that the
+    /// report it feeds is beatable.
+    #[test]
+    fn a_vine_beside_a_spiked_foot_is_climbed_from_the_side() {
+        let rows: &[&str] = &[
+            "................",
+            ".....V..........",
+            ".....V######....",
+            ".....V..........",
+            ".....V..........",
+            ".....^..........",
+            "################",
+            "################",
+        ];
+        let lv = level("vine-beside-spike", rows, (3, 5), &[("goal", 11, 1)]);
+        let platforms = extract_platforms(&lv);
+        let ledge = platforms
+            .iter()
+            .find(|p| p.surface_row == 2 && p.contains_col(7))
+            .expect("the ledge is a platform")
+            .id;
+        let x = 3.0 + (1.0 - PHYSICS.player_w) * 0.5;
+        let climb = simulate_vine_climb(&lv, &platforms, x, 6, TakeoffDir::Right);
+        assert_eq!(
+            climb.landed_on,
+            Some(ledge),
+            "the side jump should catch the vine and land on the ledge: {climb:?}"
+        );
+        let report = report(&lv);
+        assert!(
+            report.goal_reached,
+            "a level climbed this way is beatable: {:?}",
+            report.diagnosis
+        );
     }
 
     #[test]

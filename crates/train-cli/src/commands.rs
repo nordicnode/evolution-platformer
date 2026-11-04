@@ -61,6 +61,8 @@ pub(crate) const TRAIN_OPTS: &[&str] = &[
     "growth-units",
     "growth-events",
     "lesson-every",
+    "no-win-lesson",
+    "what-if-every",
     "plateau-window",
     "plateau-cem-generations",
     "plateau-cem-events",
@@ -512,6 +514,12 @@ pub fn train(a: &Args) -> Result<(), String> {
             println!("level   {} ({}x{})", l.name, l.width, l.height);
             println!("hash    {}", l.content_hash_string());
             println!("oracle  {}", reachability_line(l));
+            // A level the oracle cannot route through is one no amount of training will solve;
+            // saying so here, once, is the difference between a run that reads its own failure as
+            // a learning problem and one that reads it as a level problem.
+            if let Some(note) = sim::reach::route_gap(l).warning() {
+                println!("warning {note}");
+            }
         }
         println!(
             "ga      pop {}  elite {}  tournament {}  sigma {:.2}  rate {:.3}  crossover {:.2}  action_repeat {}  trials {}",
@@ -769,6 +777,12 @@ pub fn train(a: &Args) -> Result<(), String> {
                         .join("  |  ")
                 );
             }
+            // The one lesson that needs no plan, reported on the generation it fires: a reader
+            // who watched a win happen and then saw the run lose it deserves to know whether the
+            // system did anything about it.
+            if let Some(note) = &report.win_lesson {
+                println!("lesson  {note}");
+            }
         }
 
         if stop_on_win && solved_at.is_some() {
@@ -931,11 +945,16 @@ pub fn train(a: &Args) -> Result<(), String> {
     // with the record beside it used to replace that better artifact at the moment it was most
     // wanted. The run's result is still written, under a distinct name, and the printed path says
     // which is which.
-    let better_exists = fs::read_to_string(&champion_path)
+    // A file this build cannot read is **also** stepped aside rather than replaced. It may be an
+    // older champion whose sensors or fitness version this build no longer parses, and "cannot
+    // compare" is not "worse": overwriting it would destroy the only record of that run at the
+    // moment a new one is least likely to reproduce it.
+    let existing = fs::read_to_string(&champion_path)
         .ok()
-        .and_then(|src| ChampionFile::from_json_str(&src).ok())
-        .is_some_and(|existing| existing.fitness > champion.fitness);
-    if better_exists {
+        .and_then(|src| ChampionFile::from_json_str(&src).ok());
+    let unreadable = existing.is_none() && champion_path.is_file();
+    let better_exists = existing.is_some_and(|existing| existing.fitness > champion.fitness);
+    if better_exists || unreadable {
         let base = champion_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -956,8 +975,13 @@ pub fn train(a: &Args) -> Result<(), String> {
             }
         }
         println!(
-            "note    {} already holds a better champion; this run wrote {}",
+            "note    {} already holds {}; this run wrote {}",
             Path::new(&out_dir).join(format!("{stem}.json")).display(),
+            if unreadable {
+                "a champion this build cannot read"
+            } else {
+                "a better champion"
+            },
             champion_path.display()
         );
     }
@@ -1116,6 +1140,14 @@ pub fn train(a: &Args) -> Result<(), String> {
             "tech    {} children bred from {} technique cells",
             trainer.technique_children_bred(),
             trainer.technique().occupied()
+        );
+    }
+    // The win lesson's spend, when it happened: one extra episode and one supervised fit, paid
+    // once on the run's first win. Absent on a run that never reached the flag.
+    if trainer.win_lessons() > 0 {
+        println!(
+            "lesson  {} win lesson(s): the winning play cloned into the population (see GaConfig::win_lesson)",
+            trainer.win_lessons()
         );
     }
     // Item 5, when the cut was on: the episodes it ended and the share of the pass that is, so
@@ -1885,6 +1917,14 @@ pub(crate) fn train_config(a: &Args) -> Result<GaConfig, String> {
         // Item 4: mid-run teaching. Both halves are off by default and spend the run's own
         // episodes, so an arm needs its equal-budget control before either moves a default.
         lesson_every: usage(a.usize_opt("lesson-every", default.lesson_every as usize))? as u32,
+        // Learn from the run's first win: record the winning play and clone it into the
+        // population. On by default because it spends episodes only when the run has already
+        // solved, and the alternative is a win that lives in the record and nowhere else.
+        win_lesson: !a.has_flag("no-win-lesson"),
+        // Counterfactual branch search: every N generations, ask whether a short sequence
+        // would have survived where the best genome's own episode died. Off by default, like
+        // every unmeasured arm; the window runs it every eighth generation.
+        what_if_every: usage(a.usize_opt("what-if-every", default.what_if_every as usize))? as u32,
         plateau_window: usage(a.usize_opt("plateau-window", default.plateau_window as usize))?
             as u32,
         plateau_cem_generations: usage(a.usize_opt(
@@ -2193,8 +2233,17 @@ fn write_csv(path: &str, history: &[evo::GenRow]) -> Result<(), String> {
 fn reachability_line(level: &Level) -> String {
     let r = reach::report(level);
     if r.goal_reached {
+        // The coarse sweep keeps one surface across a spike run, so it can reach a flag the route
+        // graph cannot: `untitled-5` reads "beatable in principle" with the far side of a six-tile
+        // spike run sealed off. A run header that stopped at that sentence is the false
+        // reassurance that costs thousands of generations, so the two readings are said together.
+        let route = if reach::route_gap(level).routed() {
+            ""
+        } else {
+            ", but not by the canonical route (see the warning below)"
+        };
         format!(
-            "beatable in principle ({} platforms, start #{:?}, goal platform #{:?})",
+            "beatable in principle{route} ({} platforms, start #{:?}, goal platform #{:?})",
             r.platforms.len(),
             r.start,
             r.goal_platform
@@ -2935,11 +2984,17 @@ pub(crate) fn pack_levels(dir: &str) -> Result<Vec<PathBuf>, String> {
 
 /// Whether a path is a level a person drew and saved rather than one of the pack's own.
 ///
-/// By name, and the name is a convention the editor already writes: `custom-<stem>.json`.
+/// By name, and the names are the two conventions the editor already writes: the `custom-<stem>`
+/// a renamed drawing is saved under, and the bare `untitled` / `untitled-<n>` a document gets
+/// before it has been named at all (the editor's default for a new drawing). Both are somebody's
+/// work in progress — a half-drawn floor is allowed to be unbeatable — and neither is a pack
+/// course, so sweeping them as if they were shipped would fail the pack's own gate on a sketch.
 fn is_user_drawing(path: &Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
-        .is_some_and(|stem| stem.starts_with("custom-"))
+        .is_some_and(|stem| {
+            stem.starts_with("custom-") || stem == "untitled" || stem.starts_with("untitled-")
+        })
 }
 
 // ---------------------------------------------------------------------------

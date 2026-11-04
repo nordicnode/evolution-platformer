@@ -70,7 +70,7 @@ const CELL_PAD: f32 = 5.0;
 /// readings, which have to line up in columns, and a tool bar is not a column — at this size it also
 /// sets about a fifth more of the word per point than monospace does, which is width the dock does
 /// not have to spend.
-const CAPTION_FONT: f32 = 12.5;
+const CAPTION_FONT: f32 = 10.0;
 
 /// The five glyphs the window's own controls draw, by name.
 ///
@@ -125,7 +125,7 @@ pub const GLYPHS: [&str; 10] = [
 pub fn caption_width(ui: &Ui, text: &str) -> f32 {
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
-        FontId::new(CAPTION_FONT, FontFamily::Proportional),
+        FontId::new(CAPTION_FONT, FontFamily::Monospace),
         theme::TEXT,
     );
     galley.size().x + CELL_PAD * 2.0 + 2.0
@@ -364,7 +364,7 @@ fn stack(
 ) {
     let galley = painter.layout_no_wrap(
         name.to_string(),
-        FontId::new(CAPTION_FONT, FontFamily::Proportional),
+        FontId::new(CAPTION_FONT, FontFamily::Monospace),
         b.text,
     );
     let caption_x = b.content.center().x - galley.size().x * 0.5;
@@ -439,7 +439,7 @@ pub fn menu_row(
     }
     let galley = painter.layout_no_wrap(
         name.to_string(),
-        FontId::new(CAPTION_FONT, FontFamily::Proportional),
+        FontId::new(CAPTION_FONT, FontFamily::Monospace),
         b.text,
     );
     painter.galley(
@@ -595,7 +595,7 @@ pub fn segmented_sized(
             );
         let galley = painter.layout_no_wrap(
             (*label).to_string(),
-            FontId::new(CAPTION_FONT, FontFamily::Proportional),
+            FontId::new(CAPTION_FONT, FontFamily::Monospace),
             b.text,
         );
         let text_x = if with_icon {
@@ -957,7 +957,7 @@ mod tests {
                     .show(ctx, |ui| {
                         let r = icon_button(ui, None, None, "Save", TOOL_SIZE, false, true);
                         assert!(!r.clicked(), "a button nobody clicked is not a click");
-                        icon_button(ui, None, Some("ground_1"), "Ground", TOOL_SIZE, true, true);
+                        icon_button(ui, None, Some("ground_1"), "Build", TOOL_SIZE, true, true);
                         // A disabled control answers no pointer: the state resolver gates hover and
                         // press on `enabled`, which is the difference between "not now" and "you are
                         // pushing a dead control".
@@ -967,7 +967,7 @@ mod tests {
                         let (picked, row) = segmented(
                             ui,
                             None,
-                            &[(None, "Edit"), (None, "Play"), (None, "Evolve")],
+                            &[(None, "Build"), (None, "Play"), (None, "Train")],
                             0,
                             &[true, true, false],
                         );
@@ -1044,16 +1044,16 @@ mod tests {
                     .show(ctx, |ui| {
                         // The rule `segmented` sizes its cells with, applied to the whole set at
                         // once: one width for the widest name, never narrower than a plate.
-                        let cell = ["Edit", "Play", "Evolve", "Replay"]
+                        let cell = ["Build", "Play", "Train", "Replay"]
                             .iter()
                             .map(|word| caption_width(ui, word))
                             .fold(TOOL_SIZE.x, f32::max);
-                        for word in ["Edit", "Play", "Evolve", "Replay"] {
+                        for word in ["Build", "Play", "Train", "Replay"] {
                             let width = ui
                                 .painter()
                                 .layout_no_wrap(
                                     word.to_string(),
-                                    FontId::new(CAPTION_FONT, FontFamily::Proportional),
+                                    FontId::new(CAPTION_FONT, FontFamily::Monospace),
                                     theme::TEXT,
                                 )
                                 .size()

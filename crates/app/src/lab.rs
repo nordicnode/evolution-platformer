@@ -132,7 +132,14 @@ const WARM_PLAN_DEPTH: u32 = 64;
 ///
 /// The fit is the shipped default (300 gradient passes plus six DAgger rounds). It runs once, on the
 /// worker thread, before the first generation; the profile line says what it cost.
-fn warm_seed_from_plan(level: &Level, cfg: &GaConfig) -> (Option<Vec<Genome>>, String) {
+fn warm_seed_from_plan(
+    level: &Level,
+    cfg: &GaConfig,
+) -> (
+    Option<Vec<Genome>>,
+    Option<sim::route_plan::RoutePlan>,
+    String,
+) {
     warm_seed_from_plan_with(
         level,
         cfg,
@@ -206,16 +213,103 @@ impl PlanWarm {
 /// This is the one expensive warm-start step (the compiler plus the DAgger fit) and it is shared by
 /// a fresh run and a resumed one so the window can never offer two different answers about what the
 /// planner proved.
+///
+/// **A plan is a script, and a script can be exact.** The warm start first looks for a route whose
+/// demonstration [`evo::exact_clone`] reproduces decision for decision *and* wins the plan's replay.
+/// The default beam finds such a route on some seeds and not others: on `l11`'s scored seed the
+/// default 12-leg route is not linearly separable (the best gradient clone stops at 4/12 legs),
+/// while the same search with `per_bucket: 4` yields a 12-leg route that is exact and wins in 703
+/// frames. The ladder below is therefore not a tuning knob — it is how the window avoids handing
+/// generation zero a clone that cannot play the world the run is about to score. When no route is
+/// exact, the first certified plan is used and the gradient/DAgger fit is the fallback, exactly as
+/// before.
 fn plan_warm(
     level: &Level,
     cfg: &GaConfig,
     plan_cfg: sim::plan::PlanConfig,
     imit: &ImitateConfig,
+    seed: u64,
 ) -> Result<PlanWarm, String> {
     let started = Instant::now();
-    let plan = sim::route_plan::compile(level, cfg.master_seed, plan_cfg)
-        .map_err(|err| format!("no warm start: {}", err.line()))?;
     let eval = cfg.eval_config();
+    // The first configuration is the caller's; the rest are small widenings of the route search.
+    // `per_bucket` is the one that mattered on `l11`: a wider bucket keeps more phase-distinct
+    // waiting nodes, which produces the separable route the default drops.
+    let mut configs = vec![plan_cfg];
+    for extra in [
+        sim::plan::PlanConfig {
+            per_bucket: 4,
+            ..plan_cfg
+        },
+        sim::plan::PlanConfig {
+            per_bucket: 8,
+            ..plan_cfg
+        },
+        sim::plan::PlanConfig {
+            beam: (plan_cfg.beam * 2).min(2048),
+            ..plan_cfg
+        },
+    ] {
+        if !configs.contains(&extra) {
+            configs.push(extra);
+        }
+    }
+    // A one-epoch probe: the exact path returns before the epoch, and a non-exact route costs one
+    // gradient pass rather than the shipped 300 plus DAgger, which is what makes the ladder cheap.
+    let probe = ImitateConfig {
+        epochs: 1,
+        dagger_rounds: 0,
+        leg_rounds: 0,
+        jump_labels: false,
+        ..*imit
+    };
+    let route_count = configs.len();
+    let mut fallback: Option<(sim::route_plan::RoutePlan, ImitationReport)> = None;
+    let mut last_error: Option<String> = None;
+    for (index, route_cfg) in configs.into_iter().enumerate() {
+        let plan = match sim::route_plan::compile(level, seed, route_cfg) {
+            Ok(plan) => plan,
+            Err(err) => {
+                last_error = Some(err.line());
+                continue;
+            }
+        };
+        let (_, report) = from_certified_plan(level, &plan, &eval, cfg.shape.clone(), &probe)
+            .map_err(|why| format!("no warm start: {why}"))?;
+        // `epochs == 0` is the exact constructor: it never runs a gradient pass. An exact fit that
+        // also won the replay is the whole answer, so the ladder stops there.
+        if report.epochs == 0 && report.agreement == 1.0 {
+            if profiling() {
+                eprintln!(
+                    "lab warm exact plan {:?} (route {} of {}, {} decisions, {} legs, {})",
+                    started.elapsed(),
+                    index + 1,
+                    route_count,
+                    report.exemplars,
+                    plan.legs.len(),
+                    report
+                        .mastery
+                        .as_ref()
+                        .map(|m| m.line())
+                        .unwrap_or_default()
+                );
+            }
+            return Ok(PlanWarm {
+                clone: report.genome.clone(),
+                plan,
+                report,
+            });
+        }
+        if fallback.is_none() {
+            fallback = Some((plan, report));
+        }
+    }
+    let Some((plan, _probe)) = fallback else {
+        return Err(format!(
+            "no warm start: {}",
+            last_error.unwrap_or_else(|| "the planner found no route".into())
+        ));
+    };
     let (play, report): (RoutePlay, ImitationReport) =
         from_certified_plan(level, &plan, &eval, cfg.shape.clone(), imit)
             .map_err(|why| format!("no warm start: {why}"))?;
@@ -248,15 +342,41 @@ fn trainer_from_plan_population(
     cfg: &GaConfig,
     level: &Level,
     population: Vec<Genome>,
+    plan: Option<&sim::route_plan::RoutePlan>,
 ) -> Result<Trainer, String> {
     let mut trainer = Trainer::resume(cfg.clone(), population, 0)?;
+    // The clone is the plan's *demonstration*; the guide is its **selection pressure**. Without
+    // this the run has the route once, in a quarter of generation zero, and nothing pulls the
+    // rest of the population back onto it when a timed crossing misses. The guide is what the
+    // planner is for on a level like `l11-the-elements`: the plan's own waypoints are where the
+    // body has to be, and a genome that follows them through the deck-and-vent timing is paid
+    // for it while the bonus is alive. Selection only, so no champion can become a plan-mimic.
+    if let Some(plan) = plan {
+        trainer.seed_plan(level, &timed_route_from_plan(plan));
+    }
     if let Some(clone) = trainer.genomes.first().cloned() {
-        let result = evo::run_episode(level, &clone, &cfg.eval_config(), cfg.master_seed);
+        let seed = evo::ga::episode_seed_for(cfg, 0, 0, 0);
+        let result = evo::run_episode(level, &clone, &cfg.eval_config(), seed);
         if result.won() {
-            trainer.seed_record(level, clone, cfg.master_seed)?;
+            trainer.seed_record(level, clone, seed)?;
         }
     }
     Ok(trainer)
+}
+
+/// The plan's block actions as the guide's replay route.
+///
+/// The compiled route and the timed planner's route are the same data seen through two types:
+/// one action per decision block, from spawn, winning. `Trainer::seed_plan` replays exactly that
+/// and records the body's centres, which is the guide the selection bonus reads.
+fn timed_route_from_plan(plan: &sim::route_plan::RoutePlan) -> sim::plan::TimedRoute {
+    sim::plan::TimedRoute {
+        actions: plan.actions.clone(),
+        frames: plan.frames,
+        hops: plan.covered,
+        seed: plan.seed,
+        note: plan.note.clone(),
+    }
 }
 
 /// [`warm_seed_from_plan`] with the planner budget and the fit under the caller's control. The
@@ -267,11 +387,22 @@ fn warm_seed_from_plan_with(
     cfg: &GaConfig,
     plan_cfg: sim::plan::PlanConfig,
     imit: &ImitateConfig,
-) -> (Option<Vec<Genome>>, String) {
-    let warm = match plan_warm(level, cfg, plan_cfg, imit) {
+) -> (
+    Option<Vec<Genome>>,
+    Option<sim::route_plan::RoutePlan>,
+    String,
+) {
+    // **The plan is compiled on the seed the run actually scores.** The trainer's first episode
+    // for genome 0 is `episode_seed_for(cfg, 0, 0, 0)`, not `cfg.master_seed`; a plan compiled on
+    // the latter is a winning route in a world the run never judges, which is exactly how a 9/12-leg
+    // clone became a generation-zero member reading x 36.6. Compiling on the scored seed makes the
+    // clone's mastery the run's own first measurement.
+    let scored = evo::ga::episode_seed_for(cfg, 0, 0, 0);
+    let warm = match plan_warm(level, cfg, plan_cfg, imit, scored) {
         Ok(warm) => warm,
         Err(note) => {
             return (
+                None,
                 None,
                 format!("{note}. The population starts random rather than from a weaker route"),
             )
@@ -291,7 +422,8 @@ fn warm_seed_from_plan_with(
         "{count} of {} genomes start from that clone, the rest are random",
         cfg.pop_size
     );
-    (Some(pop), warm.note(&seeded))
+    let note = warm.note(&seeded);
+    (Some(pop), Some(warm.plan), note)
 }
 
 /// **Warm a resumed population from the plan without throwing the checkpoint away.**
@@ -318,6 +450,15 @@ fn warm_resumed_from_plan_with(
     cfg: &GaConfig,
     imit: &ImitateConfig,
 ) -> String {
+    // A resumed cohort's clone is injected at the run's current generation. It keeps id 0 when
+    // that id is free and is renumbered to the trainer's next id otherwise, so the plan is compiled
+    // on the seed that genome will actually be scored on.
+    let clone_id = if trainer.genomes.iter().any(|g| g.id == 0) {
+        trainer.next_id()
+    } else {
+        0
+    };
+    let scored = evo::ga::episode_seed_for(cfg, trainer.generation, clone_id, 0);
     let warm = match plan_warm(
         level,
         cfg,
@@ -326,6 +467,7 @@ fn warm_resumed_from_plan_with(
             ..sim::plan::PlanConfig::default()
         },
         imit,
+        scored,
     ) {
         Ok(warm) => warm,
         Err(note) => {
@@ -344,12 +486,15 @@ fn warm_resumed_from_plan_with(
     if let Err(err) = trainer.inject_batch(set) {
         return format!("no warm start: {err}. The resumed population is unchanged");
     }
+    // The same guide a fresh run gets: the resumed cohort has the route's clone, and the
+    // selection bonus is what keeps the cohort near the route while the timed legs are learned.
+    trainer.seed_plan(level, &timed_route_from_plan(&warm.plan));
     // A closed-loop clone that wins from the spawn is a legitimate record, exactly as it is on a
     // fresh run. Seed it before generation zero can replace it with an unsolved member of the
     // checkpoint's remainder.
-    let solo = evo::run_episode(level, &warm.clone, &cfg.eval_config(), cfg.master_seed);
+    let solo = evo::run_episode(level, &warm.clone, &cfg.eval_config(), warm.plan.seed);
     if solo.won() {
-        if let Err(err) = trainer.seed_record(level, warm.clone.clone(), cfg.master_seed) {
+        if let Err(err) = trainer.seed_record(level, warm.clone.clone(), warm.plan.seed) {
             eprintln!("resume warm record: {err}");
         }
     }
@@ -576,6 +721,20 @@ pub struct Packet {
     /// decision that lost. Zero when [`evo::GaConfig::repair_children`] is off, which is the
     /// terminal default and not the window's.
     pub repairs: usize,
+    /// Children injected from a **counterfactual branch** this generation: the best genome forked
+    /// its own losing episode, searched short different sequences, and learned the one that got
+    /// further. Zero when the cadence is off or this generation was not due.
+    pub what_if_children: usize,
+    /// Branches the counterfactual helper scored this generation. Zero when it did not run; a
+    /// non-zero count beside zero children means it looked and found nothing worth injecting.
+    pub what_if_branches: usize,
+    /// The helper's own account of the branch it found, when it found one. Shown beside the
+    /// counts because the counts say a child exists and this says what it was taught.
+    pub what_if_note: Option<String>,
+    /// The **win lesson's** account, on the generation it fired: the winning play fitted into the
+    /// population, or why it could not be. A viewer who just watched a win happen wants to know
+    /// whether the run kept it, and this is that sentence.
+    pub win_lesson: Option<String>,
     /// Behavioural niches the archive holds, of `evo::ARCHIVE_CELLS`. The run's *diversity*
     /// reading: a population that has collapsed onto one way of moving fills one or two
     /// niches and stays there, which no chart of its scores can show.
@@ -950,6 +1109,29 @@ fn train_from_champion(
     Ok(trainer)
 }
 
+/// **The level's route preflight, in the words the panel can show.**
+///
+/// [`sim::reach::route_gap`] answers whether the canonical route leaves the spawn and, when it
+/// does not, names the stand it ends on and the gap to the next one. A watched run is the place
+/// that warning has to appear: a population can spend thousands of generations in front of a
+/// barrier the planner cannot cross while every coarse reachability signal still says the level is
+/// beatable. It goes into the run's curriculum note because that is the panel's "what the search
+/// is doing about it" line, and the right reading for the viewer is that the search has nothing to
+/// learn from a route here until the level changes.
+///
+/// It is a warning rather than a refusal. A policy has air control the canonical sweep does not,
+/// so a level the route graph cannot cross may still fall to a lucky or learned line — but the
+/// viewer should know which of the two a stall means.
+fn preflight_note(level: &Level) -> Option<String> {
+    let gap = sim::reach::route_gap(level);
+    gap.warning().map(|why| {
+        format!(
+            "preflight: {why}; the planner has no route to teach from here, so a stall at this \
+             barrier is a level question rather than a search one"
+        )
+    })
+}
+
 impl Generator {
     /// A fresh population, or — when the plan names a checkpoint — the population that
     /// checkpoint holds.
@@ -1022,9 +1204,12 @@ impl Generator {
                 // A fresh run warms itself from the level's certified timed plan when it has one.
                 // See [`warm_seed_from_plan`] and [`RunPlan::warm_from_plan`].
                 None if plan.warm_from_plan => {
-                    let (pop, note) = warm_seed_from_plan(&level, &cfg);
+                    let (pop, warm_plan, note) = warm_seed_from_plan(&level, &cfg);
                     match pop {
-                        Some(pop) => (trainer_from_plan_population(&cfg, &level, pop)?, Some(note)),
+                        Some(pop) => (
+                            trainer_from_plan_population(&cfg, &level, pop, warm_plan.as_ref())?,
+                            Some(note),
+                        ),
                         None => (Trainer::new(cfg.clone()), Some(note)),
                     }
                 }
@@ -1039,6 +1224,7 @@ impl Generator {
                 evo::Codex::empty(&level)
             }
         };
+        let curriculum = preflight_note(&level);
         Ok(Generator {
             eval: cfg.eval_config(),
             trainer,
@@ -1048,7 +1234,7 @@ impl Generator {
             plan,
             out_dir,
             origin,
-            curriculum: None,
+            curriculum,
             detour_arm: DetourGate::new(),
             detour: None,
             traces: TraceLog::new(),
@@ -1210,10 +1396,10 @@ impl Generator {
                 ),
             },
             None if self.plan.warm_from_plan => {
-                let (pop, note) = warm_seed_from_plan(&level, &cfg);
+                let (pop, warm_plan, note) = warm_seed_from_plan(&level, &cfg);
                 match pop {
                     Some(pop) => (
-                        trainer_from_plan_population(&cfg, &level, pop)
+                        trainer_from_plan_population(&cfg, &level, pop, warm_plan.as_ref())
                             .unwrap_or_else(|_| Trainer::new(cfg.clone())),
                         Some(note),
                     ),
@@ -1236,7 +1422,7 @@ impl Generator {
         // A champion is a way *into* a run, not a setting of it: once the population exists,
         // Restart's own meaning — a fresh population — takes over again.
         self.plan.seed_from_champion = None;
-        self.curriculum = None;
+        self.curriculum = preflight_note(&self.level);
         self.detour_arm = DetourGate::new();
         self.origin = origin;
         // The codex follows the *level*, not the population: a restart keeps what the level has
@@ -1649,6 +1835,10 @@ impl Generator {
             immigrants: report.immigrants,
             archive_children: report.archive_children,
             repairs: report.repairs,
+            what_if_children: report.what_if_children,
+            what_if_branches: report.what_if_branches,
+            what_if_note: report.what_if_note,
+            win_lesson: report.win_lesson,
             archive_bits: report.archive_bits,
             archive_time_bits: report.archive_time_bits,
             fastest: report.fastest,
@@ -3669,6 +3859,10 @@ mod tests {
             warm.best().is_some_and(|best| best.result.won()),
             "the plan clone wins on the flat level and is retained as the run record"
         );
+        assert!(
+            warm.trainer.plan_guide().is_some(),
+            "the certified route must be attached as the selection guide, not only cloned"
+        );
 
         // The same level, unwarmed, is the control: same seeds, same budget, a random population.
         let cold = Generator::new(level, cfg, 2, 2, RunPlan::default(), dir, "l1-flat-run")
@@ -3676,6 +3870,10 @@ mod tests {
         assert!(
             cold.origin().is_none(),
             "nothing to declare about a population nobody handed over"
+        );
+        assert!(
+            cold.trainer.plan_guide().is_none(),
+            "a run with no plan must not be shaped by one"
         );
     }
 
@@ -3690,7 +3888,7 @@ mod tests {
             epochs: 20,
             ..ImitateConfig::default()
         };
-        let (pop, note) = warm_seed_from_plan_with(
+        let (pop, _plan, note) = warm_seed_from_plan_with(
             &level,
             &cfg,
             sim::plan::PlanConfig {
@@ -3771,7 +3969,7 @@ mod tests {
     #[test]
     fn a_level_the_planner_cannot_route_starts_random_instead_of_from_a_weaker_route() {
         let level = shipped("l2-first-gap");
-        let (pop, note) = warm_seed_from_plan_with(
+        let (pop, _plan, note) = warm_seed_from_plan_with(
             &level,
             &tiny_config(),
             sim::plan::PlanConfig {

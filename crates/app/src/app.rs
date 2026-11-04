@@ -562,6 +562,9 @@ struct EvoApp {
     /// packet and dropped on the way out, so a stale field can never be drawn under a run
     /// that has moved on.
     replay: Option<Replay>,
+    /// A validated champion on disk, available to the title screen before this
+    /// window has started an in-memory training run.
+    saved_champion: Option<evo::ChampionFile>,
     view: ViewState,
     /// `n`: run exactly one generation, then pause.
     single_step: bool,
@@ -728,9 +731,13 @@ impl EvoApp {
         // It plays the run's own champion for this level when the champions directory holds
         // one — the level is the document this window opened, so what is on the title screen
         // is what is about to be edited — and the demo run when it does not.
+        let saved_champion =
+            crate::splash::champion_file(&editor.level, &champions_dir, Some(level_path.as_path()));
         let splash = if splash.unwrap_or(screenshot.is_none()) {
             let mut splash =
                 Splash::open(&editor.level, &champions_dir, Some(level_path.as_path()));
+            splash.set_replay_available(saved_champion.is_some());
+            splash.set_train_available(!editor.level.goals.is_empty());
             if screenshot.is_some() {
                 splash.skip_opening();
             }
@@ -779,6 +786,7 @@ impl EvoApp {
             packet: None,
             summary: None,
             replay: None,
+            saved_champion,
             view: ViewState::default(),
             single_step: false,
             saved_end: false,
@@ -845,13 +853,30 @@ impl EvoApp {
         }
     }
 
-    /// The reachability tint, when the guides are on.
+    /// The reachability tint: whenever the guides are on, and **always when the level cannot be
+    /// beaten**.
+    ///
+    /// The tint is a measurement, so the guides own it while a level is merely being arranged. An
+    /// unrealisable level is not a measurement: it is the level failing, and it has to be on screen
+    /// whether or not anybody pressed `G`. That is the fact this overlay used to carry before the
+    /// guides defaulted off, and a run started on an unbeatable drawing is thousands of generations
+    /// spent on nothing — so the failure state overrides the preference.
     ///
     /// One place, read by the canvas and by nothing else, so "the overlay is off" is a fact about
     /// the window rather than a condition repeated wherever a level happens to be drawn — the same
     /// reason [`Self::edit_backdrop`] is a method instead of an `if` at the call site.
     fn reach_overlay(&self) -> Option<&ReachReport> {
-        self.guides.then_some(&self.editor.report)
+        (self.guides || self.unreachable_goal()).then_some(&self.editor.report)
+    }
+
+    /// **A flag exists and no route reaches it**: the failure state the editor has to make loud.
+    ///
+    /// A blank document is unfinished, not broken — every new level starts without a flag, and
+    /// painting the whole canvas red before one is placed would be noise about a fact its author
+    /// already knows. The state worth overriding the guides for is the one where the author has
+    /// said where the goal is and the terrain says it cannot be got to.
+    fn unreachable_goal(&self) -> bool {
+        !self.editor.level.goals.is_empty() && !self.editor.beatable()
     }
 
     /// The terrain the canvas is actually drawing.
@@ -993,15 +1018,29 @@ impl EvoApp {
     fn enter_replay(&mut self) {
         let built = match (&self.lab, &self.packet) {
             (Some(lab), Some(packet)) => lab.replay(packet),
-            (None, _) => {
-                self.editor.message = "no run on this level yet — press E to train on it".into();
-                return;
+            _ => None,
+        };
+        let built = if built.is_some() {
+            built
+        } else if self.has_saved_replay() {
+            let champion = self
+                .saved_champion
+                .as_ref()
+                .expect("has_saved_replay checked the saved champion");
+            match Replay::from_champion(&self.editor.level, champion) {
+                Ok(replay) => Some(replay),
+                Err(err) => {
+                    self.editor.message = format!("cannot open the saved replay: {err}");
+                    return;
+                }
             }
-            (_, None) => {
-                self.editor.message =
-                    "no generation scored yet: a replay needs an agent to watch".into();
-                return;
-            }
+        } else if self.lab.is_none() {
+            self.editor.message = "no run on this level yet — press E to train on it".into();
+            return;
+        } else {
+            self.editor.message =
+                "no generation scored yet: a replay needs an agent to watch".into();
+            return;
         };
         let Some(mut replay) = built else {
             // No packet, or no record in one: the first evaluation always sets a best-scoring
@@ -1037,7 +1076,16 @@ impl EvoApp {
 
     /// Is there anything to replay? A run has to have scored a generation.
     fn can_replay(&self) -> bool {
-        self.lab.is_some() && self.packet.is_some()
+        (self.lab.is_some() && self.packet.is_some()) || self.has_saved_replay()
+    }
+
+    /// A disk champion is usable only while the editor still shows the level it
+    /// was recorded on. Editing the document must not leave a green Replay door
+    /// that can only fail after it is pressed.
+    fn has_saved_replay(&self) -> bool {
+        self.saved_champion.as_ref().is_some_and(|champion| {
+            champion.metadata.level_hash == self.editor.level.content_hash_string()
+        })
     }
 
     /// One frame of the replay: step the clock unless the viewer has paused it.
@@ -1171,6 +1219,22 @@ impl EvoApp {
             // random mutation upstream of the failure to come good. `--repair-children` is
             // the same knob in the terminal, and `GaConfig::default()` keeps it off.
             repair_children: 3,
+            // **Counterfactual branch search in the window.** A watched run is exactly where
+            // a sequence question is worth paying for: every eighth generation the best
+            // genome forks its own losing episode and asks whether a short different
+            // sequence would have got further. The child it learns is an ordinary member of
+            // the next generation. The terminal keeps this off by default so the measured
+            // defaults do not move without an arm.
+            what_if_every: 8,
+            // **The plan is a teacher, not only a seed.** The window already compiles the
+            // level's certified timed route and clones it into a quarter of generation zero;
+            // the guide is the other half of that bargain. It pays selection credit for the
+            // fraction of the route a genome reaches (never fitness, never a champion), and it
+            // decays so a late run is selected on the unshaped objective. This is what took
+            // `l11-the-elements` from x 50.5 to x 60.7 in the same budget when the guide was
+            // the only arm that differed; see `lab::trainer_from_plan_population`.
+            plan_bonus: 50.0,
+            plan_bonus_generations: 120,
             ..GaConfig::default()
         };
         // **A checkpoint is a seed as much as a cohort.** Every episode a genome meets is
@@ -1328,6 +1392,15 @@ impl EvoApp {
     /// [`lab::artifact_stem`]).
     fn run_stem(&self) -> String {
         lab::artifact_stem(&self.editor.level, self.editor.path.as_deref())
+    }
+
+    /// Refresh the disk replay for the document currently on screen.
+    fn refresh_saved_champion(&mut self) {
+        self.saved_champion = crate::splash::champion_file(
+            &self.editor.level,
+            &self.options.champions,
+            self.editor.path.as_deref(),
+        );
     }
 
     /// Start a fresh population on the level as it stands, on the next seed up.
@@ -1589,6 +1662,7 @@ impl EvoApp {
             Err(err) => format!("not saved: {err}"),
         };
         self.note = Some((note, 8.0));
+        self.refresh_saved_champion();
     }
 
     /// Walk the recorded improvements, one route at a time.
@@ -1937,6 +2011,7 @@ impl EvoApp {
     /// behind it ([`panel::lab_details`]). Both report the same [`panel::Actions`], so what a widget
     /// *means* is handled once, in [`Self::apply_actions`], wherever it was drawn.
     fn evolve_panel(&mut self, ui: &mut egui::Ui) {
+        self.training_intro(ui);
         let Some(summary) = self.summary.take() else {
             // Before the first generation lands there is nothing to summarise, and a panel of zeros
             // would read as a run that is going nowhere rather than one that has not started.
@@ -1995,6 +2070,7 @@ impl EvoApp {
 
     /// The right-hand panel in the replay: the transport for one episode, and the way to its numbers.
     fn replay_panel(&mut self, ui: &mut egui::Ui) {
+        self.replay_intro(ui);
         // Scoped, so the replay is handed to the widgets and the window gets it back before anything
         // is acted on: a widget that changed the state it was drawing would be two implementations of
         // one control.
@@ -2005,6 +2081,48 @@ impl EvoApp {
             panel::replay_panel(ui, Some(&self.atlas), replay, &self.view)
         };
         self.apply_actions(actions);
+    }
+
+    /// The friendly front of the training panel; the detailed run controls remain below it.
+    fn training_intro(&self, ui: &mut egui::Ui) {
+        panel::section(ui, "TRAINING RUN");
+        ui.label(
+            egui::RichText::new("AI PLAYGROUND")
+                .font(theme::pixel_font(10.0))
+                .color(theme::ACCENT_INK),
+        );
+        ui.label(
+            egui::RichText::new("THE POPULATION IS LEARNING")
+                .font(theme::pixel_font(13.0))
+                .color(theme::TEXT),
+        );
+        ui.label(
+            egui::RichText::new("watch the little runners try, miss, and improve")
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(4.0);
+    }
+
+    /// The friendly front of the replay panel, framing the selected episode as a highlight.
+    fn replay_intro(&self, ui: &mut egui::Ui) {
+        panel::section(ui, "REPLAY CARD");
+        ui.label(
+            egui::RichText::new("HIGHLIGHT REEL")
+                .font(theme::pixel_font(10.0))
+                .color(theme::ACCENT_INK),
+        );
+        ui.label(
+            egui::RichText::new("THE STAR RUN")
+                .font(theme::pixel_font(15.0))
+                .color(theme::TEXT),
+        );
+        ui.label(
+            egui::RichText::new("the best run, side by side with its ghosts")
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(4.0);
     }
 
     /// Do what the panels' widgets asked for.
@@ -2256,6 +2374,7 @@ impl EvoApp {
             },
         };
         self.editor = editor;
+        self.refresh_saved_champion();
         self.pending_size = (self.editor.level.width, self.editor.level.height);
         self.fit_pending = true;
         // A new document is a new world, and the soundtrack says so.
@@ -2734,9 +2853,9 @@ impl EvoApp {
     /// gold plate already says which one is on. See [`ui::segmented`].
     fn dock_modes(&mut self, ui: &mut egui::Ui) {
         const OPTIONS: [(Option<&str>, &str); 4] = [
-            (Some("ground_1"), "Edit"),
+            (Some("ground_1"), "Build"),
             (Some("player_run_1"), "Play"),
-            (Some("walker_a"), "Evolve"),
+            (Some("walker_a"), "Train"),
             // The run's answer is the flag: `goal_flag_2` is the waving banner rather than the
             // pole, and at eighteen points the banner is the half of it that reads.
             (Some("goal_flag_2"), "Replay"),
@@ -2984,6 +3103,120 @@ impl EvoApp {
             Brush::Turret => crate::view::turret_picture(self.editor.turret_dir),
             _ => (brush.sprite(), false),
         }
+    }
+
+    /// The editor's right-hand course card: a friendly summary beside the build stage.
+    ///
+    /// The parts tray is deliberately visual and scrollable. This card is the stable
+    /// destination for the facts a builder checks before pressing Play: the course name,
+    /// its size, how much has been placed, and whether the route is ready.
+    fn course_card(&mut self, ui: &mut egui::Ui) {
+        panel::section(ui, "COURSE CARD");
+        // Truncated, not wrapped: a course name is a file name, and the pixel face has no room to
+        // break one over two lines in a panel this narrow — it used to overlap the card's own
+        // bottom edge. The full name is still a hover away.
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(self.editor.title().to_uppercase())
+                    .font(theme::pixel_font(13.0))
+                    .color(theme::TEXT),
+            )
+            .truncate()
+            .sense(egui::Sense::hover()),
+        )
+        .on_hover_text(self.editor.title());
+        ui.label(
+            egui::RichText::new("your course")
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(10.0);
+
+        let level = &self.editor.level;
+        self.course_stat(
+            ui,
+            "COURSE SIZE",
+            format!("{} × {}", level.width, level.height),
+            theme::COOL,
+        );
+        let placed = level.walkers.len()
+            + level.chasers.len()
+            + level.flyers.len()
+            + level.turrets.len()
+            + level.platforms.len()
+            + level.ropes.len()
+            + level.spike_balls.len()
+            + level.rocks.len()
+            + level.blocks.len()
+            + level.scenery.len();
+        self.course_stat(ui, "TRICKS PLACED", placed.to_string(), theme::RUN);
+        let ready = self.editor.beatable();
+        self.course_stat(
+            ui,
+            "COURSE STATUS",
+            if ready {
+                "READY TO PLAY"
+            } else {
+                "NEEDS A ROUTE"
+            }
+            .to_string(),
+            if ready { theme::GOOD } else { theme::BAD },
+        );
+
+        ui.add_space(10.0);
+        panel::section(ui, "QUICK KEYS");
+        for (key, label) in [
+            ("P", "playtest"),
+            ("G", "show guides"),
+            ("F", "fit course"),
+            ("?", "key card"),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(key)
+                        .font(theme::pixel_font(11.0))
+                        .color(theme::ACCENT_INK),
+                );
+                ui.label(egui::RichText::new(label).color(theme::TEXT));
+            });
+        }
+        ui.add_space(10.0);
+        let play = ui::menu_row(
+            ui,
+            Some(&self.atlas),
+            Some("player_run_1"),
+            "Playtest",
+            ui.available_width(),
+            false,
+            true,
+        );
+        if play.clicked() {
+            self.enter_play();
+        }
+    }
+
+    /// One fact in the course card, with a colored toy-like edge.
+    fn course_stat(&self, ui: &mut egui::Ui, label: &str, value: String, accent: Color32) {
+        theme::card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(5.0, 36.0), Sense::hover());
+                ui.painter_at(rect)
+                    .rect_filled(rect, CornerRadius::same(3), accent);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(value)
+                            .font(theme::pixel_font(14.0))
+                            .color(theme::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(label)
+                            .font(FontId::monospace(9.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+            });
+        });
+        ui.add_space(6.0);
     }
 
     /// The sprite drawn *under* a brush's icon, when it has one.
@@ -3736,6 +3969,16 @@ impl EvoApp {
         if let Some(plan) = self.editor.plan_verdict() {
             response = response.on_hover_text(format!("{}\n{}", plan.label(), plan.detail()));
         }
+        // **A light alone is not enough for a failure.** "Beatable" is the quiet case: a lamp is a
+        // complete sentence when nothing is wrong. An unbeatable level is the one reading that has
+        // to be legible without a hover, because the cost of missing it is a training run that
+        // cannot succeed. The full reason stays on the hover and in Details; the word is what has
+        // to be on screen.
+        if self.unreachable_goal() {
+            response = ui
+                .colored_label(theme::BAD_INK, "NOT beatable")
+                .on_hover_text(self.editor.verdict());
+        }
         let _ = response;
     }
 
@@ -4264,10 +4507,65 @@ impl EvoApp {
         if self.mode == Mode::Play {
             self.play_hud(&painter, rect);
         }
+        // **The failure state is on the picture, not only in the strip.** An author looks at the
+        // level while drawing it; a lamp at the bottom of the window is one glance away and the
+        // tint alone is easy to read as scenery. A card in the corner is the same place the
+        // playtest puts its clock, which is where this window already teaches people to look.
+        if self.mode == Mode::Edit && self.unreachable_goal() {
+            self.unbeatable_badge(&painter, rect);
+        }
 
         if self.mode == Mode::Edit {
             self.canvas_edit_gestures(ui, &response, rect, &painter);
         }
+    }
+
+    /// The failure state as a card over the picture: what is wrong, in the editor's own voice.
+    ///
+    /// The full diagnosis is long — an oracle's sentence about jump heights and wall heights —
+    /// and a canvas card that wrapped it would cover the level it is about. So the card says the
+    /// verdict and the one fact that matters (the flag has no route), and the sentence stays on
+    /// the status bar's hover and in Details, where there is room for it.
+    fn unbeatable_badge(&self, painter: &egui::Painter, rect: Rect) {
+        let title = painter.layout_no_wrap(
+            "NOT beatable".to_string(),
+            FontId::proportional(16.0),
+            theme::BAD_INK,
+        );
+        let sub = painter.layout_no_wrap(
+            "the spawn cannot reach the flag".to_string(),
+            FontId::proportional(12.0),
+            theme::TEXT_DIM,
+        );
+        let pad = 12.0;
+        let width = title.size().x.max(sub.size().x) + pad * 2.0;
+        let height = title.size().y + sub.size().y + pad * 2.0 + 2.0;
+        let panel = Rect::from_min_size(
+            Pos2::new(rect.left() + 16.0, rect.top() + 16.0),
+            Vec2::new(width, height),
+        );
+        painter.rect_filled(
+            panel.translate(Vec2::new(0.0, 3.0)),
+            CornerRadius::same(theme::RADIUS_LG),
+            Color32::from_rgba_unmultiplied(74, 52, 32, 70),
+        );
+        painter.rect_filled(panel, CornerRadius::same(theme::RADIUS_LG), theme::CARD);
+        painter.rect_stroke(
+            panel,
+            CornerRadius::same(theme::RADIUS_LG),
+            Stroke::new(3.0_f32, theme::BAD_INK),
+            StrokeKind::Inside,
+        );
+        painter.galley(
+            Pos2::new(panel.left() + pad, panel.top() + pad),
+            title,
+            theme::BAD_INK,
+        );
+        painter.galley(
+            Pos2::new(panel.left() + pad, panel.top() + pad + 18.0),
+            sub,
+            theme::TEXT_DIM,
+        );
     }
 
     /// The playtest's scoreboard: the three numbers a player reads while playing.
@@ -4283,92 +4581,140 @@ impl EvoApp {
         let Some(session) = &self.session else {
             return;
         };
-        let stats = session.sim().stats();
-        // The same quantity the fitness scores and the status line prints: the share of the
-        // distance to the flag that has been closed, so a level whose goal is above the start
-        // reads honestly rather than as a number about `x`.
-        let progress = if stats.goal_distance_pixels > 0.0 {
-            (100.0 * stats.progress_pixels / stats.goal_distance_pixels).clamp(0.0, 100.0)
-        } else {
-            100.0
+        let card = |card: Rect, title: &str, value: &str, accent: Color32| {
+            painter.rect_filled(
+                card.translate(Vec2::new(0.0, 5.0)),
+                CornerRadius::same(theme::RADIUS_LG),
+                Color32::from_rgba_unmultiplied(16, 37, 58, 150),
+            );
+            painter.rect_filled(card, CornerRadius::same(theme::RADIUS_LG), theme::CARD);
+            painter.rect_stroke(
+                card,
+                CornerRadius::same(theme::RADIUS_LG),
+                Stroke::new(3.0_f32, theme::OUTLINE),
+                StrokeKind::Inside,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(card.left() + 8.0, card.top() + 10.0),
+                    Vec2::new(5.0, card.height() - 20.0),
+                ),
+                CornerRadius::same(3),
+                accent,
+            );
+            painter.text(
+                Pos2::new(card.left() + 24.0, card.top() + 14.0),
+                egui::Align2::LEFT_TOP,
+                title,
+                FontId::monospace(9.0),
+                theme::TEXT_DIM,
+            );
+            painter.text(
+                Pos2::new(card.left() + 24.0, card.bottom() - 11.0),
+                egui::Align2::LEFT_BOTTOM,
+                value,
+                theme::pixel_font(15.0),
+                theme::TEXT,
+            );
         };
-        let cells: [(&str, String); 3] = [
-            ("TIME", sim::format_time(session.frames())),
-            (
-                "YOUR BEST",
-                session
-                    .best()
-                    .map(sim::format_time)
-                    .unwrap_or_else(|| "--".to_string()),
+
+        card(
+            Rect::from_min_size(
+                Pos2::new(rect.left() + 20.0, rect.top() + 20.0),
+                Vec2::new(220.0, 72.0),
             ),
-            ("TO THE FLAG", format!("{progress:.0}%")),
-        ];
-        let label_font = FontId::monospace(9.0);
-        let value_font = FontId::monospace(17.0);
-        // Measured before it is drawn, like every plate in the window: a cell sized by a guess
-        // clips the one value that happened to be wider than the guess.
-        let widths: Vec<f32> = cells
-            .iter()
-            .map(|(label, value)| {
-                let l =
-                    painter.layout_no_wrap(label.to_string(), label_font.clone(), theme::RIBBON);
-                let v = painter.layout_no_wrap(value.clone(), value_font.clone(), theme::OUTLINE);
-                l.size().x.max(v.size().x) + 26.0
-            })
-            .collect();
-        let height = 46.0;
-        let total: f32 = widths.iter().sum();
-        let panel = Rect::from_min_size(
-            Pos2::new(rect.left() + 16.0, rect.top() + 16.0),
-            Vec2::new(total, height),
+            &self.editor.title().to_uppercase(),
+            "PLAYTEST",
+            theme::RUN,
         );
-        // A warm-white card with the same brown outline and rounded corner as the window's own
-        // panels, and a gold hairline inside it: the scoreboard is a piece of the game's menu
-        // pinned over the picture, not a bar of the operating system.
+        let goal = Rect::from_min_size(
+            Pos2::new(rect.center().x - 116.0, rect.top() + 20.0),
+            Vec2::new(232.0, 34.0),
+        );
         painter.rect_filled(
-            panel.translate(Vec2::new(0.0, 4.0)),
-            CornerRadius::same(theme::RADIUS_LG),
-            Color32::from_rgba_unmultiplied(74, 52, 32, 90),
+            goal.translate(Vec2::new(0.0, 3.0)),
+            CornerRadius::same(16),
+            theme::OUTLINE,
         );
-        painter.rect_filled(panel, CornerRadius::same(theme::RADIUS_LG), theme::CARD);
+        painter.rect_filled(goal, CornerRadius::same(16), theme::ACCENT);
+        painter.text(
+            goal.center(),
+            egui::Align2::CENTER_CENTER,
+            "REACH THE FLAG",
+            theme::pixel_font(10.0),
+            theme::INK_ON_ACCENT,
+        );
+        card(
+            Rect::from_min_size(
+                Pos2::new(rect.right() - 220.0, rect.top() + 20.0),
+                Vec2::new(200.0, 72.0),
+            ),
+            "TIME",
+            &sim::format_time(session.frames()),
+            theme::ACCENT,
+        );
+
+        let controls = Rect::from_min_size(
+            Pos2::new(rect.center().x - 250.0, rect.bottom() - 76.0),
+            Vec2::new(500.0, 58.0),
+        );
+        painter.rect_filled(
+            controls.translate(Vec2::new(0.0, 5.0)),
+            CornerRadius::same(theme::RADIUS_LG),
+            Color32::from_rgba_unmultiplied(16, 37, 58, 180),
+        );
+        painter.rect_filled(
+            controls,
+            CornerRadius::same(theme::RADIUS_LG),
+            theme::SCREEN_WELL,
+        );
         painter.rect_stroke(
-            panel,
+            controls,
             CornerRadius::same(theme::RADIUS_LG),
             Stroke::new(3.0_f32, theme::OUTLINE),
             StrokeKind::Inside,
         );
-        painter.rect_stroke(
-            panel.shrink(5.0),
-            CornerRadius::same(theme::RADIUS),
-            Stroke::new(1.0_f32, theme::GOLD_EDGE.gamma_multiply(0.7)),
-            StrokeKind::Inside,
-        );
-        let mut x = panel.left();
-        for (index, ((label, value), width)) in cells.iter().zip(widths.iter()).enumerate() {
-            let cell = Rect::from_min_size(Pos2::new(x, panel.top()), Vec2::new(*width, height));
-            if index > 0 {
-                painter.rect_filled(
-                    Rect::from_min_size(
-                        Pos2::new(cell.left(), cell.top() + 8.0),
-                        Vec2::new(1.0, height - 16.0),
-                    ),
-                    CornerRadius::ZERO,
-                    theme::EDGE,
-                );
-            }
-            let l = painter.layout_no_wrap(label.to_string(), label_font.clone(), theme::RIBBON);
-            painter.galley(
-                Pos2::new(cell.left() + 13.0, cell.top() + 7.0),
-                l,
-                theme::RIBBON,
+        let keys = [
+            ("A / LEFT", "MOVE"),
+            ("D / RIGHT", "MOVE"),
+            ("SPACE", "JUMP"),
+            ("SHIFT", "RUN"),
+        ];
+        for (i, (key, action)) in keys.iter().enumerate() {
+            let cell = Rect::from_min_size(
+                Pos2::new(
+                    controls.left() + 12.0 + i as f32 * 121.0,
+                    controls.top() + 10.0,
+                ),
+                Vec2::new(109.0, 38.0),
             );
-            let v = painter.layout_no_wrap(value.clone(), value_font.clone(), theme::OUTLINE);
-            painter.galley(
-                Pos2::new(cell.left() + 13.0, cell.bottom() - 7.0 - v.size().y),
-                v,
-                theme::OUTLINE,
+            painter.rect_filled(
+                cell,
+                CornerRadius::same(theme::RADIUS),
+                if i == 2 { theme::ACCENT } else { theme::CARD },
             );
-            x += width;
+            painter.text(
+                Pos2::new(cell.center().x, cell.top() + 9.0),
+                egui::Align2::CENTER_TOP,
+                *key,
+                FontId::monospace(9.0),
+                if i == 2 {
+                    theme::INK_ON_ACCENT
+                } else {
+                    theme::TEXT
+                },
+            );
+            painter.text(
+                Pos2::new(cell.center().x, cell.bottom() - 6.0),
+                egui::Align2::CENTER_BOTTOM,
+                *action,
+                FontId::monospace(7.0),
+                if i == 2 {
+                    theme::INK_ON_ACCENT
+                } else {
+                    theme::TEXT_DIM
+                },
+            );
         }
     }
 
@@ -5010,6 +5356,7 @@ impl EvoApp {
                     Action::Edit => {}
                     Action::Play => self.enter_play(),
                     Action::Evolve => self.enter_evolve(),
+                    Action::Replay => self.enter_replay(),
                 }
             }
             return;
@@ -5126,6 +5473,15 @@ impl EvoApp {
                         .show_inside(ui, |ui| self.palette_tools(ui));
                     self.palette(ui)
                 });
+        }
+        // Build mode gets a course card of its own. The editor's parts tray answers
+        // "what can I place?"; this card answers "what have I made?" and keeps the
+        // canvas framed like a toy-box screen rather than leaving a large empty edge.
+        if self.mode == Mode::Edit {
+            egui::SidePanel::right("course-card")
+                .exact_width(248.0)
+                .frame(theme::panel_frame())
+                .show(ctx, |ui| self.course_card(ui));
         }
         // A run's panel, and *only* a run's. The editor used to have one as well — the verdict at
         // the top and six sections of readings under it — and it is gone: everything the editor has
@@ -5279,6 +5635,7 @@ impl EvoApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use evo::{default_shape, run_episode, ChampionFile, Genome};
     use std::path::Path;
 
     /// A levels directory of our own, holding copies of two shipped levels.
@@ -5355,6 +5712,66 @@ mod tests {
             !session.sim().is_timed(),
             "play mode must not run under the scored episode's clock"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A saved champion makes the title's Replay door a real destination, even
+    /// before this window has started a training worker.
+    #[test]
+    fn title_replay_opens_a_saved_champion_without_starting_a_lab() {
+        let ctx = Context::default();
+        let root = scratch("title-replay");
+        let level_path = root.join("levels/l1-flat-run.json");
+        let level = sim::Level::from_json_file(&level_path).expect("the copied level loads");
+        let genome = Genome::zeros(1, default_shape());
+        let config = GaConfig::default();
+        let result = run_episode(&level, &genome, &config.eval_config(), 17);
+        assert!(
+            result.won(),
+            "the title replay fixture must have an episode to show"
+        );
+        ChampionFile::new(&genome, &result, &level, 1, &config)
+            .save(root.join("champions/l1-flat-run.json"))
+            .expect("the saved champion writes");
+
+        let options = LabOptions {
+            champions: root.join("champions"),
+            ..Default::default()
+        };
+        let mut app = EvoApp::build(
+            &ctx,
+            level_path,
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets"),
+            None,
+            options,
+            Some(true),
+        )
+        .expect("the title window builds");
+        for _ in 0..120 {
+            frame(&ctx, &mut app, Vec::new());
+        }
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::R,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            app.splash.is_none(),
+            "Replay did not dismiss the title screen"
+        );
+        assert_eq!(app.mode, Mode::Replay, "Replay opened the wrong mode");
+        assert!(app.replay.is_some(), "Replay opened without an episode");
+        assert!(
+            app.lab.is_none(),
+            "a saved replay should not start a training worker"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5556,6 +5973,19 @@ mod tests {
             .find(|(n, _)| *n == name)
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| panic!("{name} was not drawn; have {:?}", app.tool_rects))
+    }
+
+    /// Enclose the spawn behind a full-height wall: a real document that cannot be beaten.
+    ///
+    /// Used by the test that pins what an unbeatable level looks like while drawing. The geometry
+    /// is built here rather than loaded, so the failure can never be a stale level file's.
+    fn wall_off_the_spawn(app: &mut EvoApp) {
+        let level = &mut app.editor.level;
+        let sx = level.spawn_tile().0;
+        for y in 0..level.height {
+            level.set_tile(sx + 1, y, Tile::Solid);
+        }
+        app.editor.refresh_report();
     }
 
     /// A window on a scratch pack, with a context of its own.
@@ -6083,6 +6513,30 @@ mod tests {
         assert!(
             app.reach_overlay().is_none(),
             "and no platform wears a reachability tint"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// **An unbeatable level shows its failure without the guides.**
+    ///
+    /// The tint, the culprit tile and the frontier line are measurements, and they left the default
+    /// view when the drawing board did. A level that cannot be finished is not a measurement, it is
+    /// a failure: a person can otherwise draw an impossible level, see the game's own sky, press
+    /// Evolve, and spend thousands of generations on it. The failure state overrides the
+    /// preference, and `G` still adds the grid and the sentence on top.
+    #[test]
+    fn an_unbeatable_level_wears_the_tint_without_the_guides() {
+        let (_ctx, root, mut app) = window("unbeatable-tint");
+        assert!(app.editor.beatable(), "the starter level is a level");
+        assert!(!app.guides);
+        assert!(app.reach_overlay().is_none());
+
+        wall_off_the_spawn(&mut app);
+        assert!(!app.editor.beatable(), "the wall cannot be jumped");
+        assert!(!app.guides, "the guides are still off");
+        assert!(
+            app.reach_overlay().is_some(),
+            "an unbeatable level has to wear the tint without being asked"
         );
         let _ = std::fs::remove_dir_all(root);
     }

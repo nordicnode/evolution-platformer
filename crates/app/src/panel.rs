@@ -184,6 +184,16 @@ pub struct RunSummary {
     /// run's own account of *why* the next generation looks the way it does: these children are
     /// not perturbations, they are the same policy with one decision corrected.
     pub repairs: usize,
+    /// Children injected from a counterfactual branch this generation, and the branches the
+    /// helper scored when it ran. The pair distinguishes "did not run" from "looked and found
+    /// nothing".
+    pub what_if_children: usize,
+    pub what_if_branches: usize,
+    /// The helper's account of the branch it found, when it found one.
+    pub what_if_note: Option<String>,
+    /// The win lesson's account, on the generation it fired: the winning play cloned into the
+    /// population, or why it could not be. `None` on every other generation.
+    pub win_lesson: Option<String>,
     /// Behavioural niches the archive holds, of `evo::ARCHIVE_CELLS`. The run's diversity
     /// reading: it falls when the population collapses onto one way of moving.
     pub archive_bits: usize,
@@ -277,6 +287,10 @@ impl RunSummary {
             immigrants: packet.immigrants,
             archive_children: packet.archive_children,
             repairs: packet.repairs,
+            what_if_children: packet.what_if_children,
+            what_if_branches: packet.what_if_branches,
+            what_if_note: packet.what_if_note.clone(),
+            win_lesson: packet.win_lesson.clone(),
             archive_bits: packet.archive_bits,
             archive_time_bits: packet.archive_time_bits,
             fastest: packet.fastest,
@@ -787,17 +801,21 @@ fn speed_rung(speed: u32) -> usize {
 /// rule for the same reason: no win, no time — and the reading says so in dim ink rather than
 /// inventing a number.
 pub fn menu_readings(summary: &RunSummary) -> [Reading; 3] {
+    let shown = summary.generation + 1;
     let generation = match summary.target {
-        Some(target) => format!("{} / {}", summary.generation + 1, target),
-        None => (summary.generation + 1).to_string(),
+        Some(target) => format!("{shown} / {target}"),
+        None => shown.to_string(),
     };
     [
         Reading {
             value: generation,
-            unit: if summary.target.is_some() {
-                "generations".to_string()
-            } else {
+            // "3 generation" was a real label in the window: a bare count has to agree
+            // with its own noun, and a count against a cap is a count of generations
+            // whatever the number is.
+            unit: if shown == 1 && summary.target.is_none() {
                 "generation".to_string()
+            } else {
+                "generations".to_string()
             },
             colour: TEXT,
         },
@@ -1251,6 +1269,27 @@ pub fn lab_details(ui: &mut egui::Ui, summary: &RunSummary, view: &mut ViewState
     // looking at a generation that suddenly moved is owed the difference.
     if summary.repairs > 0 {
         ui::stat_row(ui, "children from a mistake", summary.repairs.to_string());
+    }
+    if summary.what_if_branches > 0 {
+        ui::stat_row(ui, "what-if branches", summary.what_if_branches.to_string());
+    }
+    if summary.what_if_children > 0 {
+        ui::stat_row(
+            ui,
+            "children from a what-if",
+            summary.what_if_children.to_string(),
+        );
+    }
+    // The same in the helper's own words: the rows above say a child exists, this says what the
+    // branch did, which is the difference between a run that is exploring and one that is lucky.
+    if let Some(note) = &summary.what_if_note {
+        ui.colored_label(TEXT, note.clone());
+    }
+    // The one win this run has is the event every other row is waiting for; when the trainer
+    // turned it into a lesson, the window says so in the trainer's own words rather than leaving
+    // the viewer to wonder why the population changed the generation after a win.
+    if let Some(note) = &summary.win_lesson {
+        ui.colored_label(theme::ACCENT, note.clone());
     }
     // The run's own account of the one detour it took, in the words `evo` gave it: the window has no
     // opinion about how the step went, it only has to say it happened.
@@ -1961,8 +2000,13 @@ pub fn chart_panel(ui: &mut egui::Ui, history: &[HistoryPoint], height: f32, scr
     let font = FontId::monospace(11.0);
     let heading = match history.last() {
         Some(last) => format!(
-            "fitness — {} generations, latest max {} ({})",
+            "fitness — {} {}, latest max {} ({})",
             history.len(),
+            if history.len() == 1 {
+                "generation"
+            } else {
+                "generations"
+            },
             format_fitness(last.max_fitness),
             if last.wins > 0 {
                 "an agent reached the flag"
@@ -2369,6 +2413,10 @@ mod tests {
             // than the common one.
             archive_children: 4,
             repairs: 0,
+            what_if_children: 0,
+            what_if_branches: 0,
+            what_if_note: None,
+            win_lesson: None,
             archive_bits: 9,
             // Two of the four finish bands, so the board's speed coverage is a count rather than a
             // zero: the fixture is a run that has been going for a while.

@@ -69,7 +69,7 @@ pub fn backdrop_colours() -> [Color32; 13] {
 const GRID_LINE: Color32 = Color32::from_rgba_premultiplied(24, 30, 40, 26);
 const BOUNDS_LINE: Color32 = Color32::from_rgb(40, 52, 68);
 const SPAWN_LINE: Color32 = Color32::from_rgb(120, 92, 30);
-const UNREACHED_TINT: Color32 = Color32::from_rgba_premultiplied(90, 20, 24, 96);
+const UNREACHED_TINT: Color32 = Color32::from_rgba_premultiplied(120, 26, 26, 140);
 const CULPRIT_LINE: Color32 = Color32::from_rgb(226, 154, 40);
 const FRONTIER_LINE: Color32 = Color32::from_rgb(210, 90, 60);
 /// The sun: one pale disc, far enough away that it is a light rather than a place.
@@ -78,6 +78,10 @@ const FRONTIER_LINE: Color32 = Color32::from_rgb(210, 90, 60);
 /// that was ever *drawn* from the palette without anything using it: it sat unused in the
 /// art vocabulary from the first commit until the sky grew a sun.
 const SUN_FACE: Color32 = Color32::from_rgb(255, 240, 190);
+/// The alpha of the sun's halo at its centre. The halo fades to zero at its rim, so
+/// this is the one colour that identifies the light in a rendered frame — the tests
+/// use it the way they used to use the brightest of the three hard rings.
+const SUN_GLOW_ALPHA: u8 = 58;
 /// The far tree-line: the hazy greens of `common.py`'s four `PINE_*` tones, which the
 /// pines' own pixels are drawn in. They live here because a runner can be drawn in front of
 /// one, so the art rule has to know the colours — the sprites themselves come from the
@@ -237,11 +241,15 @@ impl RenderOpts {
     }
 
     /// The play view: no grid, no editing furniture, and the level is inhabited.
+    ///
+    /// The bounds box is editing furniture too. It says "this is the document", which is
+    /// worth a line on a canvas and is a 2-point navy frame cut across the sky on a screen
+    /// somebody is playing on — the splash has always turned it off for the same reason.
     pub fn playing() -> RenderOpts {
         RenderOpts {
             grid: false,
             spawn_marker: false,
-            bounds: true,
+            bounds: false,
             entities: false,
             ambient: true,
         }
@@ -1800,13 +1808,25 @@ fn draw_sun(painter: &Painter, viewport: Rect, camera: &Camera, level: &Level) {
         sky_line(camera, level, viewport) - SUN_ALTITUDE * camera.scale(),
     );
     let radius = (camera.scale() * 1.5).clamp(9.0, 34.0);
-    for (scale, alpha) in [(2.1, 22_u8), (1.5, 40), (1.0, 200)] {
-        painter.circle_filled(
-            centre,
-            radius * scale,
-            Color32::from_rgba_unmultiplied(SUN_FACE.r(), SUN_FACE.g(), SUN_FACE.b(), alpha),
-        );
+    // The halo is a *gradient*, not three discs. Three overlapping circles at 22, 40
+    // and 200 alpha are three visible rings — a target behind the sun — because each
+    // disc ends on a hard edge. A triangle fan from the centre out to a transparent
+    // rim interpolates in between, so the falloff is smooth at every size.
+    let glow =
+        Color32::from_rgba_unmultiplied(SUN_FACE.r(), SUN_FACE.g(), SUN_FACE.b(), SUN_GLOW_ALPHA);
+    let clear = Color32::from_rgba_unmultiplied(SUN_FACE.r(), SUN_FACE.g(), SUN_FACE.b(), 0);
+    let mut halo = Mesh::default();
+    halo.colored_vertex(centre, glow);
+    let outer = radius * 2.35;
+    for step in 0..=48 {
+        let angle = std::f32::consts::TAU * step as f32 / 48.0;
+        halo.colored_vertex(centre + Vec2::angled(angle) * outer, clear);
     }
+    for step in 0..48 {
+        halo.add_triangle(0, 1 + step, 2 + step);
+    }
+    painter.add(halo);
+    painter.circle_filled(centre, radius, SUN_FACE);
 }
 
 /// One rank of a tree-line: the same construction at any of its distances.
@@ -3622,7 +3642,7 @@ fn lava_surface_frame(clock: f32, tx: i32) -> &'static str {
 
 /// How many cells across and down a fluid's body texture is, in tiles.
 ///
-/// The art (`tools/art/terrain.py::FLUID_BLOCK`) draws one picture this many cells square and
+/// The art (`tools/art/kit.py::FLUID_BLOCK`) draws one picture this many cells square and
 /// the renderer indexes it by the cell's own position, so the two numbers are one decision and
 /// must agree. A test pins them together against the shipped atlas.
 const FLUID_BLOCK: i32 = 4;
@@ -4100,26 +4120,75 @@ pub fn draw_sim_at(
 /// against it: a change there would make the run cycle start a little early or late,
 /// which is a cosmetic difference rather than a wrong game.
 const RUN_SPEED: f32 = 0.10;
-/// Seconds of full-speed running for one turn of the six-frame run cycle.
+/// Seconds of full-speed running for one turn of the twelve-frame run cycle.
 ///
 /// The cycle is driven by *distance*, not by time, so an agent creeping at half speed
-/// gets half the frame rate: a run cycle that plays at a fixed rate while the legs move
+/// gets half the frame rate: a run cycle that plays at a fixed rate while the paws move
 /// at another is the single clearest tell of a game that is not paying attention.
-const RUN_CYCLE: f32 = 0.40;
+const RUN_CYCLE: f32 = 0.52;
 /// How long the landing pose holds after a touchdown.
-const LAND_POSE: f32 = 0.12;
+const LAND_POSE: f32 = 0.20;
+/// How long each frame of the airborne cycles is held, in seconds of air time.
+const AIR_FRAME: f32 = 0.05;
+/// Idle frames per second: three, so a six-frame breath takes two seconds and the blink
+/// lands once a cycle instead of every time the player stops to look.
+const IDLE_RATE: f32 = 3.0;
 /// How long one puff of dust stays up, and how often a runner kicks one up.
 const DUST_LIFE: f32 = 0.22;
 const DUST_PERIOD: f32 = 0.28;
 
-/// The six frames of the run cycle, in order.
-const RUN_FRAMES: [&str; 6] = [
+/// The twelve frames of the run cycle, in order.
+///
+/// Twelve rather than eight because the cycle is driven by distance: at full speed a
+/// frame lasts about forty milliseconds, which is what makes a gallop read as a gallop
+/// rather than as four poses flicking past. The paws read the same table half a cycle
+/// apart, so the extra four are four more positions a paw can be in, not four more
+/// drawings.
+const RUN_FRAMES: [&str; 12] = [
     "player_run_1",
     "player_run_2",
     "player_run_3",
     "player_run_4",
     "player_run_5",
     "player_run_6",
+    "player_run_7",
+    "player_run_8",
+    "player_run_9",
+    "player_run_10",
+    "player_run_11",
+    "player_run_12",
+];
+/// The six frames of standing still: a breath in, a breath out, and a slow blink.
+const IDLE_FRAMES: [&str; 6] = [
+    "player_idle_a",
+    "player_idle_b",
+    "player_idle_c",
+    "player_idle_d",
+    "player_idle_e",
+    "player_idle_f",
+];
+/// The six frames of each airborne stage, and the four of the landing.
+const JUMP_FRAMES: [&str; 6] = [
+    "player_jump_1",
+    "player_jump_2",
+    "player_jump_3",
+    "player_jump_4",
+    "player_jump_5",
+    "player_jump_6",
+];
+const FALL_FRAMES: [&str; 6] = [
+    "player_fall_1",
+    "player_fall_2",
+    "player_fall_3",
+    "player_fall_4",
+    "player_fall_5",
+    "player_fall_6",
+];
+const LAND_FRAMES: [&str; 4] = [
+    "player_land_1",
+    "player_land_2",
+    "player_land_3",
+    "player_land_4",
 ];
 /// The four frames of a walker's march.
 const WALKER_FRAMES: [&str; 4] = ["walker_a", "walker_b", "walker_c", "walker_d"];
@@ -4164,8 +4233,10 @@ pub struct AgentAnim {
     dust: Option<f32>,
     /// Seconds until the next puff is allowed.
     dust_timer: f32,
-    /// Seconds standing still, which drives the two idle frames.
+    /// Seconds standing still, which drives the six idle frames.
     idle: f32,
+    /// Seconds since the feet last left the ground, which drives the jump frames.
+    air: f32,
     /// Whether the agent was off the ground at the last advance.
     airborne: bool,
     /// The way it was last heading. A standing agent keeps facing the way it ran, which is
@@ -4210,6 +4281,7 @@ impl Default for AgentAnim {
             dust: None,
             dust_timer: 0.0,
             idle: 0.0,
+            air: 0.0,
             airborne: false,
             facing_left: false,
             landed: false,
@@ -4268,6 +4340,11 @@ impl AgentAnim {
             self.spawn_burst(p.x + p.w * 0.5, p.y + p.h, [220, 210, 190], 3, 1.4, -0.8);
         }
         self.airborne = !grounded;
+        if grounded {
+            self.air = 0.0;
+        } else {
+            self.air += dt;
+        }
 
         // Smoothly relax squash & stretch back to (1.0, 1.0).
         let relax = (dt * 14.0).clamp(0.0, 1.0);
@@ -4434,14 +4511,46 @@ impl AgentAnim {
         &self.rope
     }
 
-    /// Which of the six run frames is up.
+    /// Which of the twelve run frames is up.
     fn run_frame(&self) -> usize {
-        ((self.stride / (RUN_CYCLE / 6.0)) as usize).min(RUN_FRAMES.len() - 1)
+        let frames = RUN_FRAMES.len() as f32;
+        ((self.stride / (RUN_CYCLE / frames)) as usize).min(RUN_FRAMES.len() - 1)
     }
 
-    /// Whether the idle cycle is on its second frame.
-    fn idle_frame(&self) -> bool {
-        ((self.idle * 2.2) as i64).rem_euclid(2) == 1
+    /// Which of the six idle frames is up.
+    ///
+    /// Time-driven rather than distance-driven, because a body standing still has no
+    /// distance to give it: six steps a second is slow enough to read as breathing and
+    /// fast enough that the blink lands before the player stops looking.
+    fn idle_frame(&self) -> &'static str {
+        IDLE_FRAMES[((self.idle * IDLE_RATE) as usize) % IDLE_FRAMES.len()]
+    }
+
+    /// Which of the six jump frames is up: the push, the trail, the tuck, the reach.
+    fn jump_frame(&self) -> &'static str {
+        let frame = (self.air / AIR_FRAME) as usize;
+        JUMP_FRAMES[frame.min(JUMP_FRAMES.len() - 1)]
+    }
+
+    /// Which falling frame is up, by how fast the body is coming down.
+    ///
+    /// Falling faster than rising: how far the agent has fallen is a fact about the level
+    /// and how fast it is falling is a fact about the body, so the frame follows `vy` and
+    /// not the air time — two drops off two different ledges should not show the same
+    /// three drawings at the same speeds.
+    fn fall_frame(&self, vy: f32) -> &'static str {
+        // One frame per 0.16 of falling speed, so a short hop shows the first two and a
+        // long drop runs through all six: how fast the body is going is the fact the
+        // drawing follows, not how long it has been in the air.
+        let frame = (vy / 0.16) as usize;
+        FALL_FRAMES[frame.min(FALL_FRAMES.len() - 1)]
+    }
+
+    /// Which landing frame is up: the impact first, then the settle, then the rise.
+    fn land_frame(&self) -> &'static str {
+        let elapsed = 1.0 - self.land / LAND_POSE;
+        let frame = (elapsed * LAND_FRAMES.len() as f32) as usize;
+        LAND_FRAMES[frame.min(LAND_FRAMES.len() - 1)]
     }
 
     fn spawn_burst(
@@ -4493,20 +4602,18 @@ pub fn player_sprite(sim: &Sim, anim: &AgentAnim) -> (&'static str, bool) {
     if !p.grounded {
         // A pull-up has no velocity of its own — the script moves the body, not the body's `vy` — so
         // it would otherwise fall through to the falling pose while it is going *up* over a lip. The
-        // jump sprite is the one that reads as "arms working", which is what the move is.
+        // jump sprite is the one that reads as effort, which is what the move is.
         if p.vy < 0.0 || p.mantling() {
-            ("player_jump", flip)
+            (anim.jump_frame(), flip)
         } else {
-            ("player_fall", flip)
+            (anim.fall_frame(p.vy), flip)
         }
     } else if anim.land > 0.0 {
-        ("player_land", flip)
+        (anim.land_frame(), flip)
     } else if p.vx.abs() > RUN_SPEED * 0.2 {
         (RUN_FRAMES[anim.run_frame()], flip)
-    } else if anim.idle_frame() {
-        ("player_idle_b", flip)
     } else {
-        ("player_idle_a", flip)
+        (anim.idle_frame(), flip)
     }
 }
 
@@ -6243,11 +6350,11 @@ mod tests {
         }
     }
 
-    /// The centre of the sun as it was drawn: the middle of the brightest of its three rings,
-    /// which is a colour nothing else in the scenery uses.
+    /// The centre of the sun as it was drawn: the middle of its disc, which is a colour
+    /// nothing else in the scenery uses. The disc is a uniform-colour shape, so the
+    /// frame's triangle list holds it; the halo is a gradient and deliberately not.
     fn drawn_sun(frame: &Frame) -> Option<Pos2> {
-        let face = Color32::from_rgba_unmultiplied(SUN_FACE.r(), SUN_FACE.g(), SUN_FACE.b(), 200);
-        let points: Vec<Pos2> = frame.tiles(face).flat_map(|(_, tri)| *tri).collect();
+        let points: Vec<Pos2> = frame.tiles(SUN_FACE).flat_map(|(_, tri)| *tri).collect();
         let (mut min, mut max) = (*points.first()?, *points.first()?);
         for p in &points {
             min = min.min(*p);
@@ -6978,12 +7085,10 @@ mod tests {
             assert!(sky.draws(uv), "{name} is never drawn in the sky");
             assert!(!checker.draws(uv), "the editor's backdrop grew a tree-line");
         }
-        // The sun is a shape, so it is found by its colour rather than by a rectangle: the
-        // brightest of its three rings is this colour at this alpha, and nothing else in the
-        // scenery is.
-        let face = Color32::from_rgba_unmultiplied(SUN_FACE.r(), SUN_FACE.g(), SUN_FACE.b(), 200);
-        assert!(sky.used(face), "no sun in the sky");
-        assert!(!checker.used(face), "the editor's backdrop has a sun");
+        // The sun is a shape, so it is found by its colour rather than by a rectangle: its
+        // disc is this colour, and nothing else in the scenery is.
+        assert!(sky.used(SUN_FACE), "no sun in the sky");
+        assert!(!checker.used(SUN_FACE), "the editor's backdrop has a sun");
     }
 
     /// Draw a level into a headless egui context and report what came out: how many
@@ -7998,7 +8103,7 @@ mod tests {
     /// The fluid body block: the renderer's idea of how big it is and the art's must agree.
     ///
     /// `FLUID_BLOCK` is the one number two languages share — the cells are generated by
-    /// `tools/art/terrain.py::FLUID_BLOCK` — and the failure if they disagree is not a crash but
+    /// `tools/art/kit.py::FLUID_BLOCK` — and the failure if they disagree is not a crash but
     /// a pool that repeats every tile again, which is the exact bug the block exists to remove.
     /// So the shipped atlas must have all sixteen cells, and a tile's cell must be its position
     /// modulo four in **both** axes.
@@ -8287,10 +8392,10 @@ mod tests {
             anim.advance(&sim, sim::DT);
             if sim.player().mantling() {
                 mantling += 1;
-                assert_eq!(
-                    player_sprite(&sim, &anim).0,
-                    "player_jump",
-                    "a body hauling itself over a lip is climbing, not falling"
+                assert!(
+                    player_sprite(&sim, &anim).0.starts_with("player_jump_"),
+                    "a body hauling itself over a lip is climbing, not falling: {}",
+                    player_sprite(&sim, &anim).0
                 );
             }
         }
@@ -8321,7 +8426,7 @@ mod tests {
         // A jump: rising, then falling.
         sim.step(AgentAction::RunJump);
         anim.advance(&sim, sim::DT);
-        assert_eq!(player_sprite(&sim, &anim).0, "player_jump");
+        assert_eq!(player_sprite(&sim, &anim).0, "player_jump_1");
         for _ in 0..26 {
             sim.step(AgentAction::RunJump);
             anim.advance(&sim, sim::DT);
@@ -8330,7 +8435,11 @@ mod tests {
             sim.player().vy > 0.0 && !sim.player().grounded,
             "by the back half of a 40-tick jump the agent is falling"
         );
-        assert_eq!(player_sprite(&sim, &anim).0, "player_fall");
+        assert!(
+            player_sprite(&sim, &anim).0.starts_with("player_fall_"),
+            "falling: {}",
+            player_sprite(&sim, &anim).0
+        );
 
         // The landing: the pose comes from the *transition*, which is why the animation
         // has to be told about the frames the renderer skipped.
@@ -8338,13 +8447,13 @@ mod tests {
             sim.step(AgentAction::Run);
             anim.advance(&sim, sim::DT);
         }
-        assert_eq!(player_sprite(&sim, &anim).0, "player_land");
+        assert_eq!(player_sprite(&sim, &anim).0, "player_land_1");
         assert!(
             anim.landed,
             "the frame the fall ended is the one that puffs"
         );
 
-        // Running: one of the six run frames, and the run cycle is the distance run.
+        // Running: one of the twelve run frames, and the run cycle is the distance run.
         for _ in 0..20 {
             sim.step(AgentAction::Run);
             anim.advance(&sim, sim::DT);

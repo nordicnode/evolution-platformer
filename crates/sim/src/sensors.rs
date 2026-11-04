@@ -187,7 +187,29 @@ use crate::physics::{AgentAction, Flyer, LavaBall, Physics, PlayerState, Shot, W
 /// decision at a ball and at a spike is the same one — which is the same economy v12 made by
 /// giving lava the spike's value. A level without a ball observes exactly the vector it observed
 /// at v14.
-pub const VERSION: u32 = 15;
+///
+/// **v16 makes the route waypoint wait for a moving landing.**
+///
+/// The v8 waypoint names the next landing stand. On a level with moving shelving that landing is
+/// often a deck at the *near* end of its travel, and the graph names the place, not the moment:
+/// the waypoint pointed at the near deck while the deck was at the far end, so a steering policy
+/// walked or jumped at a landing that would not be there for several seconds. On
+/// `l11-the-elements` the body waits on the middle shuttle and must step onto the third; every
+/// best episode of a 2,000-generation run died on that transfer, because the only signal was
+/// "right" whether the third deck was one tile away or four.
+///
+/// The waypoint now reads **zero while the landing deck is not near the landing**: the two-slot
+/// vector says "no next step yet" rather than naming an unavailable one, and it starts pointing
+/// at the deck as the shelf arrives. A zero here is not the same as no route (which still falls
+/// back to the goal vector): it is the route saying *hold*. The v13 mover triple stays where it
+/// was — the shelf under the body, whose phase is what a rider needs to know when its ride ends —
+/// so nothing about it moved, and a static level observes exactly the vector it observed at v15.
+///
+/// It is a **re-reading** rather than an addition, so it bumps without growing: a v15 champion
+/// cannot be carried across it (`ChampionFile::migrate_sensors` refuses a same-width bump). The
+/// genome's shape does not move, which is why the training fixtures' random population is
+/// byte-identical after the bump.
+pub const VERSION: u32 = 16;
 
 /// Tiles per side of the local patch (`9×9 = 81` inputs).
 pub const PATCH_RADIUS: i32 = 4;
@@ -682,7 +704,15 @@ pub fn observe_scene(
     };
 
     // ---- v8: next route waypoint ----------------------------------------
-    let (wdx, wdy) = waypoint_delta(level, player, current_stand, (gdx, gdy));
+    // v16: a landing on a moving deck is only a step once the deck is *at* the landing. While
+    // it is at the far end the waypoint is zero — the route's way of saying "hold" — because a
+    // vector pointing at a landing that is seconds away steers a body off the deck it is on.
+    let aim = route_aim(level, player, current_stand);
+    let (wdx, wdy) = match aim {
+        Some((wx, wy)) if landing_ready(level, scene, (wx, wy)) => (wx - cx, wy - cy),
+        Some(_) => (0.0, 0.0),
+        None => (gdx, gdy),
+    };
     out[96] = (wdx / GOAL_VIEW_DISTANCE).clamp(-1.0, 1.0);
     out[97] = (wdy / GOAL_VIEW_DISTANCE).clamp(-1.0, 1.0);
 
@@ -756,7 +786,6 @@ pub fn observe_scene(
         out[109] = (dx / ROPE_VIEW_DISTANCE).clamp(-1.0, 1.0);
         out[110] = (dy / ROPE_VIEW_DISTANCE).clamp(-1.0, 1.0);
     }
-
     debug_assert!(out.iter().all(|v| v.is_finite()));
     out
 }
@@ -949,22 +978,70 @@ fn nearest_mover(player: &PlayerState, scene: &Scene<'_>) -> Option<(f32, f32, f
     best.map(|(_, vx, vy, phase)| (vx, vy, phase))
 }
 
-/// Vector from the body to the next landing stand along the level's move graph, falling
-/// back to `goal_fallback` when the body is already on the goal's own stand or off-route.
-fn waypoint_delta(
+/// The next landing stand along the level's move graph, when there is one.
+///
+/// `None` when the body is already on the goal's own stand, off-route, or has no route to the
+/// flag at all; the caller then falls back to the goal vector, which is the same reading the
+/// sensor has always used for "no next landing".
+fn route_aim(
     level: &Level,
     player: &PlayerState,
     current_stand: Option<usize>,
-    goal_fallback: (f32, f32),
-) -> (f32, f32) {
-    let (cx, cy) = player.aabb().center();
-    if let Some(stand) = current_stand {
-        let goal = level.goals.first().copied();
-        if let Some((wx, wy)) = level.routes().next_waypoint(stand, cx, goal) {
-            return (wx - cx, wy - cy);
+) -> Option<(f32, f32)> {
+    let (cx, _) = player.aabb().center();
+    let stand = current_stand?;
+    let goal = level.goals.first().copied();
+    level.routes().next_waypoint(stand, cx, goal)
+}
+
+/// Whether the route's next landing is available **now**.
+///
+/// A landing on static ground always is. A landing on a moving deck is available only when that
+/// deck is at the landing the waypoint names: the deck's current box is compared with the aim,
+/// and a shelf at the far end of its travel is two or more tiles away, which is the whole reason
+/// the waypoint has to wait. When the caller has no scene movers at all (the level-only entry
+/// point), there is nothing to check against, so the old reading — the landing is available — is
+/// kept.
+fn landing_ready(level: &Level, scene: &Scene<'_>, aim: (f32, f32)) -> bool {
+    let Some(i) = aim_platform(level, aim) else {
+        return true;
+    };
+    scene.movers.get(i).is_none_or(|m| {
+        let (mx, my) = m.center();
+        (mx - aim.0).hypot(my - aim.1) <= 2.0
+    })
+}
+
+/// The moving platform whose **near deck** is the route's aim, if the aim is a deck at all.
+///
+/// A platform has two decks, at the two ends of its travel; the graph's landing is one of them,
+/// and the waypoint names that deck's centre. The test is on the deck boxes rather than the
+/// swept band, so a static ledge that happens to lie between the two ends is not mistaken for a
+/// landing that has to wait for the shelf.
+fn aim_platform(level: &Level, aim: (f32, f32)) -> Option<usize> {
+    let (ax, ay) = aim;
+    let deck_has = |rect: Rect| {
+        ax >= rect.x && ax <= rect.x + rect.w && ay >= rect.y - 1.0 && ay <= rect.y + rect.h + 0.1
+    };
+    let mut best: Option<(f32, usize)> = None;
+    for (i, spec) in level.platforms.iter().enumerate() {
+        let mut far = spec.rect;
+        let step = spec.span * spec.dir as f32;
+        if spec.vertical {
+            far.y -= step;
+        } else {
+            far.x += step;
+        }
+        if !deck_has(spec.rect) && !deck_has(far) {
+            continue;
+        }
+        let home = spec.rect.center();
+        let d = (home.0 - ax).hypot(home.1 - ay);
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, i));
         }
     }
-    goal_fallback
+    best.map(|(_, i)| i)
 }
 
 /// One row of the action table: name, horizontal input, jump held, sprint asked for.
@@ -976,4 +1053,98 @@ pub fn action_summary() -> Vec<ActionRow> {
         .iter()
         .map(|a| (a.name(), a.input_x(), a.wants_jump(), a.wants_sprint()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PHYSICS;
+
+    /// A scene with the shelves under test and nothing else alive.
+    fn test_scene<'a>(
+        movers: &'a [Rect],
+        mover_vel: &'a [(f32, f32)],
+        mover_phase: &'a [f32],
+    ) -> Scene<'a> {
+        Scene {
+            walkers: &[],
+            flyers: &[],
+            shots: &[],
+            lava_balls: &[],
+            movers,
+            mover_vel,
+            mover_phase,
+            turrets: &[],
+            spike_balls: &[],
+            blocks: &[],
+            rocks: &[],
+            vents: &[],
+            air_ticks: 0,
+            ground_ticks: 30,
+            frames: 100,
+        }
+    }
+
+    /// **The waypoint holds while the landing deck is at the far end of its travel.**
+    ///
+    /// This is the l11 transfer that stalled the runs: the body waits on the middle shuttle's
+    /// home deck, the route's next landing is the third shuttle's near deck, and the third deck is
+    /// outside the 9×9 patch from there. The old waypoint named that landing whether the deck was
+    /// there or four tiles away, so a steering policy jumped at it on the first frame it was able
+    /// to afford and fell. The corrected reading is zero while the deck is away, and the landing
+    /// vector only once the deck has arrived.
+    #[test]
+    fn the_waypoint_waits_for_a_deck_at_the_far_end_of_its_travel() {
+        let level = Level::from_json_str(include_str!("../../../levels/l11-the-elements.json"))
+            .expect("l11 parses");
+        let stand = level
+            .routes()
+            .zone_at(54, 8)
+            .expect("the middle shuttle's home deck is a stand");
+        let player = {
+            let mut p = PlayerState::spawn(&level, &PHYSICS);
+            p.w = PHYSICS.player_w;
+            p.h = PHYSICS.player_h;
+            p.x = 54.5 - p.w * 0.5;
+            p.y = 8.5 - p.h;
+            p.vx = 0.0;
+            p.vy = 0.0;
+            p.grounded = true;
+            p
+        };
+        let mover_vel = vec![(1.0, 0.0), (-1.0, 0.0), (0.5, 0.0)];
+        let mover_phase = vec![0.1, 0.4, 0.75];
+        // The level's three shelves, in `level.platforms` order: P1, P2 (the body's), P3 (the aim).
+        let movers_far = vec![
+            Rect::new(42.0, 8.5, 3.0, 0.5),
+            Rect::new(53.0, 8.5, 3.0, 0.5),
+            Rect::new(59.0, 8.5, 3.0, 0.5),
+        ];
+        let mut movers_near = movers_far.clone();
+        movers_near[2] = Rect::new(56.0, 8.5, 3.0, 0.5);
+
+        // P3 at its far end: the landing is not available, so the waypoint is zero.
+        let far = test_scene(&movers_far, &mover_vel, &mover_phase);
+        let obs = observe_scene(&level, &player, &far, &PHYSICS, Some(stand));
+        assert_eq!(obs[96], 0.0, "the waypoint steered at an absent deck");
+        assert_eq!(obs[97], 0.0);
+
+        // P3 at its near end: the waypoint points at it (x 56.5, the route's aim).
+        let near = test_scene(&movers_near, &mover_vel, &mover_phase);
+        let obs = observe_scene(&level, &player, &near, &PHYSICS, Some(stand));
+        assert!(
+            obs[96] > 0.1,
+            "the waypoint must point at the arrived deck, got {}",
+            obs[96]
+        );
+
+        // The mover triple keeps reading the deck under the body (P2), not the aim: its phase
+        // is what a rider needs to know when the ride ends.
+        assert!(
+            obs[104] < 0.0,
+            "mover_vx must be the deck under the body, got {}",
+            obs[104]
+        );
+        assert!((obs[106] - 0.4).abs() < 1e-6, "mover_phase moved off P2");
+    }
 }

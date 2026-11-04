@@ -106,6 +106,7 @@
 //! reported both for the clone and for its untrained initialisation, so "the fit learned something"
 //! is a number and not a claim. [`agreement`]: ImitationReport::agreement
 
+use rand_xoshiro::rand_core::Rng as _;
 use sim::physics::AgentAction;
 use sim::rng::rng_from_seed;
 use sim::route_plan::RoutePlan;
@@ -726,6 +727,140 @@ pub fn clone_from_play_init(
     })
 }
 
+/// **The demonstration as an exact linear classifier, embedded in the shipped net.**
+///
+/// A timed plan is a script written by a search that already knows the answer, and on `l11` its
+/// 181 decisions are **linearly separable in the 111-wide observation**: a plain multi-class
+/// perceptron reproduces every one of them. The gradient clone does not know that, and its 300
+/// passes stop at 77 % agreement — a policy that walks the route and then misses the one block
+/// the whole level turns on.
+///
+/// This constructor takes the perceptron's eleven class rows and puts them where a `16>11` net
+/// can use them without any training: hidden unit `c` is `tanh(scale · (w_c · x + b_c))`, and the
+/// output row for action `c` reads hidden unit `c` with weight one. The output is therefore
+/// `tanh(tanh(score_c))`, a **monotone** transform applied to every class alike, so its argmax is
+/// exactly the perceptron's. The remaining five hidden units are zero and contribute nothing.
+///
+/// `scale` is chosen so the largest score is at most 2: tanh saturates by 4, and two saturated
+/// scores can round to the same `f32`, which would silently turn a correct classification into a
+/// tie. Scaling every class's row and bias by the same positive number leaves the argmax alone.
+///
+/// Returns `None` — never a partial fit — when the shape is not the one-hidden-layer memoryless
+/// net this construction describes, when the demonstration is not separable, or when the
+/// constructed net does not reproduce every demonstrated action under the real forward pass. The
+/// caller falls back to the gradient fit; a warm start must not become a lottery because this
+/// shortcut was unavailable.
+pub fn exact_clone(play: &RoutePlay, shape: &NetShape) -> Option<Genome> {
+    if shape.feedback != 0 || shape.commitment || shape.hidden.len() != 1 {
+        return None;
+    }
+    if shape.inputs != N_INPUTS || shape.hidden[0] < shape.outputs {
+        return None;
+    }
+    let n = play.decisions.len();
+    if n == 0 {
+        return None;
+    }
+    let classes = shape.outputs;
+    let inputs = shape.inputs;
+    let mut w = vec![vec![0.0f32; inputs]; classes];
+    let mut b = vec![0.0f32; classes];
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut rng = rng_from_seed(0xE7AC_7C10_5EED_2026);
+    let mut best_err = usize::MAX;
+    let mut best_w = w.clone();
+    let mut best_b = b.clone();
+    // The perceptron's convergence rate is a property of the demonstration's margin, not of a
+    // schedule; 400 passes is a ceiling for a 181-decision route and it exits at zero errors.
+    for _ in 0..400 {
+        for i in (1..n).rev() {
+            let j = (rng.next_u32() as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        let mut err = 0usize;
+        for &index in &order {
+            let d = &play.decisions[index];
+            let mut pred = 0usize;
+            let mut best = f32::NEG_INFINITY;
+            for c in 0..classes {
+                let mut score = b[c];
+                for (weight, x) in w[c].iter().zip(d.observation.iter()) {
+                    score += weight * x;
+                }
+                if score > best {
+                    best = score;
+                    pred = c;
+                }
+            }
+            let target = d.action.index();
+            if pred != target {
+                err += 1;
+                for i in 0..inputs {
+                    w[target][i] += d.observation[i];
+                    w[pred][i] -= d.observation[i];
+                }
+                b[target] += 1.0;
+                b[pred] -= 1.0;
+            }
+        }
+        if err < best_err {
+            best_err = err;
+            best_w.clone_from(&w);
+            best_b.clone_from(&b);
+        }
+        if err == 0 {
+            break;
+        }
+    }
+    if best_err != 0 {
+        return None;
+    }
+
+    // Keep every score out of tanh's saturated ends. The scale is common to all classes, so it
+    // cannot change which one wins; it only keeps their *differences* representable.
+    let mut max_abs = 0.0f32;
+    for c in 0..classes {
+        for v in &best_w[c] {
+            max_abs = max_abs.max(v.abs());
+        }
+        max_abs = max_abs.max(best_b[c].abs());
+    }
+    let scale = if max_abs > 2.0 { 2.0 / max_abs } else { 1.0 };
+
+    let hidden = shape.hidden[0];
+    let mut weights = vec![0.0f32; shape.n_weights()];
+    let mut biases = vec![0.0f32; shape.n_biases()];
+    for c in 0..classes {
+        for i in 0..inputs {
+            weights[c * inputs + i] = best_w[c][i] * scale;
+        }
+        biases[c] = best_b[c] * scale;
+    }
+    // Layer 1 is `outputs × hidden`, starting after layer 0's weights. Row `c` reads hidden unit
+    // `c` alone; the other units (including the five unused ones) contribute nothing.
+    let out_off = inputs * hidden;
+    for c in 0..classes {
+        weights[out_off + c * hidden + c] = 1.0;
+    }
+    let genome = Genome {
+        id: 0,
+        shape: shape.clone(),
+        weights,
+        biases,
+        fitness: 0.0,
+    };
+
+    // The construction is a claim about the *real* forward pass, so it is checked against it
+    // rather than trusted. A tie or a saturated pair shows up here and nowhere else.
+    let mut scratch = ActScratch::new();
+    for d in &play.decisions {
+        if genome.act(&d.observation, &mut scratch) != d.action {
+            return None;
+        }
+    }
+    Some(genome)
+}
+
 /// Replay a level's route and clone the demonstration in one call: the whole of what `--from-route`
 /// does, minus the file I/O.
 pub fn from_route(
@@ -854,6 +989,33 @@ pub fn from_certified_plan(
             play
         }
     };
+    // **Try the exact construction before spending a gradient budget.** A certified plan is a
+    // script, and a script this level can be classified exactly is a warm start with no lottery in
+    // it. The clone is only accepted if it wins the plan's own replay; an exact fit that does not
+    // play is a curiosity, and the gradient/DAgger path below is still the answer.
+    if let Some(genome) = exact_clone(&play, &shape) {
+        let mastery = measure_mastery(level, &genome, plan, eval, route.seed);
+        if mastery.won {
+            let exemplars = play.decisions.len();
+            return Ok((
+                play,
+                ImitationReport {
+                    genome,
+                    exemplars,
+                    epochs: 0,
+                    first_loss: 0.0,
+                    final_loss: 0.0,
+                    agreement: 1.0,
+                    baseline_agreement: 0.0,
+                    best_epoch: 0,
+                    mastery: Some(mastery),
+                    skills,
+                    jump_corrections: 0,
+                    jump_legs: Vec::new(),
+                },
+            ));
+        }
+    }
     let fit = ImitateConfig {
         prefer_agreement: true,
         ..*cfg

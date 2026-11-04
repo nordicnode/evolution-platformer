@@ -258,11 +258,11 @@ impl BrushGroup {
     /// one of them has to fit a panel that is 190 points wide.
     pub fn label(self) -> &'static str {
         match self {
-            BrushGroup::Ground => "Ground",
-            BrushGroup::Hazard => "Hazards",
-            BrushGroup::Traversal => "Traversal",
-            BrushGroup::Enemy => "Enemies",
-            BrushGroup::Level => "Level",
+            BrushGroup::Ground => "Build",
+            BrushGroup::Hazard => "Danger",
+            BrushGroup::Traversal => "Helpers",
+            BrushGroup::Enemy => "Friends",
+            BrushGroup::Level => "Finish",
             BrushGroup::Clear => "Clear",
         }
     }

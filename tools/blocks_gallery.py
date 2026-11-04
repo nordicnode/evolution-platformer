@@ -2,7 +2,7 @@
 """Draw the README's blocks-and-cast sheet: `docs/images/blocks-gallery.png`.
 
 The sheet is the *palette in pictures*: one cell for every part the editor can
-place, plus the runner, taken straight from `assets/tileset.png` with the
+place, plus the player, taken straight from `assets/tileset.png` with the
 manifest's own cell coordinates. Nothing here is drawn by hand, so a sprite that
 changes in the atlas changes here the next time this runs.
 
@@ -68,7 +68,7 @@ class Item:
     #: The `Brush::sprite` name this cell answers for, when the art differs from
     #: it (a cracked brush's own sprite is the transparent crack, not the tile).
     brush: str | None = None
-    #: False for the runner, who is drawn but is not something a level places.
+    #: False for the player, who is drawn but is not something a level places.
     placeable: bool = True
 
     @property
@@ -79,8 +79,8 @@ class Item:
 # Palette order, in rows: the materials with their brittle twins beside them
 # (`BrushGroup::Ground`), then the hazards and the ways through a level
 # (`Hazard` and `World`), then the cast (`Enemy`) and the one piece of scenery.
-# That is all twenty-four placeable brushes plus the runner, who is not a brush
-# but is the one body every level is about — twenty-five cells, five rows of six
+# That is all twenty-eight placeable brushes plus the player, who is not a brush
+# but is the one body every level is about — twenty-nine cells, five rows of six
 # with one cell short.
 ITEMS: tuple[Item, ...] = (
     Item("GRASS", ("ground_1",)),
@@ -95,8 +95,13 @@ ITEMS: tuple[Item, ...] = (
     # whole shelf, drawn with a leg at each end, rather than a running segment.
     Item("ONE-WAY", ("oneway_m",)),
     Item("MOVER", ("mover_m",)),
+    Item("BELT RIGHT", ("belt_r",)),
+    Item("BELT LEFT", ("belt_l",)),
     Item("SPIKES", ("spike",)),
     Item("SPRING", ("spring",)),
+    # The two pieces a body can move, and the one that moves on its own.
+    Item("CRATE", ("block",)),
+    Item("ROCK", ("boulder",)),
     # The animated surface is what a pool looks like as a whole; the plain body
     # cell is the same water without its foam, so the sheet shows the surface.
     Item("WATER", ("water_top_a",), brush="water"),
@@ -108,7 +113,7 @@ ITEMS: tuple[Item, ...] = (
     Item("SPIKED BALL", ("spike_ball",)),
     Item("SPAWN", ("spawn_marker",)),
     Item("FLAG", ("goal_flag_2",), brush="goal_top"),
-    Item("RUNNER", ("player_idle_a",), placeable=False),
+    Item("PLAYER", ("player_idle_a",), placeable=False),
     Item("WALKER", ("walker_a",)),
     Item("CHASER", ("chaser_a",)),
     Item("FLYER", ("flyer_a",)),
